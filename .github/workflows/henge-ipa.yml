@@ -107,12 +107,25 @@ jobs:
         test -f Husk/src/rppairing-ios/Cargo.lock
         test -f Henge/third_party/libzip/CMakeLists.txt
         df -h .
-    - name: Validate retained efficiency paths and decoder backpressure
+    - name: Compile engine regression checks
       working-directory: Henge
       run: |
         set -euo pipefail
+        mkdir -p build
+        exec > >(tee build/validation-00.log) 2>&1
+        trap 'task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND" >&2' ERR
         ulimit -s 65520
+        set -x
         make -j4 build/test_jit_region build/test_mmu build/test_mem build/test_jit build/test_devices build/test_fastmem build/test_memory_bounds build/test_tail_recheck build/test_cpu_sync build/test_timer_dispatch build/test_idle_integration
+    - name: Validate JIT publication, MMU and superblocks
+      working-directory: Henge
+      run: |
+        set -euo pipefail
+        mkdir -p build
+        exec > >(tee build/validation-01.log) 2>&1
+        trap 'task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND" >&2' ERR
+        ulimit -s 65520
+        set -x
         build/test_jit_region
         HV_JIT_RELAXED_BRANCH=1 build/test_jit_region
         build/test_mmu
@@ -120,6 +133,15 @@ jobs:
         build/test_jit
         HV_SUPERBLOCKS=1 build/test_jit
         HV_SUPERBLOCKS=1 HV_JIT_SPLIT=1 build/test_jit
+    - name: Validate memory, timing, CPU sync and devices
+      working-directory: Henge
+      run: |
+        set -euo pipefail
+        mkdir -p build
+        exec > >(tee build/validation-02.log) 2>&1
+        trap 'task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND" >&2' ERR
+        ulimit -s 65520
+        set -x
         build/test_mem
         HV_WALK_LOG=0 HV_IJC_PAGES=0 build/test_mem
         HV_FASTMEM=1 build/test_mem
@@ -132,6 +154,15 @@ jobs:
         build/test_idle_integration
         build/test_devices
         python3 tests/test_chain_index.py
+    - name: Validate indexes, DNS, input and Link protocol
+      working-directory: Henge
+      run: |
+        set -euo pipefail
+        mkdir -p build
+        exec > >(tee build/validation-03.log) 2>&1
+        trap 'task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND" >&2' ERR
+        ulimit -s 65520
+        set -x
         python3 tests/test_translation_race.py
         python3 tests/test_walk_log.py
         python3 tests/test_hvsparse.py
@@ -143,6 +174,14 @@ jobs:
         bash tools/link/check.sh
         xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -DHV_PROF_TEST -Icore -Ihost -Idevices host/prof_ios.c tests/test_prof_ios.c -o build/test_prof_ios
         build/test_prof_ios
+    - name: Save validation output
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Henge-validation-${{ github.run_id }}
+        retention-days: 7
+        if-no-files-found: ignore
+        path: Henge/build/validation-*.log
     - name: Fingerprint dependency toolchain
       id: toolchain
       run: |
