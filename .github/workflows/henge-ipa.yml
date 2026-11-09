@@ -99,6 +99,36 @@ jobs:
           xcodebuild -downloadComponent MetalToolchain
         fi
         xcrun --sdk macosx metal --version
+    - name: Prepare and verify build prerequisites
+      run: |
+        set -euo pipefail
+        # The runner may start in a non-login shell; expose existing tools.
+        export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
+        if ! command -v brew >/dev/null; then
+          echo '::error::Homebrew is required on this runner. Install it once using brew.sh, then restart ./run.sh.'
+          exit 1
+        fi
+        for tool in cmake xcodegen meson ninja pkg-config; do
+          if ! command -v "$tool" >/dev/null; then brew install "$tool"; fi
+        done
+        if ! command -v rustup >/dev/null; then
+          curl --proto '=https' --tlsv1.2 -fL --retry 3 https://sh.rustup.rs -o "$RUNNER_TEMP/henge-rustup.sh"
+          sh "$RUNNER_TEMP/henge-rustup.sh" -y --profile minimal --no-modify-path
+        fi
+        if ! rustup show active-toolchain; then rustup default stable; fi
+        rustup target add aarch64-apple-ios
+        echo '/opt/homebrew/bin' >> "$GITHUB_PATH"
+        echo '/usr/local/bin' >> "$GITHUB_PATH"
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        xcrun --sdk iphoneos --show-sdk-path
+        xcrun --sdk iphoneos --find clang
+        xcrun --sdk iphoneos --find swiftc
+        xcrun --sdk iphoneos metal --version
+        command -v codesign zip rsync python3 cmake xcodegen meson ninja pkg-config cargo
+        test -d Husk/src/app/Frameworks/StikJIT.xcframework
+        test -f Husk/src/rppairing-ios/Cargo.lock
+        test -f Henge/third_party/libzip/CMakeLists.txt
+        df -h .
     - name: Validate retained efficiency paths and decoder backpressure
       working-directory: Henge
       run: |
@@ -135,12 +165,6 @@ jobs:
         bash tools/link/check.sh
         xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -DHV_PROF_TEST -Icore -Ihost -Idevices host/prof_ios.c tests/test_prof_ios.c -o build/test_prof_ios
         build/test_prof_ios
-    - name: Install iOS dependency build tools
-      run: |
-        set -euo pipefail
-        brew install xcodegen meson ninja pkg-config
-        rustup target add aarch64-apple-ios
-        mkdir -p "$HOME/Desktop"
     - name: Fingerprint dependency toolchain
       id: toolchain
       run: |
@@ -246,6 +270,7 @@ jobs:
         path: |
           Henge/ios/build/*.buildlog
           Henge/build/*.log
+          Husk/build/logs/*.log
 'on':
   push:
     branches:

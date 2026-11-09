@@ -3129,10 +3129,10 @@ index 0000000..1fc2a3f
 +not establish physical memory pressure as the cause of the panic.
 diff --git a/docs/build-superblocks-20261109.md b/docs/build-superblocks-20261109.md
 new file mode 100644
-index 0000000..c5eb4f8
+index 0000000..941ebb3
 --- /dev/null
 +++ b/docs/build-superblocks-20261109.md
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,76 @@
 +# Superblocks and latest-main integration
 +
 +Upstream reviewed/integrated: be027b492bac818a3bb0c76fc8bbdd7aee42cbd2.
@@ -3204,6 +3204,11 @@ index 0000000..c5eb4f8
 +are required for this IPA.
 +
 +The emulated self-hosted runner cannot establish physical instruction-cache behavior or AVE hardware codec behavior. Link hardware codec/pixel tests previously passed on physical-Mac run 42597605953; unchanged codec paths are compiled here but those hardware runtime tests are explicitly not revalidated. Protocol/credit/worker/discovery/TLS/Keychain checks and iOS UI type checking still run.
++
++Runner validation found the 1KiB tiny-cache fixture could not open a split alias
++(the attachment API requires at least 4KiB). The fixture now maps 4KiB, limits
++logical capacity to 1KiB across cache resets, asserts resets occurred and restores
++mapped capacity before cleanup. No production memory-mapping rule is weakened.
 diff --git a/docs/experimental-fastmem.md b/docs/experimental-fastmem.md
 new file mode 100644
 index 0000000..241c467
@@ -14447,7 +14452,7 @@ index 0000000..52b2692
 +        subprocess.run(['swiftc','-parse-as-library','-swift-version','6',str(p/'fixture.swift'),'-o',str(p/'check')],check=True)
 +        subprocess.run([str(p/'check')],check=True,timeout=10)
 diff --git a/tests/test_jit.c b/tests/test_jit.c
-index 3208a93..abd456f 100644
+index 3208a93..882612c 100644
 --- a/tests/test_jit.c
 +++ b/tests/test_jit.c
 @@ -1,4 +1,5 @@
@@ -14513,6 +14518,33 @@ index 3208a93..abd456f 100644
      /* PAC: compare against the inputs, with canonical pointers in the registers. */
      {
          static HvCpu init, jit;
+@@ -74,7 +118,15 @@ int main(void) {
+        in the middle of a program, chains pending and all. */
+     {
+         static HvMachine small;
+-        if (hv_machine_init(&small, 1024) != 0) return 1;
++        /* Split RX/RW attachment requires >= 4096 bytes. Keep the actual
++           mapping valid but expose only 1 KiB to the allocator, including
++           after resets (the per-flush limit knob can be reset). */
++        if (hv_machine_init(&small, 4096) != 0) {
++            printf("small JIT mapping init failed\n");
++            return 1;
++        }
++        size_t mapped_capacity = small.jit.capacity;
++        small.jit.capacity = 1024 / sizeof(uint32_t);
+         hv_machine_add_ram(&small, (uint64_t)(uintptr_t)jit_programs_begin, jit_programs_finish - jit_programs_begin,
+                            (void *)jit_programs_begin, 1);
+         hv_machine_add_ram(&small, (uint64_t)(uintptr_t)stack, 65536, stack, 0);
+@@ -89,6 +141,9 @@ int main(void) {
+             failed += bad != 0;
+         }
+         printf("with a 1 KB JIT region: %llu flushes\n", (unsigned long long)small.stats.block_flushes);
++        failed += small.stats.block_flushes == 0;
++        small.jit.capacity = mapped_capacity;
++        hv_machine_free(&small);
+     }
+     printf("%zu programs x 2 seeds, %d failures, %d blocks translated\n", count, failed, m.nblocks);
+     return failed != 0;
 diff --git a/tests/test_jit_allocation.py b/tests/test_jit_allocation.py
 new file mode 100644
 index 0000000..060441b
