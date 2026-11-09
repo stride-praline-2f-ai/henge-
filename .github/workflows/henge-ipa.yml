@@ -1,0 +1,256 @@
+name: Henge self-hosted IPA
+permissions:
+  contents: read
+concurrency:
+  group: henge-custom-ipa
+  cancel-in-progress: true
+env:
+  HUSK: ${{ github.workspace }}/Husk
+  HENGE_GAME_MODE: '0'
+  HENGE_IPA_OUTPUT: ${{ github.workspace }}/Henge-output/Henge.ipa
+  HENGE_CI_EMULATED_RUNNER: '1'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+  IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
+jobs:
+  build:
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 180
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: build-request
+        persist-credentials: false
+    - name: Select newest installed Xcode for native touch
+      run: |
+        python3 - <<'PYSDK'
+        import glob, os, re, subprocess
+        assert subprocess.check_output(['uname', '-m'], text=True).strip() == 'arm64', 'This Henge runner requires native arm64 macOS'
+        candidates = []
+        for app in glob.glob('/Applications/Xcode*.app'):
+            developer = app + '/Contents/Developer'
+            try:
+                version = subprocess.check_output(['xcodebuild', '-version'], env={**os.environ, 'DEVELOPER_DIR': developer}, text=True)
+                match = re.search(r'Xcode (\d+(?:\.\d+)*)', version)
+                if match: candidates.append((tuple(map(int, match[1].split('.'))), developer, version))
+            except subprocess.CalledProcessError:
+                pass
+        if not candidates: raise SystemExit('No installed Xcode found')
+        _, developer, version = max(candidates)
+        print(version + developer)
+        with open(os.environ['GITHUB_ENV'], 'a') as f: f.write('DEVELOPER_DIR=' + developer + '\n')
+        PYSDK
+    - name: Load pinned inputs
+      id: inputs
+      run: |
+        python3 - <<'PY'
+        import json, os
+        from pathlib import Path
+        data = json.loads(Path('build-request/henge-build/manifest.json').read_text())
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write('henge=' + data['henge_sha'] + '\n')
+            f.write('husk=' + data['husk_sha'] + '\n')
+        PY
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Henge
+        ref: ${{ steps.inputs.outputs.henge }}
+        path: Henge
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Husk
+        ref: ${{ steps.inputs.outputs.husk }}
+        path: Husk
+        persist-credentials: false
+    - name: Verify and apply reviewed changes
+      env:
+        CUSTOM_SOURCE_COMMIT: ${{ github.sha }}
+      run: |
+        python3 - <<'PY'
+        import hashlib, json, os, plistlib, subprocess
+        from pathlib import Path
+        folder = Path('build-request/henge-build')
+        data = json.loads((folder / 'manifest.json').read_text())
+        patch = folder / 'henge.patch'
+        assert hashlib.sha256(patch.read_bytes()).hexdigest() == data['patch_sha256']
+        for check in (['git', '-C', 'Henge', 'apply', '--check', str(patch.resolve())],
+                      ['git', '-C', 'Henge', 'apply', str(patch.resolve())]):
+            subprocess.run(check, check=True)
+        path = Path('Henge/ios/Henge/Info.plist')
+        with path.open('rb') as f: info = plistlib.load(f)
+        info['HengeCustomSourceCommit'] = os.environ['CUSTOM_SOURCE_COMMIT']
+        info['HengeUpstreamCommit'] = data['henge_sha']
+        info['HengeCustomPullRequests'] = [14, 31, 32, 35, 36, 46, 60, 61, 63]
+        with path.open('wb') as f: plistlib.dump(info, f)
+        if os.environ.get('HENGE_GAME_MODE') == '1':
+            subprocess.run(['python3', 'Henge/tools/configure_gaming_experiments.py', '--info', str(path), '--game-mode'], check=True)
+        # Do not silently change normal/personal-team signing requirements.
+        for name in ['Henge.entitlements', 'Henge.personal.entitlements']:
+            actual = Path('Henge/ios/Henge') / name
+            expected = subprocess.check_output(['git', '-C', 'Henge', 'show', data['henge_sha'] + ':ios/Henge/' + name])
+            assert actual.read_bytes() == expected
+        PY
+        git -C Henge add -A
+        git -C Henge -c user.name='Henge CI' -c user.email='henge-ci@users.noreply.github.com' commit -m "Custom Henge 0.2 from ${GITHUB_SHA}"
+    - name: Ensure Metal shader compiler
+      run: |
+        if ! xcrun --sdk macosx metal --version; then
+          xcodebuild -downloadComponent MetalToolchain
+        fi
+        xcrun --sdk macosx metal --version
+    - name: Validate retained efficiency paths and decoder backpressure
+      working-directory: Henge
+      run: |
+        set -euo pipefail
+        ulimit -s 65520
+        make -j4 build/test_jit_region build/test_mmu build/test_mem build/test_jit build/test_devices build/test_fastmem build/test_memory_bounds build/test_tail_recheck build/test_cpu_sync build/test_timer_dispatch build/test_idle_integration
+        build/test_jit_region
+        HV_JIT_RELAXED_BRANCH=1 build/test_jit_region
+        build/test_mmu
+        HV_WALK_LOG=0 HV_IJC_PAGES=0 build/test_mmu
+        build/test_jit
+        HV_SUPERBLOCKS=1 build/test_jit
+        HV_SUPERBLOCKS=1 HV_JIT_SPLIT=1 build/test_jit
+        build/test_mem
+        HV_WALK_LOG=0 HV_IJC_PAGES=0 build/test_mem
+        HV_FASTMEM=1 build/test_mem
+        HV_SUPERBLOCKS=1 build/test_mem
+        build/test_fastmem
+        build/test_memory_bounds
+        build/test_tail_recheck
+        build/test_cpu_sync
+        build/test_timer_dispatch
+        build/test_idle_integration
+        build/test_devices
+        python3 tests/test_chain_index.py
+        python3 tests/test_translation_race.py
+        python3 tests/test_walk_log.py
+        python3 tests/test_hvsparse.py
+        python3 tests/test_installer_preflight.py
+        cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread -Itests/dns_mock -Icore -Ihost tests/test_dns_proxy.c -o build/test_dns_proxy
+        build/test_dns_proxy
+        swiftc ios/Henge/PhysicalMouseButtons.swift tests/test_physical_mouse_buttons.swift -o build/test_physical_mouse_buttons
+        build/test_physical_mouse_buttons
+        bash tools/link/check.sh
+        xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -DHV_PROF_TEST -Icore -Ihost -Idevices host/prof_ios.c tests/test_prof_ios.c -o build/test_prof_ios
+        build/test_prof_ios
+    - name: Install iOS dependency build tools
+      run: |
+        set -euo pipefail
+        brew install xcodegen meson ninja pkg-config
+        rustup target add aarch64-apple-ios
+        mkdir -p "$HOME/Desktop"
+    - name: Fingerprint dependency toolchain
+      id: toolchain
+      run: |
+        python3 - <<'PY'
+        import hashlib, os, subprocess
+        commands = [['xcodebuild', '-version'], ['xcrun', '--sdk', 'iphoneos', '--show-sdk-version'], ['rustc', '-vV'], ['meson', '--version'], ['ninja', '--version'], ['pkg-config', '--version']]
+        identity = b'\n'.join(subprocess.check_output(c) for c in commands)
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write('id=' + hashlib.sha256(identity).hexdigest()[:24] + '\n')
+        PY
+    - name: Restore persistent local dependencies
+      env:
+        DEP_KEY: ${{ steps.inputs.outputs.husk }}-${{ steps.toolchain.outputs.id }}
+      run: |
+        set -euo pipefail
+        cache="$HOME/Library/Caches/HengeCI/$DEP_KEY"
+        mkdir -p Husk/third_party/build Husk/build/ios-arm64
+        if [ -d "$cache/third_party" ]; then rsync -a "$cache/third_party/" Husk/third_party/build/; fi
+        if [ -d "$cache/ios-arm64" ]; then rsync -a "$cache/ios-arm64/" Husk/build/ios-arm64/; fi
+    - name: Fetch dependency sources
+      working-directory: Husk
+      run: bash ../build-request/henge-build/fetch-required-sources.sh "$PWD"
+    - name: Build required iOS libraries
+      working-directory: Husk
+      run: bash scripts/build_ios.sh libffi glib libslirp
+    - name: Build on-device pairing library
+      working-directory: Husk
+      run: bash scripts/build_rppairing_ios.sh
+    - name: Preserve dependency cache
+      env:
+        DEP_KEY: ${{ steps.inputs.outputs.husk }}-${{ steps.toolchain.outputs.id }}
+      run: |
+        set -euo pipefail
+        cache="$HOME/Library/Caches/HengeCI/$DEP_KEY"
+        mkdir -p "$cache/third_party" "$cache/ios-arm64"
+        rsync -a --delete Husk/third_party/build/ "$cache/third_party/"
+        rsync -a --delete Husk/build/ios-arm64/ "$cache/ios-arm64/"
+    - name: Copy iOS dependencies
+      working-directory: Henge
+      run: zsh ios/scripts/fetch_deps.sh
+    - name: Build restore stack
+      working-directory: Henge
+      run: zsh tools/build_ios_restore.sh
+    - name: Build iOS engine
+      working-directory: Henge
+      run: make -j4 ios-lib
+    - name: Package and inspect IPA
+      working-directory: Henge
+      run: |
+        zsh ios/scripts/package_ipa.sh
+        python3 - <<'PY'
+        import gzip, hashlib, json, os, plistlib, subprocess, zipfile
+        from pathlib import Path
+        ipa = Path(os.environ['HENGE_IPA_OUTPUT'])
+        with zipfile.ZipFile(ipa) as z:
+            assert z.testzip() is None
+            info = plistlib.loads(z.read('Payload/Henge.app/Info.plist'))
+            assert info['HengeCustomSourceCommit'] == os.environ['GITHUB_SHA']
+            assert info['HengeCustomPullRequests'] == [14, 31, 32, 35, 36, 46, 60, 61, 63]
+            manifest = json.loads(Path('../build-request/henge-build/manifest.json').read_text())
+            assert info['HengeUpstreamCommit'] == manifest['henge_sha']
+            assert info['CFBundleIdentifier'] == 'com.henge.app'
+            assert (info.get('LSSupportsGameMode') is True) == (os.environ.get('HENGE_GAME_MODE') == '1')
+            assert info.get('HengeLinkExperimental') is True and info.get('HengeLinkProtocolVersion') == manifest['henge_link']['protocol_version']
+            assert ('Henge Link protocol ' + str(manifest['henge_link']['protocol_version'])).encode() in z.read('Payload/Henge.app/HengeLink.txt')
+            executable = z.read('Payload/Henge.app/Henge')
+            assert b'header-port=%u' in executable and b'codec canvas=' in executable
+            assert b'decode-ack-window=3' in executable and b'decode-consumed=' in executable
+            assert '_henge-link._tcp' in info.get('NSBonjourServices', [])
+            assert b'Decoder cannot keep up' not in executable
+            assert b'viewer controls hidden=' in executable
+            assert b'VM background execution=not implemented' in executable
+            assert b'efficiency-v3:' in executable
+            assert b'efficiency-v2:' in executable and b'bounded IPv4/UDP/DNS parser' in executable
+            shaders = z.read('Payload/Henge.app/default.metallib')
+            assert shaders[:4] == b'MTLB' and len(shaders) > 1024
+            helper = gzip.decompress(z.read('Payload/Henge.app/henge-touch-agent.gz'))
+            assert helper[:4] == bytes.fromhex('cffaedfe') and len(helper) > 4096
+        output = dict(game_mode_experiment=os.environ.get('HENGE_GAME_MODE') == '1', physical_m4_energy_verified=False, native_metal_library_sha256=hashlib.sha256(shaders).hexdigest(), native_metal_precompiled=True, source_commit=os.environ['GITHUB_SHA'], upstream_commit=info['HengeUpstreamCommit'], patch_sha256=manifest['patch_sha256'], ipa_sha256=hashlib.sha256(ipa.read_bytes()).hexdigest(), bundle=info['CFBundleIdentifier'], version=info['CFBundleShortVersionString'], fastmem_default=False, prs=[14,31,32,35,36,46,60,61,63], touch_helper_sha256=hashlib.sha256(helper).hexdigest(), native_touch_requires_authorized_mac_signing=True, touch_launch_probe="Not repeated in this IPA-only build; guest HID authorization remains unverified")
+        output['henge_link'] = dict(manifest['henge_link'], native_fix_validation='Guest-native protocol/credit/worker/TLS/discovery/Keychain and SDK UI checks passed; physical AVE hardware codec checks not revalidated on this emulated runner', native_checks_run=int(os.environ['GITHUB_RUN_ID']))
+        output['runner'] = manifest['runner']
+        output['superblocks'] = dict(manifest['superblocks'], native_validation_run=int(os.environ['GITHUB_RUN_ID']), physical_cpu_behavior_verified=False)
+        output['background_execution'] = manifest['background_execution']
+        output['efficiency_v2'] = dict(manifest['efficiency_v2'], native_validation_run=int(os.environ['GITHUB_RUN_ID']))
+        (ipa.parent / 'Henge-build-verification.json').write_text(json.dumps(output, indent=2))
+        PY
+    - uses: actions/upload-artifact@v4
+      with:
+        name: Henge-IPA-${{ github.sha }}
+        retention-days: 14
+        compression-level: 0
+        if-no-files-found: error
+        path: |
+          ${{ github.workspace }}/Henge-output/Henge.ipa
+          ${{ github.workspace }}/Henge-output/Henge-build-verification.json
+    - name: Retain failure logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Henge-build-logs-${{ github.run_id }}
+        retention-days: 3
+        if-no-files-found: ignore
+        path: |
+          Henge/ios/build/*.buildlog
+          Henge/build/*.log
+'on':
+  push:
+    branches:
+    - main
+    paths:
+    - henge-build/**
+    - .github/workflows/henge-ipa.yml
+  workflow_dispatch: {}
