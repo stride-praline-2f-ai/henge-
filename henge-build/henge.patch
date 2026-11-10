@@ -753,7 +753,7 @@ index 0000000..bef10d1
 +    }
 +}
 diff --git a/core/machine.c b/core/machine.c
-index be05fd1..2e2a9ce 100644
+index be05fd1..977f6c0 100644
 --- a/core/machine.c
 +++ b/core/machine.c
 @@ -3,11 +3,13 @@
@@ -814,7 +814,7 @@ index be05fd1..2e2a9ce 100644
      /* So the tests can run the translator these ways too (the iOS and --phone paths read them in knobs_init). */
 -    if (getenv("HV_SUPERBLOCKS")) hv_knob[HV_K_SUPERBLOCKS] = atoi(getenv("HV_SUPERBLOCKS"));
 +    hv_knob[HV_K_SUPERBLOCKS] = getenv("HV_SUPERBLOCKS") ? atoi(getenv("HV_SUPERBLOCKS")) : 0;
-+    fprintf(stderr, "efficiency-v3: superblocks=%d (experimental) wait-probes=%d jit-finish=batched branch-patch=full-barrier-default (relaxed B-to-B opt-in); indexed chain repair and full invalidation barriers retained\n", hv_knob[HV_K_SUPERBLOCKS] != 0, m->wait_stats);
++    fprintf(stderr, "efficiency-v3: superblocks=%d (experimental) wait-probes=%d jit-finish=batched branch-patch=full-barrier (relaxed request falls back safely); indexed chain repair and full invalidation barriers retained\n", hv_knob[HV_K_SUPERBLOCKS] != 0, m->wait_stats);
      /* The exact check for an access in a page's last 15 bytes, in the access's out-of-line path (code size only):
         on the phone, Golden Gate's boot and login send 80-240K such accesses a second to the helper without it. It
         costs ~13% of the code (Mac 2026-11-09: 296-300 against 259-261 bytes a block), and the phone's code cache
@@ -3254,10 +3254,10 @@ index 0000000..941ebb3
 +mapped capacity before cleanup. No production memory-mapping rule is weakened.
 diff --git a/docs/duo-efficiency.md b/docs/duo-efficiency.md
 new file mode 100644
-index 0000000..ce61e06
+index 0000000..560f62a
 --- /dev/null
 +++ b/docs/duo-efficiency.md
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,137 @@
 +# Duo / A20 Pro scheduling and host overhead
 +
 +Prepared from the shipped custom source 031593d (build request 47dced9), retaining
@@ -3389,6 +3389,12 @@ index 0000000..ce61e06
 +then the prior memory, timer, graphics/Link and signing validations. This is a
 +selective upstream port, not a claim that every newer main commit was merged.
 +Actual energy and FPS gains on A20 Pro remain unmeasured.
++
++Cloud validation found the pre-existing, default-off HV_JIT_RELAXED_BRANCH=1
++experiment could return the old branch destination after publication on both
++MAP_JIT and split mappings. The knob now explicitly warns and uses full cache
++synchronization. Default execution is unchanged. Both requested modes are tested;
++no energy saving is claimed for disabling a failed experiment.
 diff --git a/docs/experimental-fastmem.md b/docs/experimental-fastmem.md
 new file mode 100644
 index 0000000..241c467
@@ -8475,26 +8481,39 @@ index 0000000..3902608
 +}
 +#endif
 diff --git a/host/jit_region.c b/host/jit_region.c
-index b1a4979..8b51475 100644
+index b1a4979..e1e8e9d 100644
 --- a/host/jit_region.c
 +++ b/host/jit_region.c
-@@ -114,7 +114,15 @@ void hv_jit_finish2(HvJitRegion *region, uint32_t *a, size_t na, uint32_t *b, si
+@@ -5,6 +5,7 @@
+ #include <mach/mach.h>
+ #include <pthread.h>
+ #include <stdlib.h>
++#include <stdio.h>
+ #include <string.h>
+ #include <sys/mman.h>
+ 
+@@ -114,22 +115,30 @@ void hv_jit_finish2(HvJitRegion *region, uint32_t *a, size_t na, uint32_t *b, si
      __asm__ volatile("dsb ish\n\tisb" ::: "memory");
  }
  
 +static pthread_once_t branch_policy_once = PTHREAD_ONCE_INIT;
-+static int relaxed_branch;
 +static void branch_policy(void) {
 +    const char *p = getenv("HV_JIT_RELAXED_BRANCH");
-+    relaxed_branch = p && !strcmp(p, "1");
++    if (p && !strcmp(p, "1"))
++        fprintf(stderr, "henge: relaxed branch publication unavailable: native correctness check failed; using full cache synchronization\n");
 +}
  void hv_jit_finish_branch(HvJitRegion *region, uint32_t *word) {
+-    (void)region;
+-#if TARGET_OS_OSX
+-    if (!region->rw_diff) pthread_jit_write_protect_np(1);
+-#endif
+-    /* The store first (so a refetch finds the new word), then the line, with no wait for every CPU's cache. */
+-    __asm__ volatile("dsb ish\n\tic ivau, %0" ::"r"((uintptr_t)word & ~(uintptr_t)63) : "memory");
 +    pthread_once(&branch_policy_once, branch_policy);
-+    if (!relaxed_branch) { hv_jit_finish(region, word, 1); return; }
-     (void)region;
- #if TARGET_OS_OSX
-     if (!region->rw_diff) pthread_jit_write_protect_np(1);
-@@ -125,11 +133,15 @@ void hv_jit_finish_branch(HvJitRegion *region, uint32_t *word) {
++    /* An ISB alone did not guarantee visibility of a just-patched branch on
++       the native cloud Mac. Preserve publication completion for every mode. */
++    hv_jit_finish(region, word, 1);
+ }
  
  /* Any thread: an even number of words (blocks stay 8-byte aligned), taken atomically. */
  uint32_t *hv_jit_reserve(HvJitRegion *region, size_t words) {
@@ -8513,6 +8532,22 @@ index b1a4979..8b51475 100644
  }
  
  void hv_jit_reset(HvJitRegion *region) {
+diff --git a/host/jit_region.h b/host/jit_region.h
+index dc4cac7..a2f5a0d 100644
+--- a/host/jit_region.h
++++ b/host/jit_region.h
+@@ -33,9 +33,8 @@ void hv_jit_write(HvJitRegion *region, uint32_t *start, const void *src, size_t
+ void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words);
+ /* hv_jit_finish for two ranges at once (a block's hot and cold parts): one wait for the instruction caches, not two. */
+ void hv_jit_finish2(HvJitRegion *region, uint32_t *a, size_t na, uint32_t *b, size_t nb);
+-/* After rewriting one B (an unconditional branch) as another B, which a CPU may run as it changes (Arm allows it for
+-   B): the instruction caches drop the line without waiting for them all to have done so. A CPU still running the old
+-   branch takes the way the old one went (chaining: the exit's stub, which follows the slot) until its cache lets go. */
++/* Publish a rewritten unconditional branch with full instruction-cache
++   synchronization. The former relaxed option falls back to this safe path. */
+ void hv_jit_finish_branch(HvJitRegion *region, uint32_t *word);
+ 
+ /* Space for `words` instructions, or NULL when the region is full. */
 diff --git a/host/native_touch.c b/host/native_touch.c
 new file mode 100644
 index 0000000..504e669
@@ -10190,7 +10225,7 @@ index 8825f4b..02ddd18 100644
 +#include "native_touch.h"
 +#include "../../devices/pvg_link.h"
 diff --git a/ios/Henge/HengeLog.swift b/ios/Henge/HengeLog.swift
-index 624b847..6bb3114 100644
+index 624b847..12292e7 100644
 --- a/ios/Henge/HengeLog.swift
 +++ b/ios/Henge/HengeLog.swift
 @@ -8,7 +8,7 @@ import os
@@ -10266,7 +10301,7 @@ index 624b847..6bb3114 100644
 +        if let upstream = info["HengeUpstreamCommit"] as? String {
 +            log("boot", "upstream main: \(upstream)")
 +        }
-+        log("boot", "performance revision: efficiency-v3 JIT maintenance and device trace cache; indexed repair, DNS hardening and dedup retained; superblocks experimental, background capability report only")
++        log("boot", "performance revision: Duo-aware scheduling; inline EL1 TCR/PAR/PAN; hidden-details work removed; full branch publication; efficiency-v3 retained; superblocks experimental")
 +        log("boot", "Link protocol: 2, decoder-consumption credit window=3; local discovery and opt-in Keychain pairing; three-finger viewer controls; update both devices")
 +        log("boot", "cache lifecycle: JIT translations and kernel read lookups are RAM-only; no cross-launch executable cache")
 +        if let source = info["HengeCustomSourceCommit"] as? String {
