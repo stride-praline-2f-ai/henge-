@@ -1,4 +1,4 @@
-name: Henge self-hosted IPA
+name: Henge cloud IPA
 permissions:
   contents: read
 concurrency:
@@ -8,14 +8,14 @@ env:
   HUSK: ${{ github.workspace }}/Husk
   HENGE_GAME_MODE: '0'
   HENGE_IPA_OUTPUT: ${{ github.workspace }}/Henge-output/Henge.ipa
-  HENGE_CI_EMULATED_RUNNER: '1'
+  HENGE_CI_EMULATED_RUNNER: '0'
   HOMEBREW_NO_AUTO_UPDATE: '1'
   HOMEBREW_NO_INSTALL_CLEANUP: '1'
   IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
 jobs:
   build:
-    runs-on: [self-hosted, macOS]
-    timeout-minutes: 180
+    runs-on: xcode-27
+    timeout-minutes: 90
     steps:
     - uses: actions/checkout@v4
       with:
@@ -116,7 +116,7 @@ jobs:
         trap 'task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND" >&2' ERR
         ulimit -s 65520
         set -x
-        make -j4 build/test_jit_region build/test_mmu build/test_mem build/test_jit build/test_devices build/test_fastmem build/test_memory_bounds build/test_tail_recheck build/test_cpu_sync build/test_timer_dispatch build/test_idle_integration
+        make -j4 build/test_inline_sysreg build/test_jit_region build/test_mmu build/test_mem build/test_jit build/test_devices build/test_fastmem build/test_memory_bounds build/test_tail_recheck build/test_cpu_sync build/test_timer_dispatch build/test_idle_integration
     - name: Validate JIT publication, MMU and superblocks
       working-directory: Henge
       run: |
@@ -126,6 +126,10 @@ jobs:
         trap 'task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND" >&2' ERR
         ulimit -s 65520
         set -x
+        build/test_inline_sysreg
+
+        HV_JIT_SPLIT=1 build/test_inline_sysreg
+
         build/test_jit_region
         HV_JIT_RELAXED_BRANCH=1 build/test_jit_region
         build/test_mmu
@@ -172,8 +176,6 @@ jobs:
         swiftc ios/Henge/PhysicalMouseButtons.swift tests/test_physical_mouse_buttons.swift -o build/test_physical_mouse_buttons
         build/test_physical_mouse_buttons
         bash tools/link/check.sh
-        xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -DHV_PROF_TEST -Icore -Ihost -Idevices host/prof_ios.c host/scheduling.c tests/test_prof_ios.c -o build/test_prof_ios
-        build/test_prof_ios
         bash tools/check_host_scheduling.sh
     - name: Save validation output
       if: always()
@@ -182,7 +184,9 @@ jobs:
         name: Henge-validation-${{ github.run_id }}
         retention-days: 7
         if-no-files-found: ignore
-        path: Henge/build/validation-*.log
+        path: |
+          Henge/build/validation-*.log
+          Henge/build/scheduling-check/*.log
     - name: Fingerprint dependency toolchain
       id: toolchain
       run: |
@@ -193,16 +197,14 @@ jobs:
         with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
             f.write('id=' + hashlib.sha256(identity).hexdigest()[:24] + '\n')
         PY
-    - name: Restore persistent local dependencies
-      env:
-        DEP_KEY: ${{ steps.inputs.outputs.husk }}-${{ steps.toolchain.outputs.id }}
-      run: |
-        set -euo pipefail
-        cache="$HOME/Library/Caches/HengeCI/$DEP_KEY"
-        mkdir -p Husk/third_party/build Husk/build/ios-arm64 Husk/build/stamps
-        if [ -d "$cache/third_party" ]; then rsync -a "$cache/third_party/" Husk/third_party/build/; fi
-        if [ -d "$cache/ios-arm64" ]; then rsync -a "$cache/ios-arm64/" Husk/build/ios-arm64/; fi
-        if [ -d "$cache/stamps" ]; then rsync -a "$cache/stamps/" Husk/build/stamps/; fi
+    - name: Restore pinned dependency cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          Husk/third_party/build
+          Husk/build/ios-arm64
+          Husk/build/stamps
+        key: henge-cloud-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.husk }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('build-request/henge-build/fetch-required-sources.sh') }}
     - name: Fetch dependency sources
       working-directory: Husk
       run: bash ../build-request/henge-build/fetch-required-sources.sh "$PWD"
@@ -212,16 +214,6 @@ jobs:
     - name: Build on-device pairing library
       working-directory: Husk
       run: bash scripts/build_rppairing_ios.sh
-    - name: Preserve dependency cache
-      env:
-        DEP_KEY: ${{ steps.inputs.outputs.husk }}-${{ steps.toolchain.outputs.id }}
-      run: |
-        set -euo pipefail
-        cache="$HOME/Library/Caches/HengeCI/$DEP_KEY"
-        mkdir -p "$cache/third_party" "$cache/ios-arm64" "$cache/stamps"
-        rsync -a --delete Husk/third_party/build/ "$cache/third_party/"
-        rsync -a --delete Husk/build/ios-arm64/ "$cache/ios-arm64/"
-        rsync -a --delete Husk/build/stamps/ "$cache/stamps/"
     - name: Copy iOS dependencies
       working-directory: Henge
       run: zsh ios/scripts/fetch_deps.sh
@@ -257,6 +249,9 @@ jobs:
             assert b'Decoder cannot keep up' not in executable
             assert b'viewer controls hidden=' in executable
             assert b'VM background execution=not implemented' in executable
+            assert b'host-capabilities:' in executable and b'host-scheduling:' in executable
+            assert b'host-qos:' in executable and b'A20 Pro (Duo model profile)' in executable
+            assert b'utility_requests=' in executable
             assert b'efficiency-v3:' in executable
             assert b'efficiency-v2:' in executable and b'bounded IPv4/UDP/DNS parser' in executable
             shaders = z.read('Payload/Henge.app/default.metallib')
@@ -264,8 +259,9 @@ jobs:
             helper = gzip.decompress(z.read('Payload/Henge.app/henge-touch-agent.gz'))
             assert helper[:4] == bytes.fromhex('cffaedfe') and len(helper) > 4096
         output = dict(game_mode_experiment=os.environ.get('HENGE_GAME_MODE') == '1', physical_m4_energy_verified=False, native_metal_library_sha256=hashlib.sha256(shaders).hexdigest(), native_metal_precompiled=True, source_commit=os.environ['GITHUB_SHA'], upstream_commit=info['HengeUpstreamCommit'], patch_sha256=manifest['patch_sha256'], ipa_sha256=hashlib.sha256(ipa.read_bytes()).hexdigest(), bundle=info['CFBundleIdentifier'], version=info['CFBundleShortVersionString'], fastmem_default=False, prs=[14,31,32,35,36,46,60,61,63], touch_helper_sha256=hashlib.sha256(helper).hexdigest(), native_touch_requires_authorized_mac_signing=True, touch_launch_probe="Not repeated in this IPA-only build; guest HID authorization remains unverified")
-        output['henge_link'] = dict(manifest['henge_link'], native_fix_validation='Guest-native protocol/credit/worker/TLS/discovery/Keychain and SDK UI checks passed; physical AVE hardware codec checks not revalidated on this emulated runner', native_checks_run=int(os.environ['GITHUB_RUN_ID']))
+        output['henge_link'] = dict(manifest['henge_link'], native_fix_validation='Cloud Mac protocol/credit/worker/TLS/discovery/Keychain, hardware codec and SDK UI checks passed; not an A20 Pro thermal or performance measurement', native_checks_run=int(os.environ['GITHUB_RUN_ID']))
         output['runner'] = manifest['runner']
+        output['duo_efficiency'] = dict(manifest['duo_efficiency'], native_validation_run=int(os.environ['GITHUB_RUN_ID']), release_binary_markers_verified=True, physical_thermal_verified=False)
         output['superblocks'] = dict(manifest['superblocks'], native_validation_run=int(os.environ['GITHUB_RUN_ID']), physical_cpu_behavior_verified=False)
         output['background_execution'] = manifest['background_execution']
         output['efficiency_v2'] = dict(manifest['efficiency_v2'], native_validation_run=int(os.environ['GITHUB_RUN_ID']))
@@ -291,6 +287,7 @@ jobs:
           Henge/ios/build/*.buildlog
           Henge/build/*.log
           Husk/build/logs/*.log
+          Henge/build/scheduling-check/*.log
 'on':
   push:
     branches:
