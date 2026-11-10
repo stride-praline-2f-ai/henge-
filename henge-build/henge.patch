@@ -1391,7 +1391,7 @@ index 0963d4e..30fb07e 100644
  other:
      /* PAuth key registers (CRn 2, CRm 1..3): kept, never used, since signing is a no-op. */
 diff --git a/core/translate.c b/core/translate.c
-index c4b05e0..3036a36 100644
+index c4b05e0..7699935 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -6,6 +6,7 @@
@@ -1501,7 +1501,7 @@ index c4b05e0..3036a36 100644
      if (!(e->flags & HV_BLOCK_EL1)) {
          put(e, 0xb9400000u | (HV_CPU_EL0_CNT / 4) << 10 | 28 << 5 | 6); /* ldr w6, [x28, #el0_cnt] */
          put(e, 0x36000000u | (physical ? 0u : 1u) << 19 | 6);         /* tbz w6, #enable, helper (patched) */
-@@ -1460,12 +1511,20 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
+@@ -1460,13 +1511,21 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
      }
      uint32_t slow = e->nool - 1;
      int el0 = !(e->flags & HV_BLOCK_EL1);
@@ -1515,13 +1515,15 @@ index c4b05e0..3036a36 100644
      put_lit(e, 6, COMMPAGE_TIMEBASE_OFFSET);
      put(e, LDR_X(6, 6, 0));
      put(e, ADD_LSL(r, r, 6, 0));
+-    if (r != rt) put(e, STR_X(r, 28, slot_of(rt)));
 +    if (!physical) {
 +        put(e, LDR_X(6, 28, HV_CPU_CNTVOFF));
 +        put(e, SUB_X(r, r, 6));
 +    }
-     if (r != rt) put(e, STR_X(r, 28, slot_of(rt)));
++    if (is_stolen(rt)) put(e, STR_X(r, 28, slot_of(rt))); /* X15 is scratch too, even when r == rt. */
      if (el0) e->ool[slow].join = e->n;
      return 1;
+ }
 @@ -1518,6 +1577,15 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
          put_load_field(e, rt, off);
          return 1;
@@ -3542,10 +3544,10 @@ index 0000000..941ebb3
 +mapped capacity before cleanup. No production memory-mapping rule is weakened.
 diff --git a/docs/duo-efficiency-followup.md b/docs/duo-efficiency-followup.md
 new file mode 100644
-index 0000000..31c0999
+index 0000000..27babc9
 --- /dev/null
 +++ b/docs/duo-efficiency-followup.md
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,69 @@
 +# Duo efficiency follow-up
 +
 +Baseline: cloud IPA 6e24988, implementation 805bc886. CyPort v1.2 source
@@ -3583,6 +3585,8 @@ index 0000000..31c0999
 +  This corrects a guest booting with the host's days of uptime; no startup speed
 +  or cooling gain is assumed. The EL0 XZR counter-read permission check is also
 +  retained instead of treating a discarded destination as a permission bypass.
++  The expanded test also exposed the old X15 scratch/destination collision:
++  generated counter reads now store every stolen destination, including X15.
 +* **Upstream xHCI bounds:** fc586676; invalid command slot IDs get Slot Not Enabled
 +  before slot-dependent work, with enable/no-op exceptions preserved. This is
 +  protocol hardening, not a claimed power optimization.
@@ -14799,16 +14803,17 @@ index 0000000..62767b1
 +}
 diff --git a/tests/test_display_settings.m b/tests/test_display_settings.m
 new file mode 100644
-index 0000000..9de73ba
+index 0000000..5bf491f
 --- /dev/null
 +++ b/tests/test_display_settings.m
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,57 @@
 +#import "display_settings.h"
 +#import <objc/runtime.h>
 +#include <assert.h>
 +#include <pthread.h>
 +#include <stdio.h>
 +#include <time.h>
++#include <unistd.h>
 +
 +static _Atomic unsigned reads;
 +static id (*real_object)(id,SEL,id);
@@ -14833,6 +14838,7 @@ index 0000000..9de73ba
 +    return NULL;
 +}
 +int main(void) { @autoreleasepool {
++    alarm(20);
 +    NSUserDefaults *p=NSUserDefaults.standardUserDefaults;
 +    [p removeObjectForKey:@"henge.cursor.scale"];[p removeObjectForKey:@"henge.cursor.sharp"];
 +    Method om=class_getInstanceMethod(NSUserDefaults.class,@selector(objectForKey:));
@@ -15792,10 +15798,10 @@ index 0000000..7d3474b
 +}
 diff --git a/tests/test_inline_sysreg.c b/tests/test_inline_sysreg.c
 new file mode 100644
-index 0000000..147de5e
+index 0000000..6ddec6f
 --- /dev/null
 +++ b/tests/test_inline_sysreg.c
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,99 @@
 +#include "machine.h"
 +#include "dispatch.h"
 +#include "sysreg.h"
@@ -15878,7 +15884,10 @@ index 0000000..147de5e
 +        m.stop_pc=(uintptr_t)(code+1);
 +        assert(hv_run(&cpu)==HV_EXIT_HALT);
 +        uint64_t hi=hv_counter()-(r>=2?cpu.cntvoff:0);
-+        if(rt<31)assert(cpu.x[rt]>=lo && cpu.x[rt]<=hi);
++        if(rt<31 && !(cpu.x[rt]>=lo && cpu.x[rt]<=hi)) {
++            fprintf(stderr,"counter mismatch kind=%u rt=%u el=%u got=%llu lo=%llu hi=%llu origin=%llu commpage_type=%u\n",r,rt,el,(unsigned long long)cpu.x[rt],(unsigned long long)lo,(unsigned long long)hi,(unsigned long long)cpu.cntvoff,*(volatile unsigned char *)(uintptr_t)0xfffffc090ull);
++            assert(0);
++        }
 +        counter_checks++;
 +    }
 +    for(unsigned r=0;r<4;r++)for(unsigned rt=0;rt<32;rt+=31) {
