@@ -1,0 +1,82 @@
+name: Henge Duo scheduling checks (no IPA)
+'on':
+  push:
+    branches: [feature/duo-efficiency]
+    paths: ['henge-build/**', '.github/workflows/henge-duo-checks.yml']
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: henge-duo-checks
+  cancel-in-progress: true
+jobs:
+  checks:
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: build-request
+        persist-credentials: false
+    - name: Select installed arm64 Xcode
+      run: |
+        python3 - <<'PY'
+        import glob,os,re,subprocess
+        assert subprocess.check_output(['uname','-m'],text=True).strip()=='arm64'
+        candidates=[]
+        for app in glob.glob('/Applications/Xcode*.app'):
+            dev=app+'/Contents/Developer'
+            try:
+                version=subprocess.check_output(['xcodebuild','-version'],env={**os.environ,'DEVELOPER_DIR':dev},text=True)
+                m=re.search(r'Xcode (\d+(?:\.\d+)*)',version)
+                if m:candidates.append((tuple(map(int,m[1].split('.'))),dev))
+            except subprocess.CalledProcessError:pass
+        assert candidates,'Full Xcode required'
+        with open(os.environ['GITHUB_ENV'],'a') as f:f.write('DEVELOPER_DIR='+max(candidates)[1]+'\n')
+        PY
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Henge
+        ref: be027b492bac818a3bb0c76fc8bbdd7aee42cbd2
+        path: Henge
+        persist-credentials: false
+    - name: Apply exact reviewed source patch
+      run: |
+        python3 - <<'PY'
+        from pathlib import Path
+        import hashlib,json,subprocess
+        folder=Path('build-request/henge-build')
+        manifest=json.loads((folder/'manifest.json').read_text())
+        patch=folder/'henge.patch'
+        assert hashlib.sha256(patch.read_bytes()).hexdigest()==manifest['patch_sha256']
+        subprocess.run(['git','-C','Henge','apply','--check',str(patch.resolve())],check=True)
+        subprocess.run(['git','-C','Henge','apply',str(patch.resolve())],check=True)
+        Path('Henge/check-inputs.json').write_text(json.dumps(manifest['duo_efficiency'],indent=2))
+        PY
+    - name: Native scheduling, Swift bridge and full app SDK checks
+      working-directory: Henge
+      run: bash tools/check_host_scheduling.sh
+    - name: Retain core synchronization and timer behavior
+      working-directory: Henge
+      run: |
+        set -euo pipefail
+        mkdir -p build/scheduling-check
+        exec > >(tee build/scheduling-check/engine.log) 2>&1
+        ulimit -s 65520
+        make -j4 build/test_cpu_sync build/test_timer_dispatch build/test_idle_integration build/test_jit
+        build/test_cpu_sync
+        build/test_timer_dispatch
+        build/test_idle_integration
+        build/test_jit
+        HV_SUPERBLOCKS=1 HV_JIT_SPLIT=1 build/test_jit
+    - name: Upload check results (no IPA)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Henge-Duo-checks-${{ github.sha }}
+        retention-days: 14
+        if-no-files-found: error
+        path: |
+          Henge/build/scheduling-check/*.log
+          Henge/check-inputs.json
+          Henge/docs/duo-efficiency.md

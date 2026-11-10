@@ -119,7 +119,7 @@ index 24eaa11..0000000
 -          path: /Users/runner/Desktop/Henge.ipa
 -          if-no-files-found: error
 diff --git a/Makefile b/Makefile
-index 22902ec..fe0dd95 100644
+index 22902ec..e1621a6 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -3,16 +3,16 @@ CC = clang
@@ -129,7 +129,8 @@ index 22902ec..fe0dd95 100644
 -CORE = $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
 +CORE = $(B)/fastmem_log.o $(B)/fastmem.o $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
         $(B)/exception.o $(B)/sysreg.o $(B)/machine.o
- HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
+-HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
++HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o $(B)/scheduling.o
  DEV = $(B)/pvg_lite.o $(B)/pvg_metal.o $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
 -      $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/virtio_input.o $(B)/virtio_snd.o $(B)/virtio_usb.o $(B)/virtio_balloon.o $(B)/xhci.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o $(B)/metallib.o
 +      $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/virtio_input.o $(B)/virtio_snd.o $(B)/virtio_usb.o $(B)/virtio_balloon.o $(B)/xhci.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o
@@ -201,7 +202,7 @@ index 22902ec..fe0dd95 100644
  IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
  IB = build/ios
 -IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
-+IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/net_slirp.c host/dns_proxy.c host/share.c host/native_touch.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
++IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/scheduling.c host/vm.c host/net_slirp.c host/dns_proxy.c host/share.c host/native_touch.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
            $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
  IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
  
@@ -3209,6 +3210,125 @@ index 0000000..941ebb3
 +(the attachment API requires at least 4KiB). The fixture now maps 4KiB, limits
 +logical capacity to 1KiB across cache resets, asserts resets occurred and restores
 +mapped capacity before cleanup. No production memory-mapping rule is weakened.
+diff --git a/docs/duo-efficiency.md b/docs/duo-efficiency.md
+new file mode 100644
+index 0000000..dd0d01c
+--- /dev/null
++++ b/docs/duo-efficiency.md
+@@ -0,0 +1,113 @@
++# Duo / A20 Pro scheduling and host overhead
++
++Prepared from the shipped custom source 031593d (build request 47dced9), retaining
++upstream be027b4 and prior Link/JIT/MMU/rendering changes. This is a source change;
++a prior IPA does not acquire these changes until a new IPA is built/installed.
++
++## Evidence and comparison
++
++Apple's [Duo specifications](https://www.apple.com/uk/iphone-duo/specs/) list A20
++Pro with two super cores and four efficiency cores. The user's actual Duo log
++identifies iPhone19,4, six CPUs, ~12GB physical memory and a ~6GB process limit.
++Model detection uses this observed identifier. It is unrelated to the virtual
++Mac's emulated CPU identity or an iPad which happens to stream to a Duo.
++
++[CyPort v1.2](https://github.com/Thijs2004/CyPort/releases/tag/v1.2), source tag
++f59fcb37bd4497ac9c8bfe94b0e4742942b66a1e, MacShim.m lines 1911–1931, intercepts
++pthread QoS requests and recognizes the native game's redDispatcher workers by
++name. It leaves some at user-initiated QoS and requests utility for the others.
++This is a scheduling hint, not core pinning. Its release notes also describe
++streaming budget changes, diagnostic reductions and optional FPS caps; those
++settings do not establish equal-output thermal savings. v1.3's adaptive FPS caps
++are also unsuitable as an automatic substitute for the user's selected FPS.
++No CyPort game-specific hooks, worker-name assumptions, asset/streaming changes,
++frame caps, affinity tricks or private thread APIs were copied.
++
++A Henge vCPU executes arbitrary macOS kernel and user threads. Index 2 is not
++necessarily a background job: macOS can move a game/render/browser thread there.
++Applying CyPort's worker split to all vCPUs by default could cause stalls and
++priority inversions. QoS also influences I/O and timer latency, beyond CPU choice.
++See Apple's [QoS guidance](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/EnergyGuide-iOS/PrioritizeWorkWithQoS.html),
++[Apple silicon tuning](https://developer.apple.com/documentation/apple-silicon/tuning-your-code-s-performance-for-apple-silicon/),
++[job scheduling talk](https://developer.apple.com/videos/play/tech-talks/110147/),
++and [system capability queries](https://developer.apple.com/documentation/kernel/1387446-sysctlbyname/determining_system_capabilities).
++
++## Implementation and defaults
++
++* host/scheduling.c queries hw.logicalcpu[_max] and hw.perflevelN.logicalcpu once
++  with pthread_once. Valid matching runtime P/E counts take precedence. If those
++  queries are unavailable, only the known six-core Duo uses Apple's documented
++  2+4 layout; logs and UI explicitly label this as a specification fallback.
++  Unknown models, simulators, inconsistent/missing counts do not get a guessed
++  core split. The user's observed iPad16,5 is labelled M4; its policy is unchanged.
++  Mach timebase is reported, not altered. No fabricated temperature/watt/residency
++  metric is emitted. Boot capability counts are a snapshot, not continuous core
++  availability or actual execution placement.
++* Automatic (HV_CPU_POLICY=auto, default): existing responsive iOS vCPU QoS is
++  preserved for every virtual CPU. Noncritical optional diagnostic sampler and
++  USB diagnostic work request utility. Existing preview/log-reader utility queues
++  remain. Timers, networking, audio, graphics, input, and the shared-file listener
++  retain their scheduling; a sleeping accept listener is still latency-critical.
++  There may be little scheduling-related saving when diagnostics are disabled.
++* Original (legacy): auxiliary workers inherit their original class. Guest vCPUs
++  retain the original platform policy. This provides a reversible comparison.
++* Mixed (mixed): explicitly optional and marked experimental. On a recognized Duo
++  with a valid P/E layout and active count, keep up to P virtual CPUs responsive
++  and request utility on additional vCPUs. Counts and guest core count are not
++  changed. With only 1–2 vCPUs there is no lower-priority group. No automatic
++  mixed profile is enabled on the iPad or an unknown phone. Physical frame-time
++  and energy validation is required before considering a default change.
++* HV_QOS=ui|init|default retains precedence; utility is additionally available for
++  explicit comparison. DEFAULT now actually clears an inherited higher QoS;
++  the old function skipped this request. Invalid CPU policy falls back to legacy.
++  Environment policies are re-read for a new VM rather than cached forever.
++  Settings/henge-env.txt precedence is preserved. Restart Henge to apply changes.
++* QoS API failures are logged and execution continues at the accepted/inherited
++  class. Thread names help Instruments. QoS calls happen only at worker entry,
++  with no per-block checks, new timer/polling thread or hot-path core probing.
++* SessionView no longer copies 200 log strings and publishes changing diagnostic
++  State every second while Details is closed. A nonobservable reference samples
++  the block rate using monotonic system uptime. Opening Details publishes the
++  latest sample immediately; while open it refreshes at the existing cadence
++  and obtains the exact same displayed 30 lines. Complete file logging, periodic
++  performance/cache reports, thermal transitions and lifecycle checks continue.
++  This eliminates specific unnecessary UI/log work; its device energy impact
++  has not yet been measured.
++
++No resolution, Retina scaling, colour, refresh selection, frame cap, CPU count,
++RAM, JIT mapping, guest instruction/timer semantics, disk data, game quality or
++signing entitlement is changed. This does not make unsupported signing or
++background VM execution available. Utility QoS does not grant background time.
++No assurance of cooler operation, equal FPS, or superiority to CyPort is possible
++without representative physical Duo measurements. Already functioning native
++ARM64/Metal execution does not require spoofing a new CPU type or pretending the
++Neural Engine can execute general guest instructions.
++
++## Validation and device comparison
++
++Portable: cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined
++-pthread -Ihost host/scheduling.c tests/test_scheduling.c -o build/test_scheduling;
++build/test_scheduling. Cases include runtime/model detection, simulator/unknown
++and M4 fallback, 1–16 vCPUs, inactive/invalid topology, override/reset precedence,
++protected roles and concurrent metadata reads. Linux explicitly reports native
++QoS as unverified. On Mac, the same test reads requested QoS back on an isolated
++worker and exercises utility→responsive→explicit-default restoration.
++
++tools/check_host_scheduling.sh runs these native checks, production Swift/C bridge
++and monotonic-rate regressions, profiler lifecycle, iOS C compilation checks and
++full production app Swift type checking against iPhoneOS SDK. It does not build
++or sign an app or IPA. Tests on the Mac guest cannot establish real P/E residency,
++Duo power, input latency, gaming FPS or UIKit rendering invalidation counts.
++
++On the Duo, record host-capabilities, host-scheduling, host-qos startup lines;
++check for nonzero setter/readback errors. Keep the SAME macOS image, vCPU count,
++RAM, JIT/cache settings, Retina resolution, colour, refresh, game scene/settings,
++brightness, case, charging and ambient temperature. Compare original/automatic
++first, then mixed, from equal cold states and in alternating order. Include
++startup/Safari, sustained game action with audio/input and 30–60 minutes of load.
++Use actual presented-frame intervals/P95/P99, average/1%-low FPS, input/audio
++latency and Power Profiler/Instruments on hardware. Thermal state alone is not
++power or temperature. Verify which physical cores actually execute named Henge
++threads using supported Instruments views; requested QoS is not a residency
++counter. Reject mixed if any useful throughput/frame-time/latency regresses;
++restore Automatic/Original and restart. See thermal-engineering/device-protocol.md.
 diff --git a/docs/experimental-fastmem.md b/docs/experimental-fastmem.md
 new file mode 100644
 index 0000000..241c467
@@ -8455,10 +8575,18 @@ index 0000000..4072159
 +void hv_native_touch_report(uint32_t epoch, int status);
 +#endif
 diff --git a/host/net_slirp.c b/host/net_slirp.c
-index 327c396..529e807 100644
+index 327c396..fb40eed 100644
 --- a/host/net_slirp.c
 +++ b/host/net_slirp.c
-@@ -63,11 +63,13 @@ void hv_net_set_share_socket(const char *path) {
+@@ -10,6 +10,7 @@
+    when the guest has posted receive buffers. */
+ #include "net_slirp.h"
+ #include "dns_proxy.h"
++#include "scheduling.h"
+ #include "share.h"
+ 
+ #include <arpa/inet.h>
+@@ -63,11 +64,13 @@ void hv_net_set_share_socket(const char *path) {
  }
  
  static int push(Queue *q, const uint8_t *data, uint32_t len) {
@@ -8472,7 +8600,15 @@ index 327c396..529e807 100644
          memcpy(f->data, data, len);
          f->len = len;
          q->tail++;
-@@ -277,6 +279,8 @@ void hv_net_poll(void) {
+@@ -197,6 +200,7 @@ static const SlirpCb callbacks = {
+ 
+ static void *net_thread(void *unused) {
+     (void)unused;
++    hv_schedule_aux_start(HV_ROLE_NETWORK);
+     for (;;) {
+         uint32_t timeout = 1000;
+         int64_t now = now_ms();
+@@ -277,6 +281,8 @@ void hv_net_poll(void) {
  
  int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
      machine = m;
@@ -8482,7 +8618,7 @@ index 327c396..529e807 100644
      pthread_mutex_init(&to_host.mu, NULL);
      if (pipe(wake_pipe) != 0) return -1;
 diff --git a/host/prof_ios.c b/host/prof_ios.c
-index 7bde369..f8e464e 100644
+index 7bde369..b7ff92a 100644
 --- a/host/prof_ios.c
 +++ b/host/prof_ios.c
 @@ -1,13 +1,4 @@
@@ -8500,8 +8636,11 @@ index 7bde369..f8e464e 100644
  #include <dlfcn.h>
  #include <mach/mach.h>
  #include <pthread.h>
-@@ -21,13 +12,19 @@
+@@ -19,15 +10,22 @@
+ #include <unistd.h>
+ #include "../core/machine.h"
  #include "vm.h"
++#include "scheduling.h"
  
  extern void (*hv_prof_register)(void);
 -
@@ -8522,7 +8661,7 @@ index 7bde369..f8e464e 100644
  static uintptr_t image_base;
  static int words_on;
  
-@@ -50,6 +47,8 @@ static void dump_words(void) {
+@@ -50,6 +48,8 @@ static void dump_words(void) {
      char path[1024];
      snprintf(path, sizeof path, "%s/Documents/hvprof-words.txt", home ? home : ".");
      FILE *f = fopen(path, "a");
@@ -8531,7 +8670,7 @@ index 7bde369..f8e464e 100644
      if (f) {
          fprintf(f, "# dump at %ld jit %llu lost %llu\n", (long)time(NULL), (unsigned long long)jit, (unsigned long long)words_lost);
          for (int i = 0; i < WORD_SLOTS; i++)
-@@ -60,11 +59,46 @@ static void dump_words(void) {
+@@ -60,11 +60,46 @@ static void dump_words(void) {
      words_lost = 0;
  }
  
@@ -8581,7 +8720,7 @@ index 7bde369..f8e464e 100644
  /* Functions in other images (the system's libraries), by the address dladdr names: where the rest goes */
  #define OTHER_SLOTS 256
  static struct { uintptr_t fn; const char *name; uint32_t n; } other[OTHER_SLOTS];
-@@ -73,92 +107,93 @@ static void count_other(const Dl_info *info) {
+@@ -73,92 +108,94 @@ static void count_other(const Dl_info *info) {
      uintptr_t fn = (uintptr_t)info->dli_saddr;
      uint32_t h = (uint32_t)((fn >> 2) * 2654435761u) % OTHER_SLOTS;
      for (int k = 0; k < 16; k++, h = (h + 1) % OTHER_SLOTS) {
@@ -8675,6 +8814,7 @@ index 7bde369..f8e464e 100644
 -                jit++;
 -                if (words_on) count_word(*(const volatile uint32_t *)(pc + (uintptr_t)m->jit.rw_diff)); /* the writable alias: always readable */
 -            } else count_host(pc);
++    hv_schedule_aux_start(HV_ROLE_PROFILER);
 +    int hz=bounded_env("HV_PROF_IOS_HZ",100,1,1000), secs=bounded_env("HV_PROF_IOS_SECS",30,1,3600);
 +    int duration=bounded_env("HV_PROF_IOS_DURATION",0,0,86400);
 +    unsigned seen=0;double start=0,next_dump=0;
@@ -8732,6 +8872,254 @@ index 7bde369..f8e464e 100644
 +    *samples=atomic_load(&all_samples);*dumps=atomic_load(&all_dumps);*ports=0;
 +    pthread_mutex_lock(&registry_mu);for(int i=0;i<MAX_THREADS;i++)*ports+=threads[i]!=0;pthread_mutex_unlock(&registry_mu);
  }
++#endif
+diff --git a/host/scheduling.c b/host/scheduling.c
+new file mode 100644
+index 0000000..fa6128e
+--- /dev/null
++++ b/host/scheduling.c
+@@ -0,0 +1,127 @@
++#include "scheduling.h"
++#include <errno.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/utsname.h>
++#include <unistd.h>
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#include <pthread/qos.h>
++#include <sys/sysctl.h>
++#include <mach/mach_time.h>
++#endif
++
++static pthread_once_t info_once = PTHREAD_ONCE_INIT;
++static HvHostCpuInfo info;
++#if defined(__APPLE__)
++static int sys_int(const char *name) {
++    int n=0; size_t size=sizeof n;
++    return sysctlbyname(name,&n,&size,NULL,0)==0 && size==sizeof n && n>0 && n<=256 ? n : 0;
++}
++#endif
++static void detect(void) {
++    struct utsname u;
++    if (!uname(&u)) snprintf(info.model,sizeof info.model,"%.*s",(int)sizeof info.model-1,u.machine);
++#if defined(__APPLE__)
++    info.ios = TARGET_OS_IPHONE;
++    info.simulator = TARGET_OS_SIMULATOR;
++    info.total=sys_int("hw.logicalcpu_max");
++    if (!info.total) info.total=sys_int("hw.logicalcpu");
++    info.active=sys_int("hw.logicalcpu");
++    info.performance=sys_int("hw.perflevel0.logicalcpu");
++    info.efficiency=sys_int("hw.perflevel1.logicalcpu");
++    mach_timebase_info_data_t timebase;
++    if (mach_timebase_info(&timebase)==KERN_SUCCESS) {
++        info.timebase_numer=timebase.numer; info.timebase_denom=timebase.denom;
++    }
++#else
++    long total=sysconf(_SC_NPROCESSORS_CONF), active=sysconf(_SC_NPROCESSORS_ONLN);
++    info.total=total>0 && total<=256 ? (int)total : 0;
++    info.active=active>0 && active<=256 ? (int)active : 0;
++#endif
++    hv_schedule_validate_topology(&info);
++}
++const HvHostCpuInfo *hv_host_cpu_info(void) {pthread_once(&info_once,detect); return &info;}
++const char *hv_host_model(void) {return hv_host_cpu_info()->model;}
++const char *hv_host_chip(void) {
++    const HvHostCpuInfo *h=hv_host_cpu_info();
++    if (h->duo) return "A20 Pro (Duo model profile)";
++    if (h->ios && !strcmp(h->model,"iPad16,5")) return "M4 (iPad model profile)";
++    return "Not classified";
++}
++const char *hv_host_layout_source(void) {
++    switch (hv_host_cpu_info()->layout) {
++    case HV_LAYOUT_RUNTIME:return "runtime sysctl";
++    case HV_LAYOUT_MODEL:return "Apple specification fallback";
++    default:return "unavailable";
++    }
++}
++int hv_host_performance_cores(void) {return hv_host_cpu_info()->performance;}
++int hv_host_efficiency_cores(void) {return hv_host_cpu_info()->efficiency;}
++int hv_host_is_duo(void) {return hv_host_cpu_info()->duo;}
++void hv_host_log_capabilities(void) {
++    const HvHostCpuInfo *h=hv_host_cpu_info();
++    fprintf(stderr,"host-capabilities: model=%s chip=%s logical=%d active=%d P=%d E=%d layout=%s timebase=%u/%u ns (core placement controlled by OS; no energy measurement)\n",
++        h->model,hv_host_chip(),h->total,h->active,h->performance,h->efficiency,hv_host_layout_source(),h->timebase_numer,h->timebase_denom);
++}
++HvSchedulePlan hv_schedule_read(int vcpus) {
++    return hv_schedule_plan(hv_host_cpu_info(),vcpus,getenv("HV_CPU_POLICY"),getenv("HV_QOS"));
++}
++const char *hv_schedule_qos_name(HvHostQos qos) {
++    switch(qos) {
++    case HV_QOS_DEFAULT:return "default";
++    case HV_QOS_INITIATED:return "user-initiated";
++    case HV_QOS_INTERACTIVE:return "user-interactive";
++    case HV_QOS_UTILITY:return "utility";
++    default:return "inherited";
++    }
++}
++void hv_schedule_log_plan(const HvSchedulePlan *p) {
++    const char *mode=p->mode==HV_SCHED_AUTO ? "auto" : p->mode==HV_SCHED_MIXED ? "mixed" : "legacy";
++    int utility=0, inherited=0;
++    for(int i=0;i<p->vcpus;i++) {
++        HvHostQos q=hv_schedule_role(p,HV_ROLE_CPU,(unsigned)i);
++        utility+=q==HV_QOS_UTILITY; inherited+=q==HV_QOS_INHERIT;
++    }
++    fprintf(stderr,"host-scheduling: policy=%s vcpus=%d responsive_requests=%d utility_requests=%d inherited_requests=%d override=%s reason=%s (QoS hints; no pinning; guest CPU count/Retina/refresh/timers unchanged)\n",
++        mode,p->vcpus,p->vcpus-utility-inherited,utility,inherited,hv_schedule_qos_name(p->override),p->reason);
++}
++int hv_schedule_apply(HvHostRole role, unsigned index, const HvSchedulePlan *p, int log) {
++    const char *name;
++    switch(role) {
++    case HV_ROLE_CPU:name="vCPU";break;
++    case HV_ROLE_TICKER:name="timer wake";break;
++    case HV_ROLE_NETWORK:name="network";break;
++    case HV_ROLE_SHARE_IO:name="shared file I/O";break;
++    case HV_ROLE_SHARE_LISTENER:name="share listener";break;
++    case HV_ROLE_PROFILER:name="diagnostic sampler";break;
++    default:name="USB diagnostic";break;
++    }
++    HvHostQos want=hv_schedule_role(p,role,index);
++    int rc=0;
++#if defined(__APPLE__)
++    char label[64];snprintf(label,sizeof label,"Henge %s %u",name,index);pthread_setname_np(label);
++    qos_class_t q=QOS_CLASS_UNSPECIFIED, actual=QOS_CLASS_UNSPECIFIED; int relative=0;
++    switch(want) {
++    case HV_QOS_DEFAULT:q=QOS_CLASS_DEFAULT;break;
++    case HV_QOS_INITIATED:q=QOS_CLASS_USER_INITIATED;break;
++    case HV_QOS_INTERACTIVE:q=QOS_CLASS_USER_INTERACTIVE;break;
++    case HV_QOS_UTILITY:q=QOS_CLASS_UTILITY;break;
++    default:break;
++    }
++    /* Explicit DEFAULT must clear an inherited high class, too. */
++    if (want!=HV_QOS_INHERIT) rc=pthread_set_qos_class_self_np(q,0);
++    int readback=pthread_get_qos_class_np(pthread_self(),&actual,&relative);
++    if (log || rc) fprintf(stderr,"host-qos: role=%s index=%u requested=%s result=%d readback_result=%d qos=%#x (not a core residency measurement)\n",
++        name,index,hv_schedule_qos_name(want),rc,readback,(unsigned)actual);
++#else
++    if (want!=HV_QOS_INHERIT) rc=ENOTSUP;
++    if (log) fprintf(stderr,"host-qos: role=%s index=%u requested=%s result=%d (platform has no Apple QoS)\n",name,index,hv_schedule_qos_name(want),rc);
++#endif
++    return rc;
++}
++void hv_schedule_aux_start(HvHostRole role) {
++    HvSchedulePlan plan=hv_schedule_read(0);
++    hv_schedule_apply(role,0,&plan,1);
++}
+diff --git a/host/scheduling.h b/host/scheduling.h
+new file mode 100644
+index 0000000..0744f47
+--- /dev/null
++++ b/host/scheduling.h
+@@ -0,0 +1,25 @@
++#ifndef HENGE_SCHEDULING_H
++#define HENGE_SCHEDULING_H
++#include "scheduling_policy.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++const HvHostCpuInfo *hv_host_cpu_info(void);
++const char *hv_host_model(void);
++const char *hv_host_chip(void);
++const char *hv_host_layout_source(void);
++int hv_host_performance_cores(void);
++int hv_host_efficiency_cores(void);
++int hv_host_is_duo(void);
++void hv_host_log_capabilities(void);
++HvSchedulePlan hv_schedule_read(int vcpus);
++const char *hv_schedule_qos_name(HvHostQos qos);
++void hv_schedule_log_plan(const HvSchedulePlan *plan);
++/* Only call at a host worker's entry, before guest SIMD/SP state is live.
++   Setting QoS is a scheduler hint, not core affinity. Returns a POSIX error. */
++int hv_schedule_apply(HvHostRole role, unsigned index, const HvSchedulePlan *plan, int log);
++void hv_schedule_aux_start(HvHostRole role);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/host/scheduling_policy.h b/host/scheduling_policy.h
+new file mode 100644
+index 0000000..083d66e
+--- /dev/null
++++ b/host/scheduling_policy.h
+@@ -0,0 +1,78 @@
++#ifndef HENGE_SCHEDULING_POLICY_H
++#define HENGE_SCHEDULING_POLICY_H
++
++#include <string.h>
++
++/* Pure policy: no timers, private APIs, affinity, or guest-thread guesses. */
++typedef enum { HV_SCHED_AUTO, HV_SCHED_LEGACY, HV_SCHED_MIXED } HvScheduleMode;
++typedef enum { HV_QOS_INHERIT, HV_QOS_DEFAULT, HV_QOS_INITIATED, HV_QOS_INTERACTIVE, HV_QOS_UTILITY } HvHostQos;
++typedef enum { HV_ROLE_CPU, HV_ROLE_TICKER, HV_ROLE_NETWORK, HV_ROLE_SHARE_IO,
++               HV_ROLE_SHARE_LISTENER, HV_ROLE_PROFILER, HV_ROLE_USB_PROBE } HvHostRole;
++typedef enum { HV_LAYOUT_UNKNOWN, HV_LAYOUT_RUNTIME, HV_LAYOUT_MODEL } HvLayoutSource;
++
++typedef struct {
++    char model[64];
++    int ios, simulator, total, active, performance, efficiency, duo;
++    HvLayoutSource layout;
++    unsigned timebase_numer, timebase_denom;
++} HvHostCpuInfo;
++
++static inline void hv_schedule_validate_topology(HvHostCpuInfo *h) {
++    h->duo = h->ios && !h->simulator && !strcmp(h->model, "iPhone19,4");
++    h->layout = HV_LAYOUT_UNKNOWN;
++    if (h->total > 0 && h->total <= 256 && h->performance > 0 && h->efficiency > 0 &&
++        h->performance <= h->total && h->efficiency == h->total - h->performance) {
++        h->layout = HV_LAYOUT_RUNTIME;
++    } else {
++        h->performance = h->efficiency = 0;
++        /* Apple documents A20 Pro's 2+4 layout. Model is observed in the user's
++           Duo log. This fallback is explicitly labelled, never a runtime measurement. */
++        if (h->duo && h->total == 6) {
++            h->performance = 2; h->efficiency = 4; h->layout = HV_LAYOUT_MODEL;
++        }
++    }
++}
++
++typedef struct {
++    HvScheduleMode mode;
++    HvHostQos base, override;
++    int vcpus, fast_vcpus, mixed, ios;
++    const char *reason;
++} HvSchedulePlan;
++
++static inline HvSchedulePlan hv_schedule_plan(const HvHostCpuInfo *h, int vcpus,
++                                             const char *mode, const char *override) {
++    HvSchedulePlan p = {.mode=HV_SCHED_AUTO, .base=h->ios ? HV_QOS_INITIATED : HV_QOS_INHERIT,
++                        .vcpus=vcpus, .fast_vcpus=vcpus, .ios=h->ios, .reason="critical-work-preserved"};
++    if (mode && !strcmp(mode, "legacy")) p.mode = HV_SCHED_LEGACY;
++    else if (mode && !strcmp(mode, "mixed")) p.mode = HV_SCHED_MIXED;
++    else if (mode && strcmp(mode, "auto")) {p.mode=HV_SCHED_LEGACY; p.reason="invalid-policy-legacy-fallback";}
++    if (override) {
++        if (!strcmp(override,"ui")) p.override=HV_QOS_INTERACTIVE;
++        else if (!strcmp(override,"init")) p.override=HV_QOS_INITIATED;
++        else if (!strcmp(override,"default")) p.override=HV_QOS_DEFAULT;
++        else if (!strcmp(override,"utility")) p.override=HV_QOS_UTILITY;
++    }
++    if (p.mode == HV_SCHED_MIXED) {
++        if (p.override) p.reason="HV_QOS-overrides-mixed";
++        else if (!h->duo || h->layout == HV_LAYOUT_UNKNOWN) p.reason="mixed-unavailable-on-this-host";
++        else if (h->active <= h->performance || h->active > h->total) p.reason="mixed-unavailable-active-core-count";
++        else if (vcpus <= h->performance) p.reason="no-extra-vcpus-to-classify";
++        else {p.mixed=1; p.fast_vcpus=h->performance; p.reason="experimental-vcpu-split-not-guest-worker-affinity";}
++    }
++    return p;
++}
++
++static inline HvHostQos hv_schedule_role(const HvSchedulePlan *p, HvHostRole role, unsigned index) {
++    if (role == HV_ROLE_CPU) {
++        if (p->override) return p->override;
++        return p->mixed && index < (unsigned)p->vcpus && index >= (unsigned)p->fast_vcpus ? HV_QOS_UTILITY : p->base;
++    }
++    if (p->mode == HV_SCHED_LEGACY || !p->ios) return HV_QOS_INHERIT;
++    /* No timer, networking, shared-file I/O, input, audio or GPU demotion. */
++    if (role == HV_ROLE_PROFILER || role == HV_ROLE_USB_PROBE) return HV_QOS_UTILITY;
++    /* Accepting a shared-file request is latency-sensitive, too. Never lower
++       its listener merely because it spends most of its time asleep. */
++    return HV_QOS_INHERIT;
++}
 +#endif
 diff --git a/host/share.c b/host/share.c
 index 07c5104..9c7244a 100644
@@ -8859,13 +9247,32 @@ index 07c5104..9c7244a 100644
      if (!strcmp(what, "clipboard") && !strcmp(r->method, "GET")) return clipboard_get(c, r);
      if (!strcmp(what, "clipboard") && !strcmp(r->method, "PUT")) return clipboard_put(c, r);
      if (body_discard(c, r) != 0) return -1;
+diff --git a/host/usb_host.c b/host/usb_host.c
+index a1dd4ed..5d3aa5a 100644
+--- a/host/usb_host.c
++++ b/host/usb_host.c
+@@ -1,4 +1,5 @@
+ #include "usb_host.h"
++#include "scheduling.h"
+ 
+ #include <pthread.h>
+ #include <stdio.h>
+@@ -91,6 +92,7 @@ static void print_string(HvVirtioUsb *d, uint8_t idx) {
+ }
+ 
+ static void *probe(void *arg) {
++    hv_schedule_aux_start(HV_ROLE_USB_PROBE);
+     HvVirtioUsb *d = arg;
+     int64_t s = hv_usb_wait_online(d, 120000);
+     fprintf(stderr, "usb probe: online (session %lld)\n", (long long)s);
 diff --git a/host/vm.c b/host/vm.c
-index 36f34b8..0b3517e 100644
+index 36f34b8..c28fd30 100644
 --- a/host/vm.c
 +++ b/host/vm.c
-@@ -1,9 +1,9 @@
+@@ -1,9 +1,10 @@
  #include "vm.h"
 +#include "idle_ticker.h"
++#include "scheduling.h"
  #include "pvg_lite.h"
  
  #include <TargetConditionals.h>
@@ -8874,7 +9281,7 @@ index 36f34b8..0b3517e 100644
  #include <os/lock.h>
  #include <stdatomic.h>
  #include <pthread.h>
-@@ -20,6 +20,7 @@
+@@ -20,11 +21,14 @@
  
  #include "audio_mac.h"
  #include "dispatch.h"
@@ -8882,7 +9289,14 @@ index 36f34b8..0b3517e 100644
  #include "net_slirp.h"
  
  static HvMachine m;
-@@ -205,6 +206,8 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
+ static HvCpu cpus[HV_MAX_CPUS]; /* the board takes them as an array */
+ static int ncpus = 1;
++/* Captured before VM workers start; never changed while guest execution runs. */
++static HvSchedulePlan schedule_plan;
+ static HvVmapple board;
+ /* UI display changes may arrive before or during the background machine creation. */
+ static os_unfair_lock display_lock = OS_UNFAIR_LOCK_INIT;
+@@ -205,6 +209,8 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
  }
  
  void (*hv_prof_register)(void);
@@ -8891,7 +9305,17 @@ index 36f34b8..0b3517e 100644
  
  void hv_vm_set_display_layer(void *layer) {
      CFTypeRef retained = layer ? CFRetain(layer) : NULL;
-@@ -270,11 +273,40 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
+@@ -241,6 +247,9 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
+     m.gen_checks = getenv("HV_JIT_POISON") != NULL;
+     if (getenv("HV_SLOW_MEM")) m.slow_mem = 1; /* debugging: every load and store through the helper */
+     ncpus = c->ncpus < 1 ? 1 : c->ncpus > HV_MAX_CPUS ? HV_MAX_CPUS : c->ncpus;
++    schedule_plan = hv_schedule_read(ncpus);
++    hv_host_log_capabilities();
++    hv_schedule_log_plan(&schedule_plan);
+     m.big_lock_on = ncpus > 1 && getenv("HV_BIG_LOCK"); /* debugging: one CPU in guest code at a time */
+     HvCfgParams cfg = {.nr_cpus = (uint32_t)ncpus, .ecid = c->ecid, .seed = c->seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
+     if (c->installer) cfg.run_installer1 = cfg.run_installer2 = 1;
+@@ -270,11 +279,41 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
      return 0;
  }
  
@@ -8921,6 +9345,7 @@ index 36f34b8..0b3517e 100644
 +}
 +
 +static void *kicker_thread(void *arg) {
++    hv_schedule_apply(HV_ROLE_TICKER, 0, &schedule_plan, 1);
 +    uint64_t token = (uint64_t)(uintptr_t)arg;
 +    while (idle_ticker_enabled ? hv_idle_ticker_wait(&kicker, token, cpu_active, &m) : hv_wake_current(&kicker.epoch, token)) {
          usleep(1000);
@@ -8936,7 +9361,7 @@ index 36f34b8..0b3517e 100644
      }
      return NULL;
  }
-@@ -283,13 +315,30 @@ static void *kicker_thread(void *unused) {
+@@ -283,40 +322,49 @@ static void *kicker_thread(void *unused) {
     guest's SP, a guest address, so the kernel must never push a signal frame
     there: other threads take the asynchronous signals, and a handler that does
     run here (a fault) gets a stack of its own. */
@@ -8969,15 +9394,40 @@ index 36f34b8..0b3517e 100644
      sigset_t set;
      sigfillset(&set);
      sigdelset(&set, SIGSEGV), sigdelset(&set, SIGBUS), sigdelset(&set, SIGILL), sigdelset(&set, SIGTRAP), sigdelset(&set, SIGFPE);
-@@ -317,6 +366,7 @@ static void *secondary_thread(void *arg) {
+     pthread_sigmask(SIG_BLOCK, &set, NULL);
+ }
+ 
+-/* iOS parks default-QoS threads on efficiency cores readily; the guest's CPUs are what the user waits on. */
+-void hv_vm_cpu_qos(void) {
++static void cpu_qos(unsigned index) {
+     hv_vm_prepare_cpu_thread();
+-    /* HV_QOS=ui|init|default (testing): the class the guest's CPUs run at. */
+-    const char *q = getenv("HV_QOS");
+-#if TARGET_OS_IPHONE
+-    qos_class_t c = QOS_CLASS_USER_INITIATED;
+-#else
+-    qos_class_t c = QOS_CLASS_DEFAULT;
+-#endif
+-    if (q && !strcmp(q, "ui")) c = QOS_CLASS_USER_INTERACTIVE;
+-    else if (q && !strcmp(q, "init")) c = QOS_CLASS_USER_INITIATED;
+-    else if (q && !strcmp(q, "default")) c = QOS_CLASS_DEFAULT;
+-    if (c != QOS_CLASS_DEFAULT) pthread_set_qos_class_self_np(c, 0);
++    hv_schedule_apply(HV_ROLE_CPU, index, &schedule_plan, 1);
+ }
++/* Public caller is the Mac command-line tool's CPU 0. */
++void hv_vm_cpu_qos(void) { cpu_qos(0); }
+ 
+ /* CPUs 1 and up: run whenever PSCI CPU_ON starts them; the machine stops with CPU 0. */
+ static void *secondary_thread(void *arg) {
      HvCpu *c = arg;
-     hv_vm_cpu_qos();
+-    hv_vm_cpu_qos();
++    cpu_qos(c->index);
      int r = hv_run(c);
 +    if (hv_prof_unregister) hv_prof_unregister();
      if (!c->halted)
          fprintf(stderr, "hengevm: cpu %u stopped (%s) at pc %llx el%u\n", c->index, hv_vm_reason_name(r),
                  (unsigned long long)c->pc, c->el);
-@@ -329,7 +379,15 @@ void hv_vm_flush_disks(void) {
+@@ -329,7 +377,15 @@ void hv_vm_flush_disks(void) {
  }
  
  int hv_vm_run_cpu0(void) {
@@ -8994,7 +9444,7 @@ index 36f34b8..0b3517e 100644
  }
  
  static void *cpu0_thread(void *unused) {
-@@ -343,103 +401,52 @@ static void *cpu0_thread(void *unused) {
+@@ -343,103 +399,52 @@ static void *cpu0_thread(void *unused) {
  
  void hv_vm_start(int cpu0, void (*on_exit)(int reason)) {
      exit_cb = on_exit;
@@ -9223,10 +9673,10 @@ index 0000000..4f47e2e
 +    }
 +}
 diff --git a/ios/Henge/EngineTuning.swift b/ios/Henge/EngineTuning.swift
-index f1c1303..0c961b8 100644
+index f1c1303..0b90b51 100644
 --- a/ios/Henge/EngineTuning.swift
 +++ b/ios/Henge/EngineTuning.swift
-@@ -4,6 +4,8 @@ import Foundation
+@@ -4,10 +4,13 @@ import Foundation
  /// then Documents/henge-env.txt (KEY=VALUE per line, # comments; {Documents} in a value is that folder) overrides them all.
  /// Applied at launch and again before each Mac starts, so changes need no relaunch.
  enum EngineTuning {
@@ -9235,13 +9685,19 @@ index f1c1303..0c961b8 100644
      static let refreshKey = "henge.perf.hz"
      static let superblocksKey = "henge.perf.superblocks"
      static let wfiSpinKey = "henge.perf.wfiSpin"
-@@ -15,18 +17,22 @@ enum EngineTuning {
+     static let fastFlushKey = "henge.perf.fastFlush"
++    static let cpuPolicyKey = "henge.perf.cpuPolicy"
+ 
+     static let defaults: [String: String] = [
+         // 60, not 120: every frame macOS draws is emulated and replayed, so 120 Hz
+@@ -15,18 +18,26 @@ enum EngineTuning {
          "HV_HZ": "60",         // the refresh rate macOS is told its display has
          "HV_WFI_SPIN": "0",    // microseconds an idle CPU watches for work before sleeping
          "HV_FLUSH": "2",       // disk flush: F_BARRIERFSYNC, ordered but without a full fsync
 +        "HV_SYNC_WAIT": "1", // bounded sleep after short spin while awaiting CPU acknowledgement
 +        "HV_RECHECK": "1",    // exact same-page check before full memory helper at page tails
          "HV_STATS": "10",      // seconds between engine stats lines in the log; 0 = off
++        "HV_CPU_POLICY": "auto", // responsive vCPUs; utility QoS for noncritical housekeeping
      ]
  
      static func apply() {
@@ -9250,6 +9706,9 @@ index f1c1303..0c961b8 100644
          let d = UserDefaults.standard
 -        if [30, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
 -        if d.bool(forKey: superblocksKey) { env["HV_SUPERBLOCKS"] = "1" } else { unsetenv("HV_SUPERBLOCKS") }
++        if let policy = d.string(forKey: cpuPolicyKey), ["auto", "legacy", "mixed"].contains(policy) {
++            env["HV_CPU_POLICY"] = policy
++        }
 +        env["HV_FASTMEM_STATS"] = (d.object(forKey: diagnosticsKey) as? Bool ?? false) ? "1" : "0"
 +        if [30, 60, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
 +        env["HV_SUPERBLOCKS"] = d.bool(forKey: superblocksKey) ? "1" : "0"
@@ -9659,18 +10118,19 @@ index 0aa8cf3..b15cc7d 100644
          }
      }
 diff --git a/ios/Henge/HengeBridge.h b/ios/Henge/HengeBridge.h
-index 8825f4b..eb969ca 100644
+index 8825f4b..02ddd18 100644
 --- a/ios/Henge/HengeBridge.h
 +++ b/ios/Henge/HengeBridge.h
-@@ -2,3 +2,6 @@
+@@ -2,3 +2,7 @@
  #include "Native/henge-vm.h"
  #include "Native/HuskRPPairing.h"
  #include "hvsparse.h"
++#include "../../host/scheduling.h"
 +
 +#include "native_touch.h"
 +#include "../../devices/pvg_link.h"
 diff --git a/ios/Henge/HengeLog.swift b/ios/Henge/HengeLog.swift
-index 624b847..095315b 100644
+index 624b847..6bb3114 100644
 --- a/ios/Henge/HengeLog.swift
 +++ b/ios/Henge/HengeLog.swift
 @@ -8,7 +8,7 @@ import os
@@ -9731,7 +10191,15 @@ index 624b847..095315b 100644
      }
  
      /// Turn "the app vanished with no crash log" into a labelled last line.
-@@ -363,6 +334,16 @@ enum HengeLog {
+@@ -346,6 +317,7 @@ enum HengeLog {
+ 
+         log("boot", "================ Henge starting ================")
+         log("boot", "device      : \(model)")
++        log("boot", "host chip   : \(HostScheduling.chip); cores \(HostScheduling.layout); source \(HostScheduling.layoutSource)")
+         log("boot", "system      : \(d.systemName) \(d.systemVersion)")
+         log("boot", "physical RAM: \(mem) MiB")
+         log("boot", "processors  : \(ProcessInfo.processInfo.processorCount) "
+@@ -363,6 +335,16 @@ enum HengeLog {
          let commit  = info["HengeBuildCommit"] as? String ?? "unstamped"
          let built   = info["HengeBuildDate"] as? String ?? "?"
          log("boot", "build       : \(version) (\(build)) \(commit) built \(built)")
@@ -9788,6 +10256,26 @@ index 2decce1..7e3743b 100644
              .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { result in
                  if case let .success(url) = result { machines.importFolder(url) }
              }
+diff --git a/ios/Henge/HostScheduling.swift b/ios/Henge/HostScheduling.swift
+new file mode 100644
+index 0000000..ada0d25
+--- /dev/null
++++ b/ios/Henge/HostScheduling.swift
+@@ -0,0 +1,14 @@
++import Foundation
++
++/// Host identity is independent of the Mac's advertised CPU or a remote viewer.
++enum HostScheduling {
++    static var isDuo: Bool { hv_host_is_duo() != 0 }
++    static var model: String { String(cString: hv_host_model()) }
++    static var chip: String { String(cString: hv_host_chip()) }
++    static var layoutSource: String { String(cString: hv_host_layout_source()) }
++    static var responsiveCPUs: Int { max(1, Int(hv_host_performance_cores())) }
++    static var layout: String {
++        let p = hv_host_performance_cores(), e = hv_host_efficiency_cores()
++        return p > 0 && e > 0 ? "\(p) performance / \(e) efficiency" : "Not available"
++    }
++}
 diff --git a/ios/Henge/Info.plist b/ios/Henge/Info.plist
 index 409b172..411226d 100644
 --- a/ios/Henge/Info.plist
@@ -11749,11 +12237,43 @@ index 0000000..d973aa5
 +Nearby iPads discovery finds the current address and port. Opt-in Remember on both devices saves the pairing in device-only Keychain. Forget on the iPad revokes the key. No key is advertised. Manual connection remains available.
 +
 +Three-finger tap on the Duo toggles local display controls without changing video dimensions. Choose the iPad as Main Display in macOS System Settings > Displays; the Duo remains an extension. All emulation runs on the iPad.
+diff --git a/ios/Henge/SessionStatistics.swift b/ios/Henge/SessionStatistics.swift
+new file mode 100644
+index 0000000..520f70e
+--- /dev/null
++++ b/ios/Henge/SessionStatistics.swift
+@@ -0,0 +1,21 @@
++import Foundation
++
++/// Main-actor-owned sampling state, deliberately not ObservableObject/@Observable.
++/// Sampling must not rebuild the display hierarchy while Details is closed.
++final class SessionStatistics {
++    private var previousBlocks: UInt64 = 0
++    private var previousTime: TimeInterval = 0
++    private(set) var blocksPerSecond: Double = 0
++
++    func reset(blocks: UInt64, time: TimeInterval) {
++        previousBlocks = blocks
++        previousTime = time
++        blocksPerSecond = 0
++    }
++
++    func sample(blocks: UInt64, time: TimeInterval) {
++        blocksPerSecond = Double(blocks &- previousBlocks) / max(time - previousTime, 0.001)
++        previousBlocks = blocks
++        previousTime = time
++    }
++}
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index a07052b..820f88b 100644
+index a07052b..3fd4ca6 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
-@@ -18,13 +18,14 @@ struct SessionView: View {
+@@ -14,17 +14,19 @@ struct SessionView: View {
+     @State private var cpusOn: Int32 = 0
+     @State private var userCode = false
+     @State private var blocksPerSecond: Double = 0
++    @State private var statistics = SessionStatistics()
+     @State private var framesOut: UInt64 = 0
      @State private var framesIn: UInt64 = 0
      @State private var log: [String] = []
      @State private var started = Date()
@@ -11769,7 +12289,7 @@ index a07052b..820f88b 100644
  
      @State private var typing = false
      @State private var zoomed = false
-@@ -41,6 +42,7 @@ struct SessionView: View {
+@@ -41,6 +43,7 @@ struct SessionView: View {
      @State private var zoomCentre = CGPoint(x: 0.5, y: 0.5) // where the zoomed view is, 0...1 of the Mac's screen
      @State private var map: UIImage?
      @State private var zoomFollowing: Task<Void, Never>?
@@ -11777,7 +12297,7 @@ index a07052b..820f88b 100644
      @State private var helperRunning = false
      @State private var shown = CGSize(width: 0.5, height: 0.5) // how much of the Mac's screen the zoomed view shows
      @Environment(\.scenePhase) private var scenePhase
-@@ -52,7 +54,7 @@ struct SessionView: View {
+@@ -52,7 +55,7 @@ struct SessionView: View {
              let full = CGSize(width: geo.size.width + insets.leading + insets.trailing,
                                height: geo.size.height + insets.top + insets.bottom)
              let landscape = full.width > full.height
@@ -11786,7 +12306,7 @@ index a07052b..820f88b 100644
              ZStack(alignment: .topLeading) {
                  (landscape || zoomed ? Color.black : Desk.page)
                  // One view in every layout: it holds the layer the engine draws into.
-@@ -80,9 +82,16 @@ struct SessionView: View {
+@@ -80,9 +83,16 @@ struct SessionView: View {
                          }
                      }
                      .position(x: layout.screen.midX, y: layout.screen.midY)
@@ -11806,7 +12326,7 @@ index a07052b..820f88b 100644
                  if !layout.fillsPhone {
                      uprightControls(layout)
                  } else {
-@@ -142,6 +151,7 @@ struct SessionView: View {
+@@ -142,6 +152,7 @@ struct SessionView: View {
              }
              .onAppear { shown = layout.shown }
              .onChange(of: layout.shown) { shown = $0 }
@@ -11814,7 +12334,7 @@ index a07052b..820f88b 100644
          }
          .statusBarHidden(zoomed || Device.isPad)
          .persistentSystemOverlays(.hidden)
-@@ -156,12 +166,22 @@ struct SessionView: View {
+@@ -156,17 +167,30 @@ struct SessionView: View {
              zoomFollowing?.cancel()
              zoomFollowing = on ? Task { await followPointer() } : nil
          }
@@ -11838,7 +12358,16 @@ index a07052b..820f88b 100644
              HardwareKeys.releaseAll()
              HardwareMouse.shared.releaseButtons()
          }
-@@ -176,20 +196,35 @@ struct SessionView: View {
+         .onChange(of: showDetails) { showing in
+-            if showing { HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll() }
++            if showing {
++                refreshDetails()
++                HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll()
++            }
+         }
+         .onChange(of: confirmStop) { showing in
+             if showing { HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll() }
+@@ -176,20 +200,35 @@ struct SessionView: View {
              HardwareMouse.shared.start()
          }
          .onDisappear {
@@ -11876,7 +12405,7 @@ index a07052b..820f88b 100644
      // MARK: Layout
  
      /// Where everything goes, in points from the device's top left corner.
-@@ -385,7 +420,7 @@ struct SessionView: View {
+@@ -385,7 +424,7 @@ struct SessionView: View {
  
      /// The whole screen, small, with where the zoomed view is on it.
      private func zoomMap(_ layout: Layout) -> some View {
@@ -11885,7 +12414,7 @@ index a07052b..820f88b 100644
          let viewW = min(layout.touch.width / layout.screen.width, 1) * width
          let viewH = min(layout.touch.height / layout.screen.height, 1) * height
          let left = (-layout.screen.minX / layout.screen.width) * width
-@@ -413,7 +448,7 @@ struct SessionView: View {
+@@ -413,7 +452,7 @@ struct SessionView: View {
              if henge_vm_pointer(&x, &y) == 0 {
                  moveZoom(toward: CGPoint(x: CGFloat(x) / CGFloat(mac.screen.width), y: CGFloat(y) / CGFloat(mac.screen.height)))
              }
@@ -11894,7 +12423,25 @@ index a07052b..820f88b 100644
              tick += 1
              try? await Task.sleep(nanoseconds: 33_000_000)
          }
-@@ -465,6 +500,13 @@ struct SessionView: View {
+@@ -454,6 +493,17 @@ struct SessionView: View {
+         }
+     }
+ 
++    private func refreshDetails() {
++        blocksPerSecond = statistics.blocksPerSecond
++        framesOut = henge_vm_net_frames(1)
++        framesIn = henge_vm_net_frames(0)
++        helperRunning = Sharing.helperRunning
++        // Exactly the same 30 lines that Details displays. The complete log is
++        // still written independently, including while this panel is closed.
++        let recent = HengeLog.recentLines(30)
++        if recent != log { log = recent }
++    }
++
+     private var details: some View {
+         NavigationStack {
+             List {
+@@ -465,6 +515,13 @@ struct SessionView: View {
                      LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
                  }
                  Section("Display") {
@@ -11908,7 +12455,7 @@ index a07052b..820f88b 100644
                      Toggle("Color matching", isOn: $matchScreenColors)
                      LabeledContent("Brightness", value: "\(Int(screenBrightness * 100))%")
                      Slider(value: $screenBrightness, in: 0.4...1)
-@@ -479,11 +521,39 @@ struct SessionView: View {
+@@ -479,11 +536,39 @@ struct SessionView: View {
                      }
                      .pickerStyle(.segmented)
                      Toggle("Sharp edges", isOn: $sharpCursor)
@@ -11950,7 +12497,7 @@ index a07052b..820f88b 100644
                  Section("Sharing") {
                      LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
                      if !helperRunning {
-@@ -500,24 +570,6 @@ struct SessionView: View {
+@@ -500,24 +585,6 @@ struct SessionView: View {
                           : "Once for each Mac: open Terminal on the Mac, tap this, then press Return. When macOS asks about henge-agent and local networks, choose Allow. It types \(Sharing.setUpCommand) and needs the Mac's keyboard layout to be U.S.")
                          .font(.footnote).foregroundStyle(.secondary)
                  }
@@ -11975,7 +12522,7 @@ index a07052b..820f88b 100644
                  Section("Log") {
                      VStack(alignment: .leading, spacing: 1) {
                          ForEach(Array(log.suffix(30).enumerated()), id: \.offset) { _, line in
-@@ -544,7 +596,9 @@ struct SessionView: View {
+@@ -544,7 +611,9 @@ struct SessionView: View {
          }
      }
  
@@ -11986,7 +12533,7 @@ index a07052b..820f88b 100644
          let ram = GuestMemory.prepare(mac)
          HengeLog.log("session", "available memory \(henge_available_memory() >> 20) MB")
          guard ram >= 1024 else {
-@@ -555,18 +609,23 @@ struct SessionView: View {
+@@ -555,50 +624,51 @@ struct SessionView: View {
          JITBootstrap.releaseLingeringDebugger()
          Sharing.prepare()
          EngineTuning.apply()
@@ -12012,7 +12559,32 @@ index a07052b..820f88b 100644
          started = Date()
          var used = mac
          used.lastUsed = started
-@@ -592,13 +651,14 @@ struct SessionView: View {
+         Machines.shared.update(used)
+-        var lastBlocks = henge_vm_blocks()
+-        var lastTime = Date()
++        statistics.reset(blocks: henge_vm_blocks(), time: ProcessInfo.processInfo.systemUptime)
+         var lastGPUFrames = henge_vm_gpu_frames()
+         var tick = 0
+         while !Task.isCancelled {
+-            state = henge_vm_state()
+-            cpusOn = henge_vm_cpus_on()
+-            userCode = userCode || henge_vm_guest_el0() != 0
++            let currentState = henge_vm_state(), currentCPUs = henge_vm_cpus_on()
++            if currentState != state { state = currentState }
++            if currentCPUs != cpusOn { cpusOn = currentCPUs }
++            if !userCode && henge_vm_guest_el0() != 0 { userCode = true }
+             let now = Date(), blocks = henge_vm_blocks()
+-            blocksPerSecond = Double(blocks &- lastBlocks) / max(now.timeIntervalSince(lastTime), 0.001)
+-            lastBlocks = blocks
+-            lastTime = now
+-            framesOut = henge_vm_net_frames(1)
+-            framesIn = henge_vm_net_frames(0)
+-            helperRunning = Sharing.helperRunning
+-            log = Array(HengeLog.recentLines(200))
++            statistics.sample(blocks: blocks, time: ProcessInfo.processInfo.systemUptime)
++            if showDetails { refreshDetails() }
+             let heat = ProcessInfo.processInfo.thermalState
+             if heat.rawValue != thermalState.rawValue {
                  thermalState = heat
                  HengeLog.log("session", "thermal state: \(Self.thermalLabel(heat))")
              }
@@ -12024,14 +12596,14 @@ index a07052b..820f88b 100644
 -                HengeLog.log("perf", "blocks/s \(String(format: "%.0f", blocksPerSecond)), GPU frames/10s \(gpuFrames &- lastGPUFrames), "
 -                             + "network tx \(framesOut), rx \(framesIn), dns \(henge_vm_dns(0)) answered \(henge_vm_dns(2)) unanswered, "
 -                             + "thermal \(Self.thermalLabel(heat))")
-+                HengeLog.log("perf", "guest elapsed \(Int(now.timeIntervalSince(started)))s, blocks/s \(String(format: "%.0f", blocksPerSecond)), GPU frames/10s \(gpuFrames &- lastGPUFrames), "
-+                             + "network tx \(framesOut), rx \(framesIn), dns \(henge_vm_dns(0)) answered \(henge_vm_dns(2)) unanswered, thermal \(Self.thermalLabel(heat))")
++                HengeLog.log("perf", "guest elapsed \(Int(now.timeIntervalSince(started)))s, blocks/s \(String(format: "%.0f", statistics.blocksPerSecond)), GPU frames/10s \(gpuFrames &- lastGPUFrames), "
++                             + "network tx \(henge_vm_net_frames(1)), rx \(henge_vm_net_frames(0)), dns \(henge_vm_dns(0)) answered \(henge_vm_dns(2)) unanswered, thermal \(Self.thermalLabel(heat))")
 +                henge_vm_log_cache()
 +                HengeLog.log("input", HardwareMouse.shared.scrollDiagnostics)
                  lastGPUFrames = gpuFrames
                  JITBootstrap.releaseLingeringDebugger()
              }
-@@ -608,7 +668,7 @@ struct SessionView: View {
+@@ -608,7 +678,7 @@ struct SessionView: View {
                  DispatchQueue.main.asyncAfter(deadline: .now() + 10) { showWallpaperTip = false }
              }
              if tick % 30 == 0 { HengeLog.logFootprint("session") } // how close to the limit, for a memory kill leaves no crash report
@@ -12040,7 +12612,7 @@ index a07052b..820f88b 100644
              try? await Task.sleep(nanoseconds: 1_000_000_000)
          }
      }
-@@ -618,8 +678,9 @@ struct SessionView: View {
+@@ -618,8 +688,9 @@ struct SessionView: View {
      }
  
      private func finish() {
@@ -12052,10 +12624,10 @@ index a07052b..820f88b 100644
          }
          close()
 diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
-index aa3b89d..95f4001 100644
+index aa3b89d..1da8ffa 100644
 --- a/ios/Henge/SettingsView.swift
 +++ b/ios/Henge/SettingsView.swift
-@@ -3,15 +3,23 @@ import SwiftUI
+@@ -3,15 +3,24 @@ import SwiftUI
  struct SettingsView: View {
      @ObservedObject private var jit = JITCoordinator.shared
      @AppStorage(JITCoordinator.autoEnableKey) private var jitAtLaunch = false
@@ -12072,6 +12644,7 @@ index aa3b89d..95f4001 100644
      @AppStorage(EngineTuning.fastFlushKey) private var fastFlush = true
      @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
      @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
++    @AppStorage(EngineTuning.cpuPolicyKey) private var cpuPolicy = "auto"
      @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
  
 +    @AppStorage("henge.perf.thermalProtection") private var thermalProtection = false
@@ -12080,7 +12653,7 @@ index aa3b89d..95f4001 100644
      var body: some View {
          NavigationStack {
              Form {
-@@ -41,6 +49,16 @@ struct SettingsView: View {
+@@ -41,6 +50,16 @@ struct SettingsView: View {
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  .listRowBackground(Desk.card)
@@ -12097,7 +12670,7 @@ index aa3b89d..95f4001 100644
                  if Device.isPad {
                      Section("Mouse and Trackpad") {
                          VStack(alignment: .leading, spacing: 4) {
-@@ -48,9 +66,13 @@ struct SettingsView: View {
+@@ -48,9 +67,13 @@ struct SettingsView: View {
                              Slider(value: $mouseSpeed, in: 0.5...3)
                          }
                          Toggle("Reverse scrolling", isOn: $reverseScrolling)
@@ -12113,7 +12686,30 @@ index aa3b89d..95f4001 100644
                          }
                          Text("A Magic Keyboard or a Bluetooth mouse moves the Mac's pointer. Pointer speed changes apply the next time a Mac starts; scroll speed changes apply immediately.")
                              .font(.footnote).foregroundStyle(.secondary)
-@@ -64,16 +86,45 @@ struct SettingsView: View {
+@@ -58,22 +81,68 @@ struct SettingsView: View {
+                     .listRowBackground(Desk.card)
+                 }
+                 Section("Performance") {
++                    LabeledContent("Host chip", value: HostScheduling.chip)
++                    LabeledContent("Host CPU layout", value: HostScheduling.layout)
++                    Text("\(HostScheduling.model) · \(HostScheduling.layoutSource). iOS decides which physical core runs a thread.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                    Picker("CPU scheduling", selection: $cpuPolicy) {
++                        Text("Automatic").tag("auto")
++                        Text("Original scheduling").tag("legacy")
++                        if HostScheduling.isDuo {
++                            Text("Mixed CPU QoS (experimental)").tag("mixed")
++                        }
++                    }
++                    Text("Automatic keeps virtual CPUs responsive and gives noncritical host housekeeping utility priority. Resolution, refresh, CPU count, timers, audio and graphics are unchanged. Restart Henge to apply scheduling changes.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                    if cpuPolicy == "mixed" {
++                        Text("Duo experiment: the first \(HostScheduling.responsiveCPUs) virtual CPUs keep responsive priority; additional virtual CPUs request utility priority. These are whole macOS CPUs, not just background game workers. This may reduce heat or may slow apps and worsen frame times. Core placement is not guaranteed; compare with Automatic. No measured performance or power benefit is claimed.")
++                            .font(.footnote).foregroundStyle(.secondary)
++                    }
+                     Picker("Mac refresh rate", selection: $refreshRate) {
+                         Text("30 Hz").tag(30)
+                         Text("60 Hz").tag(60)
                          Text("120 Hz").tag(120)
                      }
                      .pickerStyle(.segmented)
@@ -12144,15 +12740,15 @@ index aa3b89d..95f4001 100644
 +                    Text("A bigger code cache empties less often and takes more memory; Henge picks 1.5 GB where there is room for it. Compiled code is not saved between app launches. Applies the next time Henge opens. If JIT stops turning on, choose 1 GB.")
 +                        .font(.footnote).foregroundStyle(.secondary)
 +                    Text("60 Hz leaves more of the emulated CPU to apps. Faster disk writes order them without waiting for a full sync; a sudden power loss could lose the last ones. Quicker wake keeps an idle CPU watching for work for 50 µs, at some battery cost. Superblocks let translated code run past conditional branches. Changes apply the next time a Mac starts.")
-+                        .font(.footnote).foregroundStyle(.secondary)
+                         .font(.footnote).foregroundStyle(.secondary)
+-                    Text("macOS draws a frame for every refresh: 30 Hz leaves the most of the emulated CPU to apps, at the cost of choppier animation; 60 Hz is smoother. Faster disk writes order them without waiting for a full sync; a sudden power loss could lose the last ones. Quicker wake keeps an idle CPU watching for work for 50 µs, at some battery cost. Superblocks let translated code run past conditional branches. Changes apply the next time a Mac starts.")
 +                }
 +                .listRowBackground(Desk.card)
 +                Section("Background execution") {
 +                    LabeledContent("Background GPU capability", value: BackgroundExecutionStatus.gpuSupport)
 +                    LabeledContent("Signed GPU entitlement", value: BackgroundExecutionStatus.signedGPUAccess)
 +                    Text("These are separate capability checks, not confirmation of background execution. Running the Mac in the background is not implemented in this build. Keep Henge visible while your runner builds. No signing entitlement has been added.")
-                         .font(.footnote).foregroundStyle(.secondary)
--                    Text("macOS draws a frame for every refresh: 30 Hz leaves the most of the emulated CPU to apps, at the cost of choppier animation; 60 Hz is smoother. Faster disk writes order them without waiting for a full sync; a sudden power loss could lose the last ones. Quicker wake keeps an idle CPU watching for work for 50 µs, at some battery cost. Superblocks let translated code run past conditional branches. Changes apply the next time a Mac starts.")
++                        .font(.footnote).foregroundStyle(.secondary)
 +                }
 +                .listRowBackground(Desk.card)
 +                Section("Guest sharing") {
@@ -14203,6 +14799,25 @@ index 0000000..3b2d083
 +        print("scroll regression: callback partition invariance, repeated deltas, 4-unit bounds, fractions, no idle tail, reversal and contact-centroid transitions passed")
 +    }
 +}
+diff --git a/tests/test_host_scheduling.swift b/tests/test_host_scheduling.swift
+new file mode 100644
+index 0000000..140bd93
+--- /dev/null
++++ b/tests/test_host_scheduling.swift
+@@ -0,0 +1,13 @@
++import Foundation
++
++@main struct Check {
++    static func main() {
++        precondition(!HostScheduling.model.isEmpty && !HostScheduling.chip.isEmpty)
++        precondition(!HostScheduling.layoutSource.isEmpty && HostScheduling.responsiveCPUs >= 1)
++        let p = hv_host_performance_cores(), e = hv_host_efficiency_cores()
++        if p == 0 || e == 0 { precondition(HostScheduling.layout == "Not available") }
++        else { precondition(HostScheduling.layout == "\(p) performance / \(e) efficiency") }
++        precondition(HostScheduling.isDuo == (hv_host_is_duo() != 0))
++        print("PASS Swift/C host metadata bridge: \(HostScheduling.model), \(HostScheduling.chip), \(HostScheduling.layoutSource)")
++    }
++}
 diff --git a/tests/test_hvsparse.py b/tests/test_hvsparse.py
 new file mode 100644
 index 0000000..b0a01e7
@@ -15721,6 +16336,124 @@ index 0000000..7868300
 +    b[4]=3;hv_pvg_lite_command(p,b,sizeof b);assert(p->displays[1].page==0x8000);
 +    free(p);puts("PASS production PVG commands: two ports, short swaps, invalid ports, independent ack/mapping, hotplug IRQ, disabled-port guard");return 0;
 +}
+diff --git a/tests/test_scheduling.c b/tests/test_scheduling.c
+new file mode 100644
+index 0000000..41ee48f
+--- /dev/null
++++ b/tests/test_scheduling.c
+@@ -0,0 +1,112 @@
++#define _POSIX_C_SOURCE 200809L
++#include "scheduling.h"
++#include <assert.h>
++#include <errno.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#if defined(__APPLE__)
++#include <pthread/qos.h>
++#endif
++
++static HvHostCpuInfo duo(void) {
++    HvHostCpuInfo h={.model="iPhone19,4",.ios=1,.total=6,.active=6};
++    hv_schedule_validate_topology(&h); return h;
++}
++static void decisions(void) {
++    HvHostCpuInfo h=duo();
++    assert(h.duo && h.layout==HV_LAYOUT_MODEL && h.performance==2 && h.efficiency==4);
++    h.performance=2; h.efficiency=4; hv_schedule_validate_topology(&h);
++    assert(h.layout==HV_LAYOUT_RUNTIME);
++    HvSchedulePlan p=hv_schedule_plan(&h,6,NULL,NULL);
++    assert(p.mode==HV_SCHED_AUTO && !p.mixed && p.fast_vcpus==6);
++    for(unsigned i=0;i<6;i++) assert(hv_schedule_role(&p,HV_ROLE_CPU,i)==HV_QOS_INITIATED);
++    assert(hv_schedule_role(&p,HV_ROLE_PROFILER,0)==HV_QOS_UTILITY);
++    assert(hv_schedule_role(&p,HV_ROLE_SHARE_LISTENER,0)==HV_QOS_INHERIT);
++    assert(hv_schedule_role(&p,HV_ROLE_USB_PROBE,0)==HV_QOS_UTILITY);
++    assert(hv_schedule_role(&p,HV_ROLE_SHARE_IO,0)==HV_QOS_INHERIT);
++    assert(hv_schedule_role(&p,HV_ROLE_TICKER,0)==HV_QOS_INHERIT);
++    assert(hv_schedule_role(&p,HV_ROLE_NETWORK,0)==HV_QOS_INHERIT);
++    p=hv_schedule_plan(&h,6,"legacy",NULL);
++    for(int r=HV_ROLE_TICKER;r<=HV_ROLE_USB_PROBE;r++) assert(hv_schedule_role(&p,(HvHostRole)r,0)==HV_QOS_INHERIT);
++    for(int n=1;n<=16;n++) {
++        p=hv_schedule_plan(&h,n,"mixed",NULL);
++        assert(p.mixed==(n>2));
++        for(unsigned i=0;i<(unsigned)n;i++)
++            assert(hv_schedule_role(&p,HV_ROLE_CPU,i)==(i<2?HV_QOS_INITIATED:HV_QOS_UTILITY));
++        assert(hv_schedule_role(&p,HV_ROLE_CPU,99)==HV_QOS_INITIATED);
++        assert(hv_schedule_role(&p,HV_ROLE_TICKER,0)!=HV_QOS_UTILITY);
++        assert(hv_schedule_role(&p,HV_ROLE_NETWORK,0)!=HV_QOS_UTILITY);
++    }
++    const char *overrides[]={"ui","init","default","utility"};
++    HvHostQos wants[]={HV_QOS_INTERACTIVE,HV_QOS_INITIATED,HV_QOS_DEFAULT,HV_QOS_UTILITY};
++    for(unsigned j=0;j<4;j++) {
++        p=hv_schedule_plan(&h,6,"mixed",overrides[j]);assert(!p.mixed);
++        for(unsigned i=0;i<6;i++)assert(hv_schedule_role(&p,HV_ROLE_CPU,i)==wants[j]);
++    }
++    p=hv_schedule_plan(&h,6,"typo",NULL);assert(p.mode==HV_SCHED_LEGACY && !p.mixed);
++    h.active=2;p=hv_schedule_plan(&h,6,"mixed",NULL);assert(!p.mixed);
++    h.active=0;p=hv_schedule_plan(&h,6,"mixed",NULL);assert(!p.mixed);
++    h.active=99;p=hv_schedule_plan(&h,6,"mixed",NULL);assert(!p.mixed);
++    h=duo();h.simulator=1;hv_schedule_validate_topology(&h);assert(!h.duo);
++    p=hv_schedule_plan(&h,6,"mixed",NULL);assert(!p.mixed);
++    h=duo();h.total=8;h.performance=0;h.efficiency=0;hv_schedule_validate_topology(&h);
++    assert(h.layout==HV_LAYOUT_UNKNOWN && !h.performance && !h.efficiency);
++    p=hv_schedule_plan(&h,6,"mixed",NULL);assert(!p.mixed);
++    h=(HvHostCpuInfo){.model="iPad16,5",.ios=1,.total=10,.active=10,.performance=4,.efficiency=6};
++    hv_schedule_validate_topology(&h);assert(!h.duo && h.layout==HV_LAYOUT_RUNTIME);
++    p=hv_schedule_plan(&h,6,"mixed",NULL);assert(!p.mixed);
++    h=(HvHostCpuInfo){.model="unknown",.ios=1,.total=6,.active=6};
++    hv_schedule_validate_topology(&h);assert(h.layout==HV_LAYOUT_UNKNOWN && !h.duo);
++    p=hv_schedule_plan(&h,6,"mixed",NULL);assert(!p.mixed);
++    h=duo();h.ios=0;hv_schedule_validate_topology(&h);
++    p=hv_schedule_plan(&h,6,"auto",NULL);
++    assert(!p.mixed && hv_schedule_role(&p,HV_ROLE_CPU,0)==HV_QOS_INHERIT);
++    assert(hv_schedule_role(&p,HV_ROLE_PROFILER,0)==HV_QOS_INHERIT);
++}
++static const HvHostCpuInfo *observed;
++static void *read_info(void *unused) {
++    (void)unused;
++    for(int i=0;i<1000;i++) {
++        const HvHostCpuInfo *h=hv_host_cpu_info();assert(h==observed && h->model[0]);
++        assert(!strcmp(hv_host_model(),h->model));
++        assert(hv_host_performance_cores()==h->performance && hv_host_efficiency_cores()==h->efficiency);
++    }
++    return NULL;
++}
++static void *apply_qos(void *unused) {
++    (void)unused;
++    HvHostCpuInfo h=duo();HvSchedulePlan p=hv_schedule_plan(&h,6,"auto",NULL);
++#if defined(__APPLE__)
++    qos_class_t q;int rel;
++    assert(hv_schedule_apply(HV_ROLE_CPU,0,&p,1)==0);
++    assert(!pthread_get_qos_class_np(pthread_self(),&q,&rel) && q==QOS_CLASS_USER_INITIATED);
++    assert(hv_schedule_apply(HV_ROLE_PROFILER,0,&p,1)==0);
++    assert(!pthread_get_qos_class_np(pthread_self(),&q,&rel) && q==QOS_CLASS_UTILITY);
++    assert(hv_schedule_apply(HV_ROLE_CPU,0,&p,1)==0);
++    assert(!pthread_get_qos_class_np(pthread_self(),&q,&rel) && q==QOS_CLASS_USER_INITIATED);
++    p=hv_schedule_plan(&h,6,"auto","default");
++    assert(hv_schedule_apply(HV_ROLE_CPU,0,&p,1)==0);
++    assert(!pthread_get_qos_class_np(pthread_self(),&q,&rel) && q==QOS_CLASS_DEFAULT);
++    puts("PASS native QoS: requested classes read back; responsive CPU class restored; DEFAULT clears inherited high class (not P/E residency proof)");
++#else
++    assert(hv_schedule_apply(HV_ROLE_CPU,0,&p,0)==ENOTSUP);
++    puts("NOT VERIFIED native Apple QoS on this platform");
++#endif
++    return NULL;
++}
++int main(void) {
++    decisions();
++    observed=hv_host_cpu_info();
++    pthread_t threads[16];
++    for(int i=0;i<16;i++)assert(!pthread_create(&threads[i],NULL,read_info,NULL));
++    for(int i=0;i<16;i++)assert(!pthread_join(threads[i],NULL));
++    /* Environment policy is a fresh snapshot, not cached across launches. */
++    setenv("HV_CPU_POLICY","mixed",1);setenv("HV_QOS","ui",1);
++    HvSchedulePlan p=hv_schedule_read(6);assert(p.override==HV_QOS_INTERACTIVE);
++    setenv("HV_CPU_POLICY","auto",1);unsetenv("HV_QOS");p=hv_schedule_read(6);
++    assert(p.mode==HV_SCHED_AUTO && !p.override && !p.mixed);
++    assert(!pthread_create(&threads[0],NULL,apply_qos,NULL));assert(!pthread_join(threads[0],NULL));
++    hv_host_log_capabilities();hv_schedule_log_plan(&p);
++    puts("PASS scheduling: Duo model/runtime topology, unknown/simulator/M4 fallback, all CPU counts, protected roles, env precedence/reset and concurrent metadata reads");
++}
 diff --git a/tests/test_screen_source.py b/tests/test_screen_source.py
 new file mode 100644
 index 0000000..939c31f
@@ -15736,6 +16469,33 @@ index 0000000..939c31f
 +source = ''.join(ast.literal_eval(x) for x in re.findall(r'@?("(?:[^"\\]|\\.)*")', header))
 +assert source == (root / 'devices/pvg_screen.metal').read_text()
 +print('native Metal compiled/fallback shader source parity passed')
+diff --git a/tests/test_session_statistics.swift b/tests/test_session_statistics.swift
+new file mode 100644
+index 0000000..585491b
+--- /dev/null
++++ b/tests/test_session_statistics.swift
+@@ -0,0 +1,21 @@
++import Foundation
++
++@main struct Check {
++    static func main() {
++        let sample = SessionStatistics()
++        sample.reset(blocks: 100, time: 10)
++        sample.sample(blocks: 1100, time: 11)
++        precondition(sample.blocksPerSecond == 1000)
++        // A delayed observation reports actual elapsed work, not an assumed 1s.
++        sample.sample(blocks: 3100, time: 15)
++        precondition(sample.blocksPerSecond == 500)
++        sample.reset(blocks: UInt64.max - 5, time: 20)
++        sample.sample(blocks: 4, time: 21)
++        precondition(sample.blocksPerSecond == 10)
++        sample.reset(blocks: 50, time: 0)
++        precondition(sample.blocksPerSecond == 0)
++        sample.sample(blocks: 60, time: 0)
++        precondition(sample.blocksPerSecond.isFinite && sample.blocksPerSecond == 10000)
++        print("PASS session sampling: elapsed time, pauses, counter wrap, reset and finite zero-interval handling")
++    }
++}
 diff --git a/tests/test_surface_hash_limit.py b/tests/test_surface_hash_limit.py
 new file mode 100644
 index 0000000..01aead4
@@ -16147,6 +16907,47 @@ index 0000000..e6cb23b
 +    subprocess.run([os.environ.get('CC','cc'),'-std=c11','-Wall','-Wextra','-Werror','-O1','-g','-fsanitize=address,undefined',
 +                    '-I'+str(root/'core'),'-I'+str(root/'host'),str(p/'check.c'),'-o',str(p/'check')],check=True)
 +    subprocess.run([str(p/'check')],check=True,timeout=10)
+diff --git a/tools/check_host_scheduling.sh b/tools/check_host_scheduling.sh
+new file mode 100755
+index 0000000..5d677e6
+--- /dev/null
++++ b/tools/check_host_scheduling.sh
+@@ -0,0 +1,35 @@
++#!/bin/bash
++# Native tests + iPhoneOS SDK type checking. Does not build an app or IPA.
++set -euo pipefail
++cd "$(dirname "$0")/.."
++mkdir -p build/scheduling-check
++task_out="$PWD/build/scheduling-check"
++exec > >(tee "$task_out/checks.log") 2>&1
++trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND" >&2' ERR
++set -x
++xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread -Ihost \
++    host/scheduling.c tests/test_scheduling.c -o "$task_out/test_scheduling"
++"$task_out/test_scheduling"
++xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O2 -Ihost -c host/scheduling.c -o "$task_out/scheduling.o"
++swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h \
++    ios/Henge/HostScheduling.swift tests/test_host_scheduling.swift "$task_out/scheduling.o" -o "$task_out/test_host_bridge"
++"$task_out/test_host_bridge"
++swiftc -parse-as-library -swift-version 5 ios/Henge/SessionStatistics.swift tests/test_session_statistics.swift -o "$task_out/test_session_statistics"
++"$task_out/test_session_statistics"
++xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -DHV_PROF_TEST -Icore -Ihost -Idevices \
++    host/prof_ios.c host/scheduling.c tests/test_prof_ios.c -o "$task_out/test_prof_ios"
++"$task_out/test_prof_ios"
++SDK=$(xcrun --sdk iphoneos --show-sdk-path)
++xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot "$SDK" -std=c11 -Wall -Wextra \
++    -Icore -Ihost -Idevices -fsyntax-only host/scheduling.c host/vm.c host/prof_ios.c host/usb_host.c
++# Typecheck the actual app, not a rewritten Settings/Session fixture. There is
++# no linking, .app output, packaging, signing, new entitlement or simulator job.
++python3 - "$SDK" <<'PY'
++from pathlib import Path
++import subprocess, sys
++files = sorted(str(p) for p in Path('ios/Henge').rglob('*.swift'))
++subprocess.run(['xcrun','--sdk','iphoneos','swiftc','-typecheck','-parse-as-library',
++               '-swift-version','5','-module-name','Henge','-target','arm64-apple-ios17.0',
++               '-sdk',sys.argv[1],'-import-objc-header','ios/Henge/HengeBridge.h',*files],check=True)
++print('PASS complete app SDK typecheck:',len(files),'production Swift sources; no app or IPA built')
++PY
 diff --git a/tools/check_native_touch.sh b/tools/check_native_touch.sh
 new file mode 100755
 index 0000000..eac7481
