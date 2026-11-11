@@ -2452,7 +2452,7 @@ index 2323a43..5e1572f 100644
      if (!p) return;
      hv_pvg_metal_destroy(atomic_exchange(&p->metal, NULL));
 diff --git a/devices/pvg_lite.h b/devices/pvg_lite.h
-index 0301b42..4a16100 100644
+index 0301b42..6a360b4 100644
 --- a/devices/pvg_lite.h
 +++ b/devices/pvg_lite.h
 @@ -4,6 +4,7 @@
@@ -2484,10 +2484,11 @@ index 0301b42..4a16100 100644
  void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *command, uint32_t length);
  void hv_pvg_lite_complete(HvPvgLite *p, uint32_t channel, uint32_t stamp);
  
-@@ -55,6 +64,8 @@ int hv_pvg_trace_on(void);
+@@ -55,6 +64,9 @@ int hv_pvg_trace_on(void);
  
  /* The size macOS is told its screen is. Set before the machine starts; default 1920 x 1080. */
  void hv_pvg_lite_set_mode(uint32_t width, uint32_t height);
++int hv_pvg_lite_set_link_mode(uint32_t width, uint32_t height, uint32_t width_mm, uint32_t height_mm, uint32_t hz);
 +/* The display's one mode. A scaled resolution chosen in macOS draws smaller surfaces for the same mode. */
 +void hv_pvg_lite_mode(uint32_t *width, uint32_t *height);
  void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm);
@@ -15028,11 +15029,12 @@ index 0000000..88db6e8
 + subprocess.run([str(p/'test')],check=True,timeout=15)
 diff --git a/tests/test_cpu_sync.c b/tests/test_cpu_sync.c
 new file mode 100644
-index 0000000..8949d0e
+index 0000000..bd64ae5
 --- /dev/null
 +++ b/tests/test_cpu_sync.c
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,60 @@
 +#include "machine.h"
++#include "fastmem.h"
 +#include <assert.h>
 +#include <pthread.h>
 +#include <stdio.h>
@@ -15057,6 +15059,7 @@ index 0000000..8949d0e
 +int main(void) {
 +    alarm(15);
 +    assert(!hv_machine_init(&m, 1 << 20));
++    m.fastmem_enabled = 1;
 +    hv_cpu_reset_index(&cpu[0], &m, 0); hv_cpu_reset_index(&cpu[1], &m, 1);
 +    for (int enabled = 0; enabled <= 1; enabled++) {
 +        hv_knob[HV_K_SYNCWAIT] = enabled;
@@ -15064,13 +15067,22 @@ index 0000000..8949d0e
 +            action = round % 3;
 +            __atomic_store_n(&m.percpu[0].tlb_live, 1, __ATOMIC_SEQ_CST);
 +            __atomic_store_n(&m.percpu[1].tlb_live, 1, __ATOMIC_SEQ_CST);
-+            seq = hv_cpu_post(&cpu[1], 0);
-+            uint64_t own = hv_cpu_post(&cpu[0], 0);
++            const uint64_t regions[] = {0xfffffc0400010000ull, 0xfffffe0000020000ull};
++            for (unsigned i = 0; i < 2; i++) for (unsigned r = 0; r < 2; r++) for (int pan = 1; pan <= 2; pan++) {
++                hv_fastmem_fill(&cpu[i], regions[r], pan, 0x1000000 - regions[r]);
++                assert(hv_fastmem_read_ptr(&cpu[i], regions[r], 8, pan));
++            }
++            seq = hv_cpu_post(&cpu[1], action == 0 ? HV_REQ_TLB_ALL : 0);
++            uint64_t own = hv_cpu_post(&cpu[0], HV_REQ_TLB_ALL);
 +            pthread_t worker; assert(!pthread_create(&worker, NULL, finish_request, NULL));
 +            hv_cpu_sync(&cpu[0], &cpu[1], seq);
 +            assert(m.percpu[0].ack_seq == own && m.percpu[0].tlb_live);
 +            assert(!m.percpu[1].tlb_live || m.percpu[1].ack_seq >= seq);
 +            assert(!pthread_join(worker, NULL));
++            for (unsigned r = 0; r < 2; r++) for (int pan = 1; pan <= 2; pan++) {
++                assert(!hv_fastmem_read_ptr(&cpu[0], regions[r], 8, pan));
++                if (action == 0) assert(!hv_fastmem_read_ptr(&cpu[1], regions[r], 8, pan));
++            }
 +            assert(!m.percpu[1].ack_waiters);
 +            hv_cpu_process_requests(&cpu[1]);
 +        }
@@ -15079,7 +15091,7 @@ index 0000000..8949d0e
 +    assert(m.percpu[0].sync_sleeps && m.percpu[0].sync_timeouts);
 +    assert(!m.percpu[0].sync_errors);
 +    hv_machine_free(&m);
-+    puts("CPU sync: spinning/sleeping, acknowledgement, parked target, missed notification and own requests passed");
++    puts("CPU sync: spinning/sleeping, acknowledgement, parked target, missed notification, own requests and tagged multiwindow/PAN cache clears passed");
 +}
 diff --git a/tests/test_devices.c b/tests/test_devices.c
 index 92be30b..878cff1 100644
