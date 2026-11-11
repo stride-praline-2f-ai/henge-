@@ -3638,6 +3638,217 @@ index 7392fda..9d2d0b3 100644
      }
  
      func makeUIView(context: Context) -> Screen {
+diff --git a/ios/Henge/Controls/GamepadHub.swift b/ios/Henge/Controls/GamepadHub.swift
+new file mode 100644
+index 0000000..5861c4f
+--- /dev/null
++++ b/ios/Henge/Controls/GamepadHub.swift
+@@ -0,0 +1,74 @@
++import UIKit
++import Combine
++
++@MainActor
++final class GamepadHub: ObservableObject {
++    static let shared = GamepadHub()
++    @Published var keyboardMapping = UserDefaults.standard.bool(forKey: "henge.gamepad.keyboardMapping") {
++        didSet {
++            guard oldValue != keyboardMapping else { return }
++            UserDefaults.standard.set(keyboardMapping,forKey: "henge.gamepad.keyboardMapping")
++            releaseDelivered(); deliver()
++        }
++    }
++    private var local = GamepadState.off, remote = GamepadState.off
++    private var keys = Set<UInt8>(), mouse = Set<Int>()
++    private var look: CADisplayLink?
++    private var lastLook: CFTimeInterval = 0
++    private var lookRemainder = CGPoint.zero
++    private var proxy: LookProxy?
++    func set(_ state: GamepadState, remote: Bool = false) {
++        guard state.valid else { return }
++        if remote { guard self.remote != state else { return }; self.remote = state }
++        else { guard local != state else { return }; local = state }
++        deliver()
++    }
++    func releaseAll() { local = .off; remote = .off; releaseDelivered() }
++    private func releaseDelivered() {
++        look?.invalidate(); look = nil; proxy = nil; lastLook = 0; lookRemainder = .zero
++        henge_vm_input_release(2); keys.removeAll(); mouse.removeAll()
++        _ = henge_vm_gamepad(0,0,0,0,0,0,0,0,8)
++    }
++    private var state: GamepadState { .merged(local,remote) }
++    private func deliver() {
++        guard henge_vm_state() == 1 else { releaseAll(); return }
++        let s = state
++        if !keyboardMapping {
++            _ = henge_vm_gamepad(s.connected ? 1 : 0,s.buttons,s.lx,s.ly,s.rx,s.ry,s.left,s.right,s.hat)
++            return
++        }
++        let next = s.mappedKeys
++        for k in keys.subtracting(next) { henge_vm_input_key(2,k,0) }
++        for k in next.subtracting(keys) { henge_vm_input_key(2,k,1) }
++        keys = next
++        var buttons = Set<Int>()
++        if s.connected && s.right > 64 { buttons.insert(0) }
++        if s.connected && s.left > 64 { buttons.insert(1) }
++        if s.connected && (abs(Int(s.rx)) > 5000 || abs(Int(s.ry)) > 5000) { buttons.insert(1) }
++        for b in mouse.subtracting(buttons) { henge_vm_input_button(2,Int32(b),0) }
++        for b in buttons.subtracting(mouse) { henge_vm_input_button(2,Int32(b),1) }
++        mouse = buttons
++        let moving = s.connected && (abs(Int(s.rx)) > 5000 || abs(Int(s.ry)) > 5000)
++        if moving && look == nil {
++            let proxy = LookProxy(); proxy.owner = self; self.proxy = proxy
++            let display = CADisplayLink(target: proxy,selector: #selector(LookProxy.tick(_:)))
++            display.preferredFrameRateRange = CAFrameRateRange(minimum: 30,maximum: 60,preferred: 60)
++            display.add(to: .main,forMode: .common); look = display
++        } else if !moving { look?.invalidate(); look = nil; proxy = nil; lastLook = 0; lookRemainder = .zero }
++    }
++    fileprivate func tick(_ display: CADisplayLink) {
++        guard UIApplication.shared.applicationState == .active, henge_vm_state() == 1 else { releaseAll(); return }
++        let dt = lastLook > 0 ? min(0.05,display.timestamp-lastLook) : 1/60
++        lastLook = display.timestamp
++        let s = state
++        lookRemainder.x += CGFloat(s.rx)/32767 * 900 * dt
++        lookRemainder.y += CGFloat(s.ry)/32767 * 900 * dt
++        let x = Int32(lookRemainder.x), y = Int32(lookRemainder.y)
++        lookRemainder.x -= CGFloat(x); lookRemainder.y -= CGFloat(y)
++        if x != 0 || y != 0 { henge_vm_mouse_move(x,y) }
++    }
++}
++private final class LookProxy: NSObject {
++    weak var owner: GamepadHub?
++    @objc func tick(_ link: CADisplayLink) { MainActor.assumeIsolated { owner?.tick(link) } }
++}
+diff --git a/ios/Henge/Controls/GamepadState.swift b/ios/Henge/Controls/GamepadState.swift
+new file mode 100644
+index 0000000..7476335
+--- /dev/null
++++ b/ios/Henge/Controls/GamepadState.swift
+@@ -0,0 +1,33 @@
++import Foundation
++
++/// Full-state packets make releases authoritative after coalescing. Integer
++/// wire values avoid NaN/Infinity and have the same bounds as the USB report.
++struct GamepadState: Codable, Equatable {
++    var connected = true
++    var buttons: UInt16 = 0
++    var hat: UInt8 = 8
++    var lx: Int16 = 0, ly: Int16 = 0, rx: Int16 = 0, ry: Int16 = 0
++    var left: UInt8 = 0, right: UInt8 = 0
++    static var off: Self { Self(connected: false) }
++    var valid: Bool { hat <= 8 && ![lx, ly, rx, ry].contains(Int16.min) }
++    static func merged(_ a: Self, _ b: Self) -> Self {
++        let a = a.connected ? a : .off, b = b.connected ? b : .off
++        return Self(connected: a.connected || b.connected, buttons: a.buttons | b.buttons,
++            hat: a.hat < 8 ? a.hat : b.hat, lx: a.lx != 0 ? a.lx : b.lx, ly: a.ly != 0 ? a.ly : b.ly,
++            rx: a.rx != 0 ? a.rx : b.rx, ry: a.ry != 0 ? a.ry : b.ry, left: max(a.left,b.left),right: max(a.right,b.right))
++    }
++    /// Explicit Roblox-style keyboard fallback, not a native controller claim.
++    var mappedKeys: Set<UInt8> {
++        guard connected else { return [] }
++        var keys = Set<UInt8>()
++        if ly < -8000 || [0,1,7].contains(hat) { keys.insert(26) } // W
++        if ly > 8000 || [3,4,5].contains(hat) { keys.insert(22) } // S
++        if lx < -8000 || [5,6,7].contains(hat) { keys.insert(4) } // A
++        if lx > 8000 || [1,2,3].contains(hat) { keys.insert(7) } // D
++        let mapping: [(UInt16,UInt8)] = [(1,44),(2,6),(4,8),(8,21),(16,225),(32,224),(256,41),(512,43)]
++        for (mask,key) in mapping {
++            if buttons & mask != 0 { keys.insert(key) }
++        }
++        return keys
++    }
++}
+diff --git a/ios/Henge/Controls/GamepadSurface.swift b/ios/Henge/Controls/GamepadSurface.swift
+new file mode 100644
+index 0000000..d68b71e
+--- /dev/null
++++ b/ios/Henge/Controls/GamepadSurface.swift
+@@ -0,0 +1,86 @@
++import SwiftUI
++import UIKit
++
++/// One native multitouch surface: each finger owns its original control until
++/// release/cancel. No gesture recognizer competition or idle display timer.
++struct GamepadSurface: UIViewRepresentable {
++    var send: (GamepadState) -> Void
++    func makeUIView(context: Context) -> PadView { let v = PadView(); v.send = send; return v }
++    func updateUIView(_ view: PadView, context: Context) { view.send = send }
++    static func dismantleUIView(_ view: PadView, coordinator: ()) { view.release(); view.send = nil }
++}
++final class PadView: UIView {
++    var send: ((GamepadState) -> Void)?
++    private var fingers: [ObjectIdentifier: (Int,CGPoint)] = [:]
++    private var regions: [CGRect] { // left/right sticks, A/B/X/Y, LB/RB, LT/RT, menu
++        let w = bounds.width, h = bounds.height, size = min(120,max(72,h*0.34)), b = min(52,max(38,h*0.14))
++        return [CGRect(x:20,y:h-size-18,width:size,height:size),CGRect(x:w-size-100,y:h-size-18,width:size,height:size),
++            CGRect(x:w-120,y:110+b,width:b,height:b),CGRect(x:w-64,y:110,width:b,height:b),
++            CGRect(x:w-176,y:110,width:b,height:b),CGRect(x:w-120,y:110-b,width:b,height:b),
++            CGRect(x:20,y:12,width:68,height:38),CGRect(x:w-88,y:12,width:68,height:38),
++            CGRect(x:96,y:12,width:58,height:38),CGRect(x:w-154,y:12,width:58,height:38),
++            CGRect(x:w/2-30,y:12,width:60,height:38)]
++    }
++    override init(frame: CGRect) {
++        super.init(frame:frame); isMultipleTouchEnabled = true; isOpaque = false; backgroundColor = .clear
++        accessibilityLabel = "Virtual gamepad. Left stick moves, right stick looks, A jumps in keyboard mapping."
++    }
++    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
++    override func layoutSubviews() { super.layoutSubviews(); if !fingers.isEmpty { release() }; setNeedsDisplay() }
++    override func draw(_ rect: CGRect) {
++        let labels = ["Move","Look","A","B","X","Y","LB","RB","LT","RT","Menu"]
++        let active = Set(fingers.values.map(\.0))
++        for (i,r) in regions.enumerated() {
++            (active.contains(i) ? UIColor.systemBlue.withAlphaComponent(0.65) : UIColor.black.withAlphaComponent(0.5)).setFill()
++            UIBezierPath(roundedRect:r,cornerRadius:i<2 ? r.width/2 : 14).fill()
++            let style: [NSAttributedString.Key:Any] = [.font:UIFont.boldSystemFont(ofSize:15),.foregroundColor:UIColor.white]
++            let size = (labels[i] as NSString).size(withAttributes:style)
++            (labels[i] as NSString).draw(at:CGPoint(x:r.midX-size.width/2,y:r.midY-size.height/2),withAttributes:style)
++        }
++    }
++    override func touchesBegan(_ touches: Set<UITouch>,with event: UIEvent?) {
++        let r = regions
++        for t in touches {
++            let p = t.location(in:self)
++            // Shoulder controls win over face-button overlap in compact layouts.
++            if let i = r.indices.reversed().first(where:{r[$0].contains(p)}), !fingers.values.contains(where:{$0.0==i}) { fingers[ObjectIdentifier(t)] = (i,p) }
++        }
++        publish()
++    }
++    override func touchesMoved(_ touches: Set<UITouch>,with event: UIEvent?) {
++        for t in touches { let id = ObjectIdentifier(t); if let old = fingers[id] { fingers[id] = (old.0,t.location(in:self)) } }; publish()
++    }
++    override func touchesEnded(_ touches: Set<UITouch>,with event: UIEvent?) { for t in touches { fingers.removeValue(forKey:ObjectIdentifier(t)) }; publish() }
++    override func touchesCancelled(_ touches: Set<UITouch>,with event: UIEvent?) { touchesEnded(touches,with:event) }
++    override func didMoveToWindow() { super.didMoveToWindow(); if window == nil { release() } else { publish() } }
++    func release() { fingers.removeAll(); send?(.off); setNeedsDisplay() }
++    private func publish() {
++        var state = GamepadState()
++        for (i,p) in fingers.values {
++            if i < 2 {
++                let r = regions[i]
++                func axis(_ v: CGFloat) -> Int16 { let v = max(-1,min(1,v)); return abs(v)<0.15 ? 0 : Int16(v*32767) }
++                let x = axis((p.x-r.midX)/(r.width*0.42)), y = axis((p.y-r.midY)/(r.height*0.42))
++                if i==0 { state.lx=x;state.ly=y } else { state.rx=x;state.ry=y }
++            } else if i<8 { state.buttons |= UInt16(1 << (i-2)) }
++            else if i==8 { state.left=255 } else if i==9 { state.right=255 } else { state.buttons |= 256 }
++        }
++        send?(state); setNeedsDisplay()
++    }
++}
++
++struct LocalGamepad: View {
++    @ObservedObject private var hub = GamepadHub.shared
++    var close: () -> Void
++    var body: some View {
++        VStack(spacing:4) {
++            HStack {
++                Toggle("Keyboard mapping",isOn:$hub.keyboardMapping).fixedSize()
++                Spacer(); Button("Hide Gamepad",action:close)
++            }.padding(8).background(.ultraThinMaterial)
++            GamepadSurface { hub.set($0) }
++                .frame(height:300)
++        }
++        .onDisappear { hub.set(.off) }
++    }
++}
 diff --git a/ios/Henge/DisplayRouter.swift b/ios/Henge/DisplayRouter.swift
 index 47b0ced..af8939d 100644
 --- a/ios/Henge/DisplayRouter.swift
@@ -3846,6 +4057,33 @@ index 037685f..bbea374 100644
          log("boot", "Link protocol: 2, decoder-consumption credit window=3; local discovery and opt-in Keychain pairing; three-finger viewer controls; update both devices")
          log("boot", "cache lifecycle: JIT translations and kernel read lookups are RAM-only; no cross-launch executable cache")
          if let source = info["HengeCustomSourceCommit"] as? String {
+diff --git a/ios/Henge/HomeView.swift b/ios/Henge/HomeView.swift
+index 2c11af9..02ea359 100644
+--- a/ios/Henge/HomeView.swift
++++ b/ios/Henge/HomeView.swift
+@@ -11,6 +11,7 @@ struct HomeView: View {
+     @State private var picking = false
+     @State private var showingLink = false
+     @AppStorage("henge.link.viewerOnly") private var viewerOnly = false
++    @AppStorage("henge.link.controlsOnly") private var controlsOnly = false
+     @State private var jitReady = JITBootstrap.ready
+     @State private var chosen: UUID?
+     @State private var showMacApps = false
+@@ -44,10 +45,13 @@ struct HomeView: View {
+                         }.disabled(!jitReady)
+                     }
+                     Button {
+-                        LinkHostService.shared.stop(); jit.showSetup = false; viewerOnly = true
++                        LinkHostService.shared.stop(); jit.showSetup = false; controlsOnly = false; viewerOnly = true
+                     } label: {
+                         Label("Use this device as a display", systemImage: "rectangle.on.rectangle")
+                     }
++                    Button {
++                        LinkHostService.shared.stop(); jit.showSetup = false; controlsOnly = true; viewerOnly = true
++                    } label: { Label("Use as wireless keyboard or gamepad",systemImage:"gamecontroller") }
+                 }
+                 .padding(.horizontal, 16)
+                 .padding(.bottom, 24)
 diff --git a/ios/Henge/Installer.swift b/ios/Henge/Installer.swift
 index 2103167..4dcdfc6 100644
 --- a/ios/Henge/Installer.swift
@@ -3913,16 +4151,17 @@ index 8b4bf3b..e0c84e8 100644
      }
  
 diff --git a/ios/Henge/Link/LinkProtocol.swift b/ios/Henge/Link/LinkProtocol.swift
-index 94231b2..427317d 100644
+index 94231b2..b1a53e8 100644
 --- a/ios/Henge/Link/LinkProtocol.swift
 +++ b/ios/Henge/Link/LinkProtocol.swift
-@@ -23,14 +23,21 @@ struct LinkControl: Codable {
+@@ -23,14 +23,25 @@ struct LinkControl: Codable {
      var mode: LinkMode? = nil
      var x: Int? = nil, y: Int? = nil, code: Int? = nil, down: Bool? = nil
      var sequence: UInt64? = nil
 +    var visible: Bool? = nil
 +    var capabilities: [String]? = nil
-+    var supportsViewerVisibility: Bool { type == "ready" && capabilities?.contains("viewerVisibility") == true }
++    var gamepad: GamepadState? = nil
++    var supportsViewerVisibility: Bool { ["ready","readyInput"].contains(type) && capabilities?.contains("viewerVisibility") == true }
      func validate() throws {
          guard version == Self.currentVersion else { throw LinkError.invalid("Update Henge on both devices: different Link protocol version") }
 +        if let capabilities, capabilities.count > 8 || capabilities.contains(where: { $0.utf8.count > 64 }) {
@@ -3930,6 +4169,9 @@ index 94231b2..427317d 100644
 +        }
          switch type {
          case "hello", "ready": guard let mode else { throw LinkError.invalid("Missing display mode") }; try mode.validate()
++        case "helloInput", "readyInput": guard mode == nil else { throw LinkError.invalid("Controls-only connections have no video mode") }
++        case "gamepad": guard let gamepad, gamepad.valid else { throw LinkError.invalid("Invalid gamepad state") }
++        case "padMode": guard down != nil else { throw LinkError.invalid("Missing gamepad mapping") }
          case "move", "scroll": guard let x, let y, (-4096...4096).contains(x), (-4096...4096).contains(y) else { throw LinkError.invalid("Invalid pointer delta") }
          case "button": guard let code, (0...2).contains(code), down != nil else { throw LinkError.invalid("Invalid button") }
          case "key": guard let code, (4...231).contains(code), down != nil else { throw LinkError.invalid("Invalid HID key") }
@@ -3939,30 +4181,98 @@ index 94231b2..427317d 100644
          default: throw LinkError.invalid("Unknown control message")
          }
 diff --git a/ios/Henge/Link/LinkService.swift b/ios/Henge/Link/LinkService.swift
-index 07cd331..a36f9d9 100644
+index 07cd331..7b8dc28 100644
 --- a/ios/Henge/Link/LinkService.swift
 +++ b/ios/Henge/Link/LinkService.swift
-@@ -68,12 +68,18 @@ final class LinkHostService: ObservableObject {
+@@ -14,13 +14,14 @@ final class LinkHostService: ObservableObject {
+     @Published private(set) var mode: LinkMode?
+     @Published private(set) var active = false
+     @Published private(set) var connected = false
++    @Published private(set) var controlOnly = false
+     private var transport: LinkTransport?
+     private var encoder: LinkEncoder?
+     private var keys = Set<Int>(), buttons = Set<Int>()
+     private var token = UUID()
+     var canStart: Bool { connected && mode != nil && encoder != nil }
+     func listen(wired: Bool, remember: Bool = false) {
+-        guard !active else { return }
++        guard !active, !controlOnly else { return }
+         stop(); let generation = UUID(); token = generation
+         do {
+             let pairing = try LinkPairingStore.shared.host(remember: remember)
+@@ -34,7 +35,7 @@ final class LinkHostService: ObservableObject {
+                     HengeLog.log("link", text)
+                     if !okay {
+                         self.releaseInput()
+-                        if self.active { self.stopKeepingStatus(); self.status = text }
++                        if self.active || self.controlOnly { self.stopKeepingStatus(); self.status = text }
+                     }
+                 }
+             }
+@@ -54,8 +55,17 @@ final class LinkHostService: ObservableObject {
+     }
+     private func receive(_ command: LinkControl) {
+         guard (try? command.validate()) != nil else { return }
++        if command.type == "helloInput" {
++            guard encoder == nil, mode == nil, !active else { return }
++            controlOnly = true
++            transport?.sendControl(LinkControl(type:"readyInput",down:GamepadHub.shared.keyboardMapping,capabilities:["inputOnly","gamepad","viewerVisibility"]))
++            transport?.setInputOnly()
++            status = "Secure wireless keyboard, touchpad and gamepad connected; video is off."
++            HengeLog.log("link","controls-only peer authenticated; no encoder, decoder or second display")
++            return
++        }
+         if command.type == "hello", let proposed = command.mode {
+-            guard !active, encoder == nil else { status = "This session's display mode is already fixed. Stop the Mac before pairing again."; return }
++            guard !active, !controlOnly, encoder == nil else { status = "This session's display mode is already fixed. Stop the Mac before pairing again."; return }
+             do {
+                 guard let transport else { return }
+                 let created = try LinkEncoder(mode: proposed, send: { [weak transport] data, done in
+@@ -68,25 +78,33 @@ final class LinkHostService: ObservableObject {
                  })
                  encoder = created; mode = proposed
                  transport.onVideoAcknowledged = { [weak created] sequence in created?.acknowledge(sequence) }
 -                transport.sendControl(LinkControl(type: "ready", mode: proposed))
-+                transport.sendControl(LinkControl(type: "ready", mode: proposed, capabilities: ["viewerVisibility"]))
++                transport.sendControl(LinkControl(type: "ready", mode: proposed, capabilities: ["viewerVisibility","gamepad"]))
                  status = "Duo ready: \(proposed.width) × \(proposed.height), \(proposed.hz) Hz. Start this Mac."
                  HengeLog.log("link", "peer authenticated; native mode=\(proposed.width)x\(proposed.height) hz=\(proposed.hz); primary mode unchanged")
              } catch { status = error.localizedDescription; HengeLog.log("link", status); stopKeepingStatus() }
              return
          }
+-        guard active, henge_vm_state() == 1 else { return }
 +        if command.type == "visibility", let visible = command.visible {
 +            encoder?.setVisible(visible)
 +            if !visible { releaseInput() }
 +            else if active { henge_vm_link_connected(1) } // request the latest frame even when the guest is idle
 +            return
 +        }
-         guard active, henge_vm_state() == 1 else { return }
++        guard (active || controlOnly), henge_vm_state() == 1 else { return }
          switch command.type {
          case "move": henge_vm_mouse_move(Int32(command.x ?? 0), Int32(command.y ?? 0))
-@@ -116,6 +122,7 @@ final class LinkHostService: ObservableObject {
+         case "scroll": henge_vm_mouse_scroll(Int32(command.x ?? 0), Int32(command.y ?? 0))
+         case "key":
+             if let code = command.code, let down = command.down {
+-                if down { keys.insert(code) } else { keys.remove(code) }; henge_vm_key_hid(UInt8(code), down ? 1 : 0)
++                if down { keys.insert(code) } else { keys.remove(code) }; henge_vm_input_key(1,UInt8(code), down ? 1 : 0)
+             }
+         case "button":
+             if let code = command.code, let down = command.down {
+-                if down { buttons.insert(code) } else { buttons.remove(code) }; henge_vm_mouse_button(Int32(code), down ? 1 : 0)
++                if down { buttons.insert(code) } else { buttons.remove(code) }; henge_vm_input_button(1,Int32(code), down ? 1 : 0)
+             }
+         case "release": releaseInput()
++        case "gamepad": if let pad = command.gamepad { GamepadHub.shared.set(pad,remote:true) }
++        case "padMode": GamepadHub.shared.keyboardMapping = command.down ?? false
+         case "bye": stop()
+         default: break
+         }
+@@ -111,22 +129,23 @@ final class LinkHostService: ObservableObject {
+         }
+     }
+     func forgetPairing() {
+-        guard !active else { return }
++        guard !active, !controlOnly else { return }
+         do { try LinkPairingStore.shared.forget("host"); stop(); status = "Saved key revoked. Create a new pairing before connecting again." }
          catch { status = error.localizedDescription }
      }
      func stop() { stopKeepingStatus(); status = "Display link stopped." }
@@ -3970,24 +4280,88 @@ index 07cd331..a36f9d9 100644
      private func stopKeepingStatus() {
          token = UUID(); releaseInput()
          hv_pvg_link_set_frame_handler(nil)
-@@ -139,6 +146,7 @@ final class LinkViewerService: ObservableObject {
+         if active { henge_vm_link_connected(0) }
+-        active = false; connected = false
++        active = false; connected = false; controlOnly = false
+         encoder?.stop(); encoder = nil; transport?.stop(); transport = nil
+         key = ""; pairingName = ""; port = nil; mode = nil
+     }
+     private func releaseInput() {
+-        for key in keys { henge_vm_key_hid(UInt8(key), 0) }
+-        for button in buttons { henge_vm_mouse_button(Int32(button), 0) }
++        henge_vm_input_release(1)
++        GamepadHub.shared.set(.off,remote:true)
+         keys.removeAll(); buttons.removeAll()
+     }
+ }
+@@ -135,14 +154,19 @@ final class LinkHostService: ObservableObject {
+ final class LinkViewerService: ObservableObject {
+     @Published private(set) var status = "Select a local iPad or enter its address manually."
+     @Published private(set) var ready = false
++    @Published var keyboardMapping = false {
++        didSet { if oldValue != keyboardMapping { send(LinkControl(type:"padMode",down:keyboardMapping)) } }
++    }
+     private var transport = LinkTransport()
      private let decodeWorker = LinkDecodeWorker(report: { HengeLog.log("link-viewer", $0) })
      private var generation = UUID()
      private var mode: LinkMode?
 +    private var hostReady: LinkControl?
++    private var inputOnly = false
      // A single replaceable output, owned by the view. No array of decoded frames.
      var onPixel: ((CVPixelBuffer) -> Void)?
-     func connect(host: String, port: UInt16, key: String, wired: Bool, mode: LinkMode, peer: LinkDiscoveredPeer? = nil, remember: Bool = false) {
-@@ -165,7 +173,7 @@ final class LinkViewerService: ObservableObject {
+-    func connect(host: String, port: UInt16, key: String, wired: Bool, mode: LinkMode, peer: LinkDiscoveredPeer? = nil, remember: Bool = false) {
+-        disconnect(); let g = UUID(); generation = g; self.mode = mode
++    func connect(host: String, port: UInt16, key: String, wired: Bool, mode: LinkMode, peer: LinkDiscoveredPeer? = nil, remember: Bool = false, inputOnly: Bool = false) {
++        disconnect(); let g = UUID(); generation = g; self.mode = inputOnly ? nil : mode; self.inputOnly = inputOnly
+         let channel = transport
+         let mailbox = LinkPixelMailbox { [weak self] pixel in
+             guard let self, self.generation == g else { return }
+@@ -152,27 +176,38 @@ final class LinkViewerService: ObservableObject {
+             }
+             self.onPixel?(pixel)
+         }
+-        let decodeGeneration = decodeWorker.start(mode: mode, output: { mailbox.submit($0) })
++        let decodeGeneration = inputOnly ? UUID() : decodeWorker.start(mode: mode, output: { mailbox.submit($0) })
+         let worker = decodeWorker
+         transport.onStatus = { [weak self] text, connected in
+             Task { @MainActor in
+                 guard let self, self.generation == g else { return }
+                 self.status = text; HengeLog.log("link-viewer", text); if !connected { self.ready = false }
+-                if connected { self.transport.sendControl(LinkControl(type: "hello", mode: mode)) }
++                if connected {
++                    self.transport.sendControl(LinkControl(type: inputOnly ? "helloInput" : "hello", mode: inputOnly ? nil : mode))
++                    DispatchQueue.main.asyncAfter(deadline:.now()+8) { [weak self] in
++                        guard let self, self.generation==g, !self.ready else { return }
++                        self.disconnect()
++                        self.status = inputOnly ? "Host did not accept controls-only mode. Update Henge on both devices." : "Host did not accept the display mode. Update Henge on both devices."
++                    }
++                }
+             }
+         }
+         transport.onPacket = { [weak self, weak channel] packet in
              guard let self else { return }
-             if packet.kind == 1, let command = try? JSONDecoder().decode(LinkControl.self, from: packet.payload), command.type == "ready", command.mode == mode {
+-            if packet.kind == 1, let command = try? JSONDecoder().decode(LinkControl.self, from: packet.payload), command.type == "ready", command.mode == mode {
++            if packet.kind == 1, let command = try? JSONDecoder().decode(LinkControl.self, from: packet.payload),
++               (try? command.validate()) != nil, command.type == (inputOnly ? "readyInput" : "ready"), command.mode == (inputOnly ? nil : mode),
++               !inputOnly || command.capabilities?.contains("inputOnly") == true {
                  Task { @MainActor in
 -                    guard self.generation == g else { return }; self.ready = true
+-                    self.status = "Connected. Start macOS on the iPad; waiting for the second desktop."
 +                    guard self.generation == g else { return }; self.hostReady = command; self.ready = true
-                     self.status = "Connected. Start macOS on the iPad; waiting for the second desktop."
++                    self.status = inputOnly ? "Connected. Wireless controls only; no video or local Mac." : "Connected. Start macOS on the iPad; waiting for the second desktop."
++                    if inputOnly { self.keyboardMapping = command.down ?? false }
++                    if inputOnly { self.transport.setInputOnly() }
                      if remember, let peer {
                          do { try LinkPairingStore.shared.save("viewer", value: LinkSavedPeer(name: peer.name, key: key.trimmingCharacters(in: .whitespacesAndNewlines), wired: wired)) }
-@@ -187,9 +195,15 @@ final class LinkViewerService: ObservableObject {
+                         catch { self.status = "Connected. " + error.localizedDescription }
+                     }
+                 }
+-            } else if packet.kind == 2 {
++            } else if packet.kind == 2 && !inputOnly {
+                 worker.consume(packet.payload, generation: decodeGeneration, consumed: { [weak channel] sequence in
+                     // Runs after the decode slot is free, independently of UI work.
+                     channel?.sendControl(LinkControl(type: "videoAck", sequence: sequence))
+@@ -187,9 +222,16 @@ final class LinkViewerService: ObservableObject {
          if let peer { transport.connect(peer: peer, key: secret, wired: wired) }
          else { transport.connect(host: host.trimmingCharacters(in: .whitespacesAndNewlines), key: secret, wired: wired, port: port) }
      }
@@ -3997,6 +4371,7 @@ index 07cd331..a36f9d9 100644
 +        // Protocol-2 hosts validate known message types strictly. Send the
 +        // optional control only after their ready reply advertises support.
 +        if control.type == "visibility", hostReady?.supportsViewerVisibility != true { return }
++        if ["gamepad","padMode"].contains(control.type), hostReady?.capabilities?.contains("gamepad") != true { return }
 +        transport.sendControl(control)
 +    }
      func disconnect() {
@@ -4005,6 +4380,37 @@ index 07cd331..a36f9d9 100644
          decodeWorker.stop(); mode = nil
      }
  }
+diff --git a/ios/Henge/Link/LinkTransport.swift b/ios/Henge/Link/LinkTransport.swift
+index ab4d4d8..3a22346 100644
+--- a/ios/Henge/Link/LinkTransport.swift
++++ b/ios/Henge/Link/LinkTransport.swift
+@@ -35,6 +35,8 @@ final class LinkTransport {
+     private var ready = false
+     private var watchdog: DispatchSourceTimer?
+     private var lastReceive = ProcessInfo.processInfo.systemUptime
++    private var receiveTimeout: TimeInterval = 12
++    func setInputOnly() { queue.async { self.receiveTimeout = 4 } }
+     private var controlWindow: TimeInterval = 0
+     private var controlCount = 0
+     static let port: UInt16 = 49173
+@@ -148,7 +150,7 @@ final class LinkTransport {
+                 timer.schedule(deadline: .now() + 2, repeating: 2, leeway: .milliseconds(200))
+                 timer.setEventHandler { [weak self] in
+                     guard let self, self.generation == g else { return }
+-                    if ProcessInfo.processInfo.systemUptime - self.lastReceive > 12 { self.fail("Display connection timed out"); return }
++                    if ProcessInfo.processInfo.systemUptime - self.lastReceive > self.receiveTimeout { self.fail("Link connection timed out; held input released"); return }
+                     self.sendControl(LinkControl(type: "ping"))
+                 }
+                 self.watchdog = timer; timer.resume()
+@@ -230,7 +232,7 @@ final class LinkTransport {
+     private func fail(_ text: String) { stopNow(); onStatus?(text, false) }
+     deinit { watchdog?.cancel(); connection?.cancel(); listener?.cancel() }
+     private func stopNow() {
+-        generation &+= 1; ready = false; videosPending = 0; controlsPending = 0
++        generation &+= 1; ready = false; videosPending = 0; controlsPending = 0; receiveTimeout = 12
+         watchdog?.cancel(); watchdog = nil
+         connection?.stateUpdateHandler = nil; connection?.pathUpdateHandler = nil; connection?.cancel(); connection = nil
+         listener?.cancel(); listener = nil; parser = LinkParser()
 diff --git a/ios/Henge/Link/LinkVideo.swift b/ios/Henge/Link/LinkVideo.swift
 index f49ac55..a062560 100644
 --- a/ios/Henge/Link/LinkVideo.swift
@@ -4094,10 +4500,81 @@ index f49ac55..a062560 100644
          slots.signal()
          guard receipt.consumed else { return }
 diff --git a/ios/Henge/Link/LinkViews.swift b/ios/Henge/Link/LinkViews.swift
-index 1bc238f..31eff7e 100644
+index 1bc238f..95bfd61 100644
 --- a/ios/Henge/Link/LinkViews.swift
 +++ b/ios/Henge/Link/LinkViews.swift
-@@ -162,6 +162,7 @@ struct LinkViewerView: View {
+@@ -47,6 +47,8 @@ struct LinkHostView: View {
+ }
+ 
+ struct LinkViewerView: View {
++    @AppStorage("henge.link.controlsOnly") private var inputOnly = false
++    @State private var inputTab = 0
+     @StateObject private var viewer = LinkViewerService()
+     @StateObject private var discovery = LinkDiscovery()
+     @State private var selected: LinkDiscoveredPeer?
+@@ -67,6 +69,20 @@ struct LinkViewerView: View {
+             ZStack(alignment: .top) {
+                 Color.black.ignoresSafeArea()
+                 if connecting {
++                    if inputOnly {
++                        VStack {
++                            HStack { Button("Disconnect") { viewer.send(LinkControl(type:"release")); viewer.disconnect(); connecting=false }; Spacer(); Text(viewer.status).font(.caption) }.padding()
++                            Picker("Control",selection:$inputTab) { Text("Touchpad").tag(0); Text("Keyboard").tag(1); Text("Gamepad").tag(2) }.pickerStyle(.segmented)
++                            if inputTab == 2 {
++                                Toggle("Keyboard mapping (WASD / jump / mouse look)",isOn:$viewer.keyboardMapping).padding()
++                                GamepadSurface { viewer.send(LinkControl(type:"gamepad",gamepad:$0)) }.frame(maxHeight:.infinity)
++                                Text("Generic HID recognition depends on the game. Keyboard mapping is an explicit fallback.").font(.footnote).padding()
++                            } else {
++                                Text(inputTab == 1 ? "Type on the keyboard below. ASCII layout; hardware keyboards also work." : "Drag to move. Tap to click. Two fingers scroll or right-click. Hold and drag moves windows.").padding()
++                                LinkInputSurface(viewer:viewer,keyboard:inputTab==1).frame(maxWidth:.infinity,maxHeight:.infinity).background(.gray.opacity(0.2))
++                            }
++                        }.foregroundStyle(.white).padding(.top,20)
++                    } else {
+                     LinkVideoSurface(viewer: viewer, toggleControls: toggleControls)
+                         .ignoresSafeArea()
+                         .accessibilityLabel("Extended Mac display")
+@@ -81,11 +97,12 @@ struct LinkViewerView: View {
+                                 .accessibilityLabel("Hide display controls. Three-finger tap to show again.")
+                         }.padding(8).background(.ultraThinMaterial)
+                     }
++                    }
+                 } else {
+                     NavigationStack {
+                         Form {
+-                            Section("Henge Link · display viewer") {
+-                                Text("The Mac runs on your iPad. This device receives its second monitor and sends trackpad and hardware keyboard input. No Mac installation or JIT is required here.")
++                            Section(inputOnly ? "Henge Link · wireless controls" : "Henge Link · display viewer") {
++                                Text(inputOnly ? "Open Wireless Controls from the running Mac’s three-finger menu and create a key. This device sends keyboard, touchpad and gamepad input; no video, Mac installation or JIT runs here." : "The Mac runs on your iPad. This device receives its second monitor and sends trackpad and hardware keyboard input. No Mac installation or JIT is required here.")
+                                 Text("Nearby iPads").font(.headline)
+                                 Text(discovery.status).font(.footnote)
+                                 ForEach(discovery.peers) { peer in
+@@ -113,7 +130,7 @@ struct LinkViewerView: View {
+                                 if !pairingNotice.isEmpty { Text(pairingNotice).font(.footnote) }
+                                 Toggle("Wired Ethernet only", isOn: $wired)
+                                 Text(wired ? "Use compatible Ethernet adapters, not a plain USB-C cable. Both IP addresses must be on the same local subnet." : "Use the iPad's Wi-Fi IP address. Both devices must be on the same local network, with Wired Ethernet only turned off on both. A guest network may block device-to-device traffic.").font(.footnote)
+-                                Button("Connect as second display") {
++                                Button(inputOnly ? "Connect wireless controls" : "Connect as second display") {
+                                     let screen = UIScreen.main
+                                     let scale = screen.nativeScale
+                                     let w = Int((geometry.size.width * scale).rounded()), h = Int((geometry.size.height * scale).rounded())
+@@ -123,14 +140,14 @@ struct LinkViewerView: View {
+                                     let port = UInt16(portText) ?? 0
+                                     guard peer != nil || (manual && !host.isEmpty && port > 0) else { return }
+                                     discovery.stop(); controlsHidden = false
+-                                    viewer.connect(host: host, port: port, key: key, wired: wired, mode: mode, peer: peer, remember: remember && !manual); connecting = true
++                                    viewer.connect(host: host, port: port, key: key, wired: wired, mode: mode, peer: peer, remember: remember && !manual,inputOnly:inputOnly); connecting = true
+                                 }.disabled(key.count != 43 || (manual ? (host.isEmpty || UInt16(portText) == nil || UInt16(portText) == 0) : selected == nil))
+                                 Text(viewer.status)
+                             }
+                             Section("Main desktop on iPad") { LinkMainDesktopGuide() }
+                             Section { Text("Use landscape orientation before connecting. The negotiated pixel size stays fixed for this Mac session. Drag to move the pointer; tap to click; hold then drag to move windows; use two fingers to scroll. Move the pointer past the edge of the iPad desktop to reach this display. Tap with three fingers to hide or show the Disconnect/status bar.").font(.footnote) }
+                             Button("Back to Henge") { viewer.disconnect(); exit() }
+-                        }.navigationTitle("Use as a display")
++                        }.navigationTitle(inputOnly ? "Wireless Controls" : "Use as a display")
+                     }
+                 }
+             }
+@@ -162,13 +179,16 @@ struct LinkViewerView: View {
              }
          }
          .onChange(of: viewer.ready) { _, ready in
@@ -4105,14 +4582,164 @@ index 1bc238f..31eff7e 100644
              UIApplication.shared.isIdleTimerDisabled = ready
              // Reveal a real connection failure rather than leaving a hidden
              // error above a frozen last frame. It can still be hidden again.
-@@ -169,6 +170,7 @@ struct LinkViewerView: View {
+             if !ready { controlsHidden = false }
          }
++        .onChange(of: inputTab) { _, _ in viewer.send(LinkControl(type:"release")) }
          .statusBarHidden(connecting && controlsHidden)
          .onChange(of: phase) { _, phase in
 +            viewer.send(LinkControl(type: "visibility", visible: phase == .active))
              if phase == .background { viewer.disconnect(); connecting = false; discovery.stop(); UIApplication.shared.isIdleTimerDisabled = false }
              else if phase == .active, !connecting { discovery.start(wired: wired) }
              else if phase == .inactive { viewer.send(LinkControl(type: "release")) }
+@@ -204,18 +224,52 @@ private struct LinkVideoSurface: UIViewRepresentable {
+     func updateUIView(_ view: LinkVideoView, context: Context) { view.toggleControls = toggleControls }
+     static func dismantleUIView(_ view: LinkVideoView, coordinator: ()) { view.send = nil; view.toggleControls = nil; view.videoLayer.flushAndRemoveImage() }
+ }
+-private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
+-    override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
+-    var videoLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
++private class LinkInputView: UIView, UIGestureRecognizerDelegate, UIKeyInput {
+     var send: ((LinkControl) -> Void)?
+     var toggleControls: (() -> Void)?
+     // The surface is a remote trackpad, not a text editor. Keep iOS's system
+     // three-finger editing menu from taking the local controls gesture.
+     override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
+     override var canBecomeFirstResponder: Bool { true }
++    private var heldKeys = Set<Int>()
++    var keyboardEnabled = false {
++        didSet { if oldValue != keyboardEnabled { releaseInput(); reloadInputViews(); if window != nil { becomeFirstResponder() } } }
++    }
++    override var inputView: UIView? { keyboardEnabled ? nil : UIView(frame:.zero) }
++    var hasText: Bool { true }
++    var autocorrectionType: UITextAutocorrectionType = .no
++    var autocapitalizationType: UITextAutocapitalizationType = .none
++    var keyboardType: UIKeyboardType = .asciiCapable
++    var keyboardAppearance: UIKeyboardAppearance = .dark
++    func releaseInput() { heldKeys.removeAll(); send?(LinkControl(type:"release")) }
++    func deleteBackward() { stroke(42,shift:false) }
++    private func stroke(_ key: Int,shift: Bool) {
++        let shifted = heldKeys.contains(225)
++        if shift && !shifted { send?(LinkControl(type:"key",code:225,down:true)) }
++        if heldKeys.contains(key) { send?(LinkControl(type:"key",code:key,down:false)) }
++        send?(LinkControl(type:"key",code:key,down:true))
++        if !heldKeys.contains(key) { send?(LinkControl(type:"key",code:key,down:false)) }
++        if shift && !shifted { send?(LinkControl(type:"key",code:225,down:false)) }
++    }
++    func insertText(_ text: String) {
++        // Bound pastes and keep enough queue capacity for releases. The
++        // software keyboard is explicit US ASCII; no text enters diagnostics.
++        let plain = Array("abcdefghijklmnopqrstuvwxyz1234567890\n\u{1b}\u{8}\t -=[]\\;’`,./")
++        let shifted = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()")
++        var mapping: [Character:(Int,Bool)] = [:]
++        for (i,c) in plain.prefix(36).enumerated() { mapping[c]=(i<26 ? 4+i : 30+i-26,false) }
++        for (i,c) in shifted.enumerated() { mapping[c]=(i<26 ? 4+i : 30+i-26,true) }
++        mapping["\n"]=(40,false);mapping["\t"]=(43,false);mapping[" "]=(44,false)
++        let punctuation: [(Character,Int)] = [("-",45),("=",46),("[",47),("]",48),("\\",49),(";",51),("'",52),("`",53),(",",54),(".",55),("/",56)]
++        for (c,k) in punctuation { mapping[c]=(k,false) }
++        let upper = Array(#"_+{}|:"~<>?"#)
++        for ((_,k),c) in zip(punctuation,upper) { mapping[c]=(k,true) }
++        guard text.count <= 16 else { HengeLog.log("link-input","Paste rejected: use up to 16 ASCII characters at a time"); return }
++        for c in text { if let (key,shift)=mapping[c] { stroke(key,shift:shift) } }
++    }
+     override init(frame: CGRect) {
+         super.init(frame: frame)
+-        videoLayer.videoGravity = .resizeAspect; backgroundColor = .black
++        backgroundColor = .clear
+         let controls = UITapGestureRecognizer(target: self, action: #selector(toggleViewerControls))
+         controls.numberOfTouchesRequired = 3; controls.numberOfTapsRequired = 1
+         addGestureRecognizer(controls)
+@@ -226,7 +280,7 @@ private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
+         let hold = UILongPressGestureRecognizer(target: self, action: #selector(holdButton(_:)))
+         hold.minimumPressDuration = 0.35; hold.delegate = self; addGestureRecognizer(hold)
+     }
+-    override func didMoveToWindow() { super.didMoveToWindow(); if window != nil { becomeFirstResponder() } }
++    override func didMoveToWindow() { super.didMoveToWindow(); if window != nil { becomeFirstResponder() } else { releaseInput() } }
+     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+         gestureRecognizer is UILongPressGestureRecognizer || other is UILongPressGestureRecognizer
+     }
+@@ -236,15 +290,6 @@ private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
+         if hold.state == .ended || hold.state == .cancelled || hold.state == .failed { send?(LinkControl(type: "button", code: 0, down: false)) }
+     }
+     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+-    func show(_ pixel: CVPixelBuffer) {
+-        var format: CMVideoFormatDescription?, sample: CMSampleBuffer?
+-        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixel, formatDescriptionOut: &format) == noErr, let format else { return }
+-        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
+-        guard CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pixel, formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample) == noErr, let sample else { return }
+-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) as? [NSMutableDictionary], let first = attachments.first { first[kCMSampleAttachmentKey_DisplayImmediately] = true }
+-        if videoLayer.status == .failed { videoLayer.flush() }
+-        if videoLayer.isReadyForMoreMediaData { videoLayer.enqueue(sample) }
+-    }
+     @objc private func pointerPan(_ pan: UIPanGestureRecognizer) {
+         let p = pan.translation(in: self)
+         let dx = max(-4096, min(4096, Int(p.x * contentScaleFactor))), dy = max(-4096, min(4096, Int(p.y * contentScaleFactor)))
+@@ -260,10 +305,64 @@ private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
+     @objc private func click() { button(0) }
+     @objc private func rightClick() { button(1) }
+     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+-        for press in presses { if let key = press.key, (4...231).contains(key.keyCode.rawValue) { send?(LinkControl(type: "key", code: key.keyCode.rawValue, down: true)) } }
++        for press in presses { if let key = press.key, (4...231).contains(key.keyCode.rawValue) { heldKeys.insert(key.keyCode.rawValue); send?(LinkControl(type: "key", code: key.keyCode.rawValue, down: true)) } }
+     }
+     override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+-        for press in presses { if let key = press.key, (4...231).contains(key.keyCode.rawValue) { send?(LinkControl(type: "key", code: key.keyCode.rawValue, down: false)) } }
++        for press in presses { if let key = press.key, (4...231).contains(key.keyCode.rawValue) { heldKeys.remove(key.keyCode.rawValue); send?(LinkControl(type: "key", code: key.keyCode.rawValue, down: false)) } }
+     }
+     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) { pressesEnded(presses, with: event) }
+ }
++
++private final class LinkVideoView: LinkInputView {
++    override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
++    var videoLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
++    override init(frame: CGRect) { super.init(frame:frame); videoLayer.videoGravity = .resizeAspect; backgroundColor = .black }
++    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
++    func show(_ pixel: CVPixelBuffer) {
++        var format: CMVideoFormatDescription?, sample: CMSampleBuffer?
++        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixel, formatDescriptionOut: &format) == noErr, let format else { return }
++        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
++        guard CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pixel, formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample) == noErr, let sample else { return }
++        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) as? [NSMutableDictionary], let first = attachments.first { first[kCMSampleAttachmentKey_DisplayImmediately] = true }
++        if videoLayer.status == .failed { videoLayer.flush() }
++        if videoLayer.isReadyForMoreMediaData { videoLayer.enqueue(sample) }
++    }
++
++}
++
++private struct LinkInputSurface: UIViewRepresentable {
++    let viewer: LinkViewerService
++    let keyboard: Bool
++    func makeUIView(context: Context) -> LinkInputView {
++        let view = LinkInputView(); view.send = { [weak viewer] in viewer?.send($0) }
++        view.keyboardEnabled = keyboard; return view
++    }
++    func updateUIView(_ view: LinkInputView,context:Context) { view.keyboardEnabled = keyboard }
++    static func dismantleUIView(_ view: LinkInputView,coordinator:()) { view.releaseInput();view.resignFirstResponder();view.send = nil }
++}
++
++struct WirelessControlsHostView: View {
++    @ObservedObject private var link = LinkHostService.shared
++    @Environment(\.dismiss) private var dismiss
++    @State private var remember = false
++    var body: some View {
++        NavigationStack {
++            Form {
++                Section("Another phone as your controls") {
++                    Text("On the other phone, open Henge → Use as wireless keyboard or gamepad. Both devices must be on the same local network. This mode sends input only and uses no video stream or second monitor.")
++                    Toggle("Remember pairing in Keychain",isOn:$remember).disabled(link.connected)
++                    Button("Create secure pairing key") { link.listen(wired:false,remember:remember) }.disabled(link.connected || link.active)
++                    if !link.key.isEmpty {
++                        Text(link.key).font(.system(.footnote,design:.monospaced)).textSelection(.enabled)
++                        Button("Copy key") { UIPasteboard.general.setItems([[UIPasteboard.typeAutomatic:link.key]],options:[.localOnly:true,.expirationDate:Date().addingTimeInterval(300)]) }
++                    }
++                    if let port = link.port { Text("Manual port: \(port)") }
++                    Text(link.status)
++                    Button("Disconnect controls",role:.destructive) { link.stop() }.disabled(!link.controlOnly)
++                }
++                Section { Text("Anyone with the pairing key can control this Mac while listening. HID controller recognition depends on macOS and the game. Keyboard mapping provides WASD, Space, mouse look and trigger clicks as a separate fallback.").font(.footnote) }
++            }.navigationTitle("Wireless Controls")
++                .toolbar { ToolbarItem(placement:.confirmationAction) { Button("Done") { dismiss() } } }
++        }
++    }
++}
 diff --git a/ios/Henge/M4Performance.swift b/ios/Henge/M4Performance.swift
 new file mode 100644
 index 0000000..f98dda5
@@ -4950,6 +5577,71 @@ index 0000000..c2fd38b
 +        }
 +    }
 +}
+diff --git a/ios/Henge/SessionDiagnosticCapture.swift b/ios/Henge/SessionDiagnosticCapture.swift
+new file mode 100644
+index 0000000..0046860
+--- /dev/null
++++ b/ios/Henge/SessionDiagnosticCapture.swift
+@@ -0,0 +1,59 @@
++import Foundation
++import Combine
++
++/// A bounded consumer of SessionView's existing maintenance waiter. No new
++/// sampling timer, per-access instrumentation, key text or pairing secrets.
++@MainActor
++final class SessionDiagnosticCapture: ObservableObject {
++    @Published private(set) var active = false
++    private var end = 0.0
++    private(set) var nextDeadline: Double?
++    private var previous: (Double,HengeVmCounters,HengeVmResources)?
++    func begin() {
++        guard !active else { return }
++        let now = ProcessInfo.processInfo.systemUptime
++        active = true; end = now+30; nextDeadline = now; previous = nil
++        HengeLog.log("capture","BEGIN 30s; aggregate process CPU, VM/JIT/memory/network/presentation; no per-access counters enabled")
++    }
++    func stop() {
++        guard active else { return }
++        active = false; nextDeadline = nil; previous = nil
++        HengeLog.log("capture","END; share henge.log and henge-native.log; host presentation is not game FPS; no temperature/watts measurement")
++    }
++    func event(_ name: String) {
++        guard active else { return }
++        HengeLog.log("capture-event",name)
++        nextDeadline = ProcessInfo.processInfo.systemUptime
++    }
++    func sample() {
++        guard active else { return }
++        let now = ProcessInfo.processInfo.systemUptime
++        guard now >= (nextDeadline ?? now) else { return }
++        var vm = HengeVmCounters(), resources = HengeVmResources()
++        henge_vm_counters(&vm); henge_vm_resources(&resources)
++        var rates = "baseline"
++        if let (time,oldVM,old) = previous, now>time {
++            let seconds = now-time
++            if old.available & 1 != 0, resources.available & 1 != 0, resources.process_cpu_us >= old.process_cpu_us {
++                rates = String(format:"cpu_core_equivalents=%.3f interval_s=%.3f",Double(resources.process_cpu_us-old.process_cpu_us)/1_000_000/seconds,seconds)
++            } else { rates = "cpu=unavailable" }
++            if vm.generation==oldVM.generation && vm.epoch==oldVM.epoch,
++               vm.gpu_frames>=oldVM.gpu_frames,vm.blocks>=oldVM.blocks,vm.tx>=oldVM.tx,vm.rx>=oldVM.rx {
++                rates += String(format:" blocks_s=%.0f host_presentations_s=%.2f tx=%llu rx=%llu",Double(vm.blocks-oldVM.blocks)/seconds,Double(vm.gpu_frames-oldVM.gpu_frames)/seconds,vm.tx-oldVM.tx,vm.rx-oldVM.rx)
++            } else { rates += " vm_rates=new_epoch" }
++        }
++        previous = (now,vm,resources)
++        let power = ProcessInfo.processInfo.isLowPowerModeEnabled
++        let thermal = ProcessInfo.processInfo.thermalState.rawValue
++        let hz = getenv("HV_HZ").map { String(cString:$0) } ?? "unknown"
++        let policy = getenv("HV_CPU_POLICY").map { String(cString:$0) } ?? "unknown"
++        HengeLog.log("capture", "\(rates) state=\(vm.state) generation=\(vm.generation) epoch=\(vm.epoch) lpm=\(power) thermal=\(thermal) guest_hz=\(hz) cpu_policy=\(policy) cpu_background=\(henge_vm_cpu_background()) available_bits=\(resources.available) footprint=\(resources.footprint) resident=\(resources.resident) headroom=\(resources.headroom) jit_used=\(resources.jit_used) jit_capacity=\(resources.jit_capacity) translations=\(resources.translations) resets=\(resources.full_flushes) pad_delivered=\(resources.gamepad_delivered) pad_coalesced=\(resources.gamepad_coalesced) pad_overflow=\(resources.gamepad_overflow) detailed_counters=\(resources.detailed_counters)")
++        let preferences = UserDefaults.standard
++        HengeLog.log("capture-policy","requested_hz=\(preferences.integer(forKey:EngineTuning.refreshKey)) presentation_cap=\(preferences.integer(forKey:"henge.perf.presentationCap")) power_aware=\(preferences.object(forKey:"henge.perf.lowPowerAware") as? Bool ?? true) link_connected=\(LinkHostService.shared.connected) controls_only=\(LinkHostService.shared.controlOnly) grouped=\(preferences.bool(forKey:EngineTuning.groupsKey)) superblocks=\(preferences.bool(forKey:EngineTuning.superblocksKey))")
++        // Existing cumulative wait/idle/cache reports, only during this capture.
++        // Disabled per-access diagnostics remain explicitly unavailable.
++        henge_vm_log_cache()
++        nextDeadline = min(end,now+5)
++        if now>=end { stop() }
++    }
++}
 diff --git a/ios/Henge/SessionNativeEvents.swift b/ios/Henge/SessionNativeEvents.swift
 new file mode 100644
 index 0000000..abd82b1
@@ -5027,19 +5719,22 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..31d53ea 100644
+index f84465e..02a6e97 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
-@@ -9,6 +9,8 @@ struct SessionView: View {
+@@ -9,6 +9,11 @@ struct SessionView: View {
      let close: () -> Void
  
      @StateObject private var display = DisplayRouter()
 +    @ObservedObject private var runner = RunnerMode.shared
 +    @State private var runnerDesktop = false
++    @State private var showGamepad = false
++    @State private var showWirelessControls = false
++    @StateObject private var diagnosticCapture = SessionDiagnosticCapture()
      @State private var error: String?
      @State private var state: Int32 = 0
      @State private var bootAttempt = 0
-@@ -22,6 +24,7 @@ struct SessionView: View {
+@@ -22,6 +27,7 @@ struct SessionView: View {
      @State private var started = Date()
      @State private var runningScreen: GuestScreenSize?
      @State private var thermalState = ProcessInfo.processInfo.thermalState
@@ -5047,7 +5742,7 @@ index f84465e..31d53ea 100644
      @State private var bootRAM: UInt64 = 0 /* what the Mac was started with, which a save is for */
      @AppStorage("henge.cpus") private var cpus = 4
      @AppStorage("henge.matchScreenColors") private var matchScreenColors = true
-@@ -45,6 +48,8 @@ struct SessionView: View {
+@@ -45,6 +51,8 @@ struct SessionView: View {
      @AppStorage("henge.tips.stillWallpaperShown") private var stillWallpaperTipShown = false
      @State private var showWallpaperTip = false
      @State private var confirmStop = false
@@ -5056,7 +5751,7 @@ index f84465e..31d53ea 100644
      @State private var zoomCentre = CGPoint(x: 0.5, y: 0.5) // where the zoomed view is, 0...1 of the Mac's screen
      @State private var map: UIImage?
      @State private var zoomFollowing: Task<Void, Never>?
-@@ -190,12 +195,18 @@ struct SessionView: View {
+@@ -190,12 +198,18 @@ struct SessionView: View {
          } message: {
              Text("This turns the Mac off at once. Anything not saved on it is lost.")
          }
@@ -5078,10 +5773,11 @@ index f84465e..31d53ea 100644
          }
          .onChange(of: nativeTouch.requested) { _, _ in nativeTouch.changedRequest() }
          .onChange(of: pointerNeeded) { needed in
-@@ -204,9 +215,12 @@ struct SessionView: View {
+@@ -204,20 +218,84 @@ struct SessionView: View {
              if needed { nativeTouch.stop() }
          }
          .onChange(of: scenePhase) { phase in
++            diagnosticCapture.event("scene=\(phase)")
 +            wakeups.signal()
 +            updateZoomFollowing()
              HardwareMouse.shared.setAcceptsInput(phase == .active && !pointerNeeded)
@@ -5091,7 +5787,8 @@ index f84465e..31d53ea 100644
                  InstantResume.cameBack(mac)
                  return
              }
-@@ -214,10 +228,54 @@ struct SessionView: View {
+             nativeTouch.stop()
++            GamepadHub.shared.releaseAll()
              HardwareKeys.releaseAll()
              HardwareMouse.shared.releaseButtons()
              VolumeClicks.shared.releaseButtons()
@@ -5105,10 +5802,20 @@ index f84465e..31d53ea 100644
 +                }
 +            }
 +        }
-+        .onDisappear { runner.end() }
++        .onDisappear { diagnosticCapture.stop(); GamepadHub.shared.releaseAll(); runner.end() }
 +        .onChange(of: runner.active) { _ in updateRunnerDisplay(); wakeups.signal() }
 +        .onChange(of: runnerDesktop) { _ in updateRunnerDisplay() }
-+        .onChange(of: state) { _ in updateZoomFollowing() }
++        .onChange(of: state) { _ in
++            diagnosticCapture.event("vm_state=\(state)")
++            updateZoomFollowing()
++            if state != 1 { GamepadHub.shared.releaseAll(); showGamepad = false }
++        }
++        .overlay(alignment: .bottom) {
++            if showGamepad && state == 1 && scenePhase == .active {
++                LocalGamepad { showGamepad = false }.padding(.horizontal,8)
++            }
++        }
++        .sheet(isPresented: $showWirelessControls) { WirelessControlsHostView() }
 +        .overlay {
 +            if runner.active && !runnerDesktop {
 +                VStack(spacing: 18) {
@@ -5130,15 +5837,20 @@ index f84465e..31d53ea 100644
 +            }
 +        }
 +        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
++            diagnosticCapture.event("memory_warning"); wakeups.signal()
 +            henge_vm_trim_memory()
 +            LinkHostService.shared.trimMemory()
 +            HengeLog.logFootprint("memory-warning")
 +        }
 +        .onReceive(NotificationCenter.default.publisher(for: SessionNativeEvents.changed)) { _ in wakeups.signal() }
++        .onReceive(NotificationCenter.default.publisher(for: .NSProcessInfoPowerStateDidChange)) { _ in
++            diagnosticCapture.event("low_power=\(ProcessInfo.processInfo.isLowPowerModeEnabled)"); wakeups.signal()
++        }
 +        .onReceive(NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification)) { _ in
 +            let next = ProcessInfo.processInfo.thermalState
 +            if thermalState != next {
 +                thermalState = next
++                diagnosticCapture.event("thermal=\(next.rawValue)")
 +                wakeups.signal()
 +                HengeLog.log("session", "thermal state: \(Self.thermalLabel(next))")
 +            }
@@ -5148,7 +5860,7 @@ index f84465e..31d53ea 100644
              if showing {
                  refreshDetails()
                  HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll()
-@@ -228,10 +286,12 @@ struct SessionView: View {
+@@ -228,10 +306,12 @@ struct SessionView: View {
          }
          .onAppear {
              UIApplication.shared.isIdleTimerDisabled = true
@@ -5161,7 +5873,7 @@ index f84465e..31d53ea 100644
              LinkHostService.shared.stop()
              nativeTouch.stop()
              UIApplication.shared.isIdleTimerDisabled = false
-@@ -242,21 +302,23 @@ struct SessionView: View {
+@@ -242,21 +322,23 @@ struct SessionView: View {
              VolumeClicks.shared.stop()
          }
          .modifier(ExternalMacDisplayModifier(presentation: MacPresentation(display: display, aspect: displayAspect)))
@@ -5193,15 +5905,25 @@ index f84465e..31d53ea 100644
  
      // A fold/rotation after boot must fit the mode the guest actually received,
      // rather than stretch it by recalculating only the host view's aspect.
-@@ -484,6 +546,7 @@ struct SessionView: View {
+@@ -484,10 +566,17 @@ struct SessionView: View {
  
      /// The controls a column has too.
      @ViewBuilder private var floatingTools: some View {
 +        if runner.active { tool("hammer", "Runner dashboard", tint: .white) { runnerDesktop = false } }
          tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
++        tool("gamecontroller", "Virtual gamepad", tint: showGamepad ? Desk.accentLight : .white) { showGamepad.toggle() }
++        tool("antenna.radiowaves.left.and.right", "Wireless controls", tint: .white) { showWirelessControls = true }
          pasteTool
          tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
-@@ -513,12 +576,19 @@ struct SessionView: View {
+         tool("info.circle", "Details", tint: .white) { showDetails = true }
++        tool("waveform.path.ecg", diagnosticCapture.active ? "Stop diagnostic capture" : "Capture diagnostics for 30 seconds", tint: diagnosticCapture.active ? Desk.accentLight : .white) {
++            if diagnosticCapture.active { diagnosticCapture.stop() } else { diagnosticCapture.begin() }
++            wakeups.signal()
++        }
+     }
+ 
+     /// The whole screen, small, with where the zoomed view is on it.
+@@ -513,12 +602,19 @@ struct SessionView: View {
      }
  
      /// Keeps the pointer in view: the view moves when the pointer nears its edge.
@@ -5222,7 +5944,7 @@ index f84465e..31d53ea 100644
              }
              if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / displayAspect)) { map = UIImage(cgImage: image) }
              tick += 1
-@@ -545,6 +615,9 @@ struct SessionView: View {
+@@ -545,6 +641,9 @@ struct SessionView: View {
          VStack(alignment: .leading, spacing: 10) {
              Text("This Mac could not start").font(.system(size: 17, weight: .semibold))
              Text(text).font(.system(size: 14)).foregroundStyle(Desk.dim)
@@ -5232,7 +5954,7 @@ index f84465e..31d53ea 100644
              Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
          }
          .padding(18)
-@@ -583,6 +656,13 @@ struct SessionView: View {
+@@ -583,6 +682,13 @@ struct SessionView: View {
                      LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
                      LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
                  }
@@ -5246,7 +5968,7 @@ index f84465e..31d53ea 100644
                  Section("Display") {
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
-@@ -680,6 +760,7 @@ struct SessionView: View {
+@@ -680,6 +786,7 @@ struct SessionView: View {
      }
  
      private func run(viewport: CGSize) async {
@@ -5254,7 +5976,7 @@ index f84465e..31d53ea 100644
          error = nil
          state = 0
          userCode = false
-@@ -699,7 +780,9 @@ struct SessionView: View {
+@@ -699,7 +806,9 @@ struct SessionView: View {
          guard !Task.isCancelled else { return }
          UIApplication.shared.isIdleTimerDisabled = true
          HardwareMouse.shared.start()
@@ -5265,7 +5987,7 @@ index f84465e..31d53ea 100644
          runningScreen = screen
          let ram = GuestMemory.prepare(mac)
          HengeLog.log("session", "available memory \(henge_available_memory() >> 20) MB")
-@@ -721,38 +804,65 @@ struct SessionView: View {
+@@ -721,38 +830,66 @@ struct SessionView: View {
          HengeLog.log("display", "screen-fit: selected=\(mac.fitsDeviceScreen) viewport=\(viewport.width)x\(viewport.height) stored=\(mac.screenWidth ?? 1920)x\(mac.screenHeight ?? 1080) chosen=\(screen.width)x\(screen.height) aspect=\(screen.aspect)")
          do { try LinkHostService.shared.prepareBoot() }
          catch { self.error = error.localizedDescription; return }
@@ -5312,6 +6034,7 @@ index f84465e..31d53ea 100644
 +        let wallpaperTipAt = wallStart + 60
          while !Task.isCancelled {
 -            let currentState = henge_vm_state(), currentCPUs = henge_vm_cpus_on()
++            diagnosticCapture.sample()
 +            henge_vm_counters(&counters)
 +            runner.refresh()
 +            let currentState = counters.state, currentCPUs = henge_vm_cpus_on()
@@ -5334,7 +6057,7 @@ index f84465e..31d53ea 100644
 +            if state == 4 {
 +                statistics.reset(blocks: counters.blocks, time: uptime, epoch: counters.epoch)
 +                gpuCounter.reset()
-+                await wakeups.wait()
++                await wakeups.wait(seconds: diagnosticCapture.nextDeadline.map { max(0,$0-ProcessInfo.processInfo.systemUptime) })
 +                continue
              }
 +            statistics.sample(blocks: counters.blocks, time: uptime, epoch: counters.epoch)
@@ -5345,7 +6068,7 @@ index f84465e..31d53ea 100644
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
                  typing = false
-@@ -769,38 +879,59 @@ struct SessionView: View {
+@@ -769,38 +906,60 @@ struct SessionView: View {
                  }
                  break
              }
@@ -5388,6 +6111,7 @@ index f84465e..31d53ea 100644
 +            // State changes wake this task directly. Poll only for visible
 +            // consumers/startup or an actual maintenance deadline.
 +            var deadlines: [Double] = []
++            if let captureDeadline = diagnosticCapture.nextDeadline { deadlines.append(captureDeadline) }
 +            if showDetails || runner.active || !userCode { deadlines.append(uptime + 1) }
 +            if EngineTuning.diagnosticsEnabled { deadlines += [nextDiagnostics, nextFootprint] }
 +            if !stillWallpaperTipShown { deadlines.append(wallpaperTipAt) }
@@ -6353,16 +7077,18 @@ index a8b4506..2cbd47f 100644
      }
  }
 diff --git a/tests/test_display_settings.m b/tests/test_display_settings.m
-index 5bf491f..0c279ab 100644
+index 5bf491f..c5ea315 100644
 --- a/tests/test_display_settings.m
 +++ b/tests/test_display_settings.m
-@@ -47,6 +47,14 @@ int main(void) { @autoreleasepool {
+@@ -47,6 +47,16 @@ int main(void) { @autoreleasepool {
      assert(atomic_load(&reads)==before); /* zero defaults reads on the render path */
      [p setBool:NO forKey:@"henge.cursor.sharp"];notify();assert(!hv_display_settings_get().sharp);
      [p removeObjectForKey:@"henge.cursor.sharp"];notify();assert(hv_display_settings_get().sharp);
 +    [p setInteger:60 forKey:@"henge.perf.presentationCap"];
 +    [p setBool:YES forKey:@"henge.perf.thermalProtection"];notify();
 +    assert(hv_display_settings_get().presentation_cap == 60 && hv_display_settings_get().thermal_protection);
++    [p setBool:NO forKey:@"henge.perf.lowPowerAware"];notify();assert(!hv_display_settings_get().power_aware);
++    [p setBool:YES forKey:@"henge.perf.lowPowerAware"];notify();assert(hv_display_settings_get().power_aware);
 +    [p setInteger:30 forKey:@"henge.perf.presentationCap"];notify();
 +    assert(hv_display_settings_get().presentation_cap == 30);
 +    [p removeObjectForKey:@"henge.perf.presentationCap"];
@@ -6518,6 +7244,22 @@ index a801c82..ce611b7 100644
      hv_machine_free(&m); free(ram);
      puts("PASS fastmem benchmark: real EL1/page-table/JIT path; all guest sums identical");
  }
+diff --git a/tests/test_frame_pacing.c b/tests/test_frame_pacing.c
+index 17505fd..df11f23 100644
+--- a/tests/test_frame_pacing.c
++++ b/tests/test_frame_pacing.c
+@@ -3,6 +3,11 @@
+ #include <stdio.h>
+ int main(void) {
+  assert(hv_pacing_fps(0,0,1)==0); assert(hv_pacing_fps(0,2,1)==30);
++ assert(hv_pacing_power_fps(0,0,0,1,1)==60);
++ assert(hv_pacing_power_fps(0,0,0,1,0)==0);
++ assert(hv_pacing_power_fps(30,0,0,1,1)==30);
++ assert(hv_pacing_power_fps(0,3,1,1,1)==20);
++ assert(hv_pacing_power_fps(0,0,0,0,1)==0);
+  assert(hv_pacing_fps(60,3,1)==20); assert(hv_pacing_fps(30,0,1)==30);
+  assert(hv_pacing_fps(0,3,0)==0); assert(hv_pacing_fps(60,2,0)==60);
+  HvFramePacing p={0};unsigned draws=0;
 diff --git a/tests/test_gamepad.c b/tests/test_gamepad.c
 new file mode 100644
 index 0000000..dc0f7f4
@@ -6696,11 +7438,26 @@ index 2b1be58..cf28a94 100644
      puts("native WFI integration: guest timer resumes code, activity callback runs at entry/resume, CPU parks on exit");
  }
 diff --git a/tests/test_link.swift b/tests/test_link.swift
-index 1ac8d90..fa2ccdf 100644
+index 1ac8d90..0ef4da9 100644
 --- a/tests/test_link.swift
 +++ b/tests/test_link.swift
-@@ -24,6 +24,16 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -22,8 +22,31 @@ func mustReject(_ operation: () throws -> Void) {
+         dispatchMain()
+     }
      static func checks() throws {
++        try LinkControl(type:"helloInput").validate()
++        try LinkControl(type:"readyInput",capabilities:["inputOnly","gamepad"]).validate()
++        mustReject { try LinkControl(type:"gamepad",gamepad:GamepadState(hat:9)).validate() }
++        mustReject { try LinkControl(type:"gamepad",gamepad:GamepadState(lx:Int16.min)).validate() }
++        let local = GamepadState(buttons:1,lx:12000), remote = GamepadState(buttons:2,ry:-20000)
++        let merged = GamepadState.merged(local,remote)
++        require(merged.buttons==3 && merged.lx==12000 && merged.ry == -20000,"Input owners must merge without releasing each other")
++        require(GamepadState.merged(.off,remote)==remote,"Disconnect preserves other owner")
++        require(GamepadState(buttons:1,lx:-9000,ly:-9000).mappedKeys==Set<UInt8>([4,26,44]),"Keyboard fallback is WASD and jump")
++        let pad = LinkControl(type:"gamepad",gamepad:merged)
++        let decodedPad = try JSONDecoder().decode(LinkControl.self,from:JSONEncoder().encode(pad))
++        require(decodedPad.gamepad==merged,"Full gamepad state wire roundtrip")
++        print("PASS controls-only protocol, strict gamepad bounds, multi-owner state, keyboard mapping and release")
          let mode = LinkMode(width: 320, height: 240, widthMM: 70, heightMM: 52, hz: 60)
          try mode.validate()
 +        let legacyReady = try JSONDecoder().decode(LinkControl.self, from: JSONEncoder().encode(LinkControl(type: "ready", mode: mode)))
@@ -6716,7 +7473,7 @@ index 1ac8d90..fa2ccdf 100644
          try LinkControl(type: "release").validate()
          try LinkControl(type: "videoAck", sequence: 1).validate()
          mustReject { try LinkControl(type: "videoAck", sequence: 0).validate() }
-@@ -191,6 +201,12 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -191,6 +214,12 @@ func mustReject(_ operation: () throws -> Void) {
          var pixels = [UInt8](repeating: 0, count: mode.width * mode.height * 4)
          for i in stride(from: 0, to: pixels.count, by: 4) { pixels[i+2] = 255; pixels[i+3] = 255 }
          texture.replace(region: MTLRegionMake2D(0, 0, mode.width, mode.height), mipmapLevel: 0, withBytes: &pixels, bytesPerRow: mode.width * 4)
@@ -8277,10 +9034,10 @@ index 0000000..1df55f8
 +}
 +@end
 diff --git a/tools/link/check.sh b/tools/link/check.sh
-index c88ebe4..e1bd426 100755
+index c88ebe4..aeafc2f 100755
 --- a/tools/link/check.sh
 +++ b/tools/link/check.sh
-@@ -7,6 +7,7 @@ build/link/test_pvg_display
+@@ -7,13 +7,14 @@ build/link/test_pvg_display
  make build/pvg_lite.o build/pvg_metal.o
  python3 tests/test_surface_sync.py
  python3 tests/test_surface_hash_limit.py
@@ -8288,3 +9045,12 @@ index c88ebe4..e1bd426 100755
  xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -Idevices tests/test_planar_registry.m -framework Foundation -framework IOSurface -framework Metal -o build/link/test_planar_registry
  build/link/test_planar_registry
  cc -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined -Idevices -Icore -Ihost tests/test_pvg_ports.c -framework CoreFoundation -Wl,-dead_strip -o build/link/test_pvg_ports
+ build/link/test_pvg_ports
+ xcrun -sdk macosx metal -c devices/pvg_screen.metal -o build/link/screen.air
+ xcrun -sdk macosx metallib build/link/screen.air -o build/link/screen.metallib
+-swiftc -swift-version 5 ios/Henge/Link/LinkProtocol.swift ios/Henge/Link/LinkPairing.swift ios/Henge/Link/LinkTransport.swift ios/Henge/Link/LinkVideo.swift ios/Henge/Link/LinkFlowControl.swift ios/Henge/Link/LinkDecodeWorker.swift tests/link_flow_checks.swift tests/link_pairing_checks.swift tests/test_link.swift -framework Network -framework Security -framework Metal -framework CoreMedia -framework CoreVideo -framework VideoToolbox -o build/link/test_link
++swiftc -swift-version 5 ios/Henge/Controls/GamepadState.swift ios/Henge/Link/LinkProtocol.swift ios/Henge/Link/LinkPairing.swift ios/Henge/Link/LinkTransport.swift ios/Henge/Link/LinkVideo.swift ios/Henge/Link/LinkFlowControl.swift ios/Henge/Link/LinkDecodeWorker.swift tests/link_flow_checks.swift tests/link_pairing_checks.swift tests/test_link.swift -framework Network -framework Security -framework Metal -framework CoreMedia -framework CoreVideo -framework VideoToolbox -o build/link/test_link
+ SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+-xcrun --sdk iphoneos swiftc -typecheck -swift-version 5 -target arm64-apple-ios17.0 -sdk "$SDK" -import-objc-header tests/link_bridge_fixture.h ios/Henge/Link/*.swift tests/link_ui_fixture.swift
++xcrun --sdk iphoneos swiftc -typecheck -swift-version 5 -target arm64-apple-ios17.0 -sdk "$SDK" -import-objc-header tests/link_bridge_fixture.h ios/Henge/Controls/*.swift ios/Henge/Link/*.swift tests/link_ui_fixture.swift
+ build/link/test_link build/link/screen.metallib
