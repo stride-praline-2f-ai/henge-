@@ -24,7 +24,7 @@ index 81b0736..c9f0915 100644
  
  test-vm-lifecycle: $(B)/test_vm_lifecycle
 diff --git a/core/dispatch.c b/core/dispatch.c
-index 12bd4a9..1b189bf 100644
+index 12bd4a9..171acf7 100644
 --- a/core/dispatch.c
 +++ b/core/dispatch.c
 @@ -15,8 +15,11 @@
@@ -191,7 +191,7 @@ index 12bd4a9..1b189bf 100644
              uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
              uint32_t worst = 0;
              for (uint32_t h = 0; h < HV_BLOCK_HASH; h++) {
-@@ -924,8 +968,17 @@ static void stop_the_world(HvCpu *cpu) {
+@@ -924,8 +968,19 @@ static void stop_the_world(HvCpu *cpu) {
      }
  }
  
@@ -204,8 +204,10 @@ index 12bd4a9..1b189bf 100644
 +        /* Continue creates new host threads. Replace the owned send right on
 +           each run instead of retaining a dead thread's identity indefinitely. */
 +        mach_port_t thread = mach_thread_self();
++        pthread_mutex_lock(&cpu->pc_state->req_mu);
 +        mach_port_t previous = __atomic_exchange_n(&cpu->pc_state->thread, thread, __ATOMIC_ACQ_REL);
 +        if (previous) mach_port_deallocate(mach_task_self(), previous);
++        pthread_mutex_unlock(&cpu->pc_state->req_mu);
 +    }
      hv_big_lock(cpu->m);
      hv_fp_enter(cpu);
@@ -1293,10 +1295,10 @@ index cf4acc4..9961c12 100644
  /* Any thread: a Magic Trackpad 2 touch. phase: 0 down, 1 move, 2 up. id: a
 diff --git a/docs/desktop-heat-20261111.md b/docs/desktop-heat-20261111.md
 new file mode 100644
-index 0000000..1ef4fe1
+index 0000000..17638b3
 --- /dev/null
 +++ b/docs/desktop-heat-20261111.md
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,47 @@
 +# Desktop heat follow-up: November 11 device capture
 +
 +The supplied logs identify release c17da770d41eef2247a2b928f5a8bfefc51f4edd.
@@ -1335,7 +1337,9 @@ index 0000000..1ef4fe1
 +of expensive peer-state probes. Per-vCPU cumulative Mach CPU time is queried only
 +when the existing periodic report runs, with lifecycle generation labels and
 +explicit unavailable results. Continue replaces the owned Mach thread right
-+instead of retaining a dead thread identifier. Word profiles include PID, and
++instead of retaining a dead thread identifier. Reporting and replacement hold
++the existing per-CPU request mutex so a queried port cannot be freed/reused
++mid-sample. Word profiles include PID, and
 +disabled profiling explicitly warns that an existing file can be historical.
 +
 +These repairs improve wait correctness and attribution. They are not evidence
@@ -1824,7 +1828,7 @@ index 383ae01..7140036 100644
      if (bad) return fail(err, errlen, "The saved Mac could not be read (%s).", strerror(r.err ? r.err : EINVAL));
      /* The guest's clock goes on as far as the wall clock went since it stopped (see hv_vm_resume_counter). */
 diff --git a/host/vm.c b/host/vm.c
-index db95c05..ab024ec 100644
+index db95c05..45f0a6a 100644
 --- a/host/vm.c
 +++ b/host/vm.c
 @@ -4,6 +4,7 @@
@@ -1835,17 +1839,20 @@ index db95c05..ab024ec 100644
  #include <CoreFoundation/CoreFoundation.h>
  #include <dispatch/dispatch.h>
  #include <os/lock.h>
-@@ -343,8 +344,31 @@ static int idle_ticker_enabled = 1;
+@@ -343,8 +344,34 @@ static int idle_ticker_enabled = 1;
  static int deadline_kicks;
  
  void hv_vm_log_ticker(void) {
 +    uint64_t generation = atomic_load_explicit(&kicker.epoch.value, memory_order_acquire);
 +    for (int i = 0; i < m.ncpus; i++) {
 +        HvPerCpu *p = &m.percpu[i];
++        /* Hold the thread right stable while Continue publishes its replacement. */
++        pthread_mutex_lock(&p->req_mu);
 +        mach_port_t thread = __atomic_load_n(&p->thread, __ATOMIC_ACQUIRE);
 +        thread_basic_info_data_t info = {0};
 +        mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
 +        kern_return_t status = thread ? thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&info, &count) : KERN_INVALID_ARGUMENT;
++        pthread_mutex_unlock(&p->req_mu);
 +        if (status == KERN_SUCCESS) {
 +            uint64_t user = (uint64_t)info.user_time.seconds * 1000000 + info.user_time.microseconds;
 +            uint64_t system = (uint64_t)info.system_time.seconds * 1000000 + info.system_time.microseconds;
@@ -1867,7 +1874,7 @@ index db95c05..ab024ec 100644
      fprintf(stderr,"flush-wait: enabled=%d waits=%llu timeouts=%llu errors=%llu (cumulative; notifications on peer park and pending requests)\n",m.quiesce_enabled,(unsigned long long)atomic_load(&m.quiesce.waits),(unsigned long long)atomic_load(&m.quiesce.timeouts),(unsigned long long)atomic_load(&m.quiesce.errors));
      fprintf(stderr, "idle-ticker: active_ticks=%llu sleep_waits=%llu resumes=%llu waiting=%u marked_cpu_flags=%llu (cumulative; timer/device wakeups remain active)\n",
              (unsigned long long)atomic_load_explicit(&kicker.ticks, memory_order_relaxed),
-@@ -386,7 +410,8 @@ static pthread_key_t signal_stack_key;
+@@ -386,7 +413,8 @@ static pthread_key_t signal_stack_key;
  static pthread_once_t signal_stack_once = PTHREAD_ONCE_INIT;
  static int signal_stack_key_ready;
  static void release_signal_stack(void *p) {
@@ -1877,7 +1884,7 @@ index db95c05..ab024ec 100644
      if (sigaltstack(&disabled, NULL) == 0) free(p);
  }
  static void make_signal_stack_key(void) {
-@@ -398,7 +423,12 @@ void hv_vm_prepare_cpu_thread(void) {
+@@ -398,7 +426,12 @@ void hv_vm_prepare_cpu_thread(void) {
      static __thread int done;
      if (done) return;
      done = 1;
@@ -1891,7 +1898,7 @@ index db95c05..ab024ec 100644
      if (ss.ss_sp) {
          if (sigaltstack(&ss, NULL) != 0) free(ss.ss_sp);
          else {
-@@ -461,9 +491,17 @@ int hv_vm_disk_identity(char *out, size_t n) {
+@@ -461,9 +494,17 @@ int hv_vm_disk_identity(char *out, size_t n) {
      return 0;
  }
  
@@ -1912,7 +1919,7 @@ index db95c05..ab024ec 100644
  }
  
  int hv_vm_run_cpu0(void) {
-@@ -512,13 +550,15 @@ int hv_vm_finish_pause(void) {
+@@ -512,13 +553,15 @@ int hv_vm_finish_pause(void) {
      hv_virtio_blk_stop(board.root_blk);
      hv_virtio_blk_stop(board.aux_blk);
      /* hv_vm_run_cpu0 already detached board.snd under the device lock. */
@@ -1931,7 +1938,7 @@ index db95c05..ab024ec 100644
      set_pause_state(2);
      return 0;
  }
-@@ -702,9 +742,13 @@ static void stop_pointer(void) {
+@@ -702,9 +745,13 @@ static void stop_pointer(void) {
              hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);
              hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
          }
