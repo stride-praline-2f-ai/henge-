@@ -119,6 +119,19 @@ t=replace_once(t,
     "int r = hv_vm_run_cpu0();",
     "int r = hv_vm_run_cpu0();\n    fprintf(stderr, \"hengevm: cpu0 exited: reason=%d halt=%d pc=0x%llx exit_req=%d\\n\", r, atomic_load(&cpus[0].halted), (unsigned long long)cpus[0].pc, atomic_load(&cpus[0].exit_req));",
     "trace the VM CPU0 return preceding failed suspend")
+# A new VM must clear the run_ended flag from any prior guest session.
+# This flag is used by suspend() to reject a truly dead CPU 0.
+start=t.index("int hv_vm_start(int cpu0, void (*on_exit)(int reason))")
+end=t.find("\nfailed:",start)
+if start<0 or end<0: raise SystemExit("Unexpected VM start function layout")
+start_fn=t[start:end]
+if "run_ended = 0;" not in start_fn:
+    t=replace_once(t, "    exit_cb = on_exit;\n    cpu0_ours = cpu0;",
+                   "    exit_cb = on_exit;\n    cpu0_ours = cpu0;\n    pthread_mutex_lock(&pause_mu);\n    run_ended = 0;\n    pthread_mutex_unlock(&pause_mu);",
+                   "reset prior-session CPU0 end marker on every new VM start")
+t=replace_once(t, "    run_ended = 1;\n    if (pause_state == 1)",
+               "    fprintf(stderr, \"hengevm: CPU0 exit before pause: reason=%d halt=%d pc=%llx pause_state=%d\\n\", r, atomic_load(&cpus[0].halted), (unsigned long long)cpus[0].pc, pause_state);\n    run_ended = 1;\n    if (pause_state == 1)",
+               "diagnose genuine guest CPU exit before pause")
 vm.write_text(t)
 
 # The custom VM header adds ticker diagnostics exactly where upstream added
