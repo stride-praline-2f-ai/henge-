@@ -24,7 +24,7 @@ index 81b0736..c9f0915 100644
  
  test-vm-lifecycle: $(B)/test_vm_lifecycle
 diff --git a/core/dispatch.c b/core/dispatch.c
-index 12bd4a9..f731a1f 100644
+index 12bd4a9..1b189bf 100644
 --- a/core/dispatch.c
 +++ b/core/dispatch.c
 @@ -15,8 +15,11 @@
@@ -62,7 +62,33 @@ index 12bd4a9..f731a1f 100644
      hv_jit_reset(&m->jit);
      m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0; /* MB of it to use (testing) */
      /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */
-@@ -602,16 +621,41 @@ static void print_profile(HvMachine *m) {
+@@ -257,6 +276,7 @@ static uint32_t wfe(HvCpu *cpu) {
+     uint64_t page = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
+     if (spin || va == ~0ull || (size != 1 && size != 2 && size != 4 && size != 8) || (va & (size - 1)) ||
+         e->read_tag == HV_TLB_INVALID || e->read_tag + HV_TLB_ADJ != page) {
++        if (cpu->m->stats_interval) __atomic_fetch_add(&cpu->pc_state->wfe_dispatches, 1, __ATOMIC_RELAXED);
+         __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED); /* let another CPU run: the dispatcher's way */
+         return 0;
+     }
+@@ -284,7 +304,7 @@ static uint32_t wfe(HvCpu *cpu) {
+         }
+         if (v != want || __atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED)) break;
+         if (mach_absolute_time() >= deadline) {
+-            if (cpu->m->wait_stats) __atomic_fetch_add(&cpu->pc_state->wfe_timeouts, 1, __ATOMIC_RELAXED);
++            if (cpu->m->stats_interval) __atomic_fetch_add(&cpu->pc_state->wfe_timeouts, 1, __ATOMIC_RELAXED);
+             __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
+             break;
+         }
+@@ -292,7 +312,7 @@ static uint32_t wfe(HvCpu *cpu) {
+         else __asm__ volatile("yield" ::: "memory");
+     }
+     __asm__ volatile("clrex" ::: "memory");
+-    if (cpu->m->wait_stats) __atomic_fetch_add(&cpu->pc_state->wfe_ticks, mach_absolute_time() - begin, __ATOMIC_RELAXED);
++    if (cpu->m->stats_interval) __atomic_fetch_add(&cpu->pc_state->wfe_ticks, mach_absolute_time() - begin, __ATOMIC_RELAXED);
+     return 0;
+ }
+ 
+@@ -602,16 +622,41 @@ static void print_profile(HvMachine *m) {
      }
  }
  
@@ -107,7 +133,7 @@ index 12bd4a9..f731a1f 100644
      if (!force && now - last_t < (uint64_t)m->stats_interval * 24000000ull) {
          hv_fp_enter(cpu);
          return;
-@@ -619,6 +663,8 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -619,6 +664,8 @@ static void print_stats(HvCpu *cpu, int force) {
      double dt = (double)(now - last_t) / 24e6;
      HvStats *s = &m->stats;
  #define RATE(f) ((double)(s->f - last.f) / dt)
@@ -116,7 +142,7 @@ index 12bd4a9..f731a1f 100644
      fprintf(stderr,
              "stats %5.0fs: blocks %.2fM/s, translated %.0f/s (again: va %.0f%% va+pa %.0f%%; %.0f%% of time, %.1f insns, %.1fx), slow mem %.0fK/s, mrs %.0fK/s msr %.0fK/s sys %.0fK/s, "
              "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), blocks held %d (%.0f MB, %llu full flushes), chained %.0f/s ijc fills %.0fK/s resets %.0f/s, el%u pc %llx\n",
-@@ -632,25 +678,20 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -632,25 +679,20 @@ static void print_stats(HvCpu *cpu, int force) {
          double tot = 0;
          for (int k = 0; k < 6; k++) tot += RATE(why[k]);
          /* How much of the interval the CPU thread actually ran: below 100% means the host took it away. */
@@ -154,7 +180,7 @@ index 12bd4a9..f731a1f 100644
          fprintf(stderr, "  whole-TLB flushes/s: TLBI all here %.0f, TLBI all shared %.0f, SCTLR %.0f, TTBR1 %.0f, TCR %.0f, MAIR %.0f, range of all %.0f, requests overflowed %.0f\n",
                  RATE(flush_why[0]), RATE(flush_why[1]), RATE(flush_why[2]), RATE(flush_why[3]), RATE(flush_why[4]), RATE(flush_why[5]),
                  RATE(flush_why[6]), RATE(flush_why[7]));
-@@ -664,7 +705,9 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -664,7 +706,9 @@ static void print_stats(HvCpu *cpu, int force) {
                      RATE(flush_checked), RATE(flush_check_entries), RATE(flush_check_bad), RATE(flush_check_af));
          fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
                  RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
@@ -165,17 +191,25 @@ index 12bd4a9..f731a1f 100644
              uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
              uint32_t worst = 0;
              for (uint32_t h = 0; h < HV_BLOCK_HASH; h++) {
-@@ -924,7 +967,10 @@ static void stop_the_world(HvCpu *cpu) {
+@@ -924,8 +968,17 @@ static void stop_the_world(HvCpu *cpu) {
      }
  }
  
 +void hv_dispatch_log_stats(HvCpu *cpu) { print_stats(cpu, 1); }
 +
  int hv_run(HvCpu *cpu) {
+-    if (cpu->m->wait_stats && cpu->pc_state && !cpu->pc_state->thread) __atomic_store_n(&cpu->pc_state->thread, mach_thread_self(), __ATOMIC_RELEASE);
 +    if (cpu->index == 0) stats_new_run = 1;
-     if (cpu->m->wait_stats && cpu->pc_state && !cpu->pc_state->thread) __atomic_store_n(&cpu->pc_state->thread, mach_thread_self(), __ATOMIC_RELEASE);
++    if ((cpu->m->stats_interval || cpu->m->wait_stats) && cpu->pc_state) {
++        /* Continue creates new host threads. Replace the owned send right on
++           each run instead of retaining a dead thread's identity indefinitely. */
++        mach_port_t thread = mach_thread_self();
++        mach_port_t previous = __atomic_exchange_n(&cpu->pc_state->thread, thread, __ATOMIC_ACQ_REL);
++        if (previous) mach_port_deallocate(mach_task_self(), previous);
++    }
      hv_big_lock(cpu->m);
      hv_fp_enter(cpu);
+     int r = run(cpu, 0);
 diff --git a/core/dispatch.h b/core/dispatch.h
 index c341d16..fba956a 100644
 --- a/core/dispatch.h
@@ -191,11 +225,74 @@ index c341d16..fba956a 100644
  
  /* Drops every translated block (the JIT region is reused from the start). */
  void hv_flush_blocks(HvMachine *m);
+diff --git a/core/fastmem_log.c b/core/fastmem_log.c
+index a41d6d2..7d260b9 100644
+--- a/core/fastmem_log.c
++++ b/core/fastmem_log.c
+@@ -21,13 +21,14 @@ void hv_fastmem_log(HvMachine *m, FILE *out) {
+     fprintf(out, "code-invalidation: index=physical-page examined=%llu removed=%llu (cumulative; bucket collisions checked)\n",
+             (unsigned long long)__atomic_load_n(&m->xchain_examined, __ATOMIC_RELAXED),
+             (unsigned long long)__atomic_load_n(&m->xchain_removed, __ATOMIC_RELAXED));
+-    uint64_t wfe_ticks = 0, wfe_timeouts = 0;
++    uint64_t wfe_ticks = 0, wfe_timeouts = 0, wfe_dispatches = 0;
+     for (int i = 0; i < m->ncpus; i++) {
+         wfe_ticks += __atomic_load_n(&m->percpu[i].wfe_ticks, __ATOMIC_RELAXED);
+         wfe_timeouts += __atomic_load_n(&m->percpu[i].wfe_timeouts, __ATOMIC_RELAXED);
++        wfe_dispatches += __atomic_load_n(&m->percpu[i].wfe_dispatches, __ATOMIC_RELAXED);
+     }
+-    fprintf(out, "cpu-wfe: accumulated_counter_ticks=%llu timeouts=%llu counter_hz=24000000 stats_enabled=%d (not a measurement of low-power residency)\n",
+-            (unsigned long long)wfe_ticks, (unsigned long long)wfe_timeouts, !!m->wait_stats);
++    fprintf(out, "cpu-wfe: accumulated_counter_ticks=%llu timeouts=%llu counter_hz=24000000 unmonitored_exits=%llu stats_enabled=%d (not a measurement of low-power residency)\n",
++            (unsigned long long)wfe_ticks, (unsigned long long)wfe_timeouts, (unsigned long long)wfe_dispatches, m->stats_interval != 0);
+ #ifdef __APPLE__
+     if (getenv("HV_TASK_STATS") && !strcmp(getenv("HV_TASK_STATS"), "1")) {
+         task_power_info_data_t power = {0};
 diff --git a/core/machine.c b/core/machine.c
-index 7a01fdc..a58bdc9 100644
+index 7a01fdc..d398609 100644
 --- a/core/machine.c
 +++ b/core/machine.c
-@@ -396,18 +396,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
+@@ -219,10 +219,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+ #define HV_ULF_WAKE_ALL 0x100u
+ #define HV_ULF_NO_ERRNO 0x1000000u
+ 
+-/* Wake whoever sleeps on p's ack_seq (it moved, or p stopped using its TLB). */
++/* The wait value must change for BOTH an acknowledgement and a parked peer.
++   Waking ack_seq alone loses a park notification if the wake precedes the
++   kernel wait: ack_seq did not change, so that wait can still go to sleep. */
+ static void ack_wake(HvPerCpu *p) {
+-    if (__atomic_load_n(&p->ack_waiters, __ATOMIC_SEQ_CST))
+-        __ulock_wake(HV_UL_COMPARE_AND_WAIT | HV_ULF_WAKE_ALL | HV_ULF_NO_ERRNO, &p->ack_seq, 0);
++    if (__atomic_load_n(&p->ack_waiters, __ATOMIC_SEQ_CST)) {
++        __atomic_add_fetch(&p->ack_event, 1, __ATOMIC_SEQ_CST);
++        __ulock_wake(HV_UL_COMPARE_AND_WAIT | HV_ULF_WAKE_ALL | HV_ULF_NO_ERRNO, &p->ack_event, 0);
++    }
+ }
+ 
+ void hv_cpu_ack_wake(HvCpu *cpu) {
+@@ -271,6 +275,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+     int sleep = hv_knob[HV_K_SYNCWAIT], probed = !t0 || !mm->wait_stats, probed_long = !t0 || !mm->wait_stats;
+     if (s && mm->wait_stats) __atomic_store_n(&s->phase, HV_PHASE_SYNC, __ATOMIC_RELAXED);
+     for (uint32_t spins = 0;; spins++) {
++        uint32_t event = __atomic_load_n(&t->ack_event, __ATOMIC_SEQ_CST);
+         uint64_t ack = __atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE);
+         if (ack >= seq) break;
+         if (!probed && !(spins & 63) && mach_absolute_time() - t0 >= 2400) { /* 100 us: what is it doing? */
+@@ -295,10 +300,12 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+         if (self) hv_cpu_process_requests(self);
+         if (sleep && spins >= 64) {
+             __atomic_add_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
+-            /* Asleep until ack_seq's low word moves or 100 us pass (a missed wake costs no more than that). */
++            /* Arm before rechecking the predicates. A notification between
++               this check and kernel entry changes event, preventing sleep.
++               The 100us fallback still bounds own-request service latency. */
+             if (__atomic_load_n(&t->ack_seq, __ATOMIC_SEQ_CST) == ack && __atomic_load_n(&t->tlb_live, __ATOMIC_SEQ_CST)) {
+                 if (s) __atomic_add_fetch(&s->sync_sleeps, 1, __ATOMIC_RELAXED);
+-                int rc = __ulock_wait(HV_UL_COMPARE_AND_WAIT | HV_ULF_NO_ERRNO, &t->ack_seq, (uint32_t)ack, 100);
++                int rc = __ulock_wait(HV_UL_COMPARE_AND_WAIT | HV_ULF_NO_ERRNO, &t->ack_event, event, 100);
+                 if (rc == -ETIMEDOUT && s) __atomic_add_fetch(&s->sync_timeouts, 1, __ATOMIC_RELAXED);
+                 if (rc < 0 && rc != -ETIMEDOUT && rc != -EINTR) {
+                     if (s) __atomic_add_fetch(&s->sync_errors, 1, __ATOMIC_RELAXED);
+@@ -396,18 +403,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
      return marked;
  }
  
@@ -224,7 +321,7 @@ index 7a01fdc..a58bdc9 100644
      if (marked) __asm__ volatile("sev" ::: "memory");
      return marked;
  }
-@@ -622,6 +629,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
+@@ -622,6 +636,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
  
  /* MMIO is accessed in naturally sized pieces of at most 8 bytes. */
  int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
@@ -232,7 +329,7 @@ index 7a01fdc..a58bdc9 100644
      void *p = hv_phys_ptr(m, pa, len);
      if (p) {
          memcpy(buf, p, len);
-@@ -640,8 +648,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
+@@ -640,8 +655,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
  }
  
  int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
@@ -244,7 +341,7 @@ index 7a01fdc..a58bdc9 100644
          uint64_t off = pa - r->pa;
          uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
 diff --git a/core/machine.h b/core/machine.h
-index cafe156..7f28d1f 100644
+index cafe156..34d2a44 100644
 --- a/core/machine.h
 +++ b/core/machine.h
 @@ -127,6 +127,7 @@ typedef struct HvStats {
@@ -255,7 +352,18 @@ index cafe156..7f28d1f 100644
  } HvStats;
  
  #define HV_MAX_CPUS 8
-@@ -263,6 +264,7 @@ typedef struct HvMachine {
+@@ -203,8 +204,9 @@ typedef struct HvPerCpu {
+     int active, tlb_live;
+     uint64_t timer_deadline;
+     uint32_t timer_deadline_valid;
+-    uint64_t wfe_ticks, wfe_timeouts;
++    uint64_t wfe_ticks, wfe_timeouts, wfe_dispatches;
+     uint64_t sync_sleeps, sync_timeouts, sync_errors; /* per waiting CPU; diagnostic snapshots are atomic */
++    uint32_t ack_event;          /* generation for both acknowledgement and parked-state notifications */
+     uint32_t ack_waiters;        /* CPUs asleep in hv_cpu_sync waiting for ack_seq to move (HV_SYNC_WAIT) */
+     uint32_t walk_seq;           /* odd while it walks page tables and fills its TLB (see hv_tlbi_drop_remote_va) */
+     uint64_t walk_page[8];       /* the page walk k (walk_seq 2k -> 2k+1) fills, at [k % 8]; HV_WALK_ANY: a process switch */
+@@ -263,6 +265,7 @@ typedef struct HvMachine {
      uint64_t watch_pa;   /* debugging: the same by physical address */
      HvStats stats;
      int deadline_kicks_enabled;
@@ -1183,6 +1291,57 @@ index cf4acc4..9961c12 100644
  /* The same, by Linux input key code (what the host UI produces). */
  void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down);
  /* Any thread: a Magic Trackpad 2 touch. phase: 0 down, 1 move, 2 up. id: a
+diff --git a/docs/desktop-heat-20261111.md b/docs/desktop-heat-20261111.md
+new file mode 100644
+index 0000000..1ef4fe1
+--- /dev/null
++++ b/docs/desktop-heat-20261111.md
+@@ -0,0 +1,45 @@
++# Desktop heat follow-up: November 11 device capture
++
++The supplied logs identify release c17da770d41eef2247a2b928f5a8bfefc51f4edd.
++Kernel read cache and Superblocks are enabled; grouped accesses, WFI spinning,
++profiling, expensive wait probes and GPU timing are disabled. Timer-direct and
++secondary deadline filtering are enabled. This is not a cache/superblocks-off
++comparison, and it cannot establish their causal thermal effect.
++
++Process CPU deltas correspond to3.4–3.8 aggregate host CPU cores in early
++startup intervals and1.1–1.8 in several quieter intervals. Warm is reported39s
++after VM start; Hot about104s. Guest WFI stops after startup, while WFE and
++inter-vCPU acknowledgements continue. Some intervals spend40–52% of one CPU's
++wall interval awaiting TLBI acknowledgement; this is elapsed waiting, not CPU
++consumption. GPU execution timing is disabled, so GPU energy cannot be assigned.
++A4K video surface appears later, after the first Hot report: it cannot explain
++the earlier temperature rise by itself.
++
++Read-span reuse runs at roughly5K–23K/s. About274000 secondary periodic kicks
++are deferred by the140s sample. Retired metadata advice reaches679MiB at the
++first capacity reset. These paths execute, but they have not solved desktop heat.
++The attached hvprof-words.txt contains November10 dumps. Profiling is disabled
++in the current process, so those samples must not be attributed to this release.
++
++## Concrete source repairs
++
++Acknowledgement waits previously slept on ack_seq. A peer becoming parked
++wakes waiters without changing ack_seq. If that notification reaches the kernel
++before the waiter enters the syscall, the waiter can still sleep until the100us
++fallback. A separate32-bit notification generation now changes for both ack and
++park events. Arm/recheck and all real acknowledgement semantics remain intact;
++the same100us missed-notification/own-request-service bound remains.
++A regression injects both notifications exactly after the predicate check and
++before the real kernel wait, with no timing sleep.
++
++Basic WFE elapsed/timeouts now accompany existing interval statistics, independently
++of expensive peer-state probes. Per-vCPU cumulative Mach CPU time is queried only
++when the existing periodic report runs, with lifecycle generation labels and
++explicit unavailable results. Continue replaces the owned Mach thread right
++instead of retaining a dead thread identifier. Word profiles include PID, and
++disabled profiling explicitly warns that an existing file can be historical.
++
++These repairs improve wait correctness and attribution. They are not evidence
++that WFE spinning, GPU work or the entire desktop thermal problem is fixed.
++No guest timing, rendering quality, CPU count or performance caps are changed.
++No new IPA is requested by this checkpoint.
 diff --git a/docs/optimization-integration.md b/docs/optimization-integration.md
 new file mode 100644
 index 0000000..7c5b2e2
@@ -1338,7 +1497,7 @@ index cc902ed..15b606f 100644
      mov sp, x0
      ldr x0, [x28, #CPU_NZCV]
 diff --git a/host/prof_ios.c b/host/prof_ios.c
-index b7ff92a..73a270b 100644
+index b7ff92a..9a9648c 100644
 --- a/host/prof_ios.c
 +++ b/host/prof_ios.c
 @@ -27,7 +27,12 @@ static struct { uintptr_t off; uint32_t n; } slots[SLOTS];
@@ -1355,6 +1514,15 @@ index b7ff92a..73a270b 100644
  
  /* HV_PROF_IOS=2: the translated instruction under each JIT sample, by its encoding */
  #define WORD_SLOTS 16384
+@@ -51,7 +56,7 @@ static void dump_words(void) {
+     if (f) fseek(f, 0, SEEK_END);
+     if (f && ftell(f) >= (8 << 20)) { fclose(f); f = NULL; } /* bounded opt-in diagnostic file */
+     if (f) {
+-        fprintf(f, "# dump at %ld jit %llu lost %llu\n", (long)time(NULL), (unsigned long long)jit, (unsigned long long)words_lost);
++        fprintf(f, "# dump at %ld pid %ld jit %llu lost %llu\n", (long)time(NULL), (long)getpid(), (unsigned long long)jit, (unsigned long long)words_lost);
+         for (int i = 0; i < WORD_SLOTS; i++)
+             if (words[i].n) fprintf(f, "p %u 0 %08x\n", words[i].n, words[i].w);
+         fclose(f);
 @@ -79,6 +84,7 @@ static void unregister_thread(void *value) {
      if(port)mach_port_deallocate(mach_task_self(),port);
  }
@@ -1374,7 +1542,7 @@ index b7ff92a..73a270b 100644
      pthread_cond_broadcast(&registry_cv);
      while (!on && sampling) pthread_cond_wait(&registry_cv, &registry_mu);
      pthread_mutex_unlock(&registry_mu);
-@@ -183,15 +192,22 @@ static void *sampler(void *unused) {
+@@ -183,15 +192,25 @@ static void *sampler(void *unused) {
      }
      return NULL;
  }
@@ -1395,7 +1563,10 @@ index b7ff92a..73a270b 100644
 +void hv_prof_ios_start(void) {
 +    /* An earlier session with profiling off must not consume initialization.
 +       Native boot requests can overlap before the bridge acquires api_lock. */
-+    if(!profiler_mode())return;
++    if(!profiler_mode()) {
++        fprintf(stderr, "hengevm: profiler disabled for pid=%ld; existing hvprof-words.txt may belong to an earlier run\n", (long)getpid());
++        return;
++    }
 +    static pthread_once_t once = PTHREAD_ONCE_INIT;
 +    pthread_once(&once, start_profiler);
  }
@@ -1653,11 +1824,38 @@ index 383ae01..7140036 100644
      if (bad) return fail(err, errlen, "The saved Mac could not be read (%s).", strerror(r.err ? r.err : EINVAL));
      /* The guest's clock goes on as far as the wall clock went since it stopped (see hv_vm_resume_counter). */
 diff --git a/host/vm.c b/host/vm.c
-index db95c05..5e4c6fa 100644
+index db95c05..ab024ec 100644
 --- a/host/vm.c
 +++ b/host/vm.c
-@@ -345,6 +345,12 @@ static int deadline_kicks;
+@@ -4,6 +4,7 @@
+ #include "pvg_lite.h"
+ 
+ #include <TargetConditionals.h>
++#include <mach/mach.h>
+ #include <CoreFoundation/CoreFoundation.h>
+ #include <dispatch/dispatch.h>
+ #include <os/lock.h>
+@@ -343,8 +344,31 @@ static int idle_ticker_enabled = 1;
+ static int deadline_kicks;
+ 
  void hv_vm_log_ticker(void) {
++    uint64_t generation = atomic_load_explicit(&kicker.epoch.value, memory_order_acquire);
++    for (int i = 0; i < m.ncpus; i++) {
++        HvPerCpu *p = &m.percpu[i];
++        mach_port_t thread = __atomic_load_n(&p->thread, __ATOMIC_ACQUIRE);
++        thread_basic_info_data_t info = {0};
++        mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
++        kern_return_t status = thread ? thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&info, &count) : KERN_INVALID_ARGUMENT;
++        if (status == KERN_SUCCESS) {
++            uint64_t user = (uint64_t)info.user_time.seconds * 1000000 + info.user_time.microseconds;
++            uint64_t system = (uint64_t)info.system_time.seconds * 1000000 + info.system_time.microseconds;
++            fprintf(stderr, "vcpu-work: cpu=%d generation=%llu user_us=%llu system_us=%llu wfe_ticks=%llu wfe_timeouts=%llu unmonitored_exits=%llu (cumulative; compare within one generation; WFE is elapsed time, not low-power residency)\n",
++                i, (unsigned long long)generation, (unsigned long long)user, (unsigned long long)system,
++                (unsigned long long)__atomic_load_n(&p->wfe_ticks, __ATOMIC_RELAXED),
++                (unsigned long long)__atomic_load_n(&p->wfe_timeouts, __ATOMIC_RELAXED),
++                (unsigned long long)__atomic_load_n(&p->wfe_dispatches, __ATOMIC_RELAXED));
++        } else fprintf(stderr, "vcpu-work: cpu=%d generation=%llu unavailable=%d\n", i, (unsigned long long)generation, status);
++    }
      HvPvgLite *metrics_pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
      if (metrics_pvg) hv_pvg_lite_log_metrics(metrics_pvg);
 +    fprintf(stderr, "timer-kicks: filter=%d cpu0_poll=%llu secondary_due=%llu unknown_deadline=%llu secondary_deferred=%llu (cumulative scheduler decisions; explicit work bypasses filter)\n",
@@ -1669,7 +1867,7 @@ index db95c05..5e4c6fa 100644
      fprintf(stderr,"flush-wait: enabled=%d waits=%llu timeouts=%llu errors=%llu (cumulative; notifications on peer park and pending requests)\n",m.quiesce_enabled,(unsigned long long)atomic_load(&m.quiesce.waits),(unsigned long long)atomic_load(&m.quiesce.timeouts),(unsigned long long)atomic_load(&m.quiesce.errors));
      fprintf(stderr, "idle-ticker: active_ticks=%llu sleep_waits=%llu resumes=%llu waiting=%u marked_cpu_flags=%llu (cumulative; timer/device wakeups remain active)\n",
              (unsigned long long)atomic_load_explicit(&kicker.ticks, memory_order_relaxed),
-@@ -386,7 +392,8 @@ static pthread_key_t signal_stack_key;
+@@ -386,7 +410,8 @@ static pthread_key_t signal_stack_key;
  static pthread_once_t signal_stack_once = PTHREAD_ONCE_INIT;
  static int signal_stack_key_ready;
  static void release_signal_stack(void *p) {
@@ -1679,7 +1877,7 @@ index db95c05..5e4c6fa 100644
      if (sigaltstack(&disabled, NULL) == 0) free(p);
  }
  static void make_signal_stack_key(void) {
-@@ -398,7 +405,12 @@ void hv_vm_prepare_cpu_thread(void) {
+@@ -398,7 +423,12 @@ void hv_vm_prepare_cpu_thread(void) {
      static __thread int done;
      if (done) return;
      done = 1;
@@ -1693,7 +1891,7 @@ index db95c05..5e4c6fa 100644
      if (ss.ss_sp) {
          if (sigaltstack(&ss, NULL) != 0) free(ss.ss_sp);
          else {
-@@ -461,9 +473,17 @@ int hv_vm_disk_identity(char *out, size_t n) {
+@@ -461,9 +491,17 @@ int hv_vm_disk_identity(char *out, size_t n) {
      return 0;
  }
  
@@ -1714,7 +1912,7 @@ index db95c05..5e4c6fa 100644
  }
  
  int hv_vm_run_cpu0(void) {
-@@ -512,13 +532,15 @@ int hv_vm_finish_pause(void) {
+@@ -512,13 +550,15 @@ int hv_vm_finish_pause(void) {
      hv_virtio_blk_stop(board.root_blk);
      hv_virtio_blk_stop(board.aux_blk);
      /* hv_vm_run_cpu0 already detached board.snd under the device lock. */
@@ -1733,7 +1931,7 @@ index db95c05..5e4c6fa 100644
      set_pause_state(2);
      return 0;
  }
-@@ -702,9 +724,13 @@ static void stop_pointer(void) {
+@@ -702,9 +742,13 @@ static void stop_pointer(void) {
              hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);
              hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
          }
@@ -2838,6 +3036,62 @@ index 88db6e8..8afb1f9 100644
  void hv_jit_write(HvJitRegion *r,uint32_t *p,const void *s,size_t n){(void)r;memcpy(p,s,n);}
  void hv_jit_finish(HvJitRegion *r,uint32_t *p,size_t n){(void)r;(void)p;(void)n;}
  void hv_jit_finish_branch(HvJitRegion *r,uint32_t *p){(void)r;(void)p;}
+diff --git a/tests/test_cpu_sync.c b/tests/test_cpu_sync.c
+index bd64ae5..b60f6a1 100644
+--- a/tests/test_cpu_sync.c
++++ b/tests/test_cpu_sync.c
+@@ -5,10 +5,28 @@
+ #include <stdio.h>
+ #include <unistd.h>
+ #include <time.h>
++#include <dlfcn.h>
+ static HvMachine m;
+ static HvCpu cpu[2];
+ static int action;
+ static uint64_t seq;
++static int inject_notification;
++/* Interpose only the executable's wait call; forward to the real kernel API.
++   Inject a notification AFTER the production predicate check, BEFORE syscall
++   entry. No timing sleep is needed to reproduce the lost-wakeup window. */
++int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout_us) {
++    static int (*kernel_wait)(uint32_t, void *, uint64_t, uint32_t);
++    if (!kernel_wait) kernel_wait = (int (*)(uint32_t, void *, uint64_t, uint32_t))dlsym(RTLD_NEXT, "__ulock_wait");
++    assert(kernel_wait);
++    if (inject_notification) {
++        int kind = inject_notification; inject_notification = 0;
++        if (kind == 1) __atomic_store_n(&m.percpu[1].tlb_live, 0, __ATOMIC_SEQ_CST);
++        else __atomic_store_n(&m.percpu[1].ack_seq, seq, __ATOMIC_RELEASE);
++        hv_cpu_ack_wake(&cpu[1]);
++    }
++    return kernel_wait(operation, addr, value, timeout_us);
++}
++
+ static void *finish_request(void *unused) {
+     (void)unused;
+     struct timespec delay = {0, 10000000}; nanosleep(&delay, NULL);
+@@ -55,6 +73,21 @@ int main(void) {
+     }
+     assert(m.percpu[0].sync_sleeps && m.percpu[0].sync_timeouts);
+     assert(!m.percpu[0].sync_errors);
++    /* A peer parks or acks in the check-to-syscall window. The generation
++       must prevent sleeping even though a parked peer's ack_seq stays put. */
++    hv_knob[HV_K_SYNCWAIT] = 1;
++    for (int kind = 1; kind <= 2; kind++) for (int i = 0; i < 32; i++) {
++        __atomic_store_n(&m.percpu[0].tlb_live, 1, __ATOMIC_SEQ_CST);
++        __atomic_store_n(&m.percpu[1].tlb_live, 1, __ATOMIC_SEQ_CST);
++        seq = hv_cpu_post(&cpu[1], 0);
++        uint64_t before = m.percpu[0].sync_timeouts;
++        inject_notification = kind;
++        hv_cpu_sync(&cpu[0], &cpu[1], seq);
++        assert(!inject_notification && !m.percpu[1].ack_waiters);
++        assert(m.percpu[0].sync_timeouts == before);
++        hv_cpu_process_requests(&cpu[1]);
++    }
++    assert(!m.percpu[0].sync_errors);
+     hv_machine_free(&m);
+-    puts("CPU sync: spinning/sleeping, acknowledgement, parked target, missed notification, own requests and tagged multiwindow/PAN cache clears passed");
++    puts("CPU sync: acknowledgement, parked target, missing notifications, 64 deterministic check-to-syscall races, own requests and multiwindow/PAN clears passed");
+ }
 diff --git a/tests/test_display_router.swift b/tests/test_display_router.swift
 index a8b4506..9890251 100644
 --- a/tests/test_display_router.swift
@@ -3131,10 +3385,54 @@ index 0000000..52930cc
 +subprocess.run(['xcrun','--sdk','macosx','clang','-fobjc-arc','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(root/'devices'),str(c),'-framework','Foundation','-framework','Metal','-o',str(b/'test_gpu_upload')],check=True)
 +subprocess.run([str(b/'test_gpu_upload')],check=True)
 diff --git a/tests/test_idle_integration.c b/tests/test_idle_integration.c
-index 2b1be58..2ae07ab 100644
+index 2b1be58..cf28a94 100644
 --- a/tests/test_idle_integration.c
 +++ b/tests/test_idle_integration.c
-@@ -58,6 +58,10 @@ int main(void) {
+@@ -1,9 +1,11 @@
+ #include "machine.h"
+ #include "dispatch.h"
+ #include "sysreg.h"
++#include "mmu.h"
+ #include <assert.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <unistd.h>
+ 
+ static HvMachine m;
+ static HvCpu cpu;
+@@ -15,6 +17,7 @@ static uint64_t timer_tick(HvMachine *machine, HvCpu *c) {
+     return hv_counter() + 24000; /* same 24 MHz deadline used by engine WFI */
+ }
+ int main(void) {
++    alarm(15);
+     assert(hv_machine_init(&m, 1 << 20) == 0);
+     assert(hv_machine_add_ram(&m, (uintptr_t)code, sizeof code, code, 1) == 0);
+     hv_cpu_reset(&cpu, &m);
+@@ -29,6 +32,23 @@ int main(void) {
+     assert(m.stats.wfi == 1);
+     assert(activations >= 2); /* initial entry and resumed guest timer wait */
+     assert(!m.percpu[0].active);
++    /* Basic WFE accounting must work with expensive peer probes disabled. */
++    static uint32_t monitored[4096] __attribute__((aligned(16384)));
++    static uint32_t wait_code[4096] __attribute__((aligned(16384))) = {0xd503205f, 0xd2800540};
++    assert(!hv_machine_add_ram(&m, 0x90000000, sizeof monitored, monitored, 0));
++    assert(!hv_machine_add_ram(&m, (uintptr_t)wait_code, sizeof wait_code, wait_code, 1));
++    hv_cpu_reset(&cpu, &m); cpu.pc = (uintptr_t)wait_code; cpu.cpacr_el1 = 3u << 20;
++    m.stop_pc = (uintptr_t)(wait_code + 2); m.stats_interval = 1; m.wait_stats = 0;
++    uint64_t pa; assert(!hv_mmu_access(&cpu, 0x90000000, HV_ACC_READ, cpu.el, &pa));
++    cpu.excl_addr = 0x90000000; cpu.excl_size = 4; cpu.excl_val[0] = 0;
++    assert(hv_run(&cpu) == HV_EXIT_HALT && cpu.x[0] == 42);
++    assert(m.percpu[0].wfe_ticks && m.percpu[0].wfe_timeouts);
++    uint64_t exits = m.percpu[0].wfe_dispatches;
++    hv_cpu_reset(&cpu, &m); cpu.pc = (uintptr_t)wait_code; cpu.cpacr_el1 = 3u << 20;
++    cpu.excl_addr = ~0ull;
++    assert(hv_run(&cpu) == HV_EXIT_HALT && cpu.x[0] == 42);
++    assert(m.percpu[0].wfe_dispatches == exits + 1);
++    m.stats_interval = 0;
+     /* Periodic ticks may skip parked CPUs; explicit broadcasts must not. */
+     static HvCpu parked;
+     m.cpus[1] = &parked; m.ncpus = 2;
+@@ -58,6 +78,10 @@ int main(void) {
      m.percpu[0].active = m.percpu[1].active = 0;
      cpu.exit_req = parked.exit_req = 0;
      assert(hv_machine_kick_due(&m, 400) == 0);
@@ -3452,10 +3750,10 @@ index 585491b..61015ba 100644
  }
 diff --git a/tests/test_stats_lifecycle.py b/tests/test_stats_lifecycle.py
 new file mode 100644
-index 0000000..cac51ee
+index 0000000..0724db8
 --- /dev/null
 +++ b/tests/test_stats_lifecycle.py
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,28 @@
 +#!/usr/bin/env python3
 +"""Exercise production reporting on recreated CPU0 threads, with deep scans off/on."""
 +import os
@@ -3473,6 +3771,9 @@ index 0000000..cac51ee
 +    if result.returncode:
 +        print(output)
 +        raise SystemExit(result.returncode)
++    per_cpu = re.findall(r'vcpu-work: cpu=(\d+) generation=(\d+) user_us=(\d+) system_us=(\d+)', output)
++    assert len([x for x in per_cpu if x[0] == '0']) >= 2, 'missing real CPU0 accounting across Continue'
++    assert len({x[1] for x in per_cpu}) >= 2, 'thread accounting lacks lifecycle generations'
 +    percentages = [int(n) for n in re.findall(r'cpu thread ran (-?\d+)%', output)]
 +    assert len(percentages) >= 2, ('no actual CPU0 report before/after Continue', percentages)
 +    assert all(0 <= n <= 105 for n in percentages), percentages
@@ -3529,7 +3830,7 @@ index 01aead4..b1daca1 100644
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..feaa172 100644
+index a13a70d..7beea4f 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
 @@ -3,6 +3,8 @@
@@ -3541,7 +3842,7 @@ index a13a70d..feaa172 100644
  
  #include <fcntl.h>
  #include <mach/mach.h>
-@@ -12,13 +14,40 @@
+@@ -12,13 +14,41 @@
  #include <stdlib.h>
  #include <string.h>
  #include <unistd.h>
@@ -3578,11 +3879,12 @@ index a13a70d..feaa172 100644
 +    stats_observe(); /* baseline acknowledgement from this actual CPU0 thread */
 +    usleep(1100000); /* a deliberate CPU-time measurement interval */
 +    stats_observe(); /* do not depend on an aggregate counter hitting a 64K multiple */
++    henge_vm_log_cache(); /* real per-vCPU host CPU accounting, including after Continue */
 +}
  HengeDualMapping *henge_ios_jit_get_mapping(void) { return &mapping; }
  void hv_prof_ios_start(void) {}
  int hv_install_start(HvVirtioUsb *usb, const char *ipsw, const char *work, uint64_t ecid,
-@@ -58,6 +87,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
+@@ -58,6 +88,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
      if (fd < 0 || (data && write(fd, data, bytes) != (ssize_t)bytes) || ftruncate(fd, bytes)) exit(1);
      close(fd);
  }
@@ -3620,7 +3922,7 @@ index a13a70d..feaa172 100644
  static void *read_ui(void *unused) {
      (void)unused;
      while (!atomic_load(&reader_done)) {
-@@ -69,6 +129,8 @@ static void *read_ui(void *unused) {
+@@ -69,6 +130,8 @@ static void *read_ui(void *unused) {
          henge_vm_cpus_on();
          henge_vm_link_connected(0);
          henge_vm_gpu_frames();
@@ -3629,7 +3931,7 @@ index a13a70d..feaa172 100644
          henge_vm_balloon(-1);
          henge_vm_set_display_layer(NULL);
          if (!henge_vm_boot_display(&pixels, &width, &height, &stride)) henge_vm_free_display(pixels);
-@@ -77,7 +139,7 @@ static void *read_ui(void *unused) {
+@@ -77,7 +140,7 @@ static void *read_ui(void *unused) {
      return NULL;
  }
  int main(void) {
@@ -3638,7 +3940,7 @@ index a13a70d..feaa172 100644
      char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
      if (!mkdtemp(dir) || hv_jit_region_open(&jit, 8 << 20)) return 1;
      snprintf(rom, sizeof rom, "%s/rom", dir);
-@@ -91,6 +153,10 @@ int main(void) {
+@@ -91,6 +154,10 @@ int main(void) {
      write_file(aux, NULL, 1 << 20);
      mapping = (HengeDualMapping){.rx_addr = (uint8_t *)jit.base,
          .rw_addr = (uint8_t *)jit.base + jit.rw_diff, .size = jit.capacity * 4};
@@ -3649,7 +3951,7 @@ index a13a70d..feaa172 100644
      pthread_t reader;
      if (pthread_create(&reader, NULL, read_ui, NULL)) return 1;
      /* Warm the process-wide pointer queue before counting worker threads. */
-@@ -150,8 +216,28 @@ int main(void) {
+@@ -150,8 +217,28 @@ int main(void) {
          write_file(rom, code, sizeof code);
          int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          check("resume test boots", rc == 0);
@@ -3678,7 +3980,7 @@ index a13a70d..feaa172 100644
          henge_vm_mouse_button(1, 1);
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "suspend: %s\n", error);
-@@ -160,18 +246,40 @@ int main(void) {
+@@ -160,18 +247,40 @@ int main(void) {
              fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\n");
              return 1;
          }
@@ -3721,7 +4023,7 @@ index a13a70d..feaa172 100644
          check("a paused Mac stops", henge_vm_state() == 2 && hv_vm_board()->ram == NULL);
          uint64_t bytes = 0;
          check("the save is whole", henge_vm_saved_ok(snap, "test", &bytes, NULL) == 0 && bytes > 0);
-@@ -183,12 +291,14 @@ int main(void) {
+@@ -183,12 +292,14 @@ int main(void) {
          rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          usleep(30000);
          rc |= henge_vm_suspend(snap, "test", error, sizeof error);
@@ -3736,7 +4038,7 @@ index a13a70d..feaa172 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +319,78 @@ int main(void) {
+@@ -209,6 +320,78 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);
