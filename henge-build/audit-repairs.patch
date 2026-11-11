@@ -56,9 +56,21 @@ index 0000000..57303a2
 +}
 +#endif
 diff --git a/devices/pvg_lite.c b/devices/pvg_lite.c
-index 9f6ebcb..629b4f8 100644
+index 9f6ebcb..1a1a716 100644
 --- a/devices/pvg_lite.c
 +++ b/devices/pvg_lite.c
+@@ -878,9 +878,9 @@ int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
+ }
+ 
+ /* CPUs stopped: the GPU's queued work done, and what only it holds copied into guest memory. */
+-void hv_pvg_lite_quiesce(HvPvgLite *p) {
++int hv_pvg_lite_quiesce(HvPvgLite *p) {
+     HvPvgMetal *metal = p ? atomic_load_explicit(&p->metal, memory_order_acquire) : NULL;
+-    if (metal) hv_pvg_metal_quiesce(metal);
++    return metal ? hv_pvg_metal_quiesce(metal) : 0;
+ }
+ 
+ size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
 @@ -889,11 +889,11 @@ size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
  }
  
@@ -75,25 +87,29 @@ index 9f6ebcb..629b4f8 100644
  
  /* Debugging (the Mac runner's devstate): each channel's ring and stamps, to tell work never taken from work never
 diff --git a/devices/pvg_lite.h b/devices/pvg_lite.h
-index 0f68eae..999da98 100644
+index 0f68eae..ac454a5 100644
 --- a/devices/pvg_lite.h
 +++ b/devices/pvg_lite.h
-@@ -74,11 +74,11 @@ size_t hv_pvg_lite_state(HvPvgLite *p, void *out, size_t cap);
+@@ -72,13 +72,13 @@ void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm);
+ /* Instant resume (host/snapshot.c). State blobs: called with out NULL they return the size needed. */
+ size_t hv_pvg_lite_state(HvPvgLite *p, void *out, size_t cap);
  int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len);
- void hv_pvg_lite_quiesce(HvPvgLite *p);
+-void hv_pvg_lite_quiesce(HvPvgLite *p);
++int hv_pvg_lite_quiesce(HvPvgLite *p);
  size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap);
 -void hv_pvg_lite_set_display_state(HvPvgLite *p, const void *in, size_t len);
 +int hv_pvg_lite_set_display_state(HvPvgLite *p, const void *in, size_t len);
  #include <stdio.h>
  void hv_pvg_lite_debug(HvPvgLite *p, FILE *f);
- void hv_pvg_metal_quiesce(HvPvgMetal *m);
+-void hv_pvg_metal_quiesce(HvPvgMetal *m);
++int hv_pvg_metal_quiesce(HvPvgMetal *m);
  size_t hv_pvg_metal_display_state(HvPvgMetal *m, void *out, size_t cap);
 -void hv_pvg_metal_set_display_state(HvPvgMetal *m, const void *in, size_t len);
 +int hv_pvg_metal_set_display_state(HvPvgMetal *m, const void *in, size_t len);
  
  #endif
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..5f44bce 100644
+index 9073d22..2e44c8c 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -838,15 +838,9 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
@@ -114,8 +130,118 @@ index 9073d22..5f44bce 100644
  }
  
  static uint64_t guest_hash(HvObject *s) { return hash_bytes(s->mapped + s->first, s->alloc); }
-@@ -3159,63 +3153,80 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -1233,20 +1227,21 @@ static BOOL has_guest_pages(HvObject *o) {
+ }
+ 
+ /* Between guest memory and the GPU's own copy, in the layout the guest was told. */
+-- (void)page:(HvObject *)o toGuest:(BOOL)down task:(uint32_t)task blit:(id<MTLBlitCommandEncoder> *)blit commandBuffer:(id<MTLCommandBuffer>)cb {
++- (BOOL)page:(HvObject *)o toGuest:(BOOL)down task:(uint32_t)task blit:(id<MTLBlitCommandEncoder> *)blit commandBuffer:(id<MTLCommandBuffer>)cb {
+     id<MTLBuffer> copy = guest_copy(self, task, o);
+-    if (!copy || !has_guest_pages(o)) return;
++    if (!copy || !has_guest_pages(o)) return NO;
+     if (o->heap_whole) {
+         if (!*blit) *blit = [cb blitCommandEncoder];
+         NSUInteger bytes = MIN(copy.length, o->heap_whole.length);
+         if (down) [*blit copyFromBuffer:o->heap_whole sourceOffset:0 toBuffer:copy destinationOffset:0 size:bytes];
+         else [*blit copyFromBuffer:copy sourceOffset:0 toBuffer:o->heap_whole destinationOffset:0 size:bytes];
+-        return;
++        return *blit != nil;
      }
+     id<MTLTexture> tex = o->object;
+-    if (!tex || !o->tex_layout || tex.sampleCount > 1 || tex.isFramebufferOnly) return;
++    if (!tex || !o->tex_layout || tex.sampleCount > 1 || tex.isFramebufferOnly) return NO;
+     NSUInteger faces = tex.textureType == MTLTextureTypeCube || tex.textureType == MTLTextureTypeCubeArray ? 6 : 1;
+     if (!*blit) *blit = [cb blitCommandEncoder];
++    if (!*blit) return NO;
+     for (uint32_t s = 0; s < o->tex_slices * faces; s++)
+         for (uint32_t m = 0; m < o->tex_mips; m++) {
+             const uint8_t *mip = o->tex_layout + m * 36;
+@@ -1256,7 +1251,7 @@ static BOOL has_guest_pages(HvObject *o) {
+             uint32_t bh = o->tex_block_h ? o->tex_block_h : 1;
+             uint64_t from = o->tex_base + o->tex_stride * s + off;
+             uint64_t image = row * ((h + bh - 1) / bh);
+-            if (from + image * d > o->length) continue;
++            if (from > o->length || (d && image > (o->length - from) / d)) return NO;
+             if (down)
+                 [*blit copyFromTexture:tex sourceSlice:s sourceLevel:m sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, d)
+                               toBuffer:copy destinationOffset:from destinationBytesPerRow:row destinationBytesPerImage:image];
+@@ -1264,6 +1259,7 @@ static BOOL has_guest_pages(HvObject *o) {
+                 [*blit copyFromBuffer:copy sourceOffset:from sourceBytesPerRow:row sourceBytesPerImage:image
+                            sourceSize:MTLSizeMake(w, h, d) toTexture:tex destinationSlice:s destinationLevel:m destinationOrigin:MTLOriginMake(0, 0, 0)];
+         }
++    return YES;
+ }
+ 
+ /* The guest asks to see what the GPU made: {task, count, refs}. */
+@@ -2319,6 +2315,7 @@ static const uint8_t *half_to_byte(void) {
+     memcpy(&hx, (const uint8_t *)a + 0x24, 2), memcpy(&hy, (const uint8_t *)a + 0x26, 2);
+     if (!w || !h || w > 512 || h > 512 || stride < (uint64_t)w * 4 || stride > 8192) return;
+     uint8_t *bits = malloc((size_t)stride * h);
++    if (!bits) { [self complain:@"pointer image allocation failed"]; return; }
+     if (hv_pvg_lite_task_read(lite, 0, off, bits, (uint32_t)stride * h)) {
+         free(bits);
+         [self complain:@"pointer image unreadable"];
+@@ -2327,6 +2324,7 @@ static const uint8_t *half_to_byte(void) {
+     MTLTextureDescriptor *ct = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
+     ct.storageMode = MTLStorageModeShared;
+     id<MTLTexture> glyph = [device newTextureWithDescriptor:ct];
++    if (!glyph) { free(bits); [self complain:@"pointer texture allocation failed"]; return; }
+     [glyph replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
+     if (a[0] == 1) {
+         link_cursor=glyph;link_cw=w;link_ch=h;link_hx=hx;link_hy=hy;
+@@ -3120,22 +3118,23 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+ 
+ /* Pinned upstream Instant Resume entrypoints, adapted by the custom engine without a second replay. */
+ @interface HvReplay (Resume)
+-- (void)page:(HvObject *)o toGuest:(BOOL)down task:(uint32_t)task blit:(id<MTLBlitCommandEncoder> *)blit commandBuffer:(id<MTLCommandBuffer>)cb;
++- (BOOL)page:(HvObject *)o toGuest:(BOOL)down task:(uint32_t)task blit:(id<MTLBlitCommandEncoder> *)blit commandBuffer:(id<MTLCommandBuffer>)cb;
+ @end
+ 
+ /* Instant resume: the CPUs are stopped. Finish what the guest handed over, then copy what only the GPU holds (it drew
+    into private memory and the guest has not asked for it back) into guest memory, where a replay made after a restore
+    reads it from. A texture in a heap goes with its heap's bytes, as the heap is what is made again from guest memory. */
+-void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+-    if (!m) return;
++int hv_pvg_metal_quiesce(HvPvgMetal *m) {
++    if (!m) return 0;
+     HvReplay *r = (__bridge HvReplay *)m;
++    __block int failed = 0;
+     @autoreleasepool {
+         dispatch_sync(r->worker, ^{});
+         dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
+         dispatch_sync(r->worker, ^{
+             id<MTLCommandBuffer> cb = nil;
+             id<MTLBlitCommandEncoder> blit = nil;
+-            unsigned copied = 0;
++            NSMutableArray<HvObject *> *copied = [NSMutableArray new];
+             for (NSNumber *task in r->tasks) {
+                 NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
+                 for (NSNumber *ref in objs) {
+@@ -3143,79 +3142,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+                     if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
+                     if (o->parent && o->parent->heap_whole) continue;
+                     if (!cb) cb = [r->queue commandBuffer];
+-                    [r page:o toGuest:YES task:task.unsignedIntValue blit:&blit commandBuffer:cb];
+-                    o->guest_stale = NO;
+-                    copied++;
++                    if (!cb || ![r page:o toGuest:YES task:task.unsignedIntValue blit:&blit commandBuffer:cb]) failed = 1;
++                    else [copied addObject:o];
+                 }
+             }
+             [blit endEncoding];
+             if (cb) {
+                 [cb commit];
+                 [cb waitUntilCompleted];
++                if (cb.status != MTLCommandBufferStatusCompleted) failed = 1;
+             }
+-            fprintf(stderr, "hengevm: pvg-metal: quiesced, %u GPU-only objects copied to guest memory\n", copied);
++            if (!failed) for (HvObject *o in copied) o->guest_stale = NO;
++            fprintf(stderr, "hengevm: pvg-metal: quiesce %s, %lu GPU-only objects\n",
++                    failed ? "failed (snapshot refused)" : "complete", (unsigned long)copied.count);
+         });
+         dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
+     }
++    return failed ? -1 : 0;
  }
  
 -typedef struct DisplayState {
@@ -257,7 +383,7 @@ index 0000000..c550603
 +}
 +#endif
 diff --git a/host/snapshot.c b/host/snapshot.c
-index 383ae01..964f501 100644
+index 383ae01..62dd818 100644
 --- a/host/snapshot.c
 +++ b/host/snapshot.c
 @@ -30,8 +30,20 @@
@@ -322,6 +448,15 @@ index 383ae01..964f501 100644
      w_section(w, TAG('P', 'V', 'G', 'D'), db, db ? dn : 0);
      free(db);
  }
+@@ -596,7 +618,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+     HvVmapple *b = hv_vm_board();
+     int ncpus = hv_vm_ncpus();
+     if (!m || !b || !b->ram || ncpus < 1) return fail(err, errlen, "No machine to save.");
+-    if (!hv_vm_pause_clean()) return fail(err, errlen, "The machine is not paused, or has disk work in flight.");
++    if (!hv_vm_pause_clean()) return fail(err, errlen, "The machine is not paused, or disk/graphics work could not be preserved.");
+     if (b->vusb) return fail(err, errlen, "An installer cannot be saved.");
+     struct timespec t0, t1;
+     clock_gettime(CLOCK_MONOTONIC, &t0);
 @@ -728,7 +750,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
      if (!bad) bad = r_raw(&r, &t, sizeof t) || t.tag != TAG('E', 'N', 'D', ' ');
      free(r.buf);
@@ -331,6 +466,26 @@ index 383ae01..964f501 100644
      free(display);
      if (bad) return fail(err, errlen, "The saved Mac could not be read (%s).", strerror(r.err ? r.err : EINVAL));
      /* The guest's clock goes on as far as the wall clock went since it stopped (see hv_vm_resume_counter). */
+diff --git a/host/vm.c b/host/vm.c
+index db95c05..502e45c 100644
+--- a/host/vm.c
++++ b/host/vm.c
+@@ -512,12 +512,13 @@ int hv_vm_finish_pause(void) {
+     hv_virtio_blk_stop(board.root_blk);
+     hv_virtio_blk_stop(board.aux_blk);
+     /* hv_vm_run_cpu0 already detached board.snd under the device lock. */
+-    hv_pvg_lite_quiesce(board.pvg);
++    int graphics_clean = hv_pvg_lite_quiesce(board.pvg) == 0;
+     hv_dev_lock(&m);
+     int idle = hv_virtio_blk_idle(board.root_blk) && hv_virtio_blk_idle(board.aux_blk);
+     hv_dev_unlock(&m);
+     if (!idle) fprintf(stderr, "hengevm: pause: disk requests still in flight; it cannot be saved like this\n");
+-    pause_clean = idle;
++    if (!graphics_clean) fprintf(stderr, "hengevm: pause: graphics could not be preserved; snapshot refused\n");
++    pause_clean = idle && graphics_clean;
+     hv_vm_flush_disks();
+     set_pause_state(2);
+     return 0;
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
 index 34d6a98..f8ac1f1 100644
 --- a/ios/Henge/Native/henge-vm.c
@@ -440,7 +595,7 @@ index 0000000..7b09ed0
 +    subprocess.run([str(binary)],check=True)
 +print('Display snapshot parser: two ports, all header mutations and truncations passed ASan/UBSan')
 diff --git a/tests/test_pvg_lifecycle.m b/tests/test_pvg_lifecycle.m
-index 81cdb83..6dc9cba 100644
+index 81cdb83..eb4c3bb 100644
 --- a/tests/test_pvg_lifecycle.m
 +++ b/tests/test_pvg_lifecycle.m
 @@ -1,6 +1,8 @@
@@ -456,7 +611,7 @@ index 81cdb83..6dc9cba 100644
              cmd[0] = 0x43; cmd[1] = 24; cmd[2] = i + 1;
              hv_pvg_metal_submit(metal, board.pvg, 0, cmd, 24);
          }
-+        hv_pvg_metal_quiesce(metal);
++        if (hv_pvg_metal_quiesce(metal)) return 1;
 +        /* Restore distinct glyphs on both ports through the production serializer.
 +           Readback exercises real Metal textures, including the secondary glyph. */
 +        size_t size = sizeof(HvDisplaySnapshot) + 2 * 64;
@@ -541,7 +696,7 @@ index 01aead4..b1daca1 100644
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..d023f82 100644
+index a13a70d..c3ebf2b 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
 @@ -12,9 +12,11 @@
@@ -556,7 +711,22 @@ index a13a70d..d023f82 100644
  static HvJitRegion jit;
  static HengeDualMapping mapping;
  static int failures;
-@@ -77,7 +79,7 @@ static void *read_ui(void *unused) {
+@@ -58,6 +60,14 @@ static void write_file(const char *path, const void *data, size_t bytes) {
+     if (fd < 0 || (data && write(fd, data, bytes) != (ssize_t)bytes) || ftruncate(fd, bytes)) exit(1);
+     close(fd);
+ }
++typedef struct SaveAttempt { const char *path; int result; } SaveAttempt;
++static void *save_together(void *opaque) {
++    SaveAttempt *attempt = opaque;
++    char error[256];
++    attempt->result = henge_vm_save(attempt->path, "test", error, sizeof error);
++    if (attempt->result) fprintf(stderr, "parallel save: %s\n", error);
++    return NULL;
++}
+ static void *read_ui(void *unused) {
+     (void)unused;
+     while (!atomic_load(&reader_done)) {
+@@ -77,7 +87,7 @@ static void *read_ui(void *unused) {
      return NULL;
  }
  int main(void) {
@@ -565,7 +735,14 @@ index a13a70d..d023f82 100644
      char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
      if (!mkdtemp(dir) || hv_jit_region_open(&jit, 8 << 20)) return 1;
      snprintf(rom, sizeof rom, "%s/rom", dir);
-@@ -169,6 +171,7 @@ int main(void) {
+@@ -163,12 +173,13 @@ int main(void) {
+         check("pause releases queued right-Control", !(hv_vm_board()->usb->state[0] & (1u << 4)));
+         volatile uint64_t *count = (volatile uint64_t *)hv_vm_board()->ram;
+         uint64_t c1 = *count;
+-        usleep(20000);
++        usleep(200000); /* intentional delayed-resume coverage while CPUs are already paused */
+         check("paused: the counter stands still", c1 > 0 && *count == c1);
+         check("continue runs it on", henge_vm_continue() == 0 && henge_vm_state() == 1);
          for (int n = 0; n < 1000 && *count == c1; n++) usleep(1000);
          check("continued: the counter moves", *count > c1);
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
@@ -573,7 +750,7 @@ index a13a70d..d023f82 100644
          uint64_t c2 = *count;
          check("second suspend saves", rc == 0 && c2 > c1);
          henge_vm_stop();
-@@ -183,12 +186,14 @@ int main(void) {
+@@ -183,12 +194,14 @@ int main(void) {
          rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          usleep(30000);
          rc |= henge_vm_suspend(snap, "test", error, sizeof error);
@@ -588,7 +765,7 @@ index a13a70d..d023f82 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +214,50 @@ int main(void) {
+@@ -209,6 +222,57 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);
@@ -614,6 +791,13 @@ index a13a70d..d023f82 100644
 +        rmdir(blocked);
 +        check("running after failed save", henge_vm_state() == 1);
 +        if (henge_vm_suspend(snap, "test", error, sizeof error)) return 1;
++        SaveAttempt attempts[2] = {{snap, -1}, {snap, -1}};
++        pthread_t saves[2];
++        if (pthread_create(&saves[0], NULL, save_together, &attempts[0]) ||
++            pthread_create(&saves[1], NULL, save_together, &attempts[1])) return 1;
++        pthread_join(saves[0], NULL); pthread_join(saves[1], NULL);
++        check("concurrent saves serialize", !attempts[0].result && !attempts[1].result &&
++              henge_vm_saved_ok(snap, "test", NULL, NULL) == 0);
 +        for (int allocation = 0; allocation < 7; allocation++) {
 +            hv_snapshot_test_fail_after(allocation);
 +            rc = henge_vm_save(snap, "test", error, sizeof error);
