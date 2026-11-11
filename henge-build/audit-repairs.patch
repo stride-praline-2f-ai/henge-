@@ -3295,6 +3295,18 @@ index 037685f..bbea374 100644
          log("boot", "Link protocol: 2, decoder-consumption credit window=3; local discovery and opt-in Keychain pairing; three-finger viewer controls; update both devices")
          log("boot", "cache lifecycle: JIT translations and kernel read lookups are RAM-only; no cross-launch executable cache")
          if let source = info["HengeCustomSourceCommit"] as? String {
+diff --git a/ios/Henge/Installer.swift b/ios/Henge/Installer.swift
+index 2103167..4dcdfc6 100644
+--- a/ios/Henge/Installer.swift
++++ b/ios/Henge/Installer.swift
+@@ -199,6 +199,7 @@ final class Installer: NSObject, ObservableObject {
+         var mac = VirtualMac(name: name, ecid: ecid, seed: 0, ramMB: ramMB, diskBytes: 64 << 30)
+         (mac.screenWidth, mac.screenHeight) = Device.fittingScreen
+         mac.fitScreen = true
++        M4Performance.applyRetinaDisplay(to: &mac)
+         let fm = FileManager.default
+         try fm.createDirectory(at: mac.directory, withIntermediateDirectories: true)
+         Machines.excludeFromBackup(Machines.root)
 diff --git a/ios/Henge/InstantResume.swift b/ios/Henge/InstantResume.swift
 index 8b4bf3b..e0c84e8 100644
 --- a/ios/Henge/InstantResume.swift
@@ -3552,10 +3564,10 @@ index 1bc238f..31eff7e 100644
              else if phase == .inactive { viewer.send(LinkControl(type: "release")) }
 diff --git a/ios/Henge/M4Performance.swift b/ios/Henge/M4Performance.swift
 new file mode 100644
-index 0000000..1ee70fd
+index 0000000..f98dda5
 --- /dev/null
 +++ b/ios/Henge/M4Performance.swift
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,35 @@
 +import Foundation
 +
 +/// Hardware selection is authoritative in the native topology detector. These
@@ -3567,6 +3579,14 @@ index 0000000..1ee70fd
 +        (UserDefaults.standard.object(forKey: statisticsKey) as? Bool) ?? false
 +    }
 +    static var maximumGuestCPUs: Int { enabled ? 8 : 6 }
++    /// Used for newly created M4 Macs and the explicitly selected preset only.
++    /// Existing saved display choices are never migrated implicitly.
++    static func applyRetinaDisplay(to mac: inout VirtualMac) {
++        guard enabled else { return }
++        mac.retina = true
++        mac.fitScreen = false
++        (mac.screenWidth, mac.screenHeight) = Device.retinaScreen
++    }
 +    /// Explicit preset only; opening/upgrading Henge never overwrites choices.
 +    /// Refresh and JIT reservation are independent user choices and stay intact.
 +    static func applyAutomaticDefaults() {
@@ -3606,7 +3626,7 @@ index c0f52d6..0d81556 100644
                          .frame(maxWidth: .infinity, alignment: .leading)
                          .padding(.horizontal, 4).padding(.bottom, 12)
 diff --git a/ios/Henge/MacSettingsView.swift b/ios/Henge/MacSettingsView.swift
-index 800c854..b88b7af 100644
+index 800c854..ae5df85 100644
 --- a/ios/Henge/MacSettingsView.swift
 +++ b/ios/Henge/MacSettingsView.swift
 @@ -7,6 +7,7 @@ struct MacSettingsView: View {
@@ -3617,7 +3637,7 @@ index 800c854..b88b7af 100644
      @AppStorage("henge.cpus") private var cpus = 4
  
      init(mac: VirtualMac) { _mac = State(initialValue: mac) }
-@@ -26,16 +27,19 @@ struct MacSettingsView: View {
+@@ -26,16 +27,23 @@ struct MacSettingsView: View {
                  if Device.isPad && ProcessInfo.processInfo.physicalMemory >> 20 >= 14_000 {
                      DeskHeading("Performance")
                      VStack(alignment: .leading, spacing: 12) {
@@ -3627,10 +3647,15 @@ index 800c854..b88b7af 100644
                              cpus = 4
                              mac.ramMB = 8192
 -                            mac.retina = false
-+                            mac.retina = M4Performance.enabled
-                             mac.fitScreen = false
+-                            mac.fitScreen = false
 -                            (mac.screenWidth, mac.screenHeight) = Device.performanceScreen
-+                            (mac.screenWidth, mac.screenHeight) = M4Performance.enabled ? Device.retinaScreen : Device.performanceScreen
++                            if M4Performance.enabled {
++                                M4Performance.applyRetinaDisplay(to: &mac)
++                            } else {
++                                mac.retina = false
++                                mac.fitScreen = false
++                                (mac.screenWidth, mac.screenHeight) = Device.performanceScreen
++                            }
                              save()
                          }
                          .font(.system(size: 16, weight: .semibold))
@@ -3641,7 +3666,7 @@ index 800c854..b88b7af 100644
                              .font(.system(size: 13)).foregroundStyle(Desk.dim)
                      }
                      .padding(17)
-@@ -47,7 +51,7 @@ struct MacSettingsView: View {
+@@ -47,7 +55,7 @@ struct MacSettingsView: View {
                      HStack(alignment: .firstTextBaseline) {
                          Text("\(mac.ramMB / 1024) GB").font(.system(size: 26, weight: .bold))
                          Spacer()
@@ -3650,7 +3675,7 @@ index 800c854..b88b7af 100644
                              .font(.system(size: 13)).foregroundStyle(Desk.dim).multilineTextAlignment(.trailing)
                      }
                      Stepper("Memory", value: Binding(get: { mac.ramMB / 1024 }, set: { mac.ramMB = $0 * 1024; save() }), in: Device.memoryChoices)
-@@ -55,12 +59,18 @@ struct MacSettingsView: View {
+@@ -55,12 +63,18 @@ struct MacSettingsView: View {
                      if let note = Device.memoryNote(mac.ramMB / 1024) {
                          Text(note).font(.system(size: 13)).foregroundStyle(Desk.dim)
                      }
@@ -3670,7 +3695,7 @@ index 800c854..b88b7af 100644
                      HStack {
                          Text("CPUs").font(.system(size: 16))
                          Spacer()
-@@ -139,6 +149,7 @@ struct MacSettingsView: View {
+@@ -139,6 +153,7 @@ struct MacSettingsView: View {
          .background(Desk.page)
          .navigationTitle(mac.name)
          .navigationBarTitleDisplayMode(.inline)
@@ -3678,6 +3703,20 @@ index 800c854..b88b7af 100644
          .onDisappear(perform: save)
          .fileMover(isPresented: $movingExport, file: machines.lastExport) { result in
              switch result {
+diff --git a/ios/Henge/Machines.swift b/ios/Henge/Machines.swift
+index 29c8b3b..71cc43b 100644
+--- a/ios/Henge/Machines.swift
++++ b/ios/Henge/Machines.swift
+@@ -18,7 +18,8 @@ struct VirtualMac: Identifiable, Codable, Hashable {
+     var screenHeight: Int?
+     /// Explicit Fit selection; nil retains compatibility with older saved Macs.
+     var fitScreen: Bool?
+-    /// m4 fork: the iPad's own panel at Retina density. On by default on iPad, for Macs that never chose.
++    /// The iPad's panel at Retina density. Nil preserves an older Mac's display choice;
++    /// new high-memory M4 Macs explicitly select Retina when they are created.
+     var retina: Bool?
+     /// On an iPhone's large screen (iPhone Duo unfolded): fill it, or leave a strip at the right for the status
+     /// bar and Henge's controls. Macs that never chose fill it.
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
 index 34d6a98..d897d27 100644
 --- a/ios/Henge/Native/henge-vm.c
@@ -5907,14 +5946,19 @@ index 1ac8d90..fa2ccdf 100644
          expected = 1
 diff --git a/tests/test_m4_defaults.swift b/tests/test_m4_defaults.swift
 new file mode 100644
-index 0000000..ab44a4d
+index 0000000..70a5fc1
 --- /dev/null
 +++ b/tests/test_m4_defaults.swift
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,46 @@
 +import Foundation
 +var fixtureM4: Int32 = 1
 +func hv_host_is_m4_16gb() -> Int32 { fixtureM4 }
 +enum HengeLog { static func log(_ a: String, _ b: String) {} }
++struct VirtualMac {
++    var retina: Bool? = false, fitScreen: Bool? = true
++    var screenWidth: Int? = 1920, screenHeight: Int? = 1080
++}
++enum Device { static let retinaScreen = (width: 2752, height: 2064) }
 +@main struct Check {
 +    static func main() {
 +        let d = UserDefaults.standard
@@ -5943,6 +5987,12 @@ index 0000000..ab44a4d
 +        precondition(d.integer(forKey:"henge.perf.codeCacheMB")==1536)
 +        precondition(M4Performance.maximumGuestCPUs==8 && !M4Performance.statisticsEnabled)
 +        fixtureM4=0;precondition(M4Performance.maximumGuestCPUs==6)
++        var mac = VirtualMac()
++        M4Performance.applyRetinaDisplay(to: &mac)
++        precondition(mac.retina == false && mac.screenWidth == 1920)
++        fixtureM4=1;M4Performance.applyRetinaDisplay(to: &mac)
++        precondition(mac.retina == true && mac.fitScreen == false)
++        precondition(mac.screenWidth == 2752 && mac.screenHeight == 2064)
 +        print("M4 defaults: explicit selection, non-M4 exclusion, Retina-independent refresh/JIT preservation passed")
 +    }
 +}

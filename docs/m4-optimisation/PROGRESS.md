@@ -90,3 +90,9 @@ Explicit user preference/cache diagnostics/environment overrides still work.
 This avoids hot-path timing/counter overhead; it is not a measured power result.
 The production preference test now covers unset defaults on both host classes
 and retained explicit opt-in. Validate the amended source before release.
+Final display-default review: newly created target M4 Macs now explicitly select
+native Retina; the explicit Automatic preset uses the same function. Previously
+new Macs selected1920-wide Fit despite the old comment claiming Retina default.
+Saved Macs/imported display choices remain unchanged. The profile regression
+covers non-M4 exclusion and2752x2064 selection. This finishes the default review;
+freeze source apart from defects exposed by final validation.
