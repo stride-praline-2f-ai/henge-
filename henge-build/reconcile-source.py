@@ -92,4 +92,16 @@ if "static void vblank(" in resume:
     raise SystemExit("Unexpected foreign GPU logic in upstream snapshot segment")
 s += "\n/* Pinned upstream Instant Resume entrypoints, adapted by the custom engine without a second replay. */\n" + resume
 metal.write_text(s)
+
+# Integrate the upstream pause lifecycle with the fork's existing ticker,
+# audio device and explicit CPU0 shutdown. Do not spawn duplicate workers.
+vm=root/"host/vm.c"
+t=vm.read_text()
+t=replace_once(t,"void hv_vm_link_flap(void) {","int hv_vm_paused(void);\nvoid hv_vm_link_flap(void) {","forward-declare pause state before network callback")
+t=replace_once(t,"int hv_vm_paused(void);\nstatic void set_pause_state(int v) {","static void set_pause_state(int v) {","remove now redundant pause declaration")
+t=replace_once(t,"if (kicker_started) pthread_join(kicker, NULL);","hv_idle_ticker_advance(&kicker);\n    if (kicker_started) pthread_join(kicker_handle, NULL);","wake and join custom idle ticker during suspend")
+t=replace_once(t,"if (sound_on) hv_audio_detach(); /* the host\u0027s player stops; the stream\u0027s state stays in the device */","/* hv_vm_run_cpu0 already detached board.snd under the device lock. */","do not double-detach audio at pause")
+for dead in ("pthread_join(kicker, NULL)", "if (sound_on) hv_audio_detach();"):
+    if dead in t: raise SystemExit("Unreconciled suspend lifecycle: "+dead)
+vm.write_text(t)
 print("PASS custom/upstream reconciliation: two-port PVG state, one GPU timing path, upstream resume methods")
