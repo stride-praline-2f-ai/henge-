@@ -14,6 +14,50 @@ index 81b0736..97ba397 100644
  	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -lcompression -o $@
  
  test-vm-lifecycle: $(B)/test_vm_lifecycle
+diff --git a/core/memop.c b/core/memop.c
+index bfbac5e..d184b91 100644
+--- a/core/memop.c
++++ b/core/memop.c
+@@ -187,7 +187,7 @@ int hv_mem_decode(uint32_t insn, HvMemOp *op) {
+         } else {
+             op->size = opc ? 3 : 2;
+         }
+-        op->imm = sext((insn >> 15) & 0x7f, 7) << op->size;
++        op->imm = sext((insn >> 15) & 0x7f, 7) * (1ll << op->size);
+         op->mode = mode == 1 ? HV_ADDR_POST : mode == 3 ? HV_ADDR_PRE : HV_ADDR_OFFSET;
+         op->bytes = 2u << op->size;
+         return 0;
+diff --git a/core/translate.c b/core/translate.c
+index cebfb7d..a6d1b00 100644
+--- a/core/translate.c
++++ b/core/translate.c
+@@ -811,7 +811,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
+ /* Ends the block (returns 1), or 0 for a conditional branch the block goes on past. */
+ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+     if ((insn & 0x7c000000) == 0x14000000) { /* B, BL */
+-        uint64_t target = pc + (sext(insn & 0x3ffffff, 26) << 2);
++        uint64_t target = pc + (sext(insn & 0x3ffffff, 26) * 4);
+         if (insn >> 31) {
+             if (use_ras(e)) put_call(e, pc + 4);
+             else put_const_to(e, 30, pc + 4);
+@@ -820,7 +820,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+         return 1;
+     }
+     if ((insn & 0xff000000) == 0x54000000) { /* B.cond, BC.cond */
+-        uint64_t target = pc + (sext((insn >> 5) & 0x7ffff, 19) << 2);
++        uint64_t target = pc + (sext((insn >> 5) & 0x7ffff, 19) * 4);
+         uint32_t cond = insn & 0xf;
+         if (cond >= 14) {
+             put_branch_exit(e, target, 1);
+@@ -836,7 +836,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+     }
+     /* CBZ/CBNZ (imm19) and TBZ/TBNZ (imm14) */
+     int tb = (insn & 0x7e000000) == 0x36000000;
+-    uint64_t target = pc + (tb ? sext((insn >> 5) & 0x3fff, 14) << 2 : sext((insn >> 5) & 0x7ffff, 19) << 2);
++    uint64_t target = pc + (tb ? sext((insn >> 5) & 0x3fff, 14) * 4 : sext((insn >> 5) & 0x7ffff, 19) * 4);
+     uint32_t bare = tb ? insn & ~(0x3fffu << 5) : insn & ~(0x7ffffu << 5);
+     int rt = insn & 0x1f;
+     if (!is_stolen(rt)) {
 diff --git a/devices/display_snapshot.h b/devices/display_snapshot.h
 new file mode 100644
 index 0000000..57303a2
@@ -445,7 +489,7 @@ index cf4acc4..9961c12 100644
  void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down);
  /* Any thread: a Magic Trackpad 2 touch. phase: 0 down, 1 move, 2 up. id: a
 diff --git a/host/snapshot.c b/host/snapshot.c
-index 383ae01..5b32be2 100644
+index 383ae01..7140036 100644
 --- a/host/snapshot.c
 +++ b/host/snapshot.c
 @@ -27,11 +27,24 @@
@@ -610,16 +654,18 @@ index 383ae01..5b32be2 100644
      w_section(w, TAG('P', 'V', 'G', 'D'), db, db ? dn : 0);
      free(db);
  }
-@@ -596,7 +633,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+@@ -596,8 +633,9 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
      HvVmapple *b = hv_vm_board();
      int ncpus = hv_vm_ncpus();
      if (!m || !b || !b->ram || ncpus < 1) return fail(err, errlen, "No machine to save.");
 -    if (!hv_vm_pause_clean()) return fail(err, errlen, "The machine is not paused, or has disk work in flight.");
 +    if (!hv_vm_pause_clean()) return fail(err, errlen, "The machine is not paused, or disk/graphics work could not be preserved.");
      if (b->vusb) return fail(err, errlen, "An installer cannot be saved.");
++    if (hv_vm_sync_disks() != 0) return fail(err, errlen, "The Mac's disks could not be synchronized: %s", strerror(errno));
      struct timespec t0, t1;
      clock_gettime(CLOCK_MONOTONIC, &t0);
-@@ -624,6 +661,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+     char tmp[1100];
+@@ -624,6 +662,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
          unlink(tmp);
          return fail(err, errlen, "Cannot read the disk's details.");
      }
@@ -627,7 +673,7 @@ index 383ae01..5b32be2 100644
      w_raw(&w, &h, sizeof h);
      for (int i = 0; i < ncpus; i++) {
          CpuState s;
-@@ -659,9 +697,9 @@ static int read_header(int fd, SnapHeader *h, const char *ident, uint64_t *bytes
+@@ -659,9 +698,9 @@ static int read_header(int fd, SnapHeader *h, const char *ident, uint64_t *bytes
      struct stat st;
      Trailer t;
      if (fstat(fd, &st) != 0 || (uint64_t)st.st_size < sizeof *h + sizeof t) return -1;
@@ -640,7 +686,7 @@ index 383ae01..5b32be2 100644
      h->ident[sizeof h->ident - 1] = 0;
      if (strcmp(h->ident, ident ? ident : "")) return -2;
      if (pread(fd, &t, sizeof t, st.st_size - (off_t)sizeof t) != (ssize_t)sizeof t || t.tag != TAG('E', 'N', 'D', ' ') ||
-@@ -695,7 +733,8 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
+@@ -695,7 +734,8 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
      int hr = read_header(fd, &h, ident, NULL);
      if (hr) {
          close(fd);
@@ -650,7 +696,7 @@ index 383ae01..5b32be2 100644
      }
      char disk_now[256];
      h.disk[sizeof h.disk - 1] = 0;
-@@ -728,7 +767,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
+@@ -728,7 +768,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
      if (!bad) bad = r_raw(&r, &t, sizeof t) || t.tag != TAG('E', 'N', 'D', ' ');
      free(r.buf);
      close(fd);
@@ -660,7 +706,7 @@ index 383ae01..5b32be2 100644
      if (bad) return fail(err, errlen, "The saved Mac could not be read (%s).", strerror(r.err ? r.err : EINVAL));
      /* The guest's clock goes on as far as the wall clock went since it stopped (see hv_vm_resume_counter). */
 diff --git a/host/vm.c b/host/vm.c
-index db95c05..1f1bc3d 100644
+index db95c05..3acb537 100644
 --- a/host/vm.c
 +++ b/host/vm.c
 @@ -386,7 +386,8 @@ static pthread_key_t signal_stack_key;
@@ -687,7 +733,28 @@ index db95c05..1f1bc3d 100644
      if (ss.ss_sp) {
          if (sigaltstack(&ss, NULL) != 0) free(ss.ss_sp);
          else {
-@@ -512,12 +518,13 @@ int hv_vm_finish_pause(void) {
+@@ -461,9 +467,17 @@ int hv_vm_disk_identity(char *out, size_t n) {
+     return 0;
+ }
+ 
+-void hv_vm_flush_disks(void) {
+-    hv_disk_flush(&disk);
+-    hv_disk_flush(&aux);
++int hv_vm_flush_disks(void) {
++    int root = hv_disk_flush(&disk), auxiliary = hv_disk_flush(&aux);
++    return root || auxiliary ? -1 : 0;
++}
++
++/* Persistent snapshots must reach storage even if normal guest flushes use
++   the user's cache-only policy. This is once per save, never per guest write. */
++int hv_vm_sync_disks(void) {
++    int root = disk.readonly ? 0 : fsync(disk.fd);
++    int auxiliary = aux.readonly ? 0 : fsync(aux.fd);
++    return root || auxiliary ? -1 : 0;
+ }
+ 
+ int hv_vm_run_cpu0(void) {
+@@ -512,13 +526,15 @@ int hv_vm_finish_pause(void) {
      hv_virtio_blk_stop(board.root_blk);
      hv_virtio_blk_stop(board.aux_blk);
      /* hv_vm_run_cpu0 already detached board.snd under the device lock. */
@@ -698,12 +765,15 @@ index db95c05..1f1bc3d 100644
      hv_dev_unlock(&m);
      if (!idle) fprintf(stderr, "hengevm: pause: disk requests still in flight; it cannot be saved like this\n");
 -    pause_clean = idle;
+-    hv_vm_flush_disks();
 +    if (!graphics_clean) fprintf(stderr, "hengevm: pause: graphics could not be preserved; snapshot refused\n");
-+    pause_clean = idle && graphics_clean;
-     hv_vm_flush_disks();
++    int disks_clean = hv_vm_flush_disks() == 0;
++    if (!disks_clean) fprintf(stderr, "hengevm: pause: disk flush failed; snapshot refused\n");
++    pause_clean = idle && graphics_clean && disks_clean;
      set_pause_state(2);
      return 0;
-@@ -702,9 +709,13 @@ static void stop_pointer(void) {
+ }
+@@ -702,9 +718,13 @@ static void stop_pointer(void) {
              hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);
              hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
          }
@@ -718,6 +788,20 @@ index db95c05..1f1bc3d 100644
          rctrl_user = rctrl_click = 0;
          os_unfair_lock_unlock(&rctrl_lock);
      });
+diff --git a/host/vm.h b/host/vm.h
+index 47e26eb..8a4a83e 100644
+--- a/host/vm.h
++++ b/host/vm.h
+@@ -83,7 +83,8 @@ uint64_t hv_vm_resume_counter(uint64_t counter, int64_t wall_ns);
+ int64_t hv_vm_paused_wall_ns(void);
+ /* After a resume (or a long pause): the network link down for 2 s, 1.5 s from now. */
+ void hv_vm_link_flap(void);
+-void hv_vm_flush_disks(void);
++int hv_vm_flush_disks(void);
++int hv_vm_sync_disks(void);
+ /* The disk and auxiliary storage files as they are now (inode, size, last change): a saved machine resumes only onto these. */
+ int hv_vm_disk_identity(char *out, size_t n);
+ const char *hv_vm_reason_name(int reason);
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
 index 34d6a98..f8ac1f1 100644
 --- a/ios/Henge/Native/henge-vm.c
@@ -812,18 +896,20 @@ index 0000000..eef5d30
 + subprocess.run([str(exe)],check=True)
 diff --git a/tests/run_lifecycle_sanitizers.sh b/tests/run_lifecycle_sanitizers.sh
 new file mode 100755
-index 0000000..15f3439
+index 0000000..3c4c1fe
 --- /dev/null
 +++ b/tests/run_lifecycle_sanitizers.sh
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,14 @@
 +#!/bin/bash
 +set -euo pipefail
 +cd "$(dirname "$0")/.."
 +flags='-std=c11 -Wall -Wextra -O1 -g -fno-omit-frame-pointer -Icore -Ihost -Idevices'
 +# Separate objects: no uninstrumented engine objects or sanitizers in the IPA.
-+make -j3 B=build/asan CFLAGS="$flags -fsanitize=address,undefined" build/asan/test_vm_lifecycle build/asan/test_pvg_lifecycle
++make -j3 B=build/asan CFLAGS="$flags -fsanitize=address,undefined" build/asan/test_vm_lifecycle build/asan/test_pvg_lifecycle build/asan/test_jit build/asan/test_mem
 +ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 build/asan/test_vm_lifecycle
 +ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 build/asan/test_pvg_lifecycle
++ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 build/asan/test_jit
++ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 build/asan/test_mem
 +# Real concurrent resolver cancellation and idle wakeup paths, independently of JIT code.
 +make -j3 B=build/tsan CFLAGS="$flags -fsanitize=thread" build/tsan/test_dns_lifecycle build/tsan/test_idle_ticker
 +TSAN_OPTIONS=halt_on_error=1 build/tsan/test_dns_lifecycle
@@ -973,10 +1059,18 @@ index 01aead4..b1daca1 100644
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..abf4e0c 100644
+index a13a70d..c5496a4 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
-@@ -12,9 +12,13 @@
+@@ -3,6 +3,7 @@
+ #include "install.h"
+ #include "jit_region.h"
+ #include "vm.h"
++#include "disk.h"
+ 
+ #include <fcntl.h>
+ #include <mach/mach.h>
+@@ -12,9 +13,13 @@
  #include <stdlib.h>
  #include <string.h>
  #include <unistd.h>
@@ -990,7 +1084,7 @@ index a13a70d..abf4e0c 100644
  static HvJitRegion jit;
  static HengeDualMapping mapping;
  static int failures;
-@@ -58,6 +62,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
+@@ -58,6 +63,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
      if (fd < 0 || (data && write(fd, data, bytes) != (ssize_t)bytes) || ftruncate(fd, bytes)) exit(1);
      close(fd);
  }
@@ -1028,7 +1122,7 @@ index a13a70d..abf4e0c 100644
  static void *read_ui(void *unused) {
      (void)unused;
      while (!atomic_load(&reader_done)) {
-@@ -77,7 +112,7 @@ static void *read_ui(void *unused) {
+@@ -77,7 +113,7 @@ static void *read_ui(void *unused) {
      return NULL;
  }
  int main(void) {
@@ -1037,7 +1131,7 @@ index a13a70d..abf4e0c 100644
      char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
      if (!mkdtemp(dir) || hv_jit_region_open(&jit, 8 << 20)) return 1;
      snprintf(rom, sizeof rom, "%s/rom", dir);
-@@ -91,6 +126,10 @@ int main(void) {
+@@ -91,6 +127,10 @@ int main(void) {
      write_file(aux, NULL, 1 << 20);
      mapping = (HengeDualMapping){.rx_addr = (uint8_t *)jit.base,
          .rw_addr = (uint8_t *)jit.base + jit.rw_diff, .size = jit.capacity * 4};
@@ -1048,7 +1142,7 @@ index a13a70d..abf4e0c 100644
      pthread_t reader;
      if (pthread_create(&reader, NULL, read_ui, NULL)) return 1;
      /* Warm the process-wide pointer queue before counting worker threads. */
-@@ -152,6 +191,10 @@ int main(void) {
+@@ -152,6 +192,10 @@ int main(void) {
          check("resume test boots", rc == 0);
          usleep(50000);
          henge_vm_key_hid(0xe4, 1);
@@ -1059,7 +1153,7 @@ index a13a70d..abf4e0c 100644
          henge_vm_mouse_button(1, 1);
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "suspend: %s\n", error);
-@@ -160,15 +203,18 @@ int main(void) {
+@@ -160,15 +204,18 @@ int main(void) {
              fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\n");
              return 1;
          }
@@ -1080,7 +1174,7 @@ index a13a70d..abf4e0c 100644
          uint64_t c2 = *count;
          check("second suspend saves", rc == 0 && c2 > c1);
          henge_vm_stop();
-@@ -183,12 +229,14 @@ int main(void) {
+@@ -183,12 +230,14 @@ int main(void) {
          rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          usleep(30000);
          rc |= henge_vm_suspend(snap, "test", error, sizeof error);
@@ -1095,7 +1189,7 @@ index a13a70d..abf4e0c 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +257,72 @@ int main(void) {
+@@ -209,6 +258,78 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);
@@ -1124,6 +1218,12 @@ index a13a70d..abf4e0c 100644
 +        if (henge_vm_suspend(snap, "test", error, sizeof error)) return 1;
 +        check("interrupted partial replaced completely", access(blocked, F_OK) != 0 &&
 +              henge_vm_saved_ok(snap, "test", NULL, NULL) == 0);
++        int disk_fd = hv_vm_board()->root_blk->disk->fd;
++        hv_vm_board()->root_blk->disk->fd = -1;
++        rc = henge_vm_save(snap, "test", error, sizeof error);
++        hv_vm_board()->root_blk->disk->fd = disk_fd;
++        check("disk sync error refuses save", rc != 0 && strstr(error, "could not be synchronized"));
++        check("disk sync failure preserves prior save", henge_vm_saved_ok(snap, "test", NULL, NULL) == 0);
 +        SaveAttempt attempts[2] = {{snap, -1}, {snap, -1}};
 +        pthread_t saves[2];
 +        if (pthread_create(&saves[0], NULL, save_together, &attempts[0]) ||
