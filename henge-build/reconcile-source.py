@@ -273,4 +273,35 @@ if 'Toggle("Fill the whole screen"' not in ms:
 settings.write_text(ms)
 print("PASS Duo PR #108 integrated into existing dynamic Fit and touch geometry; single activation toggle")
 
+
+# Upstream main's experimental Mac apps translation layer must be included
+# without dropping the custom native touch helper or its Metal assets.
+project=root/"ios/project.yml"
+py=project.read_text()
+for ldflag in ("-lcompression","-lhengetl","-lbz2"):
+    if f'          - "{ldflag}"' not in py:
+        py=replace_once(py,'          - "-lz"\n',
+            '          - "-lz"\n          - "'+ldflag+'"\n',
+            "link Mac apps translation-layer dependency "+ldflag)
+build_lines=[ln for ln in py.splitlines() if ln.strip().startswith("make ios-lib ")]
+if len(build_lines)!=1: raise SystemExit("Unexpected Xcode native build phase count")
+old_build=build_lines[0]
+build_parts=old_build.split()
+for token in ("build/henge-agent.gz","build/henge-touch-agent.gz","build/tl-samples.dmg"):
+    if token not in build_parts: build_parts.append(token)
+new_build=old_build.split("make ios-lib")[0]+" ".join(build_parts)
+py=replace_once(py,old_build,new_build,"retain touch and sample-app resources in build phase")
+if 'cp -X "$SRCROOT/../build/tl-samples.dmg"' not in py:
+    lines=py.splitlines(keepends=True)
+    cp_lines=[i for i,v in enumerate(lines) if v.lstrip().startswith('cp "$SRCROOT/../build/henge-agent.gz"')]
+    if len(cp_lines)!=1: raise SystemExit("Unexpected app-helper packaging phase")
+    indent=lines[cp_lines[0]].split("cp ",1)[0]
+    append=(
+        indent+'rm -f "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"\n'
+        +indent+'cp -X "$SRCROOT/../build/tl-samples.dmg" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"\n')
+    lines.insert(cp_lines[0]+1,append)
+    py="".join(lines)
+project.write_text(py)
+print("PASS iOS build phases: custom touch helper and upstream Mac-app samples/libraries both retained")
+
 print("PASS custom/upstream reconciliation: dual-port GPU snapshots, VM pause APIs and lifecycle")
