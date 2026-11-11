@@ -39,6 +39,8 @@ with tempfile.TemporaryDirectory(prefix='henge-ipa-check-') as directory:
     helper_info = plistlib.loads((helper / 'Info.plist').read_bytes())
     framework_info = plistlib.loads((framework / 'Info.plist').read_bytes())
     assert helper_info['CFBundleIdentifier'] == plist['CFBundleIdentifier'] + '.JITHelper'
+    assert helper_info['CFBundleVersion'] == plist['CFBundleVersion'], 'JIT helper build version mismatch'
+    assert helper_info['CFBundleShortVersionString'] == plist['CFBundleShortVersionString'], 'JIT helper version mismatch'
     assert helper_info.get('NSExtension'), 'Missing JIT extension registration'
     assert framework_info.get('CFBundleIdentifier') and framework_info['CFBundlePackageType'] == 'FMWK'
     assert int(helper_info['MinimumOSVersion'].split('.')[0]) >= 26
