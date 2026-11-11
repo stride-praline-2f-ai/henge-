@@ -72,6 +72,7 @@ for entry in "${pins[@]:2}"; do
   git -C "$source_dir" merge-base --is-ancestor "$expected" HEAD
   echo "::endgroup::"
 done
+python3 "$root/build-request/henge-build/reconcile-source.py" "$source_dir"
 python3 - "$source_dir/ios/Henge/Info.plist" "$manifest" <<'PY'
 import json, plistlib, sys
 from pathlib import Path
