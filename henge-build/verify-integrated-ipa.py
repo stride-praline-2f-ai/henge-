@@ -13,11 +13,16 @@ assert ipa.is_file(), "IPA was not produced"
 with zipfile.ZipFile(ipa) as z:
     assert z.testzip() is None, "Corrupt IPA archive"
     plist=plistlib.loads(z.read("Payload/Henge.app/Info.plist"))
+assert plist.get("HengeAuditRepairsSHA256")==manifest["audit_repairs_sha256"], "Incorrect audit repairs"
+assert plist.get("HengeSnapshotSchema")==3, "Incorrect snapshot schema"
+with zipfile.ZipFile(ipa) as z:
+    assert b"hv_snapshot_test_fail_after" not in z.read("Payload/Henge.app/Henge"), "Test-only failure hook in release"
 assert plist.get("HengeMergedUpstreamCommit")==integration["main_sha"], "Incorrect upstream source"
 assert plist.get("HengeIntegratedPullRequests")==[p["number"] for p in integration["pull_requests"]], "Incorrect merged PR IDs"
 assert plist.get("HengeIntegratedPullRequestHeads")==[p["sha"] for p in integration["pull_requests"]], "Incorrect merged PR heads"
 result=Path("Henge-output/Henge-build-verification.json")
 data=json.loads(result.read_text())
+data["audit_repairs"]={"sha256":manifest["audit_repairs_sha256"],"snapshot_schema":3,"test_allocation_hook_absent":True}
 data["upstream_integration"]={
   **integration,
   "verified_in_packaged_ipa": True,

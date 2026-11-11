@@ -87,6 +87,8 @@ from pathlib import Path
 path=Path(sys.argv[1])
 i=json.loads(Path(sys.argv[2]).read_text())["upstream_integration"]
 with path.open("rb") as f: p=plistlib.load(f)
+p["HengeAuditRepairsSHA256"]=json.loads(Path(sys.argv[2]).read_text())["audit_repairs_sha256"]
+p["HengeSnapshotSchema"]=3
 p["HengeMergedUpstreamCommit"]=i["main_sha"]
 p["HengeIntegratedPullRequests"]=[int(x["number"]) for x in i["pull_requests"]]
 p["HengeIntegratedPullRequestHeads"]=[str(x["sha"]) for x in i["pull_requests"]]
