@@ -488,6 +488,70 @@ index cf4acc4..9961c12 100644
  /* The same, by Linux input key code (what the host UI produces). */
  void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down);
  /* Any thread: a Magic Trackpad 2 touch. phase: 0 down, 1 move, 2 up. id: a
+diff --git a/host/enter.S b/host/enter.S
+index cc902ed..15b606f 100644
+--- a/host/enter.S
++++ b/host/enter.S
+@@ -241,10 +241,18 @@ _hv_helper_thunk:
+     str x15, [x28, #CPU_SP]
+     ldr x15, [x28, #CPU_HOST_SP]
+     mov sp, x15
++#ifdef HV_SANITIZER_HELPERS
++    // Sanitizer runtime calls have the ordinary SIMD-clobbering C ABI even
++    // when the light helper itself is compiled -mgeneral-regs-only.
++    SAVE_FLAGS_FP
++#endif
+     mov x0, x28
+     mov x1, x7
+     bl _hv_tlb_refill
+     mov x7, x0
++#ifdef HV_SANITIZER_HELPERS
++    LOAD_FLAGS_FP
++#endif
+     ldr x0, [x28, #CPU_SP]
+     mov sp, x0
+     ldr x0, [x28, #CPU_NZCV]
+@@ -311,11 +319,19 @@ _hv_ijc_thunk:
+     str x15, [x28, #CPU_SP]
+     ldr x15, [x28, #CPU_HOST_SP]
+     mov sp, x15
++#ifdef HV_SANITIZER_HELPERS
++    // Sanitizer runtime calls have the ordinary SIMD-clobbering C ABI even
++    // when the light helper itself is compiled -mgeneral-regs-only.
++    SAVE_FLAGS_FP
++#endif
+     mov x0, x28
+     mov x1, x7
+     ldr w2, [x30]
+     bl _hv_ijc_resolve
+     mov x6, x0
++#ifdef HV_SANITIZER_HELPERS
++    LOAD_FLAGS_FP
++#endif
+     ldr x0, [x28, #CPU_SP]
+     mov sp, x0
+     ldr x0, [x28, #CPU_NZCV]
+@@ -387,12 +403,20 @@ _hv_xjump_thunk:
+     str x15, [x28, #CPU_SP]
+     ldr x15, [x28, #CPU_HOST_SP]
+     mov sp, x15
++#ifdef HV_SANITIZER_HELPERS
++    // Sanitizer runtime calls have the ordinary SIMD-clobbering C ABI even
++    // when the light helper itself is compiled -mgeneral-regs-only.
++    SAVE_FLAGS_FP
++#endif
+     mov x0, x28
+     ldr x1, [x7, #8]
+     ldr w2, [x7]
+     and w2, w2, #0x7fffffff
+     bl _hv_ijc_resolve
+     mov x6, x0
++#ifdef HV_SANITIZER_HELPERS
++    LOAD_FLAGS_FP
++#endif
+     ldr x0, [x28, #CPU_SP]
+     mov sp, x0
+     ldr x0, [x28, #CPU_NZCV]
 diff --git a/host/snapshot.c b/host/snapshot.c
 index 383ae01..7140036 100644
 --- a/host/snapshot.c
@@ -896,14 +960,14 @@ index 0000000..eef5d30
 + subprocess.run([str(exe)],check=True)
 diff --git a/tests/run_lifecycle_sanitizers.sh b/tests/run_lifecycle_sanitizers.sh
 new file mode 100755
-index 0000000..3c4c1fe
+index 0000000..189e45c
 --- /dev/null
 +++ b/tests/run_lifecycle_sanitizers.sh
 @@ -0,0 +1,14 @@
 +#!/bin/bash
 +set -euo pipefail
 +cd "$(dirname "$0")/.."
-+flags='-std=c11 -Wall -Wextra -O1 -g -fno-omit-frame-pointer -Icore -Ihost -Idevices'
++flags='-std=c11 -Wall -Wextra -O1 -g -fno-omit-frame-pointer -Icore -Ihost -Idevices -DHV_SANITIZER_HELPERS=1'
 +# Separate objects: no uninstrumented engine objects or sanitizers in the IPA.
 +make -j3 B=build/asan CFLAGS="$flags -fsanitize=address,undefined" build/asan/test_vm_lifecycle build/asan/test_pvg_lifecycle build/asan/test_jit build/asan/test_mem
 +ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 build/asan/test_vm_lifecycle
