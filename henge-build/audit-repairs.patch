@@ -3759,10 +3759,10 @@ index 0000000..7476335
 +}
 diff --git a/ios/Henge/Controls/GamepadSurface.swift b/ios/Henge/Controls/GamepadSurface.swift
 new file mode 100644
-index 0000000..d68b71e
+index 0000000..498ab30
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadSurface.swift
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,88 @@
 +import SwiftUI
 +import UIKit
 +
@@ -3778,13 +3778,15 @@ index 0000000..d68b71e
 +    var send: ((GamepadState) -> Void)?
 +    private var fingers: [ObjectIdentifier: (Int,CGPoint)] = [:]
 +    private var regions: [CGRect] { // left/right sticks, A/B/X/Y, LB/RB, LT/RT, menu
-+        let w = bounds.width, h = bounds.height, size = min(120,max(72,h*0.34)), b = min(52,max(38,h*0.14))
-+        return [CGRect(x:20,y:h-size-18,width:size,height:size),CGRect(x:w-size-100,y:h-size-18,width:size,height:size),
-+            CGRect(x:w-120,y:110+b,width:b,height:b),CGRect(x:w-64,y:110,width:b,height:b),
-+            CGRect(x:w-176,y:110,width:b,height:b),CGRect(x:w-120,y:110-b,width:b,height:b),
-+            CGRect(x:20,y:12,width:68,height:38),CGRect(x:w-88,y:12,width:68,height:38),
-+            CGRect(x:96,y:12,width:58,height:38),CGRect(x:w-154,y:12,width:58,height:38),
-+            CGRect(x:w/2-30,y:12,width:60,height:38)]
++        let scale = max(0.01,min(1,min(bounds.height/300,bounds.width/520)))
++        let w = bounds.width/scale, h: CGFloat = 300, size: CGFloat = 102, b: CGFloat = 42
++        let layout = [CGRect(x:20,y:h-size-18,width:size,height:size),CGRect(x:w-size-100,y:h-size-18,width:size,height:size),
++            CGRect(x:w-120,y:84+b,width:b,height:b),CGRect(x:w-64,y:84,width:b,height:b),
++            CGRect(x:w-176,y:84,width:b,height:b),CGRect(x:w-120,y:84-b,width:b,height:b),
++            CGRect(x:20,y:0,width:68,height:38),CGRect(x:w-88,y:0,width:68,height:38),
++            CGRect(x:96,y:0,width:58,height:38),CGRect(x:w-154,y:0,width:58,height:38),
++            CGRect(x:w/2-30,y:0,width:60,height:38)]
++        return layout.map { CGRect(x:$0.minX*scale,y:$0.minY*scale+bounds.height-300*scale,width:$0.width*scale,height:$0.height*scale) }
 +    }
 +    override init(frame: CGRect) {
 +        super.init(frame:frame); isMultipleTouchEnabled = true; isOpaque = false; backgroundColor = .clear
@@ -3913,10 +3915,10 @@ index 47b0ced..af8939d 100644
      }
  }
 diff --git a/ios/Henge/EngineTuning.swift b/ios/Henge/EngineTuning.swift
-index e579188..63ea996 100644
+index e579188..f1c61b4 100644
 --- a/ios/Henge/EngineTuning.swift
 +++ b/ios/Henge/EngineTuning.swift
-@@ -4,13 +4,21 @@ import Foundation
+@@ -4,13 +4,22 @@ import Foundation
  /// then Documents/henge-env.txt (KEY=VALUE per line, # comments; {Documents} in a value is that folder) overrides them all.
  /// Applied at launch and again before each Mac starts, so changes need no relaunch.
  enum EngineTuning {
@@ -3930,6 +3932,7 @@ index e579188..63ea996 100644
      static let wfiSpinKey = "henge.perf.wfiSpin"
      static let fastFlushKey = "henge.perf.fastFlush"
      static let cpuPolicyKey = "henge.perf.cpuPolicy"
++    static let lowPowerGuestRefreshKey = "henge.perf.lowPowerGuestRefresh"
 +    static var diagnosticsEnabled: Bool {
 +        let stats = getenv("HV_STATS").flatMap { Int(String(cString: $0)) } ?? 0
 +        return stats > 0 || getenv("HV_FASTMEM_STATS").map { String(cString: $0) == "1" } == true
@@ -3938,7 +3941,7 @@ index e579188..63ea996 100644
  
      static let defaults: [String: String] = [
          // 60, not 120: every frame macOS draws is emulated and replayed, so 120 Hz
-@@ -21,20 +29,26 @@ enum EngineTuning {
+@@ -21,20 +30,31 @@ enum EngineTuning {
          "HV_STW_WAIT": "1", // event-driven quiescence during global code flushes
          "HV_SYNC_WAIT": "1", // bounded sleep after short spin while awaiting CPU acknowledgement
          "HV_RECHECK": "1",    // exact same-page check before full memory helper at page tails
@@ -3961,12 +3964,17 @@ index e579188..63ea996 100644
          env["HV_FASTMEM_STATS"] = (d.object(forKey: diagnosticsKey) as? Bool ?? false) ? "1" : "0"
 +        if env["HV_FASTMEM_STATS"] == "1" { env["HV_STATS"] = "10" }
          if [30, 60, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
++        if d.bool(forKey:lowPowerGuestRefreshKey), ProcessInfo.processInfo.isLowPowerModeEnabled,
++           let requested = Int(env["HV_HZ"] ?? "60"), requested > 60 {
++            env["HV_HZ"] = "60"
++            HengeLog.log("power","Explicit Low Power guest session: requested=\(requested)Hz effective=60Hz; saved preference and Retina retained; next boot reevaluates; henge-env overrides remain authoritative")
++        }
          env["HV_SUPERBLOCKS"] = d.bool(forKey: superblocksKey) ? "1" : "0"
 +        env["HV_GROUPS"] = d.bool(forKey: groupsKey) ? "1" : "0"
          if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
          if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
          let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-@@ -51,6 +65,11 @@ enum EngineTuning {
+@@ -51,6 +71,11 @@ enum EngineTuning {
                      .trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "{Documents}", with: docs.path)
              }
          }
@@ -4097,7 +4105,7 @@ index 2103167..4dcdfc6 100644
          try fm.createDirectory(at: mac.directory, withIntermediateDirectories: true)
          Machines.excludeFromBackup(Machines.root)
 diff --git a/ios/Henge/InstantResume.swift b/ios/Henge/InstantResume.swift
-index 8b4bf3b..e0c84e8 100644
+index 8b4bf3b..2add421 100644
 --- a/ios/Henge/InstantResume.swift
 +++ b/ios/Henge/InstantResume.swift
 @@ -23,7 +23,7 @@ enum InstantResume {
@@ -4150,6 +4158,28 @@ index 8b4bf3b..e0c84e8 100644
          }
      }
  
+@@ -85,9 +105,21 @@ enum InstantResume {
+     /// any, is out of date the moment the Mac runs on.
+     static func cameBack(_ mac: VirtualMac) {
+         queue.async {
++            henge_vm_foreground_graphics()
+             guard henge_vm_state() == 4 else { return }
+             discard(for: mac)
+             HengeLog.log("resume", henge_vm_continue() == 0 ? "back: the Mac runs on" : "back: the Mac could not run on")
+         }
+     }
++    /// Runner preparation, foreground restoration and Instant Resume share
++    /// this one transition queue. Never wait on snapshot/VM locks on main.
++    static func prepareCPUBackground(_ completion: @escaping (Int32,String) -> Void) {
++        queue.async {
++            var error = [CChar](repeating:0,count:256)
++            let rc = henge_vm_prepare_cpu_background(&error,error.count)
++            let reason = String(cString:error)
++            DispatchQueue.main.async { completion(rc,reason) }
++        }
++    }
++    static func restoreForegroundGraphics() { queue.async { henge_vm_foreground_graphics() } }
+ }
 diff --git a/ios/Henge/Link/LinkProtocol.swift b/ios/Henge/Link/LinkProtocol.swift
 index 94231b2..b1a53e8 100644
 --- a/ios/Henge/Link/LinkProtocol.swift
@@ -5318,10 +5348,10 @@ index 25e7bad..246a6f8 100644
           now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
 diff --git a/ios/Henge/Runner/RunnerMode.swift b/ios/Henge/Runner/RunnerMode.swift
 new file mode 100644
-index 0000000..ff84e72
+index 0000000..1b3b022
 --- /dev/null
 +++ b/ios/Henge/Runner/RunnerMode.swift
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,201 @@
 +import SwiftUI
 +import BackgroundTasks
 +import UIKit
@@ -5344,7 +5374,8 @@ index 0000000..ff84e72
 +    private var revision: UInt = 0
 +    private var continued: AnyObject?
 +    private var submitted = false
-+    private var registered = false
++    private var registeredIdentifiers = Set<String>()
++    private var requestIdentifier: String?
 +    private var expired: ((@escaping () -> Void) -> Void)?
 +
 +    static let repositoryKey = "henge.runner.repository"
@@ -5394,20 +5425,21 @@ index 0000000..ff84e72
 +        guard UserDefaults.standard.bool(forKey: Self.backgroundKey) else {
 +            background = "Enable background processing before starting the runner."; return
 +        }
++        var companionAge: Int = -1
++        guard hv_share_runner_status(&companionAge) == 2, (0...70).contains(companionAge) else {
++            background = "Wait for the Mac companion to report Listener running before preparing CPU background jobs."; return
++        }
 +        guard LinkHostService.shared.mode == nil else {
 +            background = "Disconnect the extended display and restart without it before CPU-only background work. Video encoding needs GPU access."; return
 +        }
 +        finishBackground(success: true)
 +        let id = UUID(); preparationID = id; preparingCPU = true
 +        background = "Preparing CPU background work: pausing and draining graphics in the foreground…"
-+        DispatchQueue.global(qos: .userInitiated).async {
-+            var error = [CChar](repeating: 0, count: 256)
-+            let rc = henge_vm_prepare_cpu_background(&error, error.count)
-+            let reason = String(cString: error)
-+            DispatchQueue.main.async {
++        InstantResume.prepareCPUBackground { rc,reason in
 +                guard self.preparationID == id, self.active else {
-+                    if UIApplication.shared.applicationState == .active { henge_vm_foreground_graphics() }
-+                    else { InstantResume.pause(force: true) }
++                    // The scene/end transition already queued its pause,
++                    // restoration or destruction. A stale callback must not
++                    // undo a newer preparation on that same transition queue.
 +                    return
 +                }
 +                self.preparingCPU = false
@@ -5420,7 +5452,6 @@ index 0000000..ff84e72
 +                    return
 +                }
 +                self.requestBackground()
-+            }
 +        }
 +    }
 +    func end() {
@@ -5431,7 +5462,7 @@ index 0000000..ff84e72
 +        status = "Not started"
 +    }
 +    func returnedToForeground() {
-+        henge_vm_foreground_graphics()
++        if preparingCPU { preparationID = UUID(); preparingCPU = false }
 +        cpuPrepared = false
 +        if grantCPU { finishBackground(success: true) }
 +        if active { requestBackground() }
@@ -5450,24 +5481,26 @@ index 0000000..ff84e72
 +            guard cpuOnly || (BGTaskScheduler.supportedResources.contains(.gpu) && Entitlements.has(BackgroundExecutionStatus.gpuEntitlement)) else {
 +                background = "This install cannot run the Mac’s GPU in the background. Keep Henge visible or use Split View; PiP does not grant GPU access."; return
 +            }
-+            let identifier = (Bundle.main.bundleIdentifier ?? "com.henge.app") + ".runner.session"
-+            if !registered {
-+                registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: .main) { task in
++            let identifier = (Bundle.main.bundleIdentifier ?? "com.henge.app") + (cpuOnly ? ".runner.cpu" : ".runner.session")
++            if !registeredIdentifiers.contains(identifier) {
++                let registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: .main) { task in
 +                    guard let task = task as? BGContinuedProcessingTask else { task.setTaskCompleted(success: false); return }
 +                    MainActor.assumeIsolated { RunnerMode.shared.attach(task) }
 +                }
++                if registered { registeredIdentifiers.insert(identifier) }
 +            }
-+            guard registered else { background = "iOS refused background task registration. Keep Henge visible."; return }
++            guard registeredIdentifiers.contains(identifier) else { background = "iOS refused background task registration. Keep Henge visible."; return }
 +            let request = BGContinuedProcessingTaskRequest(identifier: identifier, title: "Henge Mac runner", subtitle: "Running the selected Mac for GitHub Actions")
 +            request.strategy = .fail; request.requiredResources = cpuOnly ? [] : .gpu
 +            do {
 +                grantCPU = cpuOnly
++                requestIdentifier = identifier
 +                try BGTaskScheduler.shared.submit(request); submitted = true
 +                background = "Waiting for iOS background permission. Keep Henge visible until granted."
 +            } catch {
 +                if cpuOnly {
 +                    cpuPrepared = false
-+                    if UIApplication.shared.applicationState == .active { henge_vm_foreground_graphics() }
++                    if UIApplication.shared.applicationState == .active { InstantResume.restoreForegroundGraphics() }
 +                    else { InstantResume.pause(force: true) }
 +                }
 +                background = "iOS declined background processing. Keep Henge visible or use Split View."
@@ -5480,8 +5513,11 @@ index 0000000..ff84e72
 +    #if compiler(>=6.2)
 +    @available(iOS 26.0, *)
 +    private func attach(_ task: BGContinuedProcessingTask) {
++        guard task.identifier == requestIdentifier, active, continued == nil,
++              task.identifier.hasSuffix(".runner.cpu") == grantCPU, !grantCPU || cpuPrepared else {
++            task.setTaskCompleted(success: false); return
++        }
 +        submitted = false
-+        guard active, !grantCPU || cpuPrepared else { task.setTaskCompleted(success: false); return }
 +        continued = task
 +        // No invented completion percentage for an idle listener. The user or
 +        // iOS can end this task at any time; it is not an always-on service.
@@ -5490,6 +5526,7 @@ index 0000000..ff84e72
 +            let owner = RunnerMode.shared
 +            guard owner.continued === task else { return }
 +            owner.continued = nil
++            owner.cpuPrepared = false
 +            owner.background = "iOS ended background processing. The Mac was paused."
 +            // Quiesce GPU work before completing the task and relinquishing its
 +            // resource grant. OS expiration can still impose its own deadline.
@@ -5509,16 +5546,16 @@ index 0000000..ff84e72
 +            if success { task.progress.completedUnitCount = 1 }
 +            task.setTaskCompleted(success: success)
 +        }
-+        if #available(iOS 26.0, *), submitted, let bundle = Bundle.main.bundleIdentifier {
-+            BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: bundle + ".runner.session")
++        if #available(iOS 26.0, *), submitted, let requestIdentifier {
++            BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: requestIdentifier)
 +        }
 +        #endif
-+        continued = nil; submitted = false
++        continued = nil; submitted = false; requestIdentifier = nil
 +    }
 +}
 diff --git a/ios/Henge/Runner/RunnerView.swift b/ios/Henge/Runner/RunnerView.swift
 new file mode 100644
-index 0000000..c2fd38b
+index 0000000..ae7bf9f
 --- /dev/null
 +++ b/ios/Henge/Runner/RunnerView.swift
 @@ -0,0 +1,55 @@
@@ -5565,7 +5602,7 @@ index 0000000..c2fd38b
 +                }
 +                Section("Leaving Henge") {
 +                    Toggle("Request background processing", isOn: $background).disabled(runner.active)
-+                    Toggle("CPU-only background jobs", isOn: $cpuBackground).disabled(runner.active)
++                    Toggle("CPU-only background jobs (experimental)", isOn: $cpuBackground).disabled(runner.active)
 +                    Text(runner.background).font(.footnote)
 +                    Text("CPU mode needs no GPU grant: once the Mac runner is ready, prepare it from the runner dashboard before leaving. Henge pauses briefly, drains graphics, then continues CPU, network and disk work. New graphics commands wait in the guest until you return; GUI tools, Simulator or GPU-dependent builds may stall. Persistent saves require returning to the foreground first. iOS can end the task or terminate Henge. PiP does not provide unlimited execution.")
 +                        .font(.footnote).foregroundStyle(.secondary)
@@ -5719,7 +5756,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..02a6e97 100644
+index f84465e..ee16187 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,11 @@ struct SessionView: View {
@@ -5773,7 +5810,7 @@ index f84465e..02a6e97 100644
          }
          .onChange(of: nativeTouch.requested) { _, _ in nativeTouch.changedRequest() }
          .onChange(of: pointerNeeded) { needed in
-@@ -204,20 +218,84 @@ struct SessionView: View {
+@@ -204,20 +218,88 @@ struct SessionView: View {
              if needed { nativeTouch.stop() }
          }
          .onChange(of: scenePhase) { phase in
@@ -5829,7 +5866,11 @@ index f84465e..02a6e97 100644
 +                    }
 +                    Text("Local desktop presentation is stopped while this dashboard is shown. macOS and guest jobs keep running; display resolution and Retina quality are preserved.")
 +                        .font(.footnote).foregroundStyle(.secondary)
-+                    Button("Show Mac Desktop") { runnerDesktop = true }
++                    Button("Show Mac Desktop") {
++                        runner.returnedToForeground()
++                        InstantResume.cameBack(mac)
++                        runnerDesktop = true
++                    }
 +                    Button("Stop Mac and Runner", role: .destructive) { confirmStop = true }
 +                }
 +                .padding(28).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -5860,7 +5901,7 @@ index f84465e..02a6e97 100644
              if showing {
                  refreshDetails()
                  HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll()
-@@ -228,10 +306,12 @@ struct SessionView: View {
+@@ -228,10 +310,12 @@ struct SessionView: View {
          }
          .onAppear {
              UIApplication.shared.isIdleTimerDisabled = true
@@ -5873,7 +5914,7 @@ index f84465e..02a6e97 100644
              LinkHostService.shared.stop()
              nativeTouch.stop()
              UIApplication.shared.isIdleTimerDisabled = false
-@@ -242,21 +322,23 @@ struct SessionView: View {
+@@ -242,21 +326,23 @@ struct SessionView: View {
              VolumeClicks.shared.stop()
          }
          .modifier(ExternalMacDisplayModifier(presentation: MacPresentation(display: display, aspect: displayAspect)))
@@ -5905,25 +5946,27 @@ index f84465e..02a6e97 100644
  
      // A fold/rotation after boot must fit the mode the guest actually received,
      // rather than stretch it by recalculating only the host view's aspect.
-@@ -484,10 +566,17 @@ struct SessionView: View {
- 
+@@ -485,6 +571,19 @@ struct SessionView: View {
      /// The controls a column has too.
      @ViewBuilder private var floatingTools: some View {
-+        if runner.active { tool("hammer", "Runner dashboard", tint: .white) { runnerDesktop = false } }
          tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
-+        tool("gamecontroller", "Virtual gamepad", tint: showGamepad ? Desk.accentLight : .white) { showGamepad.toggle() }
-+        tool("antenna.radiowaves.left.and.right", "Wireless controls", tint: .white) { showWirelessControls = true }
++        Menu {
++            Button(showGamepad ? "Hide Virtual Gamepad" : "Show Virtual Gamepad",systemImage:"gamecontroller") { showGamepad.toggle() }
++            Button("Wireless Keyboard / Gamepad",systemImage:"antenna.radiowaves.left.and.right") { showWirelessControls = true }
++            if runner.active { Button("Runner Dashboard",systemImage:"hammer") { runnerDesktop = false } }
++            Button(diagnosticCapture.active ? "Stop Diagnostic Capture" : "Capture Diagnostics (30 seconds)",systemImage:"waveform.path.ecg") {
++                if diagnosticCapture.active { diagnosticCapture.stop() } else { diagnosticCapture.begin() }
++                wakeups.signal()
++            }
++        } label: {
++            Image(systemName:"gamecontroller").font(.system(size:19,weight:.medium))
++                .foregroundStyle(showGamepad || diagnosticCapture.active ? Desk.accentLight : .white)
++                .frame(width:44,height:44).contentShape(Rectangle())
++        }.accessibilityLabel("Gamepad, wireless controls and diagnostics")
          pasteTool
          tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
          tool("info.circle", "Details", tint: .white) { showDetails = true }
-+        tool("waveform.path.ecg", diagnosticCapture.active ? "Stop diagnostic capture" : "Capture diagnostics for 30 seconds", tint: diagnosticCapture.active ? Desk.accentLight : .white) {
-+            if diagnosticCapture.active { diagnosticCapture.stop() } else { diagnosticCapture.begin() }
-+            wakeups.signal()
-+        }
-     }
- 
-     /// The whole screen, small, with where the zoomed view is on it.
-@@ -513,12 +602,19 @@ struct SessionView: View {
+@@ -513,12 +612,19 @@ struct SessionView: View {
      }
  
      /// Keeps the pointer in view: the view moves when the pointer nears its edge.
@@ -5944,7 +5987,7 @@ index f84465e..02a6e97 100644
              }
              if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / displayAspect)) { map = UIImage(cgImage: image) }
              tick += 1
-@@ -545,6 +641,9 @@ struct SessionView: View {
+@@ -545,6 +651,9 @@ struct SessionView: View {
          VStack(alignment: .leading, spacing: 10) {
              Text("This Mac could not start").font(.system(size: 17, weight: .semibold))
              Text(text).font(.system(size: 14)).foregroundStyle(Desk.dim)
@@ -5954,7 +5997,7 @@ index f84465e..02a6e97 100644
              Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
          }
          .padding(18)
-@@ -583,6 +682,13 @@ struct SessionView: View {
+@@ -583,6 +692,13 @@ struct SessionView: View {
                      LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
                      LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
                  }
@@ -5968,7 +6011,7 @@ index f84465e..02a6e97 100644
                  Section("Display") {
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
-@@ -680,6 +786,7 @@ struct SessionView: View {
+@@ -680,6 +796,7 @@ struct SessionView: View {
      }
  
      private func run(viewport: CGSize) async {
@@ -5976,7 +6019,7 @@ index f84465e..02a6e97 100644
          error = nil
          state = 0
          userCode = false
-@@ -699,7 +806,9 @@ struct SessionView: View {
+@@ -699,7 +816,9 @@ struct SessionView: View {
          guard !Task.isCancelled else { return }
          UIApplication.shared.isIdleTimerDisabled = true
          HardwareMouse.shared.start()
@@ -5987,7 +6030,7 @@ index f84465e..02a6e97 100644
          runningScreen = screen
          let ram = GuestMemory.prepare(mac)
          HengeLog.log("session", "available memory \(henge_available_memory() >> 20) MB")
-@@ -721,38 +830,66 @@ struct SessionView: View {
+@@ -721,38 +840,66 @@ struct SessionView: View {
          HengeLog.log("display", "screen-fit: selected=\(mac.fitsDeviceScreen) viewport=\(viewport.width)x\(viewport.height) stored=\(mac.screenWidth ?? 1920)x\(mac.screenHeight ?? 1080) chosen=\(screen.width)x\(screen.height) aspect=\(screen.aspect)")
          do { try LinkHostService.shared.prepareBoot() }
          catch { self.error = error.localizedDescription; return }
@@ -6068,7 +6111,7 @@ index f84465e..02a6e97 100644
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
                  typing = false
-@@ -769,38 +906,60 @@ struct SessionView: View {
+@@ -769,38 +916,60 @@ struct SessionView: View {
                  }
                  break
              }
@@ -6198,7 +6241,7 @@ index 0000000..75768bd
 +    }
 +}
 diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
-index e1693b0..8526008 100644
+index e1693b0..2be155b 100644
 --- a/ios/Henge/SettingsView.swift
 +++ b/ios/Henge/SettingsView.swift
 @@ -10,6 +10,7 @@ struct SettingsView: View {
@@ -6217,15 +6260,16 @@ index e1693b0..8526008 100644
      @AppStorage(EngineTuning.cpuPolicyKey) private var cpuPolicy = "auto"
      @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
      @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
-@@ -40,6 +42,7 @@ struct SettingsView: View {
+@@ -40,6 +42,8 @@ struct SettingsView: View {
      }
  
      @AppStorage("henge.perf.thermalProtection") private var thermalProtection = false
 +    @AppStorage("henge.perf.lowPowerAware") private var lowPowerAware = true
++    @AppStorage(EngineTuning.lowPowerGuestRefreshKey) private var lowPowerGuestRefresh = false
      @AppStorage("henge.perf.presentationCap") private var presentationCap = 0
  
      var body: some View {
-@@ -126,6 +129,14 @@ struct SettingsView: View {
+@@ -126,6 +130,14 @@ struct SettingsView: View {
                      .listRowBackground(Desk.card)
                  }
                  Section("Performance") {
@@ -6240,11 +6284,14 @@ index e1693b0..8526008 100644
                      LabeledContent("Host chip", value: HostScheduling.chip)
                      LabeledContent("Host CPU layout", value: HostScheduling.layout)
                      Text("\(HostScheduling.model) · \(HostScheduling.layoutSource). iOS decides which physical core runs a thread.")
-@@ -150,12 +161,15 @@ struct SettingsView: View {
+@@ -150,12 +162,18 @@ struct SettingsView: View {
                      }
                      .pickerStyle(.segmented)
                      Toggle("Thermal display protection", isOn: $thermalProtection)
 +                    Toggle("Match Low Power Mode", isOn: $lowPowerAware)
++                    Toggle("60 Hz Mac in Low Power Mode (next start)",isOn:$lowPowerGuestRefresh)
++                    Text("Optional: when Low Power Mode is on at startup, a requested 120 Hz Mac starts at 60 Hz to avoid guest animation work that the display cannot show. Turn Low Power Mode off and restart to restore 120 Hz. This is an explicit refresh trade-off, never a Retina resolution reduction.")
++                        .font(.footnote).foregroundStyle(.secondary)
 +                    Text("Aligns display presentation with the system’s 60 Hz Low Power Mode limit. Turning Low Power Mode off restores your selected presentation policy. Retina, guest CPU count and the saved 60/120 Hz Mac preference stay unchanged.")
 +                        .font(.footnote).foregroundStyle(.secondary)
                      Picker("Presentation limit", selection: $presentationCap) {
@@ -6257,7 +6304,7 @@ index e1693b0..8526008 100644
                          .font(.footnote).foregroundStyle(.secondary)
                      Toggle("Faster disk writes", isOn: $fastFlush)
                      Toggle("Quicker wake from idle", isOn: $wfiSpin)
-@@ -168,6 +182,9 @@ struct SettingsView: View {
+@@ -168,6 +186,9 @@ struct SettingsView: View {
                      Toggle("Superblocks (experimental)", isOn: $superblocks)
                      Text("Continues translated code through conditional branches within the same page, bounded to 48 instructions at a conditional exit. May reduce dispatch work but increase code-cache pressure. Off by default; performance on your device is unverified. Applies to a new Mac session.")
                          .font(.footnote).foregroundStyle(.secondary)
@@ -6267,7 +6314,7 @@ index e1693b0..8526008 100644
                      Picker("Code cache", selection: $codeCacheMB) {
                          Text("512 MB").tag(512)
                          Text("1 GB").tag(1024)
-@@ -182,7 +199,7 @@ struct SettingsView: View {
+@@ -182,7 +203,7 @@ struct SettingsView: View {
                  Section("Background execution") {
                      LabeledContent("Background GPU capability", value: BackgroundExecutionStatus.gpuSupport)
                      LabeledContent("Signed GPU entitlement", value: BackgroundExecutionStatus.signedGPUAccess)
@@ -6276,7 +6323,7 @@ index e1693b0..8526008 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  .listRowBackground(Desk.card)
-@@ -194,13 +211,13 @@ struct SettingsView: View {
+@@ -194,13 +215,13 @@ struct SettingsView: View {
                  .listRowBackground(Desk.card)
                  Section("Instant Resume") {
                      Toggle("Resume where you left off", isOn: $instantResume)
@@ -7740,7 +7787,7 @@ index 553c4b6..64d0cb9 100644
 + puts("iOS profiler lifecycle: off/on/off/on, port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
  }
 diff --git a/tests/test_pvg_lifecycle.m b/tests/test_pvg_lifecycle.m
-index 81cdb83..c388829 100644
+index 81cdb83..5b1f7e9 100644
 --- a/tests/test_pvg_lifecycle.m
 +++ b/tests/test_pvg_lifecycle.m
 @@ -1,9 +1,15 @@
@@ -7799,7 +7846,7 @@ index 81cdb83..c388829 100644
  int main(void) {
      alarm(30);
      for (int cycle = 0; cycle < 6; cycle++) @autoreleasepool {
-@@ -27,12 +66,45 @@ int main(void) {
+@@ -27,12 +66,50 @@ int main(void) {
              cmd[0] = 0x43; cmd[1] = 24; cmd[2] = i + 1;
              hv_pvg_metal_submit(metal, board.pvg, 0, cmd, 24);
          }
@@ -7838,6 +7885,11 @@ index 81cdb83..c388829 100644
 +        free(saved); free(readback);
          hv_pvg_metal_cursor_moved(metal);
          hv_pvg_metal_set_layer(metal, NULL);
++        /* Real GPU queue fence before freezing. Destruction in CPU mode must
++           release resources without submitting another background fence. */
++        hv_pvg_metal_set_display_paused(metal,1);
++        hv_pvg_lite_set_cpu_background(board.pvg,1);
++        assert(hv_pvg_metal_background_fence(metal)==0);
          hv_pvg_metal_destroy(metal);
          hv_vmapple_destroy(&board);
          hv_machine_free(&machine);

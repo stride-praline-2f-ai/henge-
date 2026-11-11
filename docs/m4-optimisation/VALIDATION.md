@@ -46,3 +46,8 @@ Compare new/old source with equal workload, Retina, refresh, brightness and
 instrumentation; vary CPU/RAM/JIT separately. iOS owns clock/core/thermal policy.
 Actual runner registration needs user credentials in the guest; standard signing
 has no guaranteed background GPU grant, and PiP does not provide one.
+
+
+## Controls/power checkpoint
+Run43118728860 passed native regressions, CPU-only runner pause/continue/save-refusal/foreground restoration, xHCI descriptor/IN transfers/coalescing/releases/ownership, production PVG ring gating/drain, ASan/UBSan and existing concurrency/graphics checks. Superseded before app compile by source cfb3d0d / run43119690219. This is partial evidence, not final release validation. Current later source also serializes runner transitions through InstantResume and adds real frozen-renderer destruction coverage; requires a fresh full source run.
+Physical-only: iOS continued CPU grant/expiration, real macOS graphics-driver backpressure during Xcode, controller/GameController/Roblox recognition, multi-device gestures and actual LPM thermal/FPS comparisons. No physical test or temperature/power result claimed.
