@@ -1,47 +1,48 @@
-# Validation
+# Final cloud validation
 
-Passed locally: production scheduling policy/detection regression compiled with
-GCC, AddressSanitizer and UndefinedBehaviorSanitizer; concurrent metadata reads,
-M4 high-memory/low-memory/simulator/fallback selection and existing Duo policy.
-This Linux result does not validate Apple QoS or physical core placement.
-Resource-budget production policy also passed ASan/UBSan for dynamic headroom,
-pressure precedence, exact thresholds and recovery.
+https://github.com/stride-praline-2f-ai/henge-/actions/runs/43110959717
+Source `61fd5508a2431cce317546f46ae8acddf080c097`; cumulative patch `c847738eb8dd9433b25c6b13b9eeea6162ec8328f1dd3875e7d3659d6ddad191`.
 
-Pending: ARM64 `test_mmu` coalesced read-span/PAN/remap boundaries, all native
-lifecycle/snapshot regressions, native Metal detached-presentation regression,
-Swift/profile/default tests and complete iPhoneOS app compilation.
+Passed: native JIT/MMU/scalar/pair/vector/atomic/grouped tests; translation
+publication/invalidation/cache-exhaustion barriers;64 deterministic CPU
+acknowledgement notification races; VM creation/failure/stop/restart and repeated
+pause/save/continue/restore; corrupt/incompatible/changed-disk/failed-save checks;
+disk/audio/network/DNS lifetimes; both display snapshot ports and real queued
+Metal completions; cache trim/live ownership; display-pulse queue/generation/scene
+checks;4000 concurrent clipboard updates; Swift wait/signal/timer/cancellation
+races; native-touch stale task ownership; M4 detection/defaults/Retina selection;
+Link protocol/visibility/codec/input; ASan/UBSan and concurrency diagnostics;
+production Swift/iPhoneOS Metal SDK checks; full iPhoneOS Release app compilation.
+Restore archive error propagation has a production-block regression. Dependency
+cache keys include actual source/script/toolchain identity. IPA checks remain a
+required final pipeline stage, never inferred from compilation alone.
 
-Cloud infrastructure inherited five queued validation runs with no assigned
-jobs; Actions cancellation and self-hosted inventory API calls returned 403.
-Both original workflows retain shared cancellation. Do not claim a runnable
-self-hosted Mac or launch packaging while unavailable.
+## Measured component results
 
-Physical M4 comparisons: fixed workload, same Retina/refresh; compare 2/4/6/8
-vCPUs and 6/8/10/12GB guest RAM separately, then 1GB/1.5GB JIT. Record sustained
-task time, frame-time behaviour, process footprint/headroom and thermal category.
-No whole-app speed, temperature, energy, battery or gaming gain is yet measured.
+Reference run43108150736, ARM64 cloud Mac, six sample medians:
 
-Update: cloud 43104343753 assigned a GitHub-hosted ARM64 Xcode27 runner.
-JIT/MMU/superblocks, lifecycle/snapshots, concurrency/Metal diagnostics and actual
-Swift/iPhoneOS typecheck passed. Failure was benchmark fixture patch drift,
-now repaired; full app compilation remains pending. Existing self-hosted runner
-mode remains supported but its availability is not established.
-Local clipboard ASan/UBSan regression passed 4000 concurrent publications.
-Display-pulse controlled-queue regression and explicit iPhoneOS Metal syntax
-check are new and pending; do not infer a green M4 release from prior checks.
+| Complete helper operation | Before | After |
+| --- | ---: | ---: |
+| Small RAM read |12.3455ns|7.9685ns|
+|12KB RAM read |221.7045ns|194.52ns|
 
-Green checkpoint: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43106141682
-Source 6edf085a07b5df5164e5e35687f87087b82fe535, cumulative patch
-6221e972bbd2dc01ec224fac70240830513c400e6db63a84f712366bd9381f35.
-Native JIT/MMU, memory helpers, lifecycle/snapshots, display-pulse queue fixture,
-clipboard concurrency, Metal/resource tests, Link/input/native checks, sanitizers,
-actual iPhoneOS presenter syntax, production Swift typecheck and complete Release
-app compile all passed. Packaging was skipped as required.
-The newer event-driven session/boot-display waits, explicit M4 preset, optional
-input ownership and repeated glyph reuse need the next exact-source checkpoint.
+The reference patches restore the old cache/emitter/helper path; this does not
+isolate coalescing alone. This is not physical M4 energy or whole-app FPS.
+Multiwindow cache and grouped-access benefits vary by memory/code shape; they
+remain explicit experiments.4 CPUs and8GB are a retained safe baseline, not an
+invented hardware optimum.1/1.5GB JIT and6/8/10/12GB RAM comparisons remain available.
 
-Checkpoint43108150736, sourcea57898b084e54f10527793a237985d41858c3549:
-all native/sanitizer checks, new wait and M4 preset tests,64-source production
-Swift SDK typecheck and complete iPhoneOS app compile passed. No IPA packaged.
-The final restore-archive error-propagation change is newer and needs validation;
-local production-block success/failure regression passed.
+## Physical limits
+
+No cloud test measured watts, exact temperature, sustained Roblox/Safari FPS or
+real Magic Keyboard/Pencil/external display experience. The new Duo capture was
+an older0.3.0(101) binary: Normal/Warm thermal categories, roughly3.3–3.9 aggregate
+CPU equivalents near the end, two sessions with different experiment settings,
+and no Low Power Mode transition timestamp. Its reported cooling is a valuable
+power-policy clue, not proof that guest workload is irrelevant or game FPS equal.
+New logs record launch/power-state transitions without a polling timer.
+
+Compare new/old source with equal workload, Retina, refresh, brightness and
+instrumentation; vary CPU/RAM/JIT separately. iOS owns clock/core/thermal policy.
+Actual runner registration needs user credentials in the guest; standard signing
+has no guaranteed background GPU grant, and PiP does not provide one.
