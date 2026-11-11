@@ -19,6 +19,9 @@ with zipfile.ZipFile(ipa) as z:
     plist=plistlib.loads(z.read("Payload/Henge.app/Info.plist"))
 assert plist.get("HengeAuditRepairsSHA256")==manifest["audit_repairs_sha256"], "Incorrect audit repairs"
 assert plist.get("HengeSnapshotSchema")==3, "Incorrect snapshot schema"
+sdk=plist.get('DTSDKName', '')
+assert sdk.startswith('iphoneos') and tuple(int(x) for x in sdk[8:].split('.')) >= (27, 1), 'Duo fullscreen requires iOS 27.1+ SDK'
+
 with zipfile.ZipFile(ipa) as z:
     assert b"hv_snapshot_test_fail_after" not in z.read("Payload/Henge.app/Henge"), "Test-only failure hook in release"
 assert plist.get("HengeMergedUpstreamCommit")==integration["main_sha"], "Incorrect upstream source"
@@ -70,5 +73,12 @@ data["upstream_integration"]={
   "ipa_sha256": hashlib.sha256(ipa.read_bytes()).hexdigest(),
   "device_thermal_or_battery_gain_verified": False
 }
+state['workstreams'][-1].update(state='verified', changes=['Final integrated device IPA archive inspected'],
+    evidence=['Actions run ' + os.environ['GITHUB_RUN_ID'], 'Source ' + os.environ['GITHUB_SHA'],
+              'arm64 iOS platform, bundle metadata, nested signatures, entitlement values and cumulative patch markers verified'])
+state['final_artifact'] = dict(source_commit=os.environ['GITHUB_SHA'], run_id=int(os.environ['GITHUB_RUN_ID']),
+    ipa_sha256=data['upstream_integration']['ipa_sha256'], filename=ipa.name)
+state['release_requested'] = False
+(ipa.parent / 'Henge-optimization-completion.json').write_text(json.dumps(state,indent=2)+'\n')
 result.write_text(json.dumps(data,indent=2)+"\n")
 print("Verified packaged source markers:",integration["main_sha"],integration["pull_requests"])

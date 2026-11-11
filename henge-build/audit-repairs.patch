@@ -1185,7 +1185,7 @@ index cf4acc4..9961c12 100644
  /* Any thread: a Magic Trackpad 2 touch. phase: 0 down, 1 move, 2 up. id: a
 diff --git a/docs/optimization-integration.md b/docs/optimization-integration.md
 new file mode 100644
-index 0000000..42bbc58
+index 0000000..7c5b2e2
 --- /dev/null
 +++ b/docs/optimization-integration.md
 @@ -0,0 +1,68 @@
@@ -1206,7 +1206,7 @@ index 0000000..42bbc58
 +| Graphics presentation | Existing dirty-event presenter, bounded drawable retry and newest-frame coalescing. Exact duplicate cursor state is suppressed before scheduling work; guest swaps remain authoritative. |
 +| Retina/cursor policy | One atomic preferences/thermal word, updated by notifications. Physical layer scale and window identity survive reparenting. No per-frame defaults reads or periodic preferences timer. |
 +| Display lifecycle | DisplayRouter owns target selection. Fold/rotation refreshes coalesce; monitor disconnects and target replacement remain immediate. Snapshot restore preserves both display ports. |
-+| Link capture | Existing decoder-consumption credit window remains authoritative. Visibility epochs reject hidden and stale capture/encode work; return requests the latest secondary frame without changing guest monitor geometry. |
++| Link capture | Existing decoder-consumption credit window remains authoritative. Protocol-2 ready capabilities negotiate optional visibility messages for older-peer compatibility. Visibility epochs reject hidden and stale capture/encode work; return requests the latest secondary frame without changing guest monitor geometry. |
 +| Thermal policy | Existing explicit presentation cap plus opt-in thermal protection consume the coherent settings word. No implicit guest resolution, Retina, refresh-rate or vCPU reduction. |
 +| Pressure recovery | UI memory warnings queue trimming on the renderer/Link owners. Release library-cache ownership, cached texture wrappers and excess pixel buffers; live resources remain owned. |
 +| Pause/save/resume | Native bridge serialises lifecycle; CPU save halt, ticker cancellation, disk/audio/GPU quiescence, both displays and virtual-counter freezing use the existing repaired snapshot path. Atomic saves reject incompatible native layouts and changed disk identities. |
@@ -1913,18 +1913,24 @@ index 037685f..d91a56f 100644
          log("boot", "cache lifecycle: JIT translations and kernel read lookups are RAM-only; no cross-launch executable cache")
          if let source = info["HengeCustomSourceCommit"] as? String {
 diff --git a/ios/Henge/Link/LinkProtocol.swift b/ios/Henge/Link/LinkProtocol.swift
-index 94231b2..fa18a3b 100644
+index 94231b2..427317d 100644
 --- a/ios/Henge/Link/LinkProtocol.swift
 +++ b/ios/Henge/Link/LinkProtocol.swift
-@@ -23,6 +23,7 @@ struct LinkControl: Codable {
+@@ -23,14 +23,21 @@ struct LinkControl: Codable {
      var mode: LinkMode? = nil
      var x: Int? = nil, y: Int? = nil, code: Int? = nil, down: Bool? = nil
      var sequence: UInt64? = nil
 +    var visible: Bool? = nil
++    var capabilities: [String]? = nil
++    var supportsViewerVisibility: Bool { type == "ready" && capabilities?.contains("viewerVisibility") == true }
      func validate() throws {
          guard version == Self.currentVersion else { throw LinkError.invalid("Update Henge on both devices: different Link protocol version") }
++        if let capabilities, capabilities.count > 8 || capabilities.contains(where: { $0.utf8.count > 64 }) {
++            throw LinkError.invalid("Invalid capability list")
++        }
          switch type {
-@@ -31,6 +32,7 @@ struct LinkControl: Codable {
+         case "hello", "ready": guard let mode else { throw LinkError.invalid("Missing display mode") }; try mode.validate()
+         case "move", "scroll": guard let x, let y, (-4096...4096).contains(x), (-4096...4096).contains(y) else { throw LinkError.invalid("Invalid pointer delta") }
          case "button": guard let code, (0...2).contains(code), down != nil else { throw LinkError.invalid("Invalid button") }
          case "key": guard let code, (4...231).contains(code), down != nil else { throw LinkError.invalid("Invalid HID key") }
          case "videoAck": guard let sequence, sequence > 0 else { throw LinkError.invalid("Invalid video acknowledgement") }
@@ -1933,10 +1939,17 @@ index 94231b2..fa18a3b 100644
          default: throw LinkError.invalid("Unknown control message")
          }
 diff --git a/ios/Henge/Link/LinkService.swift b/ios/Henge/Link/LinkService.swift
-index 07cd331..ecdb133 100644
+index 07cd331..a36f9d9 100644
 --- a/ios/Henge/Link/LinkService.swift
 +++ b/ios/Henge/Link/LinkService.swift
-@@ -74,6 +74,12 @@ final class LinkHostService: ObservableObject {
+@@ -68,12 +68,18 @@ final class LinkHostService: ObservableObject {
+                 })
+                 encoder = created; mode = proposed
+                 transport.onVideoAcknowledged = { [weak created] sequence in created?.acknowledge(sequence) }
+-                transport.sendControl(LinkControl(type: "ready", mode: proposed))
++                transport.sendControl(LinkControl(type: "ready", mode: proposed, capabilities: ["viewerVisibility"]))
+                 status = "Duo ready: \(proposed.width) × \(proposed.height), \(proposed.hz) Hz. Start this Mac."
+                 HengeLog.log("link", "peer authenticated; native mode=\(proposed.width)x\(proposed.height) hz=\(proposed.hz); primary mode unchanged")
              } catch { status = error.localizedDescription; HengeLog.log("link", status); stopKeepingStatus() }
              return
          }
@@ -1957,6 +1970,41 @@ index 07cd331..ecdb133 100644
      private func stopKeepingStatus() {
          token = UUID(); releaseInput()
          hv_pvg_link_set_frame_handler(nil)
+@@ -139,6 +146,7 @@ final class LinkViewerService: ObservableObject {
+     private let decodeWorker = LinkDecodeWorker(report: { HengeLog.log("link-viewer", $0) })
+     private var generation = UUID()
+     private var mode: LinkMode?
++    private var hostReady: LinkControl?
+     // A single replaceable output, owned by the view. No array of decoded frames.
+     var onPixel: ((CVPixelBuffer) -> Void)?
+     func connect(host: String, port: UInt16, key: String, wired: Bool, mode: LinkMode, peer: LinkDiscoveredPeer? = nil, remember: Bool = false) {
+@@ -165,7 +173,7 @@ final class LinkViewerService: ObservableObject {
+             guard let self else { return }
+             if packet.kind == 1, let command = try? JSONDecoder().decode(LinkControl.self, from: packet.payload), command.type == "ready", command.mode == mode {
+                 Task { @MainActor in
+-                    guard self.generation == g else { return }; self.ready = true
++                    guard self.generation == g else { return }; self.hostReady = command; self.ready = true
+                     self.status = "Connected. Start macOS on the iPad; waiting for the second desktop."
+                     if remember, let peer {
+                         do { try LinkPairingStore.shared.save("viewer", value: LinkSavedPeer(name: peer.name, key: key.trimmingCharacters(in: .whitespacesAndNewlines), wired: wired)) }
+@@ -187,9 +195,15 @@ final class LinkViewerService: ObservableObject {
+         if let peer { transport.connect(peer: peer, key: secret, wired: wired) }
+         else { transport.connect(host: host.trimmingCharacters(in: .whitespacesAndNewlines), key: secret, wired: wired, port: port) }
+     }
+-    func send(_ control: LinkControl) { guard ready else { return }; transport.sendControl(control) }
++    func send(_ control: LinkControl) {
++        guard ready else { return }
++        // Protocol-2 hosts validate known message types strictly. Send the
++        // optional control only after their ready reply advertises support.
++        if control.type == "visibility", hostReady?.supportsViewerVisibility != true { return }
++        transport.sendControl(control)
++    }
+     func disconnect() {
+-        generation = UUID(); ready = false; transport.onPacket = nil; transport.onStatus = nil; transport.stop(); transport = LinkTransport()
++        generation = UUID(); ready = false; hostReady = nil; transport.onPacket = nil; transport.onStatus = nil; transport.stop(); transport = LinkTransport()
+         decodeWorker.stop(); mode = nil
+     }
+ }
 diff --git a/ios/Henge/Link/LinkVideo.swift b/ios/Henge/Link/LinkVideo.swift
 index f49ac55..a062560 100644
 --- a/ios/Henge/Link/LinkVideo.swift
@@ -3098,10 +3146,27 @@ index 2b1be58..2ae07ab 100644
      puts("native WFI integration: guest timer resumes code, activity callback runs at entry/resume, CPU parks on exit");
  }
 diff --git a/tests/test_link.swift b/tests/test_link.swift
-index 1ac8d90..2f52570 100644
+index 1ac8d90..fa2ccdf 100644
 --- a/tests/test_link.swift
 +++ b/tests/test_link.swift
-@@ -191,6 +191,12 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -24,6 +24,16 @@ func mustReject(_ operation: () throws -> Void) {
+     static func checks() throws {
+         let mode = LinkMode(width: 320, height: 240, widthMM: 70, heightMM: 52, hz: 60)
+         try mode.validate()
++        let legacyReady = try JSONDecoder().decode(LinkControl.self, from: JSONEncoder().encode(LinkControl(type: "ready", mode: mode)))
++        require(!legacyReady.supportsViewerVisibility, "Legacy protocol-2 host must not receive optional visibility messages")
++        let negotiated = try JSONDecoder().decode(LinkControl.self, from: JSONEncoder().encode(LinkControl(type: "ready", mode: mode, capabilities: ["viewerVisibility"])))
++        require(negotiated.supportsViewerVisibility, "New host must advertise visibility support")
++        struct LegacyReady: Decodable { let version:Int; let type:String; let mode:LinkMode }
++        let oldViewer = try JSONDecoder().decode(LegacyReady.self, from: JSONEncoder().encode(negotiated))
++        require(oldViewer.version == 2 && oldViewer.mode == mode, "Optional ready capabilities must preserve older viewers")
++        mustReject { try LinkControl(type: "ready", mode: mode, capabilities: Array(repeating:"x",count:9)).validate() }
++        mustReject { try LinkControl(type: "visibility").validate() }
++        try LinkControl(type: "visibility", visible:false).validate()
+         try LinkControl(type: "release").validate()
+         try LinkControl(type: "videoAck", sequence: 1).validate()
+         mustReject { try LinkControl(type: "videoAck", sequence: 0).validate() }
+@@ -191,6 +201,12 @@ func mustReject(_ operation: () throws -> Void) {
          var pixels = [UInt8](repeating: 0, count: mode.width * mode.height * 4)
          for i in stride(from: 0, to: pixels.count, by: 4) { pixels[i+2] = 255; pixels[i+3] = 255 }
          texture.replace(region: MTLRegionMake2D(0, 0, mode.width, mode.height), mipmapLevel: 0, withBytes: &pixels, bytesPerRow: mode.width * 4)
