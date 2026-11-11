@@ -6798,6 +6798,51 @@ index 0000000..5e76514
 +         } else {
 +             for (uint32_t off = 0; off < chunk && !rc; off += 8) { /* MMIO: at most 8 bytes at a time */
 +                 uint32_t piece = chunk - off < 8 ? chunk - off : 8;
+diff --git a/tests/link_control_service_fixture.c b/tests/link_control_service_fixture.c
+new file mode 100644
+index 0000000..631ad4f
+--- /dev/null
++++ b/tests/link_control_service_fixture.c
+@@ -0,0 +1,26 @@
++/* Native input/GPU boundary spy only. The production host/client services,
++   schema, TLS transport, pairing and decode worker execute without a VM. */
++#include "link_control_service_fixture.h"
++#include <stdatomic.h>
++static _Atomic unsigned keys,releases,video,displays,held;
++static _Atomic int cpu_background;
++int henge_vm_state(void){return 1;}
++int henge_vm_cpu_background(void){return atomic_load(&cpu_background);}
++void henge_vm_mouse_move(int dx,int dy){(void)dx;(void)dy;}
++void henge_vm_mouse_scroll(int dx,int dy){(void)dx;(void)dy;}
++void henge_vm_input_key(unsigned source,uint8_t usage,int down){
++    (void)usage;if(source==1){atomic_fetch_add(&keys,1);atomic_store(&held,!!down);}
++}
++void henge_vm_input_button(unsigned source,int button,int down){(void)source;(void)button;(void)down;}
++void henge_vm_input_release(unsigned source){if(source==1){atomic_store(&held,0);atomic_fetch_add(&releases,1);}}
++void henge_vm_link_connected(int connected){(void)connected;}
++int henge_vm_set_link_display(uint32_t w,uint32_t h,uint32_t wm,uint32_t hm,uint32_t hz){
++    (void)w;(void)h;(void)wm;(void)hm;(void)hz;atomic_fetch_add(&displays,1);return 0;
++}
++void hv_pvg_link_set_frame_handler(HvPvgLinkFrameHandler handler){if(handler)atomic_fetch_add(&video,1);}
++unsigned test_control_keys(void){return atomic_load(&keys);}
++unsigned test_control_releases(void){return atomic_load(&releases);}
++unsigned test_control_video(void){return atomic_load(&video);}
++unsigned test_control_displays(void){return atomic_load(&displays);}
++unsigned test_control_held(void){return atomic_load(&held);}
++void test_control_cpu_background(int enabled){atomic_store(&cpu_background,!!enabled);}
+diff --git a/tests/link_control_service_fixture.h b/tests/link_control_service_fixture.h
+new file mode 100644
+index 0000000..0b2b481
+--- /dev/null
++++ b/tests/link_control_service_fixture.h
+@@ -0,0 +1,7 @@
++#include "link_bridge_fixture.h"
++unsigned test_control_keys(void);
++unsigned test_control_releases(void);
++unsigned test_control_video(void);
++unsigned test_control_displays(void);
++unsigned test_control_held(void);
++void test_control_cpu_background(int enabled);
 diff --git a/tests/mem_programs.S b/tests/mem_programs.S
 index bcbed3f..2b4c47a 100644
 --- a/tests/mem_programs.S
@@ -7692,6 +7737,85 @@ index 1ac8d90..0ef4da9 100644
          encoder.capture(texture: texture, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero)
          waitFrame()
          expected = 1
+diff --git a/tests/test_link_control_services.py b/tests/test_link_control_services.py
+new file mode 100644
+index 0000000..752feee
+--- /dev/null
++++ b/tests/test_link_control_services.py
+@@ -0,0 +1,15 @@
++"""Run actual production Link service class bodies on macOS over real TLS.
++Only unused UIKit import is removed; native VM/gamepad sink is a boundary spy.
++"""
++from pathlib import Path
++import subprocess
++root=Path(__file__).resolve().parents[1]
++out=root/'build/link';out.mkdir(parents=True,exist_ok=True)
++source=(root/'ios/Henge/Link/LinkService.swift').read_text()
++assert source.count('import UIKit\n')==1
++adapted=out/'LinkServiceMac.swift'
++adapted.write_text(source.replace('import UIKit\n',''))
++subprocess.run(['xcrun','--sdk','macosx','clang','-fblocks','-std=c11','-Wall','-Wextra','-Werror','-Itests','-c','tests/link_control_service_fixture.c','-o',str(out/'control_fixture.o')],cwd=root,check=True)
++files=['ios/Henge/Controls/GamepadState.swift']+[f'ios/Henge/Link/{name}.swift' for name in ['LinkProtocol','LinkPairing','LinkTransport','LinkVideo','LinkFlowControl','LinkDecodeWorker']]
++subprocess.run(['swiftc','-parse-as-library','-swift-version','5','-import-objc-header','tests/link_control_service_fixture.h',*files,str(adapted),'tests/test_link_control_services.swift',str(out/'control_fixture.o'),'-framework','Network','-framework','Security','-framework','Metal','-framework','CoreMedia','-framework','CoreVideo','-framework','VideoToolbox','-o',str(out/'control_services')],cwd=root,check=True)
++subprocess.run([str(out/'control_services')],cwd=root,check=True,timeout=50)
+diff --git a/tests/test_link_control_services.swift b/tests/test_link_control_services.swift
+new file mode 100644
+index 0000000..1c15d2a
+--- /dev/null
++++ b/tests/test_link_control_services.swift
+@@ -0,0 +1,52 @@
++import Foundation
++import Darwin
++
++enum HengeLog { static func log(_ tag:String,_ message:String) { print("\(tag): \(message)") } }
++@MainActor final class GamepadHub {
++    static let shared = GamepadHub()
++    var keyboardMapping = false
++    var last = GamepadState.off
++    func set(_ state:GamepadState,remote:Bool = false) { precondition(remote); last = state }
++}
++@main @MainActor struct ControlServiceChecks {
++    static func wait(_ description:String,_ predicate:() -> Bool) async {
++        let deadline = ProcessInfo.processInfo.systemUptime+15
++        while !predicate() {
++            precondition(ProcessInfo.processInfo.systemUptime<deadline,description)
++            try? await Task.sleep(nanoseconds:10_000_000)
++        }
++    }
++    static func main() async {
++        setbuf(stdout,nil); alarm(45)
++        let host = LinkHostService.shared, viewer = LinkViewerService()
++        host.listen(wired:false)
++        await wait("listener never opened") { host.port != nil }
++        var pixels = 0; viewer.onPixel = { _ in pixels += 1 }
++        let mode = LinkMode(width:320,height:240,widthMM:70,heightMM:52,hz:60)
++        viewer.connect(host:"127.0.0.1",port:host.port!,key:host.key,wired:false,mode:mode,inputOnly:true)
++        await wait("production controls-only handshake failed") { viewer.ready && host.controlOnly }
++        precondition(host.mode==nil && !host.active && !host.canStart)
++        precondition(test_control_video()==0 && test_control_displays()==0 && pixels==0)
++        let beforeKeys = test_control_keys()
++        viewer.send(LinkControl(type:"key",code:26,down:true))
++        viewer.send(LinkControl(type:"gamepad",gamepad:GamepadState(buttons:1,lx:15000)))
++        await wait("owned remote key/gamepad not delivered") { test_control_keys()>beforeKeys && GamepadHub.shared.last.buttons==1 }
++        precondition(test_control_held()==1 && GamepadHub.shared.last.lx==15000)
++        viewer.keyboardMapping = true
++        await wait("host mapping preference not applied") { GamepadHub.shared.keyboardMapping }
++        test_control_cpu_background(1)
++        let gated = test_control_keys(), released = test_control_releases()
++        viewer.send(LinkControl(type:"key",code:27,down:true))
++        viewer.send(LinkControl(type:"release")) // ordered barrier, not a timing sleep
++        await wait("CPU-mode release was suppressed") { test_control_releases()>released }
++        precondition(test_control_keys()==gated && test_control_held()==0 && !GamepadHub.shared.last.connected)
++        test_control_cpu_background(0)
++        viewer.send(LinkControl(type:"key",code:26,down:true))
++        await wait("foreground input did not return") { test_control_held()==1 }
++        viewer.disconnect()
++        await wait("disconnect did not release owned input") { !host.connected && test_control_held()==0 && !GamepadHub.shared.last.connected }
++        host.stop(); precondition(test_control_video()==0 && test_control_displays()==0 && pixels==0)
++        alarm(0)
++        print("PASS production controls-only host/client over real TLS: negotiation, owned keyboard/gamepad, mapping, CPU gate, releases, disconnect; no video handler, display mode or decoded pixels")
++    }
++}
 diff --git a/tests/test_m4_defaults.swift b/tests/test_m4_defaults.swift
 new file mode 100644
 index 0000000..70a5fc1
@@ -9349,10 +9473,10 @@ index 0000000..1df55f8
 +}
 +@end
 diff --git a/tools/link/check.sh b/tools/link/check.sh
-index c88ebe4..aeafc2f 100755
+index c88ebe4..00251c5 100755
 --- a/tools/link/check.sh
 +++ b/tools/link/check.sh
-@@ -7,13 +7,14 @@ build/link/test_pvg_display
+@@ -7,13 +7,16 @@ build/link/test_pvg_display
  make build/pvg_lite.o build/pvg_metal.o
  python3 tests/test_surface_sync.py
  python3 tests/test_surface_hash_limit.py
@@ -9369,3 +9493,5 @@ index c88ebe4..aeafc2f 100755
 -xcrun --sdk iphoneos swiftc -typecheck -swift-version 5 -target arm64-apple-ios17.0 -sdk "$SDK" -import-objc-header tests/link_bridge_fixture.h ios/Henge/Link/*.swift tests/link_ui_fixture.swift
 +xcrun --sdk iphoneos swiftc -typecheck -swift-version 5 -target arm64-apple-ios17.0 -sdk "$SDK" -import-objc-header tests/link_bridge_fixture.h ios/Henge/Controls/*.swift ios/Henge/Link/*.swift tests/link_ui_fixture.swift
  build/link/test_link build/link/screen.metallib
++
++python3 tests/test_link_control_services.py
