@@ -283,7 +283,7 @@ index 5244f5e..93eba61 100644
 +$(B)/test_fastmem_bench: tests/test_fastmem_bench.c $(ENGINE)
 +	$(CC) $(CFLAGS) tests/test_fastmem_bench.c $(ENGINE) -o $@
 diff --git a/core/cpu.h b/core/cpu.h
-index c27ac6c..5d5c7f7 100644
+index c27ac6c..c54a576 100644
 --- a/core/cpu.h
 +++ b/core/cpu.h
 @@ -90,13 +90,25 @@ typedef struct HvCpu {
@@ -303,7 +303,7 @@ index c27ac6c..5d5c7f7 100644
 +       Kept in existing padding so the TLB and assembly offsets stay fixed. */
 +    uint64_t fm_attempts;     /* 0x518: eligible inline lookup attempts */
 +    uint64_t fm_hits;         /* 0x520: lookups that supplied the actual load address */
-+    uint64_t fm_misses[4];    /* 0x528: unavailable, empty, tag/page-end mismatch, reserved */
++    uint64_t fm_misses[4];    /* 0x528: nonkernel, unavailable, empty/tag/page-end mismatch, reserved */
 +    /* Plain EL1 register reads fit in one generated load. Upstream c7f4279
 +       used 0x4e8/0x4f0; those slots hold this fork's fastmem pointers. Use
 +       remaining padding instead, preserving every TLB/assembly/LUT offset. */
@@ -753,7 +753,7 @@ index 0000000..d373d12
 +#endif
 diff --git a/core/fastmem_log.c b/core/fastmem_log.c
 new file mode 100644
-index 0000000..5282713
+index 0000000..a41d6d2
 --- /dev/null
 +++ b/core/fastmem_log.c
 @@ -0,0 +1,85 @@
@@ -835,7 +835,7 @@ index 0000000..5282713
 +        if (!hv_fastmem_snapshot(c, &fm)) { fprintf(out, "fastmem: cpu=%d unavailable; ordinary TLB fallback\n", i); continue; }
 +#define SNAP(x) ((unsigned long long)__atomic_load_n(&(x), __ATOMIC_RELAXED))
 +        unsigned long long attempts = SNAP(c->fm_attempts), hits = SNAP(c->fm_hits);
-+        fprintf(out, "fastmem: cpu=%d layout=tagged-multiwindow attempts=%llu hits=%llu hit_pct=%.2f fallback[unavailable=%llu empty=%llu tag_or_page_end=%llu reserved=%llu] fills=%llu full_clears=%llu range_drops=%llu list_full=%llu\n",
++        fprintf(out, "fastmem: cpu=%d layout=tagged-multiwindow attempts=%llu hits=%llu hit_pct=%.2f fallback[nonkernel=%llu unavailable=%llu empty_tag_or_page_end=%llu reserved=%llu] fills=%llu full_clears=%llu range_drops=%llu list_full=%llu\n",
 +                i, attempts, hits, attempts ? 100.0 * (double)hits / (double)attempts : 0.0,
 +                SNAP(c->fm_misses[0]), SNAP(c->fm_misses[1]), SNAP(c->fm_misses[2]), SNAP(c->fm_misses[3]),
 +                (unsigned long long)fm.fills, (unsigned long long)fm.clears, (unsigned long long)fm.drops, (unsigned long long)fm.saturated);
@@ -1420,7 +1420,7 @@ index 0963d4e..ed831ed 100644
  other:
      /* PAuth key registers (CRn 2, CRm 1..3): kept, never used, since signing is a no-op. */
 diff --git a/core/translate.c b/core/translate.c
-index 2084e98..08d4663 100644
+index 2084e98..cebfb7d 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -6,6 +6,7 @@
@@ -1455,7 +1455,7 @@ index 2084e98..08d4663 100644
  static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      HvMemOp op;
      if (hv_mem_decode(insn, &op) != 0) {
-@@ -1068,33 +1077,77 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1068,33 +1077,81 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      int el_idx = g_el;
      uint32_t slow = ~0u;
      if (!role) {
@@ -1468,13 +1468,17 @@ index 2084e98..08d4663 100644
 +        op.mode != HV_ADDR_PRE && op.mode != HV_ADDR_POST && op.bytes <= 8) {
 +        int diagnostics = e->m->fastmem_diagnostics;
 +        if (diagnostics) put_fastmem_count(e, T, HV_CPU_FM_ATTEMPTS);
++        // EL1 also accesses low user VAs. They can never enter this kernel
++        // LUT: skip its metadata entirely. With bit 63 set, an empty zero tag
++        // cannot match the full-width subtraction, so no post-load CBZ is needed.
++        fm_miss[fm_nmiss++] = e->n;
++        put(e, 0xb6000000u | 31u << 19 | (uint32_t)addr); // tbz addr,#63
 +        uint32_t ptr = HV_CPU_FM_READ + (el_idx - 1) * 8;
 +        put(e, LDR_X(U, 28, ptr));
-+        fm_miss[fm_nmiss++] = e->n; put(e, CBNZ_X(U) ^ (1u << 24)); /* cbz: disabled */
++        fm_miss[fm_nmiss++] = e->n; put(e, CBNZ_X(U) ^ (1u << 24));
 +        put(e, UBFM_X(T, addr, HV_TLB_PAGE_BITS, HV_FASTMEM_BITS - 1));
 +        put(e, ADD_LSL(T, U, T, 4));
-+        put(e, LDP_X(T, U, T, 0)); // exact tag and addend, no NZCV change
-+        fm_miss[fm_nmiss++] = e->n; put(e, CBNZ_X(T) ^ (1u << 24)); // empty
++        put(e, LDP_X(T, U, T, 0));
 +        put(e, SUB_X(T, addr, T));
 +        put(e, UBFM_X(T, T, HV_TLB_PAGE_BITS, 63));
 +        fm_miss[fm_nmiss++] = e->n; put(e, CBNZ_X(T)); // wrong page or page end
@@ -1545,7 +1549,7 @@ index 2084e98..08d4663 100644
      }
      /* Single loads and stores take [addr, addend] directly; the rest want the host address in A. */
      int reg_offset = op.kind == HV_MEM_SINGLE || op.kind == HV_MEM_LITERAL || op.kind == HV_MEM_LDRA;
-@@ -1441,10 +1494,10 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1441,10 +1498,10 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
      return 0;
  }
  
@@ -1560,7 +1564,7 @@ index 2084e98..08d4663 100644
     helper when they are off. */
  #define COMMPAGE_TIMEBASE_OFFSET 0xfffffc088ull
  #define COMMPAGE_TIMEBASE_TYPE   0xfffffc090ull
-@@ -1453,7 +1506,7 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
+@@ -1453,7 +1510,7 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
      if (type < 0) type = *(volatile uint8_t *)(uintptr_t)COMMPAGE_TIMEBASE_TYPE;
      if (type == 0) return 0; /* the kernel's own path: leave it to the helper */
      int rt = insn & 0x1f;
@@ -1569,7 +1573,7 @@ index 2084e98..08d4663 100644
      if (!(e->flags & HV_BLOCK_EL1)) {
          put(e, 0xb9400000u | (HV_CPU_EL0_CNT / 4) << 10 | 28 << 5 | 6); /* ldr w6, [x28, #el0_cnt] */
          put(e, 0x36000000u | (physical ? 0u : 1u) << 19 | 6);         /* tbz w6, #enable, helper (patched) */
-@@ -1461,6 +1514,10 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
+@@ -1461,6 +1518,10 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
      }
      uint32_t slow = e->nool - 1;
      int el0 = !(e->flags & HV_BLOCK_EL1);
@@ -1580,7 +1584,7 @@ index 2084e98..08d4663 100644
      int r = is_stolen(rt) ? 15 : rt;
      if (type == 1) put(e, 0xd5033fdfu);                                  /* isb; then CNTVCT_EL0 */
      put(e, (type == 1 ? 0xd53be040u : type == 2 ? 0xd53be0c0u : 0xd53cfac0u) | (uint32_t)r);
-@@ -1471,7 +1528,7 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
+@@ -1471,7 +1532,7 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
          put(e, LDR_X(6, 28, HV_CPU_CNTVOFF));
          put(e, SUB_X(r, r, 6));
      }
@@ -1589,7 +1593,7 @@ index 2084e98..08d4663 100644
      if (el0) e->ool[slow].join = e->n;
      return 1;
  }
-@@ -1523,12 +1580,21 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1523,12 +1584,21 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
          put_load_field(e, rt, off);
          return 1;
      }
@@ -1613,7 +1617,7 @@ index 2084e98..08d4663 100644
          if (!read || !el1) return 0;
          put_const_to(e, rt, (e->flags & HV_BLOCK_PAN) ? HV_PSTATE_PAN : 0);
          return 1;
-@@ -1775,11 +1841,13 @@ static void emit_ool(Emit *e) {
+@@ -1775,11 +1845,13 @@ static void emit_ool(Emit *e) {
          }
          uint32_t site_at = link_site(e, o->at);
          if (o->recheck) { /* the fast check refuses a page's last 15 bytes: check exactly, and go back if it fits */
@@ -1632,7 +1636,7 @@ index 2084e98..08d4663 100644
              put(e, B_OP);
              plink(e, e->n - 1, 1, o->at + 1, 0);
          }
-@@ -2021,6 +2089,7 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
+@@ -2021,6 +2093,7 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
  }
  
  uint32_t hv_translate_last_words(void) { return E.flat ? E.pool_at : E.nhot; } /* hot words (no pool) of this thread's last block */
@@ -1640,7 +1644,7 @@ index 2084e98..08d4663 100644
  
  /* A B, B.cond, CBZ or CBNZ now going off words away, if it reaches. 1 if it does. */
  int hv_branch_retarget(uint32_t *w, int64_t off) {
-@@ -2049,10 +2118,14 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
+@@ -2049,10 +2122,14 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
          if (want > m->jit.capacity) want = m->jit.capacity;
          if (want < (size_t)hot + cold) want = (size_t)hot + cold;
          uint32_t *p = hv_jit_reserve(&m->jit, want);
@@ -14325,7 +14329,7 @@ index 0000000..091433d
 +#endif
 diff --git a/tests/benchmark_fastmem.sh b/tests/benchmark_fastmem.sh
 new file mode 100755
-index 0000000..c0c06d6
+index 0000000..3b77608
 --- /dev/null
 +++ b/tests/benchmark_fastmem.sh
 @@ -0,0 +1,36 @@
@@ -14360,7 +14364,7 @@ index 0000000..c0c06d6
 +  values={}
 +  for mixed,enabled,ns in re.findall(r'mixed=(\d+) enabled=(\d+) ns_per_load=([\d.]+)',Path(f'build/fastmem-{version}-{split}.log').read_text()):
 +   values.setdefault((int(mixed),int(enabled)),[]).append(float(ns))
-+  assert all(len(v)==7 for v in values.values()) and len(values)==6
++  assert all(len(v)==7 for v in values.values()) and len(values)==8
 +  summary[f'{version}-split{split}']={f'multiwindow{m}-enabled{e}':statistics.median(v) for (m,e),v in values.items()}
 +print(json.dumps(summary,indent=2))
 +Path('build/fastmem-native-summary.json').write_text(json.dumps(summary,indent=2)+'\n')
@@ -14408,10 +14412,10 @@ index 0000000..668168f
 +#endif
 diff --git a/tests/fastmem-baseline.patch b/tests/fastmem-baseline.patch
 new file mode 100644
-index 0000000..c8a74f4
+index 0000000..9d4dcd8
 --- /dev/null
 +++ b/tests/fastmem-baseline.patch
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,250 @@
 +--- a/core/fastmem.c
 ++++ b/core/fastmem.c
 +@@ -4,17 +4,29 @@
@@ -14628,17 +14632,25 @@ index 0000000..c8a74f4
 + #define HV_FASTMEM_PAGES (HV_FASTMEM_SIZE >> HV_TLB_PAGE_BITS)
 +--- a/core/translate.c
 ++++ b/core/translate.c
-+@@ -1089,13 +1089,18 @@
++@@ -1086,20 +1086,21 @@
++         op.mode != HV_ADDR_PRE && op.mode != HV_ADDR_POST && op.bytes <= 8) {
++         int diagnostics = e->m->fastmem_diagnostics;
++         if (diagnostics) put_fastmem_count(e, T, HV_CPU_FM_ATTEMPTS);
++-        // EL1 also accesses low user VAs. They can never enter this kernel
++-        // LUT: skip its metadata entirely. With bit 63 set, an empty zero tag
++-        // cannot match the full-width subtraction, so no post-load CBZ is needed.
++-        fm_miss[fm_nmiss++] = e->n;
++-        put(e, 0xb6000000u | 31u << 19 | (uint32_t)addr); // tbz addr,#63
 +         uint32_t ptr = HV_CPU_FM_READ + (el_idx - 1) * 8;
 +         put(e, LDR_X(U, 28, ptr));
-+         fm_miss[fm_nmiss++] = e->n; put(e, CBNZ_X(U) ^ (1u << 24)); /* cbz: disabled */
++-        fm_miss[fm_nmiss++] = e->n; put(e, CBNZ_X(U) ^ (1u << 24));
 +-        put(e, UBFM_X(T, addr, HV_TLB_PAGE_BITS, HV_FASTMEM_BITS - 1));
 +-        put(e, ADD_LSL(T, U, T, 4));
-+-        put(e, LDP_X(T, U, T, 0)); // exact tag and addend, no NZCV change
-+-        fm_miss[fm_nmiss++] = e->n; put(e, CBNZ_X(T) ^ (1u << 24)); // empty
++-        put(e, LDP_X(T, U, T, 0));
 +-        put(e, SUB_X(T, addr, T));
 +-        put(e, UBFM_X(T, T, HV_TLB_PAGE_BITS, 63));
 +-        fm_miss[fm_nmiss++] = e->n; put(e, CBNZ_X(T)); // wrong page or page end
+++        fm_miss[fm_nmiss++] = e->n; put(e, CBNZ_X(U) ^ (1u << 24)); /* cbz: disabled */
 ++        put(e, LDR_X(U, 28, HV_CPU_FM_BASE));
 ++        put(e, SUB_X(U, addr, U));
 ++        put(e, UBFM_X(T, U, HV_FASTMEM_BITS, 63));
@@ -15761,10 +15773,10 @@ index 0000000..7901051
 +}
 diff --git a/tests/test_fastmem_bench.c b/tests/test_fastmem_bench.c
 new file mode 100644
-index 0000000..f669f69
+index 0000000..63f6972
 --- /dev/null
 +++ b/tests/test_fastmem_bench.c
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,67 @@
 +/* Real EL1 JIT reads through real 16KB page tables. Paired cache-off/on,
 +   warmed loops and identical sums; no claims about physical Duo watts/FPS. */
 +#include "machine.h"
@@ -15785,6 +15797,7 @@ index 0000000..f669f69
 +static unsigned next = 1;
 +static const uint64_t code_va = 0xfffffe0000100000ull;
 +static const uint64_t data_a = 0xfffffe0000200000ull, data_b = 0xfffffc0400204000ull;
++static const uint64_t data_user = 0x200000;
 +static const uint64_t data_c = 0xfffffe0010200000ull; // same ordinary TLB slot, different cache slot
 +static uint64_t *tab(unsigned p) { return (uint64_t *)(ram + p * PG); }
 +static void map(uint64_t va, unsigned physical) {
@@ -15795,7 +15808,7 @@ index 0000000..f669f69
 +    tab((unsigned)((*l3 & ~0x3fffull) - PA) / PG)[(va >> 14) & 2047] = (PA + physical * PG) | 3 | (1u << 10);
 +}
 +static void run(unsigned mixed, unsigned count) {
-+    cpu.pc = code_va; cpu.x[0] = data_a; cpu.x[4] = mixed ? data_a ^ (mixed == 2 ? data_c : data_b) : 0;
++    cpu.pc = code_va; cpu.x[0] = mixed == 3 ? data_user : data_a; cpu.x[4] = mixed && mixed != 3 ? data_a ^ (mixed == 2 ? data_c : data_b) : 0;
 +    cpu.x[2] = 0; cpu.x[3] = count;
 +    assert(hv_run(&cpu) == HV_EXIT_HALT);
 +    assert(cpu.x[2] == count && cpu.x[3] == 0);
@@ -15809,17 +15822,17 @@ index 0000000..f669f69
 +    const uint32_t code[] = {0xf9400001, 0xca040000, 0x8b010042, 0xf1000463, 0x54ffff81};
 +    memcpy(ram + 10 * PG, code, sizeof code);
 +    *(uint64_t *)(ram + 11 * PG) = *(uint64_t *)(ram + 12 * PG) = *(uint64_t *)(ram + 13 * PG) = 1;
-+    map(code_va, 10); map(data_a, 11); map(data_b, 12); map(data_c, 13);
++    map(code_va, 10); map(data_a, 11); map(data_b, 12); map(data_c, 13); map(data_user, 11);
 +    m.stop_pc = code_va + sizeof code;
 +    mach_timebase_info_data_t tb; assert(!mach_timebase_info(&tb));
 +    // More rounds alternate the order to limit shared-runner drift.
-+    for (unsigned round = 0; round < 7; round++) for (unsigned mixed = 0; mixed < 3; mixed++)
++    for (unsigned round = 0; round < 7; round++) for (unsigned mixed = 0; mixed < 4; mixed++)
 +        for (unsigned k = 0; k < 2; k++) {
 +            unsigned enabled = k ^ (round & 1);
 +            m.fastmem_enabled = enabled; m.fastmem_diagnostics = 0;
 +            hv_flush_blocks(&m); hv_cpu_reset(&cpu, &m);
-+            cpu.sctlr_el1 |= 1; cpu.ttbr1_el1 = PA; cpu.mair_el1 = 0xff;
-+            cpu.tcr_el1 = 22ull << 16 | 1ull << 30;
++            cpu.sctlr_el1 |= 1; cpu.ttbr0_el1 = cpu.ttbr1_el1 = PA; cpu.mair_el1 = 0xff;
++            cpu.tcr_el1 = 22ull | 2ull << 14 | 22ull << 16 | 1ull << 30;
 +            cpu.cpacr_el1 = 3u << 20; cpu.el = 1;
 +            run(mixed, 1000);
 +            uint64_t begin = mach_absolute_time();
@@ -15833,10 +15846,10 @@ index 0000000..f669f69
 +}
 diff --git a/tests/test_fastmem_jit.py b/tests/test_fastmem_jit.py
 new file mode 100644
-index 0000000..d1619b7
+index 0000000..0cd94a4
 --- /dev/null
 +++ b/tests/test_fastmem_jit.py
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,161 @@
 +"""Execute Henge's actual emitted scalar memory code in Unicorn ARM64.
 +
 +Run with Python packages unicorn and capstone installed. The test build replaces
@@ -15942,7 +15955,7 @@ index 0000000..d1619b7
 +    expected_counters = [0] * 6
 +    if diagnostics and enabled and table and not store:
 +        expected_counters[0] = 1
-+        reason = 0 if not pointer else 1 if not lut else 2 if outside or wrong_tag or page_end else None
++        reason = 0 if address < (1 << 63) else 1 if not pointer else 2 if not lut or outside or wrong_tag or page_end else None
 +        expected_counters[1 if reason is None else 2 + reason] = 1
 +    assert list(counters) == expected_counters, (hex(insn), counters, expected_counters)
 +    if not expected_slow:
@@ -15989,6 +16002,8 @@ index 0000000..d1619b7
 +            for flags in (1, 9):
 +                run(driver, 0xf9400020, kernel=kernel, flags=flags, tlb=False)
 +                run(driver, 0xf9400020, kernel=kernel, flags=flags, wrong_tag=True, tlb=False)
++        for kernel in (0, 0x10000, 0x7fff000000000000):
++            run(driver, 0xf9400020, kernel=kernel, lut=False, tlb=True)
 +        # An all-zero slot cannot accept an EL1 access to user VA zero.
 +        run(driver, 0xf9400020, kernel=0, offset=0, lut=False, tlb=False)
 +        code = run(driver, 0xf9400020, tlb=False)
