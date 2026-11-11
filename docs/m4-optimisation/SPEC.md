@@ -18,3 +18,21 @@ an available Mac runner without observing it.
 Workstreams: profile/CPU; TLB/JIT; memory; Metal/resource ownership; demand-driven
 ProMotion; idle/device work; sustained gaming; input/external display; thermal
 maintenance; optional diagnostics; defaults/integration; correctness/release.
+
+Implementation decisions retained from actual resource ownership:
+- Keep native buffer-backed scanout; guest CPU writes can change it outside GPU
+  epochs. Do not suppress authoritative swaps by surface identity or hash the
+  whole Retina framebuffer on the CPU. Damage pulses coalesce to the latest one.
+- Borrowed guest memory and CAMetalDrawable ownership do not become reusable
+  heap allocations. Copying into a heap would undo zero-copy; persistent screen
+  textures cannot use memoryless storage. Preserve exact existing surface reuse.
+- Guest serialized Metal pipelines and barriers remain authoritative. Adding
+  argument buffers or merging passes without transforming that guest protocol
+  would change shader bindings/order, not provide a safe M4-family shortcut.
+- Live executable aliases cannot be recreated after debugger detachment. Reclaim
+  retired metadata after quiescence, not live translations or RX mappings.
+- No supported API pins vCPUs to P/E cores or sets CPU frequency. Low Power Mode
+  evidence does not justify demoting arbitrary guest CPUs and delaying TLBI acks.
+- Physical comparisons keep workload, Retina/refresh, brightness and diagnostics
+  equal. Test CPU, RAM and JIT settings separately; record task time/frame times,
+  headroom and thermal category over sustained runs. No optimum is invented.

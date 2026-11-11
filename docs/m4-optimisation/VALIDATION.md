@@ -29,3 +29,13 @@ mode remains supported but its availability is not established.
 Local clipboard ASan/UBSan regression passed 4000 concurrent publications.
 Display-pulse controlled-queue regression and explicit iPhoneOS Metal syntax
 check are new and pending; do not infer a green M4 release from prior checks.
+
+Green checkpoint: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43106141682
+Source 6edf085a07b5df5164e5e35687f87087b82fe535, cumulative patch
+6221e972bbd2dc01ec224fac70240830513c400e6db63a84f712366bd9381f35.
+Native JIT/MMU, memory helpers, lifecycle/snapshots, display-pulse queue fixture,
+clipboard concurrency, Metal/resource tests, Link/input/native checks, sanitizers,
+actual iPhoneOS presenter syntax, production Swift typecheck and complete Release
+app compile all passed. Packaging was skipped as required.
+The newer event-driven session/boot-display waits, explicit M4 preset, optional
+input ownership and repeated glyph reuse need the next exact-source checkpoint.

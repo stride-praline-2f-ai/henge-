@@ -45,3 +45,26 @@ required. The complete M4 plan is NOT finished; packaging remains disabled.
 - New Duo capture/user Low Power Mode observation is useful evidence about OS
   power policy, not proof of unchanged watts/workload. Added event-only launch
   and Low Power Mode transition records. No automatic refresh reduction added.
+
+- Replaced the settled session's 1Hz UI heartbeat with coalesced native state
+  notifications and cancellable maintenance deadlines. Startup/visible Details
+  and Runner status retain timely polling; guest timers/interrupts are unchanged.
+  Added cancellation, signal and timer-race tests for the production wait object.
+- Native-touch and zoom-follow polling now stop when inactive/paused/external.
+  Exact repeated primary cursor glyph bytes reuse the existing Metal texture;
+  position/visibility changes still use the normal damage path.
+- Explicit M4 Automatic now resets experimental/diagnostic switches coherently,
+  preserves refresh/JIT choices and honours environment overrides. Memory UI
+  distinguishes virtual guest RAM from dynamic process headroom.
+
+Next source-level checkpoint: validate the new session wait/callback lifecycle,
+M4 preset and cursor change in cloud; reconcile resource/gaming/Link coverage
+against existing implementations. No IPA requested; complete integration and
+application build remain mandatory.
+- BootDisplay now stops its former 4Hz lifecycle polling after Metal takeover;
+  native state notifications retain shutdown/restart handling. Together with the
+  clipboard and session changes this removes seven scheduled checks/second on a
+  settled desktop with diagnostics off (not a measurement of CPU watts saved).
+- Checkpoint 6edf085a / run 43106141682 passed ALL native checks, sanitizers and
+  full iPhoneOS Release app compile. No IPA produced. Later session/input/preset
+  and cursor commits still require their own full validation.
