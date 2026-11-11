@@ -811,7 +811,7 @@ index cc902ed..15b606f 100644
      mov sp, x0
      ldr x0, [x28, #CPU_NZCV]
 diff --git a/host/prof_ios.c b/host/prof_ios.c
-index b7ff92a..8eb24e6 100644
+index b7ff92a..a919b06 100644
 --- a/host/prof_ios.c
 +++ b/host/prof_ios.c
 @@ -183,15 +183,22 @@ static void *sampler(void *unused) {
@@ -823,7 +823,8 @@ index b7ff92a..8eb24e6 100644
 -    if(!getenv("HV_PROF_IOS") || !strcmp(getenv("HV_PROF_IOS"),"0"))return;
 +static void start_profiler(void) {
      words_on = atoi(getenv("HV_PROF_IOS")) >= 2;
-     Dl_info info;if(dladdr((void *)hv_prof_ios_start,&info))image_base=(uintptr_t)info.dli_fbase;
+-    Dl_info info;if(dladdr((void *)hv_prof_ios_start,&info))image_base=(uintptr_t)info.dli_fbase;
++    Dl_info info;if(dladdr((void *)start_profiler,&info))image_base=(uintptr_t)info.dli_fbase;
      if(pthread_key_create(&thread_key,unregister_thread)!=0)return;
      pthread_t t;
      if(pthread_create(&t,NULL,sampler,NULL)!=0){pthread_key_delete(thread_key);return;}
@@ -1912,18 +1913,19 @@ index 01aead4..b1daca1 100644
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..678703d 100644
+index a13a70d..8a8691d 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
-@@ -3,6 +3,7 @@
+@@ -3,6 +3,8 @@
  #include "install.h"
  #include "jit_region.h"
  #include "vm.h"
 +#include "disk.h"
++#include "dispatch.h"
  
  #include <fcntl.h>
  #include <mach/mach.h>
-@@ -12,9 +13,13 @@
+@@ -12,9 +14,13 @@
  #include <stdlib.h>
  #include <string.h>
  #include <unistd.h>
@@ -1937,7 +1939,7 @@ index a13a70d..678703d 100644
  static HvJitRegion jit;
  static HengeDualMapping mapping;
  static int failures;
-@@ -58,6 +63,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
+@@ -58,6 +64,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
      if (fd < 0 || (data && write(fd, data, bytes) != (ssize_t)bytes) || ftruncate(fd, bytes)) exit(1);
      close(fd);
  }
@@ -1975,7 +1977,7 @@ index a13a70d..678703d 100644
  static void *read_ui(void *unused) {
      (void)unused;
      while (!atomic_load(&reader_done)) {
-@@ -69,6 +105,8 @@ static void *read_ui(void *unused) {
+@@ -69,6 +106,8 @@ static void *read_ui(void *unused) {
          henge_vm_cpus_on();
          henge_vm_link_connected(0);
          henge_vm_gpu_frames();
@@ -1984,7 +1986,7 @@ index a13a70d..678703d 100644
          henge_vm_balloon(-1);
          henge_vm_set_display_layer(NULL);
          if (!henge_vm_boot_display(&pixels, &width, &height, &stride)) henge_vm_free_display(pixels);
-@@ -77,7 +115,7 @@ static void *read_ui(void *unused) {
+@@ -77,7 +116,7 @@ static void *read_ui(void *unused) {
      return NULL;
  }
  int main(void) {
@@ -1993,7 +1995,7 @@ index a13a70d..678703d 100644
      char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
      if (!mkdtemp(dir) || hv_jit_region_open(&jit, 8 << 20)) return 1;
      snprintf(rom, sizeof rom, "%s/rom", dir);
-@@ -91,6 +129,10 @@ int main(void) {
+@@ -91,6 +130,10 @@ int main(void) {
      write_file(aux, NULL, 1 << 20);
      mapping = (HengeDualMapping){.rx_addr = (uint8_t *)jit.base,
          .rw_addr = (uint8_t *)jit.base + jit.rw_diff, .size = jit.capacity * 4};
@@ -2004,7 +2006,7 @@ index a13a70d..678703d 100644
      pthread_t reader;
      if (pthread_create(&reader, NULL, read_ui, NULL)) return 1;
      /* Warm the process-wide pointer queue before counting worker threads. */
-@@ -150,8 +192,21 @@ int main(void) {
+@@ -150,8 +193,25 @@ int main(void) {
          write_file(rom, code, sizeof code);
          int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          check("resume test boots", rc == 0);
@@ -2014,6 +2016,10 @@ index a13a70d..678703d 100644
 +               wall-clock reporting intervals are actually observed. */
 +            if (henge_vm_pause(error, sizeof error)) return 1;
 +            hv_vm_machine()->chain = 0;
++            /* The original loop may already have a published self-link. Use
++               the real quiescent cache flush, rather than only blocking new
++               links, before restarting the reporting fixture. */
++            hv_flush_blocks(hv_vm_machine());
 +            if (henge_vm_continue()) return 1;
 +            usleep(2200000);
 +        }
@@ -2026,7 +2032,7 @@ index a13a70d..678703d 100644
          henge_vm_mouse_button(1, 1);
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "suspend: %s\n", error);
-@@ -160,18 +215,40 @@ int main(void) {
+@@ -160,18 +220,40 @@ int main(void) {
              fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\n");
              return 1;
          }
@@ -2069,7 +2075,7 @@ index a13a70d..678703d 100644
          check("a paused Mac stops", henge_vm_state() == 2 && hv_vm_board()->ram == NULL);
          uint64_t bytes = 0;
          check("the save is whole", henge_vm_saved_ok(snap, "test", &bytes, NULL) == 0 && bytes > 0);
-@@ -183,12 +260,14 @@ int main(void) {
+@@ -183,12 +265,14 @@ int main(void) {
          rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          usleep(30000);
          rc |= henge_vm_suspend(snap, "test", error, sizeof error);
@@ -2084,7 +2090,7 @@ index a13a70d..678703d 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +288,78 @@ int main(void) {
+@@ -209,6 +293,78 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);
