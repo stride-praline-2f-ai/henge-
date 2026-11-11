@@ -117,7 +117,7 @@ t=replace_once(t,
 # Logging only; no control-flow or QoS changes.
 t=replace_once(t,
     "int r = hv_vm_run_cpu0();",
-    "int r = hv_vm_run_cpu0();\n    fprintf(stderr, \"hengevm: cpu0 exited: reason=%d halt=%d pc=0x%llx exit_req=%d\\n\", r, atomic_load(&cpus[0].halted), (unsigned long long)cpus[0].pc, atomic_load(&cpus[0].exit_req));",
+    "int r = hv_vm_run_cpu0();\n    fprintf(stderr, \"hengevm: cpu0 exited: reason=%d halt=%d pc=0x%llx exit_req=%d\\n\", r, atomic_load(&cpus[0].halted), (unsigned long long)cpus[0].pc, __atomic_load_n(&cpus[0].exit_req, __ATOMIC_RELAXED));",
     "trace the VM CPU0 return preceding failed suspend")
 # A new VM must clear the run_ended flag from any prior guest session.
 # This flag is used by suspend() to reject a truly dead CPU 0.
