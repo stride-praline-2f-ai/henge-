@@ -192,10 +192,39 @@ index c341d16..fba956a 100644
  /* Drops every translated block (the JIT region is reused from the start). */
  void hv_flush_blocks(HvMachine *m);
 diff --git a/core/machine.c b/core/machine.c
-index 7a01fdc..2bdf71c 100644
+index 7a01fdc..a58bdc9 100644
 --- a/core/machine.c
 +++ b/core/machine.c
-@@ -622,6 +622,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
+@@ -396,18 +396,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
+     return marked;
+ }
+ 
+-/* Experimental deadline filter. CPU0 retains the original periodic device poll;
++/* Deadline filter. CPU0 retains the original periodic device poll;
+    timer writes publish deadlines and actual interrupts/requests still kick directly. */
+ unsigned hv_machine_kick_due(HvMachine *m, uint64_t now) {
+-    unsigned marked = 0;
++    unsigned marked = 0, due_count = 0, unknown = 0, deferred = 0, polls = 0;
+     for (int i = 0; i < m->ncpus; i++) {
+         HvPerCpu *p = &m->percpu[i];
+         if (!m->cpus[i] || !__atomic_load_n(&p->active, __ATOMIC_SEQ_CST)) continue;
+         uint32_t valid = __atomic_load_n(&p->timer_deadline_valid, __ATOMIC_ACQUIRE);
+         uint64_t due = __atomic_load_n(&p->timer_deadline, __ATOMIC_ACQUIRE);
+-        if (i && valid && (!due || due > now)) continue;
++        if (i && valid && (!due || due > now)) { deferred++; continue; }
++        if (!i) polls++;
++        else if (valid) due_count++;
++        else unknown++;
+         __atomic_store_n(&m->cpus[i]->exit_req, 1, __ATOMIC_SEQ_CST); marked++;
+     }
++    atomic_fetch_add_explicit(&m->timer_kicks_cpu0, polls, memory_order_relaxed);
++    atomic_fetch_add_explicit(&m->timer_kicks_due, due_count, memory_order_relaxed);
++    atomic_fetch_add_explicit(&m->timer_kicks_unknown, unknown, memory_order_relaxed);
++    atomic_fetch_add_explicit(&m->timer_kicks_deferred, deferred, memory_order_relaxed);
+     if (marked) __asm__ volatile("sev" ::: "memory");
+     return marked;
+ }
+@@ -622,6 +629,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
  
  /* MMIO is accessed in naturally sized pieces of at most 8 bytes. */
  int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
@@ -203,7 +232,7 @@ index 7a01fdc..2bdf71c 100644
      void *p = hv_phys_ptr(m, pa, len);
      if (p) {
          memcpy(buf, p, len);
-@@ -640,8 +641,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
+@@ -640,8 +648,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
  }
  
  int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
@@ -215,7 +244,7 @@ index 7a01fdc..2bdf71c 100644
          uint64_t off = pa - r->pa;
          uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
 diff --git a/core/machine.h b/core/machine.h
-index cafe156..d4afed7 100644
+index cafe156..7f28d1f 100644
 --- a/core/machine.h
 +++ b/core/machine.h
 @@ -127,6 +127,7 @@ typedef struct HvStats {
@@ -226,6 +255,14 @@ index cafe156..d4afed7 100644
  } HvStats;
  
  #define HV_MAX_CPUS 8
+@@ -263,6 +264,7 @@ typedef struct HvMachine {
+     uint64_t watch_pa;   /* debugging: the same by physical address */
+     HvStats stats;
+     int deadline_kicks_enabled;
++    _Atomic uint64_t timer_kicks_cpu0, timer_kicks_due, timer_kicks_unknown, timer_kicks_deferred;
+     int wait_stats;
+     int jit_tail_enabled;
+     int chain;               /* block chaining and the indirect-branch cache are enabled */
 diff --git a/core/memop.c b/core/memop.c
 index bfbac5e..a638d30 100644
 --- a/core/memop.c
@@ -1146,6 +1183,80 @@ index cf4acc4..9961c12 100644
  /* The same, by Linux input key code (what the host UI produces). */
  void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down);
  /* Any thread: a Magic Trackpad 2 touch. phase: 0 down, 1 move, 2 up. id: a
+diff --git a/docs/optimization-integration.md b/docs/optimization-integration.md
+new file mode 100644
+index 0000000..42bbc58
+--- /dev/null
++++ b/docs/optimization-integration.md
+@@ -0,0 +1,68 @@
++# Integrated optimisation checkpoint
++
++Distribution remains blocked until `henge-build/optimization-state.json` records
++all implementation and regression workstreams verified against the cumulative
++patch hash. App compilation does not authorise packaging.
++
++## Ownership and activation
++
++| Responsibility | Authoritative path and integration |
++| --- | --- |
++| RAM translation | Existing per-CPU TLB in core/mmu; read helpers reuse exactly its validated host span. PAN/EL tables, TLBI and smaller guest granules retain existing rules. Writes still pass code invalidation/watch handling. |
++| Grouped accesses | Existing translate.c group planner and cold fallback; now follows in-place 64-bit ADD/SUB address increments. One experimental setting maps to HV_GROUPS. |
++| Idle wakeups | Existing generation-cancelled HvIdleTicker sleeps when all CPUs park. Timer-register writes publish deadlines; CPU0 retains I/O polling; secondary periodic kicks require a due or unknown timer. Explicit device/TLBI wakes bypass filtering. |
++| JIT publication | Full branch publication and invalidation barriers, one borrowed RX/RW region. Retire all references before advising dead block/slot payload with MADV_FREE. No executable page reclamation or cross-launch code persistence. |
++| Graphics presentation | Existing dirty-event presenter, bounded drawable retry and newest-frame coalescing. Exact duplicate cursor state is suppressed before scheduling work; guest swaps remain authoritative. |
++| Retina/cursor policy | One atomic preferences/thermal word, updated by notifications. Physical layer scale and window identity survive reparenting. No per-frame defaults reads or periodic preferences timer. |
++| Display lifecycle | DisplayRouter owns target selection. Fold/rotation refreshes coalesce; monitor disconnects and target replacement remain immediate. Snapshot restore preserves both display ports. |
++| Link capture | Existing decoder-consumption credit window remains authoritative. Visibility epochs reject hidden and stale capture/encode work; return requests the latest secondary frame without changing guest monitor geometry. |
++| Thermal policy | Existing explicit presentation cap plus opt-in thermal protection consume the coherent settings word. No implicit guest resolution, Retina, refresh-rate or vCPU reduction. |
++| Pressure recovery | UI memory warnings queue trimming on the renderer/Link owners. Release library-cache ownership, cached texture wrappers and excess pixel buffers; live resources remain owned. |
++| Pause/save/resume | Native bridge serialises lifecycle; CPU save halt, ticker cancellation, disk/audio/GPU quiescence, both displays and virtual-counter freezing use the existing repaired snapshot path. Atomic saves reject incompatible native layouts and changed disk identities. |
++| Diagnostics | Existing lifecycle-consistent CPU/frame/footprint metrics; opt-in GPU timing and deep hash scans. New read-reuse/reclaimed-metadata, cursor/coalescing and timer-decision counters attribute eliminated work. |
++
++## Deliberate safe alternatives
++
++* A scanout's mapping ID or GPU command epoch cannot prove unchanged pixels:
++  guest CPU writes can modify shared scanout outside those epochs. Never skip an
++  authoritative swap from either value. Full CPU hashing/readback would add
++  bandwidth and synchronisation. Event-driven dirty presentation, exact cursor
++  comparison and coalescing remove provably redundant work without losing frames.
++* Guest data stores can write translated code, ROM or watched memory. Reuse is
++  limited to checked RAM reads; stores preserve the existing physical write path.
++* TLB tags/addends cannot be removed merely because their load instructions are
++  hot. They enforce permission and current mapping identity. Independent cached
++  pointers would require another invalidation protocol. Reuse the existing TLB.
++* Keep grouped accesses, TLB preload and superblocks experimental until their
++  measured benefit outweighs code growth/cache effects. The native paired checks
++  measure code shapes, not whole-device heat or game FPS.
++* Keep equal responsive vCPU QoS by default. CPU0 performs device work; other
++  vCPUs acknowledge shared invalidations. Demoting arbitrary guest CPUs can
++  increase acknowledgement latency. QoS does not guarantee core placement;
++  four vCPUs are a retained default, not proof of optimality for every workload.
++* Do not MADV_FREE live JIT code: iOS execute capability is secured while the
++  debugger is attached and may not be reacquired after detachment. Retired
++  metadata is advised only after the global barrier, outside allocation boundary
++  pages and with the asynchronous profiler disabled.
++* Do not discard live guest GPU surfaces or arbitrary file-backed guest RAM on
++  memory warnings. Shared/private texture ownership and guest-visible bytes must
++  survive. Trim only unowned caches and excess buffers.
++* Keep switch-flush elision disabled: ASID reuse can otherwise leave kept stale
++  mappings. Disk flush mode and explicit overrides retain their existing semantics.
++* The custom renderer deliberately targets the iOS 27 execution path. Restoring
++  obsolete iOS 17 metallib relabelling would add a second, unused conversion path.
++  General iOS 17 VM-renderer compatibility is not claimed.
++
++## Validation scope
++
++Native ARM64 cloud checks exercise real JIT execution, page tables, grouped
++fallbacks, TLBI/chain repair, pause/save/restore and worker cleanup, Metal resource
++lifecycle, Link hardware encoding/decoding/TLS/credits, display routing, settings,
++input and networking. ASan/UBSan/TSan cover supported native paths. The iOS app
++must also compile and link before the release gate opens.
++
++Physical Duo folding, sustained Roblox performance, display appearance, sideloaded
++JIT entitlements and watts/thermal residency still require device verification.
++iOS may suspend/terminate background work; persistent save is atomic but cannot
++guarantee unlimited background execution. Cloud compilation and microbenchmarks
++are not evidence of physical-device energy improvement.
 diff --git a/docs/thermal-engineering/architecture.md b/docs/thermal-engineering/architecture.md
 index 55c66e6..fe9dd9e 100644
 --- a/docs/thermal-engineering/architecture.md
@@ -1542,10 +1653,23 @@ index 383ae01..7140036 100644
      if (bad) return fail(err, errlen, "The saved Mac could not be read (%s).", strerror(r.err ? r.err : EINVAL));
      /* The guest's clock goes on as far as the wall clock went since it stopped (see hv_vm_resume_counter). */
 diff --git a/host/vm.c b/host/vm.c
-index db95c05..3acb537 100644
+index db95c05..5e4c6fa 100644
 --- a/host/vm.c
 +++ b/host/vm.c
-@@ -386,7 +386,8 @@ static pthread_key_t signal_stack_key;
+@@ -345,6 +345,12 @@ static int deadline_kicks;
+ void hv_vm_log_ticker(void) {
+     HvPvgLite *metrics_pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
+     if (metrics_pvg) hv_pvg_lite_log_metrics(metrics_pvg);
++    fprintf(stderr, "timer-kicks: filter=%d cpu0_poll=%llu secondary_due=%llu unknown_deadline=%llu secondary_deferred=%llu (cumulative scheduler decisions; explicit work bypasses filter)\n",
++            deadline_kicks,
++            (unsigned long long)atomic_load_explicit(&m.timer_kicks_cpu0, memory_order_relaxed),
++            (unsigned long long)atomic_load_explicit(&m.timer_kicks_due, memory_order_relaxed),
++            (unsigned long long)atomic_load_explicit(&m.timer_kicks_unknown, memory_order_relaxed),
++            (unsigned long long)atomic_load_explicit(&m.timer_kicks_deferred, memory_order_relaxed));
+     fprintf(stderr,"flush-wait: enabled=%d waits=%llu timeouts=%llu errors=%llu (cumulative; notifications on peer park and pending requests)\n",m.quiesce_enabled,(unsigned long long)atomic_load(&m.quiesce.waits),(unsigned long long)atomic_load(&m.quiesce.timeouts),(unsigned long long)atomic_load(&m.quiesce.errors));
+     fprintf(stderr, "idle-ticker: active_ticks=%llu sleep_waits=%llu resumes=%llu waiting=%u marked_cpu_flags=%llu (cumulative; timer/device wakeups remain active)\n",
+             (unsigned long long)atomic_load_explicit(&kicker.ticks, memory_order_relaxed),
+@@ -386,7 +392,8 @@ static pthread_key_t signal_stack_key;
  static pthread_once_t signal_stack_once = PTHREAD_ONCE_INIT;
  static int signal_stack_key_ready;
  static void release_signal_stack(void *p) {
@@ -1555,7 +1679,7 @@ index db95c05..3acb537 100644
      if (sigaltstack(&disabled, NULL) == 0) free(p);
  }
  static void make_signal_stack_key(void) {
-@@ -398,7 +399,12 @@ void hv_vm_prepare_cpu_thread(void) {
+@@ -398,7 +405,12 @@ void hv_vm_prepare_cpu_thread(void) {
      static __thread int done;
      if (done) return;
      done = 1;
@@ -1569,7 +1693,7 @@ index db95c05..3acb537 100644
      if (ss.ss_sp) {
          if (sigaltstack(&ss, NULL) != 0) free(ss.ss_sp);
          else {
-@@ -461,9 +467,17 @@ int hv_vm_disk_identity(char *out, size_t n) {
+@@ -461,9 +473,17 @@ int hv_vm_disk_identity(char *out, size_t n) {
      return 0;
  }
  
@@ -1590,7 +1714,7 @@ index db95c05..3acb537 100644
  }
  
  int hv_vm_run_cpu0(void) {
-@@ -512,13 +526,15 @@ int hv_vm_finish_pause(void) {
+@@ -512,13 +532,15 @@ int hv_vm_finish_pause(void) {
      hv_virtio_blk_stop(board.root_blk);
      hv_virtio_blk_stop(board.aux_blk);
      /* hv_vm_run_cpu0 already detached board.snd under the device lock. */
@@ -1609,7 +1733,7 @@ index db95c05..3acb537 100644
      set_pause_state(2);
      return 0;
  }
-@@ -702,9 +718,13 @@ static void stop_pointer(void) {
+@@ -702,9 +724,13 @@ static void stop_pointer(void) {
              hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);
              hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
          }
@@ -1681,18 +1805,29 @@ index 7392fda..bfda5bd 100644
  
      func makeUIView(context: Context) -> Screen {
 diff --git a/ios/Henge/DisplayRouter.swift b/ios/Henge/DisplayRouter.swift
-index 47b0ced..9a0ec30 100644
+index 47b0ced..f6edeb5 100644
 --- a/ios/Henge/DisplayRouter.swift
 +++ b/ios/Henge/DisplayRouter.swift
-@@ -10,6 +10,7 @@ final class DisplayRouter: ObservableObject {
+@@ -10,11 +10,18 @@ final class DisplayRouter: ObservableObject {
      private var targets = DisplayTargetSelection()
      private var layers: [UUID: CAMetalLayer] = [:]
      private var selected: UUID?
 +    private var refreshTask: Task<Void, Never>?
  
      func connect(_ id: UUID, layer: CAMetalLayer, role: DisplayTargetSelection.Role) {
++        let replacedSelected = selected == id && layers[id] !== layer
++        let previous = selected
          layers[id] = layer
-@@ -27,12 +28,19 @@ final class DisplayRouter: ObservableObject {
+         targets.connect(id, role: role)
+         updateTarget()
++        if replacedSelected && selected == previous {
++            refreshTask?.cancel(); refreshTask = nil
++            sendTarget()
++        }
+     }
+ 
+     func disconnect(_ id: UUID) {
+@@ -27,12 +34,19 @@ final class DisplayRouter: ObservableObject {
      /// even when macOS is idle and isn't submitting another frame.
      func refresh(_ id: UUID? = nil) {
          guard id == nil || id == selected else { return }
@@ -1764,6 +1899,19 @@ index e579188..2314dca 100644
          for (k, v) in env.sorted(by: { $0.key < $1.key }) {
              setenv(k, v, 1)
              HengeLog.log("tuning", "\(k)=\(v)")
+diff --git a/ios/Henge/HengeLog.swift b/ios/Henge/HengeLog.swift
+index 037685f..d91a56f 100644
+--- a/ios/Henge/HengeLog.swift
++++ b/ios/Henge/HengeLog.swift
+@@ -338,7 +338,7 @@ enum HengeLog {
+         if let upstream = info["HengeUpstreamCommit"] as? String {
+             log("boot", "upstream main: \(upstream)")
+         }
+-        log("boot", "performance revision: Duo-aware scheduling; inline EL1 TCR/PAR/PAN/TTBR/UAO; tagged multiwindow Fast Memory; 0.3 shutdown and graphics fixes; event-driven flush waits; full branch publication; superblocks and TLB preload experimental")
++        log("boot", "performance revision: Duo-aware scheduling; inline EL1 TCR/PAR/PAN/TTBR/UAO; tagged multiwindow Fast Memory; checked RAM span reuse; deadline-aware secondary kicks; cursor damage/coalescing; pressure cache cleanup; full branch publication; grouped memory, superblocks and TLB preload experimental")
+         log("boot", "Link protocol: 2, decoder-consumption credit window=3; local discovery and opt-in Keychain pairing; three-finger viewer controls; update both devices")
+         log("boot", "cache lifecycle: JIT translations and kernel read lookups are RAM-only; no cross-launch executable cache")
+         if let source = info["HengeCustomSourceCommit"] as? String {
 diff --git a/ios/Henge/Link/LinkProtocol.swift b/ios/Henge/Link/LinkProtocol.swift
 index 94231b2..fa18a3b 100644
 --- a/ios/Henge/Link/LinkProtocol.swift
@@ -2379,6 +2527,41 @@ index 091433d..d5481c3 100644
  #define TARGET_OS_IPHONE 1
  typedef int32_t OSStatus;
  typedef uint32_t UInt32, AudioUnitRenderActionFlags;
+diff --git a/tests/bench_programs.S b/tests/bench_programs.S
+index b4f57c2..0245150 100644
+--- a/tests/bench_programs.S
++++ b/tests/bench_programs.S
+@@ -48,6 +48,30 @@ PROGRAM bench_mem
+     b.ne 3b
+ END bench_mem
+ 
++// Consecutive ordinary loads separated by address increments. This isolates
++// the new planner extension; it does not stand in for macOS/game performance.
++PROGRAM bench_iter_load
++    sub x23, sp, #8192
++    mov x4, #7
++    stp x4, x4, [x23]
++    stp x4, x4, [x23, #16]
++    mov x0, #0
++    movz x2, #0x4, lsl #16
++1:  sub x23, sp, #8192
++    ldr x4, [x23]
++    add x23, x23, #8
++    ldr x6, [x23]
++    add x23, x23, #8
++    ldp x7, x8, [x23]
++    add x0, x0, x4
++    add x0, x0, x6
++    add x0, x0, x7
++    add x0, x0, x8
++    subs x2, x2, #1
++    b.ne 1b
++    mov x5, #0
++END bench_iter_load
++
+ // An interpreter loop: a jump table and BR, 300000 times.
+ PROGRAM bench_dispatch
+     adr x10, 7f
 diff --git a/tests/benchmark_surface_hash.py b/tests/benchmark_surface_hash.py
 new file mode 100644
 index 0000000..eef5d30
@@ -2498,6 +2681,23 @@ index 0000000..6ad7a55
 +fi
 +printf '\nExpanded diagnostic pass: %d failed checks\n' "$failures"
 +test "$failures" -eq 0
+diff --git a/tests/test_bench.c b/tests/test_bench.c
+index b3af248..b8e6466 100644
+--- a/tests/test_bench.c
++++ b/tests/test_bench.c
+@@ -10,10 +10,11 @@ DECLARE_PROGRAM(bench_calls);
+ DECLARE_PROGRAM(bench_mem);
+ DECLARE_PROGRAM(bench_dispatch);
+ DECLARE_PROGRAM(bench_loop);
++DECLARE_PROGRAM(bench_iter_load);
+ extern const char bench_programs_begin[], bench_programs_finish[];
+ 
+ static const TestProgram programs[] = {
+-    TEST_PROGRAM(bench_calls), TEST_PROGRAM(bench_mem), TEST_PROGRAM(bench_dispatch), TEST_PROGRAM(bench_loop),
++    TEST_PROGRAM(bench_calls), TEST_PROGRAM(bench_mem), TEST_PROGRAM(bench_dispatch), TEST_PROGRAM(bench_loop), TEST_PROGRAM(bench_iter_load),
+ };
+ 
+ /* EL0, so the indirect-branch cache takes these low (user) addresses. */
 diff --git a/tests/test_chain_index.py b/tests/test_chain_index.py
 index 88db6e8..8afb1f9 100644
 --- a/tests/test_chain_index.py
@@ -2525,7 +2725,7 @@ index 88db6e8..8afb1f9 100644
  void hv_jit_finish(HvJitRegion *r,uint32_t *p,size_t n){(void)r;(void)p;(void)n;}
  void hv_jit_finish_branch(HvJitRegion *r,uint32_t *p){(void)r;(void)p;}
 diff --git a/tests/test_display_router.swift b/tests/test_display_router.swift
-index a8b4506..d7548df 100644
+index a8b4506..9890251 100644
 --- a/tests/test_display_router.swift
 +++ b/tests/test_display_router.swift
 @@ -3,13 +3,14 @@ import QuartzCore
@@ -2545,7 +2745,7 @@ index a8b4506..d7548df 100644
          let phoneLayer = CAMetalLayer(), monitorLayer = CAMetalLayer()
          let phone = UUID(), monitor = UUID()
          let router = DisplayRouter()
-@@ -30,6 +31,16 @@ struct DisplayRouterTests {
+@@ -30,8 +31,24 @@ struct DisplayRouterTests {
          // The last monitor going gives the Mac back to the phone, and a late repeat changes nothing.
          router.disconnect(monitor)
          precondition(engineShows(phoneLayer) && !router.isExternal)
@@ -2561,7 +2761,15 @@ index a8b4506..d7548df 100644
 +        precondition(engineCalls == switched && engineShows(monitorLayer))
          router.disconnect(monitor)
          precondition(engineShows(phoneLayer) && !router.isExternal)
++        let replacement = CAMetalLayer()
++        let beforeReplacement = engineCalls
++        router.connect(phone, layer: replacement, role: .device)
++        precondition(engineShows(replacement) && engineCalls == beforeReplacement + 1)
++        router.connect(phone, layer: replacement, role: .device)
++        precondition(engineCalls == beforeReplacement + 1)
          print("Display router: all checks passed")
+     }
+ }
 diff --git a/tests/test_display_settings.m b/tests/test_display_settings.m
 index 5bf491f..0c279ab 100644
 --- a/tests/test_display_settings.m
@@ -2671,6 +2879,47 @@ index 0000000..2b0957a
 +        print("PASS engine tuning: actual defaults, explicit overrides, removed overrides, foreign environment and grouped-path activation")
 +    }
 +}
+diff --git a/tests/test_fastmem_bench.c b/tests/test_fastmem_bench.c
+index a801c82..5a5660d 100644
+--- a/tests/test_fastmem_bench.c
++++ b/tests/test_fastmem_bench.c
+@@ -3,6 +3,8 @@
+ #include "machine.h"
+ #include "dispatch.h"
+ #include "fastmem.h"
++#include "mmu.h"
++#include "memop.h"
+ #include <mach/mach_time.h>
+ #include <pthread/qos.h>
+ #include <assert.h>
+@@ -65,6 +67,27 @@ int main(void) {
+             double ns = (double)(mach_absolute_time() - begin) * tb.numer / tb.denom;
+             printf("fastmem-bench: round=%u mixed=%u enabled=%u ns_per_load=%.3f result=%u\n", round, mixed, enabled, ns / count, count);
+         }
++    /* Isolate the redundant helper work removed by checked host-span reuse.
++       Same real mappings/permissions, same reads/checksum, alternating order. */
++    m.stats_interval = 0;
++    run(0, 1000);
++    for (unsigned round = 0; round < 3; round++) for (unsigned k = 0; k < 2; k++) {
++        unsigned reused = k ^ (round & 1), count = 500000;
++        uint64_t sum = 0, begin = mach_absolute_time();
++        for (unsigned i = 0; i < count; i++) {
++            uint64_t value, pa;
++            if (reused) assert(!hv_vmem_xfer(&cpu, data_a, &value, sizeof value, 0, 1, 0));
++            else {
++                assert(!hv_mmu_access(&cpu, data_a, HV_ACC_READ, 1, &pa));
++                assert(!hv_phys_read(&m, pa, &value, sizeof value));
++            }
++            sum += value;
++        }
++        double ns = (double)(mach_absolute_time() - begin) * tb.numer / tb.denom;
++        assert(sum == count);
++        printf("helper-read-bench: round=%u span_reuse=%u ns_per_read=%.3f checksum=%llu\n",
++               round, reused, ns / count, (unsigned long long)sum);
++    }
+     hv_machine_free(&m); free(ram);
+     puts("PASS fastmem benchmark: real EL1/page-table/JIT path; all guest sums identical");
+ }
 diff --git a/tests/test_gpu_copy_bounds.py b/tests/test_gpu_copy_bounds.py
 new file mode 100644
 index 0000000..aebcda1
@@ -2770,6 +3019,21 @@ index 0000000..52930cc
 +b=root/'build';b.mkdir(exist_ok=True);c=b/'test_gpu_upload.m';c.write_text(pre+method+post)
 +subprocess.run(['xcrun','--sdk','macosx','clang','-fobjc-arc','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(root/'devices'),str(c),'-framework','Foundation','-framework','Metal','-o',str(b/'test_gpu_upload')],check=True)
 +subprocess.run([str(b/'test_gpu_upload')],check=True)
+diff --git a/tests/test_idle_integration.c b/tests/test_idle_integration.c
+index 2b1be58..2ae07ab 100644
+--- a/tests/test_idle_integration.c
++++ b/tests/test_idle_integration.c
+@@ -58,6 +58,10 @@ int main(void) {
+     m.percpu[0].active = m.percpu[1].active = 0;
+     cpu.exit_req = parked.exit_req = 0;
+     assert(hv_machine_kick_due(&m, 400) == 0);
++    assert(atomic_load(&m.timer_kicks_cpu0) == 4);
++    assert(atomic_load(&m.timer_kicks_due) == 1);
++    assert(atomic_load(&m.timer_kicks_unknown) == 1);
++    assert(atomic_load(&m.timer_kicks_deferred) == 2);
+     hv_machine_free(&m);
+     puts("native WFI integration: guest timer resumes code, activity callback runs at entry/resume, CPU parks on exit");
+ }
 diff --git a/tests/test_link.swift b/tests/test_link.swift
 index 1ac8d90..2f52570 100644
 --- a/tests/test_link.swift
@@ -2820,6 +3084,56 @@ index 3462d79..6e35ea5 100644
      puts("Metal library cache: exact-byte hit, immutable key, FIFO eviction, byte/entry bounds, oversized bypass, failed retry and retained library passed");
      return 0;
  } }
+diff --git a/tests/test_mmu.c b/tests/test_mmu.c
+index 3f46cf5..54adf81 100644
+--- a/tests/test_mmu.c
++++ b/tests/test_mmu.c
+@@ -7,6 +7,8 @@
+ #include "machine.h"
+ #include "mmu.h"
+ #include "sysreg.h"
++#include "memop.h"
++#include <assert.h>
+ 
+ #define PT_PA 0x80000000ull
+ #define PT_SIZE (1u << 20)
+@@ -146,6 +148,36 @@ int main(void) {
+         failures++;
+     }
+ 
++    /* Exercise the real read helper, with mappings filled by the real walker.
++       Cached reads must respect page ends, remaps and separate PAN rights. */
++    uint8_t *span_ram = aligned_alloc(16384, 32768); assert(span_ram);
++    memset(span_ram, 0x35, 16384); memset(span_ram + 16384, 0x6a, 16384);
++    assert(!hv_machine_add_ram(&m, 0x50000000, 32768, span_ram, 0));
++    const uint64_t span_va = 0x100020000ull;
++    uint64_t *span_leaf = map(r0, 14, 48, span_va, 3, 0x50000000 | PAGE | AF | AP(1), 0);
++    map(r0, 14, 48, span_va + 16384, 3, 0x50004000 | PAGE | AF | AP(1), 0);
++    hv_tlb_flush(&cpu);
++    assert(!hv_mmu_access(&cpu, span_va, HV_ACC_READ, 1, &pa));
++    assert(hv_tlb_read_span(&cpu, span_va + 16380, 4, 1));
++    assert(!hv_tlb_read_span(&cpu, span_va + 16380, 8, 1));
++    uint8_t readback[8];
++    int saved_stats = m.stats_interval; m.stats_interval = 1;
++    uint64_t reused = m.stats.vmem_read_reuses;
++    assert(!hv_vmem_xfer(&cpu, span_va + 16380, readback, 8, 0, 1, 0));
++    assert(m.stats.vmem_read_reuses > reused);
++    assert(readback[0] == 0x35 && readback[3] == 0x35 && readback[4] == 0x6a && readback[7] == 0x6a);
++    *span_leaf = 0x50004000 | PAGE | AF | AP(1);
++    hv_tlb_flush_va_page(&cpu, span_va, -1);
++    assert(!hv_tlb_read_span(&cpu, span_va, 8, 1));
++    assert(!hv_vmem_xfer(&cpu, span_va, readback, 8, 0, 1, 0) && readback[0] == 0x6a);
++    cpu.pstate_extra |= HV_PSTATE_PAN;
++    assert(!hv_tlb_read_span(&cpu, span_va, 8, 1));
++    assert(hv_mmu_access(&cpu, span_va, HV_ACC_READ, 1, &pa) == HV_FSC_PERMISSION(3));
++    cpu.pstate_extra &= ~(uint64_t)HV_PSTATE_PAN;
++    m.stats_interval = saved_stats;
++    checks += 9;
++    puts("  real cached helper: warm span, page crossing, remap and PAN views passed");
++
+     /* 4 KB granule, 39-bit TTBR0 (levels 1-3): pages, 2 MB and 1 GB blocks. */
+     pt_next = 2 * 65536;
+     uint64_t r4 = alloc_table();
 diff --git a/tests/test_optimization_primitives.c b/tests/test_optimization_primitives.c
 new file mode 100644
 index 0000000..425a58c

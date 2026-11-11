@@ -18,4 +18,9 @@ for item in state['workstreams'][:-1]:
         assert item['exceptions'] and all(len(reason) > 80 for reason in item['exceptions']), item['name']
 assert not pending, 'IPA blocked: incomplete workstreams: ' + '; '.join(pending)
 assert state.get('final_reconciliation_complete') is True, 'Final requirements reconciliation has not been completed'
-print('PASS complete implementation gate:', manifest['audit_repairs_sha256'])
+validation = state.get('final_validation', {})
+assert validation.get('patch_sha256') == manifest['audit_repairs_sha256'], 'Final checks used another patch'
+assert validation.get('native_regressions') == 'passed' and validation.get('sanitizers') == 'passed', 'Native correctness checks incomplete'
+assert validation.get('ios_app_compile') == 'passed', 'Full iOS app compilation incomplete'
+assert isinstance(validation.get('run_id'), int) and len(validation.get('source_commit', '')) == 40, 'Missing traceable validation source'
+print('PASS complete implementation gate:',  manifest['audit_repairs_sha256'])
