@@ -30,3 +30,10 @@ Hardware/account-only validation remains explicit: physical M4 energy/temperatur
 Safari/game frame times,120Hz panel/peripheral behaviour, real user runner
 registration and signing-dependent background GPU permission. None is claimed
 as a cloud-measured result. See SPEC.md for rejected unsafe shortcuts.
+
+
+## Controls/power follow-up — development, no IPA
+Source worktree: /workspace/henge-log-fixes/Henge. Wrapper: /workspace/henge-controls/build-request.
+Implemented: USB gamepad reports and ownership-safe input, CPU-only runner foreground GPU drain/ring gate/replay, explicit save refusal during CPU mode, Duo demand-driven presentation, notification-cached Low Power Mode presentation. Native/sanitizer/SDK validation pending.
+Next: finish virtual controls UI and controls-only Link; bounded diagnostic capture; resolve cloud checks before final reconciliation. Do not package this checkpoint.
+CPU background grant/expiry, macOS GPU-driver backpressure under real builds, game recognition and actual thermal/FPS comparisons require devices. GUI/Simulator/GPU jobs may wait for foreground. No always-on execution claim.

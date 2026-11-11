@@ -555,7 +555,7 @@ index 0000000..eca2756
 +}
 +#endif
 diff --git a/devices/display_settings.h b/devices/display_settings.h
-index c3c0a3d..7e399f1 100644
+index c3c0a3d..d2fb12b 100644
 --- a/devices/display_settings.h
 +++ b/devices/display_settings.h
 @@ -2,6 +2,9 @@
@@ -573,11 +573,11 @@ index c3c0a3d..7e399f1 100644
  /* The presenter and Link worker read one coherent word, with no preferences
     access or polling timer in a frame. Notifications preserve live settings. */
 -typedef struct { unsigned scale; BOOL sharp; } HvDisplaySettings;
-+typedef struct { unsigned scale; BOOL sharp; int presentation_cap, thermal; BOOL thermal_protection; } HvDisplaySettings;
++typedef struct { unsigned scale; BOOL sharp; int presentation_cap, thermal; BOOL thermal_protection, low_power, power_aware; } HvDisplaySettings;
  static _Atomic unsigned hv_display_settings_word;
  static os_unfair_lock hv_display_settings_lock = OS_UNFAIR_LOCK_INIT;
  static unsigned hv_display_default_scale __attribute__((unused)) = 1;
-@@ -22,8 +25,15 @@ static void hv_display_settings_refresh(void) {
+@@ -22,8 +25,17 @@ static void hv_display_settings_refresh(void) {
      scale = saved >= 1 && saved <= 3 ? (unsigned)saved : hv_display_default_scale;
  #endif
      id sharp = [prefs objectForKey:@"henge.cursor.sharp"];
@@ -585,8 +585,10 @@ index c3c0a3d..7e399f1 100644
 +    NSInteger selected = [prefs integerForKey:@"henge.perf.presentationCap"];
 +    unsigned cap = selected == 30 ? 1 : selected == 60 ? 2 : 0;
 +    unsigned thermal = (unsigned)NSProcessInfo.processInfo.thermalState;
++    BOOL powerAware = [prefs objectForKey:@"henge.perf.lowPowerAware"] == nil || [prefs boolForKey:@"henge.perf.lowPowerAware"];
 +    unsigned word = scale | ((!sharp || [sharp boolValue]) ? 4u : 0u) | cap << 3 |
-+                    ([prefs boolForKey:@"henge.perf.thermalProtection"] ? 32u : 0u) | ((thermal & 3u) << 6);
++                    ([prefs boolForKey:@"henge.perf.thermalProtection"] ? 32u : 0u) | ((thermal & 3u) << 6) |
++                    (powerAware ? 256u : 0u) | (NSProcessInfo.processInfo.lowPowerModeEnabled ? 512u : 0u);
 +    unsigned previous = atomic_exchange_explicit(&hv_display_settings_word, word, memory_order_acq_rel);
      os_unfair_lock_unlock(&hv_display_settings_lock);
 +    if (previous && previous != word)
@@ -594,18 +596,21 @@ index c3c0a3d..7e399f1 100644
  }
  static HvDisplaySettings hv_display_settings_get(void) {
      static dispatch_once_t once;
-@@ -34,13 +44,25 @@ static HvDisplaySettings hv_display_settings_get(void) {
+@@ -34,13 +46,29 @@ static HvDisplaySettings hv_display_settings_get(void) {
  #endif
          /* Process-lifetime cache, shared by this translation unit's replay
             instances; the observer captures no replay or display resources. */
 -        static id observer;
-+        static id observer, thermalObserver;
++        static id observer, thermalObserver, powerObserver;
          observer = [NSNotificationCenter.defaultCenter addObserverForName:NSUserDefaultsDidChangeNotification
              object:nil queue:nil usingBlock:^(NSNotification *note) { (void)note; hv_display_settings_refresh(); }];
          (void)observer;
 +        thermalObserver = [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification
 +            object:nil queue:nil usingBlock:^(NSNotification *note) { (void)note; hv_display_settings_refresh(); }];
 +        (void)thermalObserver;
++        powerObserver = [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoPowerStateDidChangeNotification
++            object:nil queue:nil usingBlock:^(NSNotification *note) { (void)note; hv_display_settings_refresh(); }];
++        (void)powerObserver;
 +#if TARGET_OS_IPHONE
 +        static id foregroundObserver;
 +        foregroundObserver = [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
@@ -619,7 +624,8 @@ index c3c0a3d..7e399f1 100644
 +    unsigned cap = (word >> 3) & 3u;
 +    return (HvDisplaySettings){.scale=word & 3u,.sharp=(word & 4u) != 0,
 +        .presentation_cap=cap == 1 ? 30 : cap == 2 ? 60 : 0,
-+        .thermal=(int)((word >> 6) & 3u),.thermal_protection=(word & 32u) != 0};
++        .thermal=(int)((word >> 6) & 3u),.thermal_protection=(word & 32u) != 0,
++        .power_aware=(word & 256u)!=0,.low_power=(word & 512u)!=0};
  }
  #endif
 diff --git a/devices/display_snapshot.h b/devices/display_snapshot.h
@@ -661,6 +667,57 @@ index 0000000..57303a2
 +        total += bytes[p];
 +    }
 +    return total == len ? 0 : -1;
++}
++#endif
+diff --git a/devices/frame_pacing.h b/devices/frame_pacing.h
+index 3fbc062..d11e277 100644
+--- a/devices/frame_pacing.h
++++ b/devices/frame_pacing.h
+@@ -7,6 +7,10 @@ static inline int hv_pacing_fps(int selected, int thermal, int protect) {
+     int heat = protect && thermal >= 2 ? (thermal >= 3 ? 20 : 30) : 0;
+     return heat && (!cap || heat < cap) ? heat : cap;
+ }
++static inline int hv_pacing_power_fps(int selected,int thermal,int protect,int power_aware,int low_power) {
++    int cap=hv_pacing_fps(selected,thermal,protect);
++    return power_aware && low_power && (!cap || cap>60) ? 60 : cap;
++}
+ static inline double hv_pacing_delay(HvFramePacing *p, double now, int fps) {
+     if (!fps) { p->next = 0; return 0; }
+     return p->next > now ? p->next - now : 0;
+diff --git a/devices/gamepad.h b/devices/gamepad.h
+new file mode 100644
+index 0000000..d8870d1
+--- /dev/null
++++ b/devices/gamepad.h
+@@ -0,0 +1,30 @@
++#ifndef HENGE_GAMEPAD_H
++#define HENGE_GAMEPAD_H
++#include <stdint.h>
++#include <string.h>
++#define HV_GAMEPAD_BYTES 13
++/* USB Generic Desktop Game Pad: 16 buttons, null-capable hat, four signed
++   stick axes and two unsigned triggers. No vendor driver or guest helper. */
++static const uint8_t hv_gamepad_descriptor[] = {
++    0x05,0x01,0x09,0x05,0xa1,0x01,
++    0x05,0x09,0x19,0x01,0x29,0x10,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x10,0x81,0x02,
++    0x05,0x01,0x09,0x39,0x15,0x00,0x25,0x07,0x35,0x00,0x46,0x3b,0x01,0x65,0x14,
++    0x75,0x04,0x95,0x01,0x81,0x42,0x75,0x04,0x95,0x01,0x81,0x01,
++    0x65,0x00,0x35,0x00,0x45,0x00,
++    0x09,0x30,0x09,0x31,0x09,0x33,0x09,0x34,0x16,0x01,0x80,0x26,0xff,0x7f,
++    0x75,0x10,0x95,0x04,0x81,0x02,
++    0x09,0x32,0x09,0x35,0x15,0x00,0x26,0xff,0x00,0x75,0x08,0x95,0x02,0x81,0x02,0xc0
++};
++static inline void hv_gamepad_pack(uint8_t out[HV_GAMEPAD_BYTES], uint16_t buttons,
++                                  unsigned hat, const int16_t axes[4], uint8_t left, uint8_t right) {
++    out[0]=(uint8_t)buttons;out[1]=(uint8_t)(buttons>>8);out[2]=hat<8?(uint8_t)hat:8;
++    for(unsigned i=0;i<4;i++) {
++        int16_t v=axes[i]==INT16_MIN ? -32767 : axes[i];
++        out[3+i*2]=(uint8_t)v;out[4+i*2]=(uint8_t)((uint16_t)v>>8);
++    }
++    out[11]=left;out[12]=right;
++}
++static inline void hv_gamepad_neutral(uint8_t out[HV_GAMEPAD_BYTES]) {
++    memset(out,0,HV_GAMEPAD_BYTES);out[2]=8;
 +}
 +#endif
 diff --git a/devices/gpu_copy_bounds.h b/devices/gpu_copy_bounds.h
@@ -719,10 +776,19 @@ index 30699bd..c058e49 100644
      id<MTLLibrary> cached = _libraries[data];
      if (cached) { _hits++; return cached; }
 diff --git a/devices/pvg_lite.c b/devices/pvg_lite.c
-index 9f6ebcb..3da97c2 100644
+index 9f6ebcb..3fa9233 100644
 --- a/devices/pvg_lite.c
 +++ b/devices/pvg_lite.c
-@@ -202,6 +202,14 @@ void hv_pvg_lite_apply_link_connected(HvPvgLite *p,int connected){
+@@ -90,6 +90,8 @@ struct HvPvgLite {
+     double last_tally;
+     _Atomic(HvPvgMetal *) metal; /* release-published after the cached layer is applied */
+     int metal_tried;
++    atomic_int cpu_background; /* set only after a foreground pause drained GPU work */
++    int background_retry; /* device lock: replay retained doorbells once on return */
+     uint32_t stamps_pending; /* channels Metal finished, for the next poll */
+     uint64_t vblanks;        /* refresh events sent (HV_PVG_VBLANK) */
+ };
+@@ -202,6 +204,32 @@ void hv_pvg_lite_apply_link_connected(HvPvgLite *p,int connected){
  void hv_pvg_lite_link_connected(HvPvgLite *p,int connected){
      if(p&&p->metal)hv_pvg_metal_link_connected(p->metal,connected);
  }
@@ -732,24 +798,96 @@ index 9f6ebcb..3da97c2 100644
 +void hv_pvg_lite_set_display_paused(HvPvgLite *p, int paused) {
 +    if (!p) return;
 +    HvPvgMetal *metal = atomic_load_explicit(&p->metal, memory_order_acquire);
-+    if (metal) hv_pvg_metal_set_display_paused(metal, paused);
++    if (metal) hv_pvg_metal_set_display_paused(metal, paused || hv_pvg_lite_cpu_background(p));
++}
++
++int hv_pvg_lite_cpu_background(HvPvgLite *p) {
++    return p && atomic_load_explicit(&p->cpu_background, memory_order_acquire);
++}
++
++/* Device lock held. Entry requires stopped CPUs and a completed GPU pause.
++   Retain commands in the guest-owned rings: no host allocations, fake stamps,
++   dropped draws or repeatedly polled retry jobs while backgrounded. */
++void hv_pvg_lite_set_cpu_background(HvPvgLite *p, int enabled) {
++    if (!p) return;
++    atomic_store_explicit(&p->cpu_background, !!enabled, memory_order_release);
++    if (!enabled) p->background_retry = 1;
++}
++
++int hv_pvg_lite_background_fence(HvPvgLite *p) {
++    HvPvgMetal *metal = p ? atomic_load_explicit(&p->metal, memory_order_acquire) : NULL;
++    return metal ? hv_pvg_metal_background_fence(metal) : 0;
 +}
  
  static int task_read(HvPvgLite *p, uint32_t task, uint64_t off, void *to, uint32_t n);
  static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args) {
-@@ -878,9 +886,9 @@ int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
+@@ -591,6 +619,10 @@ static void ensure_metal(HvPvgLite *p) {
+ }
+ 
+ static void do_channel(HvPvgLite *p, uint32_t ch) {
++    if (hv_pvg_lite_cpu_background(p)) {
++        if (ch && ch < MAX_CHANNELS) p->chan_pending |= 1u << ch;
++        return;
++    }
+     uint64_t root = (uint64_t)reg(p, 0x101c) << 14, buf = (uint64_t)reg(p, 0x1030) << 14;
+     if (!root || !buf || !ch) return;
+     uint32_t *rec = hv_phys_ptr(p->m, root + 0x400 + 0x14 * (ch - 1), 0x14);
+@@ -729,6 +761,12 @@ static void vblank(HvPvgLite *p) {
+ 
+ void hv_pvg_lite_poll(HvPvgLite *p) {
+     if (!p) return;
++    if (hv_pvg_lite_cpu_background(p)) return;
++    if (p->background_retry) {
++        p->background_retry = 0;
++        do_root(p);
++        do_mapper(p);
++    }
+     vblank(p);
+     uint32_t chans = p->chan_pending;
+     if (chans) {
+@@ -744,7 +782,7 @@ static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
+     uint64_t v = 0;
+     switch (off) {
+     case 0x100c:
+-        do_root(p); /* the driver spins on this waiting for ring space */
++        if (!hv_pvg_lite_cpu_background(p)) do_root(p); /* the driver's normal ring backpressure */
+         v = p->root_rp;
+         break;
+     case 0x1018:
+@@ -764,6 +802,10 @@ static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+     HvPvgLite *p = opaque;
+     (void)size;
+     if (off >= 0x1000 && off < 0x2000) p->regs[(off - 0x1000) / 4] = (uint32_t)v;
++    if (hv_pvg_lite_cpu_background(p)) {
++        if (off == 0x1020 && v && v < MAX_CHANNELS) p->chan_pending |= 1u << v;
++        return;
++    }
+     /* Doorbells are answered here, on the CPU that rang: no waiting for CPU 0 to come by. */
+     if (off == 0x1008) {
+         do_root(p);
+@@ -791,7 +833,7 @@ static void iosfc_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+     HvPvgLite *p = opaque;
+     (void)size;
+     if (off >= 0x1000 && off < 0x1040) p->io_regs[(off - 0x1000) / 8] = v;
+-    if (off == 0x1018) do_mapper(p);
++    if (off == 0x1018 && !hv_pvg_lite_cpu_background(p)) do_mapper(p);
+ }
+ 
+ HvPvgLite *hv_pvg_lite_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t iosfc_pa, int gfx_irq, int iosfc_irq) {
+@@ -878,9 +920,10 @@ int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
  }
  
  /* CPUs stopped: the GPU's queued work done, and what only it holds copied into guest memory. */
 -void hv_pvg_lite_quiesce(HvPvgLite *p) {
 +int hv_pvg_lite_quiesce(HvPvgLite *p) {
++    if (hv_pvg_lite_cpu_background(p)) return 0; /* already drained before entering CPU mode */
      HvPvgMetal *metal = p ? atomic_load_explicit(&p->metal, memory_order_acquire) : NULL;
 -    if (metal) hv_pvg_metal_quiesce(metal);
 +    return metal ? hv_pvg_metal_quiesce(metal) : 0;
  }
  
  size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
-@@ -889,11 +897,11 @@ size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
+@@ -889,11 +932,11 @@ size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
  }
  
  /* After hv_pvg_lite_set_state: the screen and the pointer as they were, before the guest draws again. */
@@ -765,10 +903,10 @@ index 9f6ebcb..3da97c2 100644
  
  /* Debugging (the Mac runner's devstate): each channel's ring and stamps, to tell work never taken from work never
 diff --git a/devices/pvg_lite.h b/devices/pvg_lite.h
-index 0f68eae..2c1b4a9 100644
+index 0f68eae..9cbb3ab 100644
 --- a/devices/pvg_lite.h
 +++ b/devices/pvg_lite.h
-@@ -38,8 +38,12 @@ int hv_pvg_lite_old_driver(HvPvgLite *p);
+@@ -38,8 +38,18 @@ int hv_pvg_lite_old_driver(HvPvgLite *p);
  const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint32_t mapping);
  void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping);
  void hv_pvg_metal_cursor_moved(HvPvgMetal *m);
@@ -779,10 +917,16 @@ index 0f68eae..2c1b4a9 100644
  void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer);
 +void hv_pvg_metal_set_display_paused(HvPvgMetal *m, int paused);
 +void hv_pvg_lite_set_display_paused(HvPvgLite *p, int paused);
++/* CPU-only continued processing. Entry is legal only after the foreground
++   VM pause/GPU drain. Setter requires the device lock; getter is any-thread. */
++void hv_pvg_lite_set_cpu_background(HvPvgLite *p, int enabled);
++int hv_pvg_lite_cpu_background(HvPvgLite *p);
++int hv_pvg_lite_background_fence(HvPvgLite *p);
++int hv_pvg_metal_background_fence(HvPvgMetal *m);
  uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m);
  void hv_pvg_metal_log_metrics(HvPvgMetal *m);
  void hv_pvg_lite_log_metrics(HvPvgLite *p);
-@@ -55,6 +59,8 @@ void hv_pvg_lite_link_connected(HvPvgLite *p, int connected);
+@@ -55,6 +65,8 @@ void hv_pvg_lite_link_connected(HvPvgLite *p, int connected);
  void hv_pvg_lite_apply_link_connected(HvPvgLite *p, int connected);
  void hv_pvg_metal_link_connected(HvPvgMetal *m, int connected);
  void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m);
@@ -791,7 +935,7 @@ index 0f68eae..2c1b4a9 100644
  void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *command, uint32_t length);
  void hv_pvg_lite_complete(HvPvgLite *p, uint32_t channel, uint32_t stamp);
  
-@@ -72,13 +78,13 @@ void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm);
+@@ -72,13 +84,13 @@ void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm);
  /* Instant resume (host/snapshot.c). State blobs: called with out NULL they return the size needed. */
  size_t hv_pvg_lite_state(HvPvgLite *p, void *out, size_t cap);
  int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len);
@@ -810,7 +954,7 @@ index 0f68eae..2c1b4a9 100644
  
  #endif
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..183d654 100644
+index 9073d22..4c8248c 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -891,7 +1035,7 @@ index 9073d22..183d654 100644
      double drawable_retry_deadline; /* at most two seconds of retrying an unavailable target */
      uint32_t screen_w, screen_h;
      id<MTLBuffer> test_readback; /* HV_PVG_GPU_TEST: the drawable's pixels for screenshots */
-@@ -227,13 +254,31 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -227,12 +254,30 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
  - (void)complain:(NSString *)what;
  - (HvObject *)object:(uint32_t)ref task:(uint32_t)task;
  - (void)drawCursor;
@@ -907,8 +1051,8 @@ index 9073d22..183d654 100644
 +- (void)requestDisplayPulse;
 +- (void)displayPulse:(CAMetalDisplayLink *)link update:(CAMetalDisplayLinkUpdate *)update;
 +#endif
- @end
- 
++@end
++
 +#if TARGET_OS_IPHONE
 +@interface HvDisplayPulse : NSObject <CAMetalDisplayLinkDelegate>
 +@property(nonatomic, weak) HvReplay *owner;
@@ -918,12 +1062,11 @@ index 9073d22..183d654 100644
 +    link.paused = YES; // one damage-driven pulse, never an idle refresh loop
 +    [self.owner displayPulse:link update:update];
 +}
-+@end
+ @end
 +#endif
-+
+ 
  /* What Metal asks while it reads a serialized pipeline. */
  @interface HvContext : NSObject {
- @public
 @@ -457,6 +502,16 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
  @end
  
@@ -1216,11 +1359,11 @@ index 9073d22..183d654 100644
 -                               (int)NSProcessInfo.processInfo.thermalState,
 -                               protection && [protection boolValue]);
 +    HvDisplaySettings settings = hv_display_settings_get();
-+        int cap = hv_pacing_fps(settings.presentation_cap, settings.thermal, settings.thermal_protection);
++        int cap = hv_pacing_power_fps(settings.presentation_cap, settings.thermal, settings.thermal_protection,settings.power_aware,settings.low_power);
          if (!pacing_policy_logged || cap != pacing_fps) {
              pacing_policy_logged = YES;
 -            fprintf(stderr, "hengevm: display-pacing: cap=%d thermal=%ld resolution=unchanged guest-rendering=unchanged\n", cap, (long)NSProcessInfo.processInfo.thermalState);
-+            fprintf(stderr, "hengevm: display-pacing: cap=%d thermal=%d resolution=unchanged guest-rendering=unchanged\n", cap, settings.thermal);
++            fprintf(stderr, "hengevm: display-pacing: cap=%d thermal=%d low-power=%d aware=%d resolution=unchanged guest-rendering=unchanged\n", cap, settings.thermal,settings.low_power,settings.power_aware);
              pacing_fps = cap;
          }
 +}
@@ -1312,7 +1455,15 @@ index 9073d22..183d654 100644
      if (presenter_running || !layer || !screen_tex || drawable_retry_pending || pacing_pending) return;
      [self updatePacingPolicy];
      double now = now_seconds();
-@@ -2552,7 +2709,15 @@ static const uint8_t *half_to_byte(void) {
+@@ -2507,6 +2664,7 @@ static const uint8_t *half_to_byte(void) {
+    submit another guest write. All link cursor state belongs to this worker. */
+ - (void)sendLinkMapping:(uint64_t)mapping {
+     link_mapping=mapping;
++    if (hv_pvg_lite_cpu_background(lite)) return; /* a Link encoder also submits GPU work */
+     HvPvgLinkFrameHandler handler=link_frame_handler();
+     HvObject *surface=surfaces[@(mapping)];
+     if(!handler || !surface)return;
+@@ -2552,7 +2710,15 @@ static const uint8_t *half_to_byte(void) {
  /* The pointer moved or changed: the screen again, with no need to go through the GPU queue's worker. */
  - (void)screenChanged {
      os_unfair_lock_lock(&screen_lock);
@@ -1329,7 +1480,7 @@ index 9073d22..183d654 100644
          screen_dirty = YES;
          [self kickPresenter:YES];
      }
-@@ -2562,13 +2727,24 @@ static const uint8_t *half_to_byte(void) {
+@@ -2562,13 +2728,24 @@ static const uint8_t *half_to_byte(void) {
  - (void)presentLoop {
      for (;;) @autoreleasepool {
          os_unfair_lock_lock(&screen_lock);
@@ -1356,7 +1507,7 @@ index 9073d22..183d654 100644
              presenter_running = NO;
              [self kickPresenter:NO];
              os_unfair_lock_unlock(&screen_lock);
-@@ -2597,7 +2773,12 @@ static const uint8_t *half_to_byte(void) {
+@@ -2597,7 +2774,12 @@ static const uint8_t *half_to_byte(void) {
              target.drawableSize = want;
              [CATransaction commit];
          }
@@ -1370,7 +1521,7 @@ index 9073d22..183d654 100644
          if (!drawable) {
              os_unfair_lock_lock(&screen_lock);
              screen_dirty = YES;
-@@ -2636,6 +2817,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2636,6 +2818,7 @@ static const uint8_t *half_to_byte(void) {
          cw0 = cursor_w, ch0 = cursor_h, hx = cursor_hot_x, hy = cursor_hot_y;
          BOOL same_target = layer_generation == generation && layer == target;
          BOOL same_size = screen_w == W && screen_h == H;
@@ -1378,7 +1529,7 @@ index 9073d22..183d654 100644
          if (same_target && same_size) {
              screen_dirty = NO;
              drawable_retry_deadline = 0;
-@@ -2717,7 +2899,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2717,7 +2900,7 @@ static const uint8_t *half_to_byte(void) {
          // Serialize the final check and commit with set_layer: a switch that has
          // returned must not be followed by a commit to its old target.
          os_unfair_lock_lock(&screen_lock);
@@ -1387,8 +1538,12 @@ index 9073d22..183d654 100644
              if (frame_metrics_enabled) {
                  [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
                      os_unfair_lock_lock(&self->frame_metrics_lock);
-@@ -2741,7 +2923,7 @@ static const uint8_t *half_to_byte(void) {
-     if (atomic_load(&stopping)) return;
+@@ -2738,10 +2921,10 @@ static const uint8_t *half_to_byte(void) {
+ 
+ /* What the display should show: at most a few times a second by CPU, for tests and the boot's first frames. */
+ - (void)present:(uint64_t)mapping {
+-    if (atomic_load(&stopping)) return;
++    if (atomic_load(&stopping) || hv_pvg_lite_cpu_background(lite)) return;
      double now = now_seconds();
      on_screen = mapping;
 -    if ([self hasDisplayLayer]) {
@@ -1396,7 +1551,7 @@ index 9073d22..183d654 100644
          late = NO;
          [self showOnLayer:mapping];
          return;
-@@ -2834,13 +3016,19 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2834,13 +3017,19 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->completions = dispatch_group_create();
          r->device = dev;
          r->queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
@@ -1408,7 +1563,7 @@ index 9073d22..183d654 100644
          r->frame_metrics_lock = OS_UNFAIR_LOCK_INIT;
 +        r->display_scene_active = YES;
 +#if TARGET_OS_IPHONE
-+        r->display_driven = hv_host_is_m4_16gb();
++        r->display_driven = hv_host_is_m4_16gb() || hv_host_is_duo();
 +#endif
          r->frame_metrics_enabled = getenv("HV_FRAME_STATS") && !strcmp(getenv("HV_FRAME_STATS"), "1");
          r->library_cache = [[HvMetalLibraryCache alloc] initWithMaxBytes:getenv("HV_GPU_LIBRARY_CACHE_OFF") ? 0 : 8 * 1024 * 1024 entries:32];
@@ -1417,7 +1572,7 @@ index 9073d22..183d654 100644
          r->resource_tally = getenv("HV_PVG_TALLY") != NULL;
          r->batch_cache = getenv("HV_GPU_BATCH_CACHE") && !strcmp(getenv("HV_GPU_BATCH_CACHE"), "1");
          r->tasks = [NSMutableDictionary new];
-@@ -2848,6 +3036,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2848,6 +3037,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->surfaces = [NSMutableDictionary new];
          r->planar = [NSMutableDictionary new];
          r->complaints = [NSMutableSet new];
@@ -1442,7 +1597,7 @@ index 9073d22..183d654 100644
          r->shot = getenv("HV_PVG_SHOT");
          cp_start(r);
  #if !TARGET_OS_IPHONE
-@@ -2864,6 +3070,31 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2864,6 +3071,31 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
              r->shot_timer = timer;
          }
  #endif
@@ -1474,7 +1629,7 @@ index 9073d22..183d654 100644
          fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
          return (HvPvgMetal *)CFBridgingRetain(r);
      }
-@@ -2874,13 +3105,26 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
+@@ -2874,20 +3106,35 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
      @autoreleasepool {
          HvReplay *r = CFBridgingRelease(m);
          atomic_store(&r->stopping, 1);
@@ -1501,7 +1656,19 @@ index 9073d22..183d654 100644
          /* No CPU can enqueue more work. Delayed presentation blocks see
             stopping before touching guest memory; already queued work drains. */
          dispatch_sync(r->worker, ^{ r->late = NO; });
-@@ -2998,16 +3242,46 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
+         dispatch_sync(r->presenter, ^{});
+-        id<MTLCommandBuffer> fence = [r->queue commandBuffer];
+-        [fence commit];
+-        [fence waitUntilCompleted];
++        if (!hv_pvg_lite_cpu_background(r->lite)) {
++            id<MTLCommandBuffer> fence = [r->queue commandBuffer];
++            [fence commit];
++            [fence waitUntilCompleted];
++        } /* CPU mode entered only after the foreground fence below completed. */
+         dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
+         /* GPU completions may have enqueued a final readback on the worker. */
+         dispatch_sync(r->worker, ^{
+@@ -2998,16 +3245,46 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
      }
      r->pacing_pending = NO; r->frame_pacing.next = 0; /* reattaching the same layer also wakes a stopped presenter */
      r->layer = l;
@@ -1548,7 +1715,7 @@ index 9073d22..183d654 100644
  uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m) {
      return m ? ((__bridge HvReplay *)m)->gpu_frames : 0;
  }
-@@ -3015,7 +3289,7 @@ uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m) {
+@@ -3015,7 +3292,7 @@ uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m) {
  void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
      if (!m) return;
      HvReplay *r = (__bridge HvReplay *)m;
@@ -1557,7 +1724,7 @@ index 9073d22..183d654 100644
          [r screenChanged];
          return;
      }
-@@ -3117,25 +3391,37 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+@@ -3117,25 +3394,37 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
      if(atomic_exchange(&r->link_cursor_queued,1))return;
      dispatch_async(r->worker,^{atomic_store(&r->link_cursor_queued,0);if (!atomic_load(&r->stopping)) [r sendLinkMapping:r->link_mapping];});
  }
@@ -1599,7 +1766,7 @@ index 9073d22..183d654 100644
              for (NSNumber *task in r->tasks) {
                  NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
                  for (NSNumber *ref in objs) {
-@@ -3143,79 +3429,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -3143,79 +3432,117 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
                      if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
                      if (o->parent && o->parent->heap_whole) continue;
                      if (!cb) cb = [r->queue commandBuffer];
@@ -1631,6 +1798,24 @@ index 9073d22..183d654 100644
 -    uint32_t cursor_w, cursor_h, cursor_stride, cursor_shown;
 -    int32_t hot_x, hot_y;
 -} DisplayState;
++/* Entry is foreground-only, with CPUs stopped and local presentation paused.
++   Fence both guest and Link submissions before the CPU-only gate is published. */
++int hv_pvg_metal_background_fence(HvPvgMetal *m) {
++    if (!m) return 0;
++    HvReplay *r = (__bridge HvReplay *)m;
++    __block int failed = 0;
++    dispatch_sync(r->worker, ^{
++        r->late = NO;
++        id<MTLCommandBuffer> fence = [r->queue commandBuffer];
++        [fence commit];
++        [fence waitUntilCompleted];
++        failed = !fence || fence.status != MTLCommandBufferStatusCompleted;
++    });
++    dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
++    dispatch_sync(r->worker, ^{});
++    return failed ? -1 : 0;
++}
++
 +#include "display_snapshot.h"
  
  size_t hv_pvg_metal_display_state(HvPvgMetal *m, void *out, size_t cap) {
@@ -1765,10 +1950,178 @@ index 0000000..c550603
 +}
 +#endif
 diff --git a/devices/xhci.c b/devices/xhci.c
-index c355628..e7a802e 100644
+index c355628..ff98ede 100644
 --- a/devices/xhci.c
 +++ b/devices/xhci.c
-@@ -1137,3 +1137,21 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
+@@ -133,9 +133,20 @@ struct HvXhciDev {
+     const uint8_t *report_desc;
+     unsigned report_desc_len;
+ };
++static const uint8_t gp_device_desc[18] = {
++    18,1,0,2,0,0,0,64,0x27,0x06,0x03,0x00,0,1,1,2,3,1
++};
++static const uint8_t gp_config_desc[34] = {
++    9,2,34,0,1,1,0,0x80,25,
++    9,4,0,0,1,3,0,0,0,
++    9,0x21,0x11,0x01,0,1,0x22,sizeof hv_gamepad_descriptor,0,
++    7,5,0x81,3,16,0,8
++};
++static const char *const gp_strings[] = {NULL,"HengeVM","Henge Virtual Gamepad","1"};
+ static const struct HvXhciDev devs[HV_XHCI_DEVICES] = {
+     {kbd_strings, kbd_device_desc, kbd_config_desc, kbd_report_desc, sizeof kbd_report_desc},
+     {tp_strings, tp_device_desc, tp_config_desc, tp_report_desc, sizeof tp_report_desc},
++    {gp_strings, gp_device_desc, gp_config_desc, hv_gamepad_descriptor, sizeof hv_gamepad_descriptor},
+ };
+ 
+ static int xlog(void) {
+@@ -373,7 +384,13 @@ static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, in
+         src = tmp, len = 1;
+     } else if (type == 0xa1 && req == 1) { /* GET_REPORT: wValue is (type << 8) | report ID */
+         if (x->slots[slot].dev == 0) src = x->state, len = 8;
+-        else {
++        else if (x->slots[slot].dev == 2) {
++            if (value != 0x100) return -1;
++            pthread_mutex_lock(&x->mu);
++            memcpy(tmp,x->gp_state,HV_GAMEPAD_BYTES);
++            pthread_mutex_unlock(&x->mu);
++            src=tmp;len=HV_GAMEPAD_BYTES;
++        } else {
+             int rtype = value >> 8, rid = value & 0xff;
+             if (rtype == 3) { /* feature: the sensor-configuration registers */
+                 if (rid == 0x01) { /* the header for the register just selected */
+@@ -507,6 +524,15 @@ static void run_ep_in(HvXhci *x, int slot) {
+             x->delivered++;
+             transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
+         }
++    } else if (s->dev == 2) {
++        while (x->gp_online && x->gp_head != x->gp_tail && ring_peek(x,r,trb,&at)) {
++            int type=(trb[3]>>10)&0x3f;ring_advance(r);
++            if (type!=TRB_NORMAL) continue;
++            uint64_t buf=(uint64_t)trb[1]<<32|trb[0];uint32_t want=trb[2]&0x1ffff;
++            uint32_t n=want<HV_GAMEPAD_BYTES?want:HV_GAMEPAD_BYTES;
++            wr(x,buf,x->gp_reports[x->gp_head++%64],n);x->gp_delivered++;
++            transfer_event(x,at,n<want?CC_SHORT_PACKET:CC_SUCCESS,want-n,slot,dci);
++        }
+     } else {
+         while (x->tp_rhead != x->tp_rtail && ring_peek(x, r, trb, &at)) {
+             int type = (trb[3] >> 10) & 0x3f;
+@@ -558,6 +584,7 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
+     int port = slot_ctx[6]; /* root hub port number, dword 1 bits 23:16 */
+     int dev = port - 1;
+     if (dev < 0 || dev >= HV_XHCI_DEVICES) return CC_TRB_ERROR;
++    if (dev==2 && !x->gp_online) return CC_CONTEXT_STATE;
+     x->slots[slot].dev = dev;
+     uint32_t dw3 = (uint32_t)(bsr ? 1 : 2) << 27 | (uint32_t)(bsr ? 0 : slot); /* default or addressed; address = slot */
+     memcpy(slot_ctx + 12, &dw3, 4);
+@@ -704,7 +731,8 @@ static void run_commands(HvXhci *x) {
+    Magic Trackpad 2 is. */
+ static void port_connect(HvXhci *x) {
+     for (int p = 0; p < HV_XHCI_PORTS; p++) {
+-        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
++        if (p==2 && !x->gp_online) { x->portsc[p]=PORT_PP; continue; }
++        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p==1 ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+         port_event(x, p);
+     }
+ }
+@@ -737,6 +765,7 @@ static void port_write(HvXhci *x, int p, uint32_t v) {
+ /* ---- registers ---- */
+ 
+ static void reset(HvXhci *x) {
++    pthread_mutex_lock(&x->mu);
+     x->usbcmd = 0;
+     x->usbsts = 1; /* halted */
+     x->dnctrl = x->config = 0;
+@@ -750,6 +779,7 @@ static void reset(HvXhci *x) {
+     memset(x->reports, 0, sizeof x->reports);
+     x->rhead = x->rtail = 0;
+     memset(x->state, 0, sizeof x->state);
++    memset(x->key_owners,0,sizeof x->key_owners);
+     memset(x->tp_fingers, 0, sizeof x->tp_fingers);
+     x->tp_button = 0;
+     x->tp_ts = 0;
+@@ -760,8 +790,12 @@ static void reset(HvXhci *x) {
+     x->tp_db = 0;
+     x->tp_multi_logs = 0;
+     x->tp_f1_len = 0;
++    x->gp_online=x->gp_desired;
++    x->gp_head=x->gp_tail=0;
++    if (x->gp_desired) memcpy(x->gp_reports[x->gp_tail++],x->gp_state,HV_GAMEPAD_BYTES);
+     for (int p = 0; p < HV_XHCI_PORTS; p++)
+-        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
++        x->portsc[p] = p==2 && !x->gp_online ? PORT_PP : PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p==1 ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
++    pthread_mutex_unlock(&x->mu);
+     update_irq(x);
+ }
+ 
+@@ -933,27 +967,24 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
+ 
+ /* ---- the keyboard's reports ---- */
+ 
+-void hv_xhci_key(HvXhci *x, uint8_t usage, int down) {
+-    if (!x || !usage) return;
++void hv_xhci_key_source(HvXhci *x,uint8_t usage,int down,unsigned source) {
++    if (!x || usage<4 || usage>231 || source>3) return;
+     pthread_mutex_lock(&x->mu);
+-    uint8_t *s = x->state;
+-    if (usage >= 0xe0 && usage <= 0xe7) { /* modifiers live in byte 0 */
+-        uint8_t bit = (uint8_t)(1u << (usage - 0xe0));
+-        s[0] = down ? s[0] | bit : s[0] & ~bit;
+-    } else {
+-        int i;
+-        for (i = 2; i < 8 && s[i] != usage; i++) {}
+-        if (down && i == 8) { /* not held yet: take a free place */
+-            for (i = 2; i < 8 && s[i]; i++) {}
+-            if (i < 8) s[i] = usage;
+-        } else if (!down && i < 8) { /* let go: close the gap */
+-            memmove(s + i, s + i + 1, (size_t)(7 - i));
+-            s[7] = 0;
+-        }
+-    }
+-    if (x->rtail - x->rhead < HV_XHCI_REPORTS) memcpy(x->reports[x->rtail++ % HV_XHCI_REPORTS], s, 8);
+-    pthread_mutex_unlock(&x->mu);
+-    hv_machine_wake(x->m);
++    uint8_t before=x->key_owners[usage],bit=(uint8_t)(1u<<source);
++    uint8_t after=down ? before|bit : before&~bit;
++    x->key_owners[usage]=after;
++    if (!!before==!!after) {pthread_mutex_unlock(&x->mu);return;}
++    uint8_t *s=x->state;memset(s,0,8);unsigned held=0;
++    for(unsigned k=4;k<224;k++) if(x->key_owners[k]) {if(held<6)s[2+held]=(uint8_t)k;held++;}
++    if(held>6)memset(s+2,1,6); /* boot-keyboard ErrorRollOver, never lose a release */
++    for(unsigned k=224;k<232;k++) if(x->key_owners[k])s[0]|=(uint8_t)(1u<<(k-224));
++    if(x->rtail-x->rhead==HV_XHCI_REPORTS)x->rhead++;
++    memcpy(x->reports[x->rtail++%HV_XHCI_REPORTS],s,8);
++    pthread_mutex_unlock(&x->mu);hv_machine_wake(x->m);
++}
++void hv_xhci_key(HvXhci *x,uint8_t usage,int down) { hv_xhci_key_source(x,usage,down,0); }
++void hv_xhci_release_source(HvXhci *x,unsigned source) {
++    for(unsigned k=4;k<232;k++)hv_xhci_key_source(x,(uint8_t)k,0,source);
+ }
+ 
+ /* Linux input key codes to HID keyboard usages (the same table macOS's virtio
+@@ -1114,6 +1145,14 @@ void hv_xhci_touch_button(HvXhci *x, int down) {
+ 
+ void hv_xhci_poll(HvXhci *x) {
+     if (!x) return;
++    pthread_mutex_lock(&x->mu);
++    int changed=x->gp_online!=x->gp_desired;
++    if (changed) {
++        x->gp_online=x->gp_desired;
++        x->portsc[2]=(x->portsc[2]&PORT_PP)|PORT_CSC|(x->gp_online ? PORT_CCS|SPEED_FULL<<PORT_SPEED_SHIFT|7u<<PORT_PLS_SHIFT:0);
++    }
++    pthread_mutex_unlock(&x->mu);
++    if (changed) port_event(x,2);
+     for (int slot = 1; slot <= HV_XHCI_SLOTS; slot++)
+         if (x->slots[slot].dev >= 0) run_ep_in(x, slot);
+ }
+@@ -1122,6 +1161,7 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
+     HvXhci *x = calloc(1, sizeof *x);
+     x->m = m;
+     pthread_mutex_init(&x->mu, NULL);
++    hv_gamepad_neutral(x->gp_state);
+     /* QEMU's xHCI IDs. Class 0x0c0330 with revision 0: macOS's IOPCIClassMatch compares all 32 bits. */
+     hv_pci_init(&x->pci, 0x1b36, 0x000d, 0x0c033000, 0x1af4, 0x1100);
+     x->pci.opaque = x;
+@@ -1137,3 +1177,48 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
      reset(x);
      return x;
  }
@@ -1779,27 +2132,110 @@ index c355628..e7a802e 100644
 +    if (!x) return;
 +    pthread_mutex_lock(&x->mu);
 +    memset(x->state, 0, sizeof x->state);
++    memset(x->key_owners,0,sizeof x->key_owners);
 +    x->rhead = x->rtail;
 +    memcpy(x->reports[x->rtail++ % HV_XHCI_REPORTS], x->state, sizeof x->state);
 +    x->tp_rhead = x->tp_rtail;
 +    x->tp_button = 0;
 +    for (int i = 0; i < HV_TP_FINGERS; i++) if (x->tp_fingers[i].in) x->tp_fingers[i].state = 7;
 +    tp_queue(x, 0);
++    hv_gamepad_neutral(x->gp_state);
++    x->gp_head=x->gp_tail;
++    memcpy(x->gp_reports[x->gp_tail++%64],x->gp_state,HV_GAMEPAD_BYTES);
 +    memset(x->tp_fingers, 0, sizeof x->tp_fingers);
 +    tp_queue(x, 0);
 +    pthread_mutex_unlock(&x->mu);
 +    hv_machine_wake(x->m);
 +}
++
++void hv_xhci_gamepad(HvXhci *x,int connected,uint16_t buttons,unsigned hat,
++                     const int16_t axes[4],uint8_t left,uint8_t right) {
++    if (!x || !axes) return;
++    uint8_t report[HV_GAMEPAD_BYTES];
++    if (connected) hv_gamepad_pack(report,buttons,hat,axes,left,right);
++    else hv_gamepad_neutral(report);
++    pthread_mutex_lock(&x->mu);
++    int changed=x->gp_desired!=!!connected || memcmp(x->gp_state,report,sizeof report);
++    x->gp_desired=!!connected;
++    if (changed) {
++        memcpy(x->gp_state,report,sizeof report);
++        if (x->gp_tail!=x->gp_head && !memcmp(x->gp_reports[(x->gp_tail-1)%64],report,3) &&
++            !memcmp(x->gp_reports[(x->gp_tail-1)%64]+11,report+11,2)) {
++            memcpy(x->gp_reports[(x->gp_tail-1)%64],report,sizeof report);x->gp_coalesced++;
++        } else {
++            if (x->gp_tail-x->gp_head==64) {x->gp_head++;x->gp_overflow++;}
++            memcpy(x->gp_reports[x->gp_tail++%64],report,sizeof report);
++        }
++    }
++    pthread_mutex_unlock(&x->mu);
++    if (changed) hv_machine_wake(x->m);
++}
 diff --git a/devices/xhci.h b/devices/xhci.h
-index cf4acc4..9961c12 100644
+index cf4acc4..e5eefc1 100644
 --- a/devices/xhci.h
 +++ b/devices/xhci.h
-@@ -88,6 +88,8 @@ typedef struct HvXhci {
+@@ -4,17 +4,19 @@
+ #include <pthread.h>
+ 
+ #include "pcie.h"
++#include "gamepad.h"
+ 
+ /* An xHCI USB host controller (xHCI 1.0, one interrupter, 32-byte contexts,
+-   INTx) with two USB HID devices: a boot keyboard on port 1 and a Magic
++   INTx) with two default USB HID devices: a boot keyboard on port 1 and a Magic
+    Trackpad 2 on port 2: what Virtualization.framework gives a macOS guest as
+-   its "Virtual USB Keyboard", plus Apple's multitouch pad, so the guest's
++   its "Virtual USB Keyboard", plus Apple's multitouch pad. Port 3 is an
++   opt-in Generic Desktop HID gamepad. The guest's
+    own gesture engine sees a real trackpad. Changes come from the host UI on
+    any thread (hv_xhci_key, hv_xhci_touch); the CPU thread delivers them
+    (hv_xhci_poll). */
+ #define HV_XHCI_SLOTS 8
+-#define HV_XHCI_PORTS 2
+-#define HV_XHCI_DEVICES 2
++#define HV_XHCI_PORTS 3
++#define HV_XHCI_DEVICES 3
+ #define HV_XHCI_INTRS 4
+ #define HV_XHCI_EPS 32 /* device context index 1..31 */
+ #define HV_XHCI_REPORTS 256
+@@ -52,7 +54,7 @@ typedef struct HvXhci {
+     /* device slots: -1 until the device on the slot's port is addressed */
+     int slot_used[HV_XHCI_SLOTS + 1];
+     struct HvXhciSlot {
+-        int dev;         /* 0 keyboard, 1 trackpad, -1 none */
++        int dev;         /* 0 keyboard, 1 trackpad, 2 optional gamepad, -1 none */
+         int configured;
+         HvXhciRing ep[HV_XHCI_EPS];
+         int ep_running[HV_XHCI_EPS];
+@@ -63,6 +65,7 @@ typedef struct HvXhci {
+     uint32_t rhead, rtail;
+     uint8_t state[8];      /* modifiers, reserved, six keys: the current report */
+     uint64_t delivered;
++    uint8_t key_owners[256]; /* physical, remote keyboard, mapped gamepad, reserved */
+     /* Magic Trackpad 2: the fingers on the pad and their reports (Apple
+        multitouch format, report ID 2: 12-byte prefix plus 9 bytes a finger). */
+     struct HvTpFinger {
+@@ -83,11 +86,23 @@ typedef struct HvXhci {
+     uint32_t tp_multi_logs; /* multi-finger deliveries logged, capped */
+     uint8_t tp_f1[8];   /* feature report 1: the header for the selected sensor register */
+     int tp_f1_len;
++    /* Port 3 stays disconnected until requested. Producers use mu; only the
++       CPU/device thread publishes port status and xHCI completion events. */
++    int gp_desired, gp_online;
++    uint8_t gp_state[HV_GAMEPAD_BYTES], gp_reports[64][HV_GAMEPAD_BYTES];
++    uint32_t gp_head, gp_tail;
++    uint64_t gp_delivered, gp_coalesced, gp_overflow;
+ } HvXhci;
+ 
  HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus);
  /* Any thread: a key went down or up (HID usage page 7 usage, e.g. 4 = A; 0xe0-0xe7 are modifiers). */
  void hv_xhci_key(HvXhci *x, uint8_t usage, int down);
++void hv_xhci_key_source(HvXhci *x,uint8_t usage,int down,unsigned source);
++void hv_xhci_release_source(HvXhci *x,unsigned source);
 +/* Session interruption: discard pending downs and queue authoritative release reports. */
 +void hv_xhci_release_input(HvXhci *x);
++void hv_xhci_gamepad(HvXhci *x, int connected, uint16_t buttons, unsigned hat,
++                     const int16_t axes[4], uint8_t left, uint8_t right);
  /* The same, by Linux input key code (what the host UI produces). */
  void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down);
  /* Any thread: a Magic Trackpad 2 touch. phase: 0 down, 1 move, 2 up. id: a
@@ -2612,7 +3048,7 @@ index 37b2313..da6d7a1 100644
 +
  #endif
 diff --git a/host/snapshot.c b/host/snapshot.c
-index 383ae01..7140036 100644
+index 383ae01..62b69a3 100644
 --- a/host/snapshot.c
 +++ b/host/snapshot.c
 @@ -27,11 +27,24 @@
@@ -2777,7 +3213,12 @@ index 383ae01..7140036 100644
      w_section(w, TAG('P', 'V', 'G', 'D'), db, db ? dn : 0);
      free(db);
  }
-@@ -596,8 +633,9 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+@@ -592,12 +629,14 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
+ /* ---- the file ---- */
+ 
+ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errlen) {
++    if (hv_vm_cpu_background()) return fail(err, errlen, "Return Henge to the foreground before saving a CPU background runner. Graphics commands are still queued in the guest.");
+     HvMachine *m = hv_vm_machine();
      HvVmapple *b = hv_vm_board();
      int ncpus = hv_vm_ncpus();
      if (!m || !b || !b->ram || ncpus < 1) return fail(err, errlen, "No machine to save.");
@@ -2788,7 +3229,7 @@ index 383ae01..7140036 100644
      struct timespec t0, t1;
      clock_gettime(CLOCK_MONOTONIC, &t0);
      char tmp[1100];
-@@ -624,6 +662,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+@@ -624,6 +663,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
          unlink(tmp);
          return fail(err, errlen, "Cannot read the disk's details.");
      }
@@ -2796,7 +3237,7 @@ index 383ae01..7140036 100644
      w_raw(&w, &h, sizeof h);
      for (int i = 0; i < ncpus; i++) {
          CpuState s;
-@@ -659,9 +698,9 @@ static int read_header(int fd, SnapHeader *h, const char *ident, uint64_t *bytes
+@@ -659,9 +699,9 @@ static int read_header(int fd, SnapHeader *h, const char *ident, uint64_t *bytes
      struct stat st;
      Trailer t;
      if (fstat(fd, &st) != 0 || (uint64_t)st.st_size < sizeof *h + sizeof t) return -1;
@@ -2809,7 +3250,7 @@ index 383ae01..7140036 100644
      h->ident[sizeof h->ident - 1] = 0;
      if (strcmp(h->ident, ident ? ident : "")) return -2;
      if (pread(fd, &t, sizeof t, st.st_size - (off_t)sizeof t) != (ssize_t)sizeof t || t.tag != TAG('E', 'N', 'D', ' ') ||
-@@ -695,7 +734,8 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
+@@ -695,7 +735,8 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
      int hr = read_header(fd, &h, ident, NULL);
      if (hr) {
          close(fd);
@@ -2819,7 +3260,7 @@ index 383ae01..7140036 100644
      }
      char disk_now[256];
      h.disk[sizeof h.disk - 1] = 0;
-@@ -728,7 +768,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
+@@ -728,7 +769,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
      if (!bad) bad = r_raw(&r, &t, sizeof t) || t.tag != TAG('E', 'N', 'D', ' ');
      free(r.buf);
      close(fd);
@@ -2829,7 +3270,7 @@ index 383ae01..7140036 100644
      if (bad) return fail(err, errlen, "The saved Mac could not be read (%s).", strerror(r.err ? r.err : EINVAL));
      /* The guest's clock goes on as far as the wall clock went since it stopped (see hv_vm_resume_counter). */
 diff --git a/host/vm.c b/host/vm.c
-index db95c05..5666074 100644
+index db95c05..3fd6356 100644
 --- a/host/vm.c
 +++ b/host/vm.c
 @@ -4,6 +4,7 @@
@@ -2920,7 +3361,7 @@ index db95c05..5666074 100644
  }
  
  int hv_vm_run_cpu0(void) {
-@@ -512,13 +553,16 @@ int hv_vm_finish_pause(void) {
+@@ -512,19 +553,45 @@ int hv_vm_finish_pause(void) {
      hv_virtio_blk_stop(board.root_blk);
      hv_virtio_blk_stop(board.aux_blk);
      /* hv_vm_run_cpu0 already detached board.snd under the device lock. */
@@ -2940,7 +3381,45 @@ index db95c05..5666074 100644
      set_pause_state(2);
      return 0;
  }
-@@ -627,6 +671,7 @@ static void *cpu0_thread(void *unused) {
+ 
+ int hv_vm_pause_clean(void) { return hv_vm_paused() && pause_clean; }
+ 
++int hv_vm_cpu_background(void) { return hv_pvg_lite_cpu_background(board.pvg); }
++int hv_vm_set_cpu_background(int enabled) {
++    if (!board.pvg || (enabled && !hv_vm_pause_clean())) return -1;
++    if (!!enabled == hv_vm_cpu_background()) return 0;
++    hv_dev_lock(&m);
++    hv_pvg_lite_set_cpu_background(board.pvg, enabled);
++    hv_dev_unlock(&m);
++    if (enabled && hv_pvg_lite_background_fence(board.pvg)) {
++        hv_dev_lock(&m);
++        hv_pvg_lite_set_cpu_background(board.pvg, 0);
++        hv_dev_unlock(&m);
++        return -1;
++    }
++    hv_pvg_lite_set_display_paused(board.pvg, enabled || hv_vm_paused());
++    if (!enabled && sound_on && !hv_vm_paused()) {
++        hv_audio_attach(board.snd);
++        hv_virtio_snd_resume(board.snd);
++    }
++    fprintf(stderr, "hengevm: runner CPU background=%d; GPU rings retained, no fabricated completions\n", !!enabled);
++    hv_machine_kick_all(&m);
++    return 0;
++}
++
+ /* Where the guest's counter goes on from after a pause or a restore: as much later as the wall clock moved meanwhile, so
+    its clock is right at once (macOS then also checks it with the network) -- the counter on a host (an iPhone asleep)
+    stops for longer than the wall clock does. A jump of 10 minutes was seen to do no harm beyond what a Mac left alone
+@@ -588,7 +655,7 @@ int hv_vm_continue(void) {
+     }
+     hv_virtio_blk_start(board.root_blk);
+     hv_virtio_blk_start(board.aux_blk);
+-    if (sound_on) {
++    if (sound_on && !hv_vm_cpu_background()) {
+         hv_audio_attach(board.snd);
+         hv_virtio_snd_resume(board.snd);
+     }
+@@ -627,6 +694,7 @@ static void *cpu0_thread(void *unused) {
  }
  
  int hv_vm_start(int cpu0, void (*on_exit)(int reason)) {
@@ -2948,7 +3427,15 @@ index db95c05..5666074 100644
      exit_cb = on_exit;
      pthread_mutex_lock(&pause_mu);
      run_ended = 0;
-@@ -702,9 +747,13 @@ static void stop_pointer(void) {
+@@ -685,6 +753,7 @@ void hv_vm_stop(void) {
+ static os_unfair_lock rctrl_lock = OS_UNFAIR_LOCK_INIT;
+ static int rctrl_user, rctrl_click;
+ static int left_user, left_click, left_sent; /* only the pointer queue touches these */
++static uint8_t button_owners[3];
+ 
+ static dispatch_queue_t pointer_queue(void) {
+     static dispatch_queue_t q;
+@@ -702,9 +771,14 @@ static void stop_pointer(void) {
              hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);
              hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
          }
@@ -2957,17 +3444,70 @@ index db95c05..5666074 100644
 +            hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
 +        }
          left_user = left_click = left_sent = 0;
++        memset(button_owners,0,sizeof button_owners);
          os_unfair_lock_lock(&rctrl_lock);
 -        if (board.usb && (rctrl_user || rctrl_click)) hv_xhci_key(board.usb, HID_RIGHT_CONTROL, 0);
 +        hv_xhci_release_input(board.usb);
          rctrl_user = rctrl_click = 0;
          os_unfair_lock_unlock(&rctrl_lock);
      });
+@@ -752,7 +826,13 @@ static void left_update(void) {
+ static void button_now(void *ctx) {
+     if (atomic_load(&input_stopping)) return;
+     intptr_t v = (intptr_t)ctx;
+-    int button = (int)(v >> 1), down = (int)(v & 1);
++    int button = (int)((v >> 1)&3), down = (int)(v & 1);
++    unsigned owner=(unsigned)(v>>3)&3u;
++    if (button>2) return;
++    uint8_t before=button_owners[button],bit=(uint8_t)(1u<<owner);
++    button_owners[button]=down ? before|bit : before&~bit;
++    down=button_owners[button]!=0;
++    if (!!before==down) return;
+     if (button == 0) {
+         left_user = down;
+         left_update();
+@@ -777,6 +857,16 @@ void hv_vm_mouse_button(int button, int down) {
+     if (button < 0 || button > 2) return;
+     dispatch_async_f(pointer_queue(), (void *)(intptr_t)(button << 1 | !!down), button_now);
+ }
++void hv_vm_mouse_button_source(int button,int down,unsigned source) {
++    if(button<0 || button>2 || source>2)return;
++    dispatch_async_f(pointer_queue(),(void *)(intptr_t)(source<<3|button<<1|!!down),button_now);
++}
++void hv_vm_key_hid_source(uint8_t usage,int down,unsigned source) { hv_xhci_key_source(board.usb,usage,down,source); }
++void hv_vm_release_input_source(unsigned source) {
++    if(source<1 || source>2)return;
++    hv_xhci_release_source(board.usb,source);
++    for(int b=0;b<3;b++)hv_vm_mouse_button_source(b,0,source);
++}
+ 
+ /* The guest takes a wheel event as 8 bits: -200 arrives as +56, the wrong way. So big moves go in pieces. */
+ static void wheel(uint16_t axis, int amount) {
+@@ -802,6 +892,9 @@ void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
+ void hv_vm_touch_frame(uint32_t ts_ms) { hv_xhci_touch_frame(board.usb, ts_ms); }
+ 
+ void hv_vm_touch_button(int down) { hv_xhci_touch_button(board.usb, down); }
++void hv_vm_gamepad(int connected,uint16_t buttons,unsigned hat,const int16_t axes[4],uint8_t left,uint8_t right) {
++    hv_xhci_gamepad(board.usb,connected,buttons,hat,axes,left,right);
++}
+ 
+ int hv_vm_pointer(int *x, int *y) {
+     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
 diff --git a/host/vm.h b/host/vm.h
-index 47e26eb..8a4a83e 100644
+index 47e26eb..da802d1 100644
 --- a/host/vm.h
 +++ b/host/vm.h
-@@ -83,7 +83,8 @@ uint64_t hv_vm_resume_counter(uint64_t counter, int64_t wall_ns);
+@@ -77,13 +77,18 @@ int hv_vm_finish_pause(void);
+ int hv_vm_paused(void);
+ int hv_vm_continue(void);
+ int hv_vm_pause_clean(void); /* paused with no disk request in flight: it can be saved */
++/* CPU background entry: paused and GPU-clean in the foreground. Exit may run
++   while CPUs execute. Native bridge serializes transitions and VM lifetime. */
++int hv_vm_cpu_background(void);
++int hv_vm_set_cpu_background(int enabled);
+ uint64_t hv_vm_paused_counter(void); /* the guest's virtual counter when it paused */
+ /* The counter to go on from after a pause or a restore made at wall_ns (CLOCK_REALTIME): see vm.c. */
+ uint64_t hv_vm_resume_counter(uint64_t counter, int64_t wall_ns);
  int64_t hv_vm_paused_wall_ns(void);
  /* After a resume (or a long pause): the network link down for 2 s, 1.5 s from now. */
  void hv_vm_link_flap(void);
@@ -2977,6 +3517,17 @@ index 47e26eb..8a4a83e 100644
  /* The disk and auxiliary storage files as they are now (inode, size, last change): a saved machine resumes only onto these. */
  int hv_vm_disk_identity(char *out, size_t n);
  const char *hv_vm_reason_name(int reason);
+@@ -101,6 +106,10 @@ void hv_vm_mouse_hwheel(int dx);
+ void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms);
+ void hv_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
+ void hv_vm_touch_button(int down); /* the pad's full press (a click) */
++void hv_vm_gamepad(int connected,uint16_t buttons,unsigned hat,const int16_t axes[4],uint8_t left,uint8_t right);
++void hv_vm_key_hid_source(uint8_t usage,int down,unsigned source);
++void hv_vm_mouse_button_source(int button,int down,unsigned source);
++void hv_vm_release_input_source(unsigned source);
+ /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
+ int hv_vm_pointer(int *x, int *y);
+ /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */
 diff --git a/ios/Henge/Autopilot.swift b/ios/Henge/Autopilot.swift
 index 6a0a9cc..e01a852 100644
 --- a/ios/Henge/Autopilot.swift
@@ -3005,7 +3556,7 @@ index 6a0a9cc..e01a852 100644
          case "env": // "env HV_QOS ui": an engine setting read when the next Mac starts (one not in henge-env.txt, which wins)
              let kv = arg.split(separator: " ", maxSplits: 1).map(String.init)
 diff --git a/ios/Henge/BackgroundExecutionStatus.swift b/ios/Henge/BackgroundExecutionStatus.swift
-index b65b6ce..4511710 100644
+index b65b6ce..5ebbb7a 100644
 --- a/ios/Henge/BackgroundExecutionStatus.swift
 +++ b/ios/Henge/BackgroundExecutionStatus.swift
 @@ -17,6 +17,6 @@ enum BackgroundExecutionStatus {
@@ -3013,7 +3564,7 @@ index b65b6ce..4511710 100644
      }
      static func log() {
 -        HengeLog.log("background", "GPU capability=\(gpuSupport); signed GPU entitlement=\(signedGPUAccess); VM background execution=not implemented; keep Henge visible during builds")
-+        HengeLog.log("background", "GPU capability=\(gpuSupport); signed GPU entitlement=\(signedGPUAccess); runner background processing requires an active iOS GPU grant; otherwise keep Henge visible during builds")
++        HengeLog.log("background", "GPU capability=\(gpuSupport); signed GPU entitlement=\(signedGPUAccess); CPU runner requires foreground GPU drain plus active continued-processing grant; GPU runner additionally requires signed GPU access; PiP is not an execution grant")
      }
  }
 diff --git a/ios/Henge/BootDisplay.swift b/ios/Henge/BootDisplay.swift
@@ -3718,10 +4269,17 @@ index 29c8b3b..71cc43b 100644
      /// On an iPhone's large screen (iPhone Duo unfolded): fill it, or leave a strip at the right for the status
      /// bar and Henge's controls. Macs that never chose fill it.
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..d897d27 100644
+index 34d6a98..de15e9a 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
-@@ -27,19 +27,38 @@
+@@ -23,23 +23,45 @@
+ 
+ #include <fcntl.h>
+ #include <unistd.h>
++#include <sys/resource.h>
++#include <mach/mach.h>
++
+ 
  HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
  
  static _Atomic int state;
@@ -3762,7 +4320,7 @@ index 34d6a98..d897d27 100644
      exit_reason = reason;
      int halt = hv_vm_cpu(0)->halted;
      exit_outcome = HENGE_VM_OUTCOME_ERROR;
-@@ -49,13 +68,12 @@ static void on_exit(int reason) {
+@@ -49,13 +71,12 @@ static void on_exit(int reason) {
      case HV_HALT_HOST: exit_outcome = HENGE_VM_OUTCOME_HOST_STOP; break;
      case HV_HALT_PANIC: exit_outcome = HENGE_VM_OUTCOME_PANIC; break;
      }
@@ -3779,7 +4337,7 @@ index 34d6a98..d897d27 100644
      fprintf(stderr, "henge: the machine stopped (%s, halt reason %d); CPU threads ended, disks flushed%s\n",
              exit_description(), halt, installer_session ? "" : ", machine released");
      pthread_rwlock_unlock(&api_lock);
-@@ -75,26 +93,27 @@ static int begin_start(char *err, size_t errlen) {
+@@ -75,26 +96,27 @@ static int begin_start(char *err, size_t errlen) {
          pthread_rwlock_unlock(&api_lock);
          return -1;
      }
@@ -3811,7 +4369,7 @@ index 34d6a98..d897d27 100644
      pthread_rwlock_unlock(&api_lock);
      return 0;
  }
-@@ -117,8 +136,10 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
+@@ -117,8 +139,10 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
  }
  
  int henge_vm_pause(char *err, size_t errlen) {
@@ -3824,7 +4382,7 @@ index 34d6a98..d897d27 100644
          snprintf(err, errlen, "No Mac is running.");
          return -1;
      }
-@@ -133,21 +154,25 @@ int henge_vm_pause(char *err, size_t errlen) {
+@@ -133,21 +157,25 @@ int henge_vm_pause(char *err, size_t errlen) {
          snprintf(err, errlen, "The Mac stopped by itself.");
          return -1;
      }
@@ -3851,7 +4409,7 @@ index 34d6a98..d897d27 100644
      fprintf(stderr, "henge: %s\n", r ? err : "the paused Mac is saved");
      return r;
  }
-@@ -165,13 +190,15 @@ int henge_vm_continue(void) {
+@@ -165,19 +193,52 @@ int henge_vm_continue(void) {
          pthread_rwlock_unlock(&api_lock);
          return -1;
      }
@@ -3869,7 +4427,44 @@ index 34d6a98..d897d27 100644
      }
      pthread_rwlock_unlock(&api_lock);
      fprintf(stderr, "henge: the Mac runs on%s\n", r ? " -- no, its CPU threads could not start" : "");
-@@ -293,21 +320,22 @@ static int lock_running(void) {
+     return r;
+ }
+ 
++int henge_vm_prepare_cpu_background(char *err, size_t errlen) {
++    pthread_rwlock_wrlock(&api_lock);
++    int rc = -1;
++    if (state != 1 || installer_session) snprintf(err,errlen,"Start the Mac and its runner before preparing CPU background work.");
++    else if (hv_vm_pause()) snprintf(err,errlen,"The Mac stopped while preparing background work.");
++    else {
++        set_state(4); counter_epoch++;
++        int prepared = hv_vm_set_cpu_background(1) == 0;
++        if (!prepared) snprintf(err,errlen,"Graphics or disks could not be quiesced. Keep Henge visible.");
++        set_state(1); counter_epoch++;
++        if (hv_vm_continue()) {
++            retain_counters(); hv_vm_destroy(); exit_outcome=HENGE_VM_OUTCOME_ERROR; set_state(2);
++            snprintf(err,errlen,"The Mac's CPU threads could not restart.");
++        } else rc = prepared ? 0 : -1;
++    }
++    pthread_rwlock_unlock(&api_lock);
++    return rc;
++}
++
++void henge_vm_foreground_graphics(void) {
++    pthread_rwlock_wrlock(&api_lock);
++    if ((state==1 || state==4) && hv_vm_cpu_background()) (void)hv_vm_set_cpu_background(0);
++    pthread_rwlock_unlock(&api_lock);
++}
++int henge_vm_cpu_background(void) {
++    pthread_rwlock_rdlock(&api_lock);
++    int enabled=(state==1 || state==4) && hv_vm_cpu_background();
++    pthread_rwlock_unlock(&api_lock);
++    return enabled;
++}
++
+ static int boot_or_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
+                           int cpus, const char *resume, const char *ident, char *err, size_t errlen) {
+     { extern void hv_prof_ios_start(void); hv_prof_ios_start(); }
+@@ -293,21 +354,22 @@ static int lock_running(void) {
      return 0;
  }
  void henge_vm_stop(void) {
@@ -3902,7 +4497,7 @@ index 34d6a98..d897d27 100644
      pthread_rwlock_unlock(&api_lock);
  }
  
-@@ -344,13 +372,13 @@ void henge_vm_log_cache(void) {
+@@ -344,13 +406,13 @@ void henge_vm_log_cache(void) {
  
  uint64_t henge_vm_blocks(void) {
      pthread_rwlock_rdlock(&api_lock);
@@ -3918,7 +4513,7 @@ index 34d6a98..d897d27 100644
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
-@@ -454,11 +482,30 @@ void henge_vm_set_display_layer(void *layer) {
+@@ -454,11 +516,30 @@ void henge_vm_set_display_layer(void *layer) {
      hv_vm_set_display_layer(layer);
  }
  uint64_t henge_vm_gpu_frames(void) {
@@ -3951,11 +4546,88 @@ index 34d6a98..d897d27 100644
  int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride) {
      if (!lock_running()) return -1;
      HvBootDisplay d;
+@@ -509,3 +590,63 @@ uint64_t henge_largest_mapping_mb(void) {
+     }
+     return 0;
+ }
++
++void henge_vm_resources(HengeVmResources *out) {
++    if (!out) return;
++    memset(out,0,sizeof *out);
++    struct rusage usage;
++    if (!getrusage(RUSAGE_SELF,&usage)) {
++        out->process_cpu_us=(uint64_t)(usage.ru_utime.tv_sec+usage.ru_stime.tv_sec)*1000000+
++            (uint64_t)usage.ru_utime.tv_usec+(uint64_t)usage.ru_stime.tv_usec;
++        out->available|=1;
++    }
++    task_vm_info_data_t info={0};mach_msg_type_number_t count=TASK_VM_INFO_COUNT;
++    if (task_info(mach_task_self(),TASK_VM_INFO,(task_info_t)&info,&count)==KERN_SUCCESS) {
++        out->footprint=info.phys_footprint;out->resident=info.resident_size;
++        out->available|=2;
++    }
++#if TARGET_OS_IPHONE
++    out->headroom=os_proc_available_memory();
++    out->available|=4;
++#endif
++    pthread_rwlock_rdlock(&api_lock);
++    if (state==1 || state==4) {
++        out->available|=8;
++        HvMachine *m=hv_vm_machine();
++        pthread_mutex_lock(&m->tr_mu);
++        out->jit_used=m->jit.used*4;out->jit_capacity=(m->jit.limit?m->jit.limit:m->jit.capacity)*4;
++        pthread_mutex_unlock(&m->tr_mu);
++        out->translations=__atomic_load_n(&m->stats.translations,__ATOMIC_RELAXED);
++        out->full_flushes=__atomic_load_n(&m->stats.flush_full,__ATOMIC_RELAXED);
++        out->detailed_counters=m->stats_interval!=0;
++        HvXhci *x=hv_vm_board()->usb;
++        if (x) {
++            pthread_mutex_lock(&x->mu);
++            out->gamepad_delivered=x->gp_delivered;out->gamepad_coalesced=x->gp_coalesced;out->gamepad_overflow=x->gp_overflow;
++            pthread_mutex_unlock(&x->mu);
++        }
++    }
++    pthread_rwlock_unlock(&api_lock);
++}
++
++
++int henge_vm_gamepad(int connected,uint16_t buttons,int16_t lx,int16_t ly,int16_t rx,int16_t ry,
++                     uint8_t left,uint8_t right,uint8_t hat) {
++    if (!lock_running()) return -1;
++    int16_t axes[4]={lx,ly,rx,ry};
++    hv_vm_gamepad(connected,buttons,hat,axes,left,right);
++    pthread_rwlock_unlock(&api_lock);
++    return 0;
++}
++void henge_vm_input_key(unsigned source,uint8_t usage,int down) {
++    if(source<1 || source>2 || !lock_running())return;
++    hv_vm_key_hid_source(usage,down,source);pthread_rwlock_unlock(&api_lock);
++}
++void henge_vm_input_button(unsigned source,int button,int down) {
++    if(source<1 || source>2 || !lock_running())return;
++    hv_vm_mouse_button_source(button,down,source);pthread_rwlock_unlock(&api_lock);
++}
++void henge_vm_input_release(unsigned source) {
++    if(source<1 || source>2 || !lock_running())return;
++    hv_vm_release_input_source(source);pthread_rwlock_unlock(&api_lock);
++}
 diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
-index b8c41fa..bec85c0 100644
+index b8c41fa..fa7de75 100644
 --- a/ios/Henge/Native/henge-vm.h
 +++ b/ios/Henge/Native/henge-vm.h
-@@ -41,6 +41,9 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
+@@ -34,6 +34,12 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
+ int henge_vm_pause(char *err, size_t errlen);
+ int henge_vm_save(const char *path, const char *ident, char *err, size_t errlen);
+ int henge_vm_continue(void);
++/* Foreground-only preparation pauses/drains the GPU, gates its guest rings,
++   and continues CPU/I/O. Caller must obtain an iOS continued CPU grant before
++   leaving the app. Return to foreground restores graphics; no PiP keepalive. */
++int henge_vm_prepare_cpu_background(char *err, size_t errlen);
++void henge_vm_foreground_graphics(void);
++int henge_vm_cpu_background(void);
+ int henge_vm_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
+                     int cpus, const char *path, const char *ident, char *err, size_t errlen);
+ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int64_t *saved_at);
+@@ -41,6 +47,9 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
  /* 0 not started, 1 running, 2 stopped, 3 starting/stopping, 4 paused (saved, or being saved).
     Normal guests are fully released before state 2; installer sessions retain
     their restore stack and can_start stays false. */
@@ -3965,7 +4637,7 @@ index b8c41fa..bec85c0 100644
  int henge_vm_state(void);
  /* A new generation starts with each successful boot, even in the same view. */
  uint64_t henge_vm_generation(void);
-@@ -62,6 +65,15 @@ int henge_vm_knob(const char *name, int value);
+@@ -62,6 +71,27 @@ int henge_vm_knob(const char *name, int value);
  long henge_vm_balloon(long target_mb);
  
  /* Progress, for the session screen. */
@@ -3977,6 +4649,18 @@ index b8c41fa..bec85c0 100644
 +    int state;
 +} HengeVmCounters;
 +void henge_vm_counters(HengeVmCounters *out);
++typedef struct HengeVmResources {
++    uint64_t process_cpu_us, footprint, resident, headroom, jit_used, jit_capacity, translations, full_flushes;
++    uint64_t gamepad_delivered, gamepad_coalesced, gamepad_overflow;
++    int detailed_counters;
++    unsigned available; /* bit 0 process CPU, bit 1 memory, bit 2 headroom, bit 3 VM */
++} HengeVmResources;
++void henge_vm_resources(HengeVmResources *out); /* explicit capture only; no sampling thread */
++int henge_vm_gamepad(int connected,uint16_t buttons,int16_t lx,int16_t ly,int16_t rx,int16_t ry,
++                     uint8_t left,uint8_t right,uint8_t hat);
++void henge_vm_input_key(unsigned source,uint8_t usage,int down);
++void henge_vm_input_button(unsigned source,int button,int down);
++void henge_vm_input_release(unsigned source); /* 1 remote keyboard, 2 mapped gamepad */
 +void henge_vm_trim_memory(void); /* release disposable caches; preserves guest RAM and live code */
  void henge_vm_log_cache(void);           /* optional per-CPU cache-use diagnostics */
  uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
@@ -4007,12 +4691,13 @@ index 25e7bad..246a6f8 100644
           now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
 diff --git a/ios/Henge/Runner/RunnerMode.swift b/ios/Henge/Runner/RunnerMode.swift
 new file mode 100644
-index 0000000..0275149
+index 0000000..ff84e72
 --- /dev/null
 +++ b/ios/Henge/Runner/RunnerMode.swift
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,194 @@
 +import SwiftUI
 +import BackgroundTasks
++import UIKit
 +
 +/// One owner for the opt-in guest runner and its iOS execution grant. The
 +/// registration token is transient; GitHub stores the runner credential in the
@@ -4023,6 +4708,10 @@ index 0000000..0275149
 +    @Published private(set) var active = false
 +    @Published private(set) var status = "Not started"
 +    @Published private(set) var background = "Keep Henge visible, or use Split View."
++    @Published private(set) var preparingCPU = false
++    @Published private(set) var cpuPrepared = false
++    private var grantCPU = false
++    private var preparationID = UUID()
 +    private var macID: UUID?
 +    private var command: String?
 +    private var revision: UInt = 0
@@ -4035,6 +4724,8 @@ index 0000000..0275149
 +    static let nameKey = "henge.runner.name"
 +    static let macKey = "henge.runner.mac"
 +    static let backgroundKey = "henge.runner.background"
++    static let cpuBackgroundKey = "henge.runner.cpuBackground"
++    var usesCPUBackground: Bool { UserDefaults.standard.object(forKey: Self.cpuBackgroundKey) as? Bool ?? true }
 +    static func valid(repository: String, name: String) -> Bool {
 +        repository.range(of: #"\Ahttps://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z"#, options: .regularExpression) != nil &&
 +        !name.isEmpty && name.count <= 64 && !name.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
@@ -4070,14 +4761,52 @@ index 0000000..0275149
 +        let message = age > 70 ? "Mac companion not responding" : labels.indices.contains(Int(value)) ? labels[Int(value)] : "Unknown runner status"
 +        if message != status { status = message }
 +    }
-+    var mayRunInBackground: Bool { continued != nil }
++    var mayRunInBackground: Bool { continued != nil && (!grantCPU || cpuPrepared) }
++    func prepareCPUBackground() {
++        guard active, !preparingCPU, usesCPUBackground, UIApplication.shared.applicationState == .active else { return }
++        guard UserDefaults.standard.bool(forKey: Self.backgroundKey) else {
++            background = "Enable background processing before starting the runner."; return
++        }
++        guard LinkHostService.shared.mode == nil else {
++            background = "Disconnect the extended display and restart without it before CPU-only background work. Video encoding needs GPU access."; return
++        }
++        finishBackground(success: true)
++        let id = UUID(); preparationID = id; preparingCPU = true
++        background = "Preparing CPU background work: pausing and draining graphics in the foreground…"
++        DispatchQueue.global(qos: .userInitiated).async {
++            var error = [CChar](repeating: 0, count: 256)
++            let rc = henge_vm_prepare_cpu_background(&error, error.count)
++            let reason = String(cString: error)
++            DispatchQueue.main.async {
++                guard self.preparationID == id, self.active else {
++                    if UIApplication.shared.applicationState == .active { henge_vm_foreground_graphics() }
++                    else { InstantResume.pause(force: true) }
++                    return
++                }
++                self.preparingCPU = false
++                guard rc == 0 else { self.background = reason; return }
++                self.cpuPrepared = true
++                HengeLog.log("runner", "CPU background prepared; guest GPU commands retained; CPU/network/disk live; no GPU resource request")
++                guard UIApplication.shared.applicationState == .active else {
++                    InstantResume.pause(force: true)
++                    self.background = "Preparation was interrupted. Return to Henge before requesting CPU background work."
++                    return
++                }
++                self.requestBackground()
++            }
++        }
++    }
 +    func end() {
++        preparationID = UUID(); preparingCPU = false; cpuPrepared = false
 +        if active { _ = hv_share_runner_set(#"{"version":1,"action":"stop"}"#) }
 +        active = false; macID = nil; command = nil; revision = 0; expired = nil
 +        finishBackground(success: true)
 +        status = "Not started"
 +    }
 +    func returnedToForeground() {
++        henge_vm_foreground_graphics()
++        cpuPrepared = false
++        if grantCPU { finishBackground(success: true) }
 +        if active { requestBackground() }
 +    }
 +    func requestBackground() {
@@ -4087,7 +4816,11 @@ index 0000000..0275149
 +        }
 +        #if compiler(>=6.2)
 +        if #available(iOS 26.0, *) {
-+            guard BGTaskScheduler.supportedResources.contains(.gpu), Entitlements.has(BackgroundExecutionStatus.gpuEntitlement) else {
++            let cpuOnly = usesCPUBackground
++            if cpuOnly && !cpuPrepared {
++                background = "When the runner is ready, tap Prepare CPU Background before leaving Henge."; return
++            }
++            guard cpuOnly || (BGTaskScheduler.supportedResources.contains(.gpu) && Entitlements.has(BackgroundExecutionStatus.gpuEntitlement)) else {
 +                background = "This install cannot run the Mac’s GPU in the background. Keep Henge visible or use Split View; PiP does not grant GPU access."; return
 +            }
 +            let identifier = (Bundle.main.bundleIdentifier ?? "com.henge.app") + ".runner.session"
@@ -4099,21 +4832,29 @@ index 0000000..0275149
 +            }
 +            guard registered else { background = "iOS refused background task registration. Keep Henge visible."; return }
 +            let request = BGContinuedProcessingTaskRequest(identifier: identifier, title: "Henge Mac runner", subtitle: "Running the selected Mac for GitHub Actions")
-+            request.strategy = .fail; request.requiredResources = .gpu
++            request.strategy = .fail; request.requiredResources = cpuOnly ? [] : .gpu
 +            do {
++                grantCPU = cpuOnly
 +                try BGTaskScheduler.shared.submit(request); submitted = true
 +                background = "Waiting for iOS background permission. Keep Henge visible until granted."
-+            } catch { background = "iOS declined background processing. Keep Henge visible or use Split View." }
++            } catch {
++                if cpuOnly {
++                    cpuPrepared = false
++                    if UIApplication.shared.applicationState == .active { henge_vm_foreground_graphics() }
++                    else { InstantResume.pause(force: true) }
++                }
++                background = "iOS declined background processing. Keep Henge visible or use Split View."
++            }
 +            return
 +        }
 +        #endif
-+        background = "Background GPU processing needs iOS 26 or later and authorised signing."
++        background = "Continued background processing needs iOS 26 or later. Keep Henge visible."
 +    }
 +    #if compiler(>=6.2)
 +    @available(iOS 26.0, *)
 +    private func attach(_ task: BGContinuedProcessingTask) {
 +        submitted = false
-+        guard active else { task.setTaskCompleted(success: false); return }
++        guard active, !grantCPU || cpuPrepared else { task.setTaskCompleted(success: false); return }
 +        continued = task
 +        // No invented completion percentage for an idle listener. The user or
 +        // iOS can end this task at any time; it is not an always-on service.
@@ -4129,7 +4870,10 @@ index 0000000..0275149
 +                expire { DispatchQueue.main.async { task.setTaskCompleted(success: false) } }
 +            } else { task.setTaskCompleted(success: false) }
 +        } }
-+        background = "iOS granted background GPU processing. iOS may end it; this is not unlimited execution."
++        background = grantCPU
++            ? "CPU background granted. CPU/network/disk jobs may continue; graphics jobs wait for Henge to return. iOS can end this task."
++            : "iOS granted background GPU processing. iOS may end it; this is not unlimited execution."
++        HengeLog.log("runner", "continued grant=\(grantCPU ? "CPU" : "GPU"); prepared=\(cpuPrepared)")
 +    }
 +    #endif
 +    private func finishBackground(success: Bool) {
@@ -4147,10 +4891,10 @@ index 0000000..0275149
 +}
 diff --git a/ios/Henge/Runner/RunnerView.swift b/ios/Henge/Runner/RunnerView.swift
 new file mode 100644
-index 0000000..9113b29
+index 0000000..c2fd38b
 --- /dev/null
 +++ b/ios/Henge/Runner/RunnerView.swift
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,55 @@
 +import SwiftUI
 +
 +struct RunnerView: View {
@@ -4162,6 +4906,7 @@ index 0000000..9113b29
 +    @AppStorage(RunnerMode.nameKey) private var name = "Henge-Mac"
 +    @AppStorage(RunnerMode.macKey) private var macID = ""
 +    @AppStorage(RunnerMode.backgroundKey) private var background = false
++    @AppStorage(RunnerMode.cpuBackgroundKey) private var cpuBackground = true
 +    @State private var token = ""
 +    @State private var error: String?
 +    private var selected: VirtualMac? { machines.all.first { $0.id.uuidString == macID } ?? machines.all.first }
@@ -4192,9 +4937,10 @@ index 0000000..9113b29
 +                    Text("Henge installs the official ARM64 GitHub runner after verifying its release SHA-256. Xcode and its command line tools must already be installed in the Mac for iOS builds. Use labels [self-hosted, macOS, ARM64, henge] in your workflow. Hosted xcode-27 workflows remain separate.")
 +                }
 +                Section("Leaving Henge") {
-+                    Toggle("Request background GPU processing", isOn: $background)
++                    Toggle("Request background processing", isOn: $background).disabled(runner.active)
++                    Toggle("CPU-only background jobs", isOn: $cpuBackground).disabled(runner.active)
 +                    Text(runner.background).font(.footnote)
-+                    Text("PiP alone does not authorise background Metal work. Without an iOS GPU grant, Henge pauses the Mac when you leave. Split View keeps it visible on iPad. iOS can end background tasks or terminate the app; runner jobs are not guaranteed to survive.")
++                    Text("CPU mode needs no GPU grant: once the Mac runner is ready, prepare it from the runner dashboard before leaving. Henge pauses briefly, drains graphics, then continues CPU, network and disk work. New graphics commands wait in the guest until you return; GUI tools, Simulator or GPU-dependent builds may stall. Persistent saves require returning to the foreground first. iOS can end the task or terminate Henge. PiP does not provide unlimited execution.")
 +                        .font(.footnote).foregroundStyle(.secondary)
 +                }
 +            }
@@ -4281,7 +5027,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..fcfc3d9 100644
+index f84465e..31d53ea 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,8 @@ struct SessionView: View {
@@ -4332,7 +5078,7 @@ index f84465e..fcfc3d9 100644
          }
          .onChange(of: nativeTouch.requested) { _, _ in nativeTouch.changedRequest() }
          .onChange(of: pointerNeeded) { needed in
-@@ -204,20 +215,63 @@ struct SessionView: View {
+@@ -204,9 +215,12 @@ struct SessionView: View {
              if needed { nativeTouch.stop() }
          }
          .onChange(of: scenePhase) { phase in
@@ -4341,11 +5087,11 @@ index f84465e..fcfc3d9 100644
              HardwareMouse.shared.setAcceptsInput(phase == .active && !pointerNeeded)
              guard phase != .active else {
                  display.refresh()
-                 InstantResume.cameBack(mac)
 +                runner.returnedToForeground()
+                 InstantResume.cameBack(mac)
                  return
              }
-             nativeTouch.stop()
+@@ -214,10 +228,54 @@ struct SessionView: View {
              HardwareKeys.releaseAll()
              HardwareMouse.shared.releaseButtons()
              VolumeClicks.shared.releaseButtons()
@@ -4370,6 +5116,10 @@ index f84465e..fcfc3d9 100644
 +                    Text("GitHub Runner").font(.largeTitle.bold())
 +                    Text(runner.status)
 +                    Text(runner.background).font(.footnote).foregroundStyle(.secondary)
++                    if runner.usesCPUBackground {
++                        Button(runner.preparingCPU ? "Preparing…" : "Prepare CPU Background") { runner.prepareCPUBackground() }
++                            .disabled(runner.preparingCPU || runner.cpuPrepared || state != 1)
++                    }
 +                    Text("Local desktop presentation is stopped while this dashboard is shown. macOS and guest jobs keep running; display resolution and Retina quality are preserved.")
 +                        .font(.footnote).foregroundStyle(.secondary)
 +                    Button("Show Mac Desktop") { runnerDesktop = true }
@@ -4398,7 +5148,7 @@ index f84465e..fcfc3d9 100644
              if showing {
                  refreshDetails()
                  HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll()
-@@ -228,10 +282,12 @@ struct SessionView: View {
+@@ -228,10 +286,12 @@ struct SessionView: View {
          }
          .onAppear {
              UIApplication.shared.isIdleTimerDisabled = true
@@ -4411,7 +5161,7 @@ index f84465e..fcfc3d9 100644
              LinkHostService.shared.stop()
              nativeTouch.stop()
              UIApplication.shared.isIdleTimerDisabled = false
-@@ -242,21 +298,23 @@ struct SessionView: View {
+@@ -242,21 +302,23 @@ struct SessionView: View {
              VolumeClicks.shared.stop()
          }
          .modifier(ExternalMacDisplayModifier(presentation: MacPresentation(display: display, aspect: displayAspect)))
@@ -4443,7 +5193,7 @@ index f84465e..fcfc3d9 100644
  
      // A fold/rotation after boot must fit the mode the guest actually received,
      // rather than stretch it by recalculating only the host view's aspect.
-@@ -484,6 +542,7 @@ struct SessionView: View {
+@@ -484,6 +546,7 @@ struct SessionView: View {
  
      /// The controls a column has too.
      @ViewBuilder private var floatingTools: some View {
@@ -4451,7 +5201,7 @@ index f84465e..fcfc3d9 100644
          tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
          pasteTool
          tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
-@@ -513,12 +572,19 @@ struct SessionView: View {
+@@ -513,12 +576,19 @@ struct SessionView: View {
      }
  
      /// Keeps the pointer in view: the view moves when the pointer nears its edge.
@@ -4472,7 +5222,7 @@ index f84465e..fcfc3d9 100644
              }
              if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / displayAspect)) { map = UIImage(cgImage: image) }
              tick += 1
-@@ -545,6 +611,9 @@ struct SessionView: View {
+@@ -545,6 +615,9 @@ struct SessionView: View {
          VStack(alignment: .leading, spacing: 10) {
              Text("This Mac could not start").font(.system(size: 17, weight: .semibold))
              Text(text).font(.system(size: 14)).foregroundStyle(Desk.dim)
@@ -4482,7 +5232,7 @@ index f84465e..fcfc3d9 100644
              Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
          }
          .padding(18)
-@@ -583,6 +652,13 @@ struct SessionView: View {
+@@ -583,6 +656,13 @@ struct SessionView: View {
                      LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
                      LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
                  }
@@ -4496,7 +5246,7 @@ index f84465e..fcfc3d9 100644
                  Section("Display") {
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
-@@ -680,6 +756,7 @@ struct SessionView: View {
+@@ -680,6 +760,7 @@ struct SessionView: View {
      }
  
      private func run(viewport: CGSize) async {
@@ -4504,7 +5254,7 @@ index f84465e..fcfc3d9 100644
          error = nil
          state = 0
          userCode = false
-@@ -699,7 +776,9 @@ struct SessionView: View {
+@@ -699,7 +780,9 @@ struct SessionView: View {
          guard !Task.isCancelled else { return }
          UIApplication.shared.isIdleTimerDisabled = true
          HardwareMouse.shared.start()
@@ -4515,7 +5265,7 @@ index f84465e..fcfc3d9 100644
          runningScreen = screen
          let ram = GuestMemory.prepare(mac)
          HengeLog.log("session", "available memory \(henge_available_memory() >> 20) MB")
-@@ -721,38 +800,65 @@ struct SessionView: View {
+@@ -721,38 +804,65 @@ struct SessionView: View {
          HengeLog.log("display", "screen-fit: selected=\(mac.fitsDeviceScreen) viewport=\(viewport.width)x\(viewport.height) stored=\(mac.screenWidth ?? 1920)x\(mac.screenHeight ?? 1080) chosen=\(screen.width)x\(screen.height) aspect=\(screen.aspect)")
          do { try LinkHostService.shared.prepareBoot() }
          catch { self.error = error.localizedDescription; return }
@@ -4595,7 +5345,7 @@ index f84465e..fcfc3d9 100644
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
                  typing = false
-@@ -769,38 +875,59 @@ struct SessionView: View {
+@@ -769,38 +879,59 @@ struct SessionView: View {
                  }
                  break
              }
@@ -4724,7 +5474,7 @@ index 0000000..75768bd
 +    }
 +}
 diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
-index e1693b0..0517ebc 100644
+index e1693b0..8526008 100644
 --- a/ios/Henge/SettingsView.swift
 +++ b/ios/Henge/SettingsView.swift
 @@ -10,6 +10,7 @@ struct SettingsView: View {
@@ -4743,7 +5493,15 @@ index e1693b0..0517ebc 100644
      @AppStorage(EngineTuning.cpuPolicyKey) private var cpuPolicy = "auto"
      @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
      @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
-@@ -126,6 +128,14 @@ struct SettingsView: View {
+@@ -40,6 +42,7 @@ struct SettingsView: View {
+     }
+ 
+     @AppStorage("henge.perf.thermalProtection") private var thermalProtection = false
++    @AppStorage("henge.perf.lowPowerAware") private var lowPowerAware = true
+     @AppStorage("henge.perf.presentationCap") private var presentationCap = 0
+ 
+     var body: some View {
+@@ -126,6 +129,14 @@ struct SettingsView: View {
                      .listRowBackground(Desk.card)
                  }
                  Section("Performance") {
@@ -4758,7 +5516,15 @@ index e1693b0..0517ebc 100644
                      LabeledContent("Host chip", value: HostScheduling.chip)
                      LabeledContent("Host CPU layout", value: HostScheduling.layout)
                      Text("\(HostScheduling.model) · \(HostScheduling.layoutSource). iOS decides which physical core runs a thread.")
-@@ -155,7 +165,7 @@ struct SettingsView: View {
+@@ -150,12 +161,15 @@ struct SettingsView: View {
+                     }
+                     .pickerStyle(.segmented)
+                     Toggle("Thermal display protection", isOn: $thermalProtection)
++                    Toggle("Match Low Power Mode", isOn: $lowPowerAware)
++                    Text("Aligns display presentation with the system’s 60 Hz Low Power Mode limit. Turning Low Power Mode off restores your selected presentation policy. Retina, guest CPU count and the saved 60/120 Hz Mac preference stay unchanged.")
++                        .font(.footnote).foregroundStyle(.secondary)
+                     Picker("Presentation limit", selection: $presentationCap) {
+                         Text("Automatic").tag(0)
                          Text("60 fps").tag(60)
                          Text("30 fps").tag(30)
                      }
@@ -4767,7 +5533,7 @@ index e1693b0..0517ebc 100644
                          .font(.footnote).foregroundStyle(.secondary)
                      Toggle("Faster disk writes", isOn: $fastFlush)
                      Toggle("Quicker wake from idle", isOn: $wfiSpin)
-@@ -168,6 +178,9 @@ struct SettingsView: View {
+@@ -168,6 +182,9 @@ struct SettingsView: View {
                      Toggle("Superblocks (experimental)", isOn: $superblocks)
                      Text("Continues translated code through conditional branches within the same page, bounded to 48 instructions at a conditional exit. May reduce dispatch work but increase code-cache pressure. Off by default; performance on your device is unverified. Applies to a new Mac session.")
                          .font(.footnote).foregroundStyle(.secondary)
@@ -4777,7 +5543,7 @@ index e1693b0..0517ebc 100644
                      Picker("Code cache", selection: $codeCacheMB) {
                          Text("512 MB").tag(512)
                          Text("1 GB").tag(1024)
-@@ -182,7 +195,7 @@ struct SettingsView: View {
+@@ -182,7 +199,7 @@ struct SettingsView: View {
                  Section("Background execution") {
                      LabeledContent("Background GPU capability", value: BackgroundExecutionStatus.gpuSupport)
                      LabeledContent("Signed GPU entitlement", value: BackgroundExecutionStatus.signedGPUAccess)
@@ -4786,7 +5552,7 @@ index e1693b0..0517ebc 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  .listRowBackground(Desk.card)
-@@ -194,13 +207,13 @@ struct SettingsView: View {
+@@ -194,13 +211,13 @@ struct SettingsView: View {
                  .listRowBackground(Desk.card)
                  Section("Instant Resume") {
                      Toggle("Resume where you left off", isOn: $instantResume)
@@ -5752,6 +6518,25 @@ index a801c82..ce611b7 100644
      hv_machine_free(&m); free(ram);
      puts("PASS fastmem benchmark: real EL1/page-table/JIT path; all guest sums identical");
  }
+diff --git a/tests/test_gamepad.c b/tests/test_gamepad.c
+new file mode 100644
+index 0000000..dc0f7f4
+--- /dev/null
++++ b/tests/test_gamepad.c
+@@ -0,0 +1,13 @@
++#include "gamepad.h"
++#include <assert.h>
++#include <stdio.h>
++int main(void) {
++    uint8_t report[HV_GAMEPAD_BYTES];hv_gamepad_neutral(report);
++    assert(report[2]==8);for(unsigned i=0;i<sizeof report;i++)if(i!=2)assert(report[i]==0);
++    int16_t axes[4]={-32768,32767,-1,0};hv_gamepad_pack(report,0x3ff,1,axes,0,255);
++    assert(report[0]==255 && report[1]==3 && report[2]==1);
++    assert(report[3]==1 && report[4]==128 && report[5]==255 && report[6]==127);
++    assert(report[11]==0 && report[12]==255);
++    hv_gamepad_pack(report,0,99,axes,1,2);assert(report[2]==8);
++    puts("gamepad: signed sticks, bounded hat, buttons, triggers and neutral report passed");
++}
 diff --git a/tests/test_gpu_copy_bounds.py b/tests/test_gpu_copy_bounds.py
 new file mode 100644
 index 0000000..aebcda1
@@ -6304,6 +7089,46 @@ index 81cdb83..c388829 100644
 +    puts("Metal lifecycle: 6 cycles, 384 GPU completions drained; both display glyphs restored, malformed input rejected, stale glyphs cleared");
      return 0;
  }
+diff --git a/tests/test_pvg_ports.c b/tests/test_pvg_ports.c
+index 7868300..8b66237 100644
+--- a/tests/test_pvg_ports.c
++++ b/tests/test_pvg_ports.c
+@@ -4,6 +4,13 @@
+ #include <assert.h>
+ static _Alignas(0x4000) uint8_t memory[0x10000];
+ static int irqs;
++static int metal_submits;
++HvPvgMetal *hv_pvg_metal_create(HvPvgLite *p){(void)p;return (HvPvgMetal *)(uintptr_t)1;}
++void hv_pvg_metal_set_layer(HvPvgMetal *p,void *layer){(void)p;(void)layer;}
++void hv_pvg_metal_unmap(HvPvgMetal *p,uint32_t mapping){(void)p;(void)mapping;}
++void hv_pvg_metal_submit(HvPvgMetal *m,HvPvgLite *p,uint32_t ch,uint32_t *cmd,uint32_t len){
++    (void)m;(void)p;assert(ch==1 && len==12 && cmd[2]==123);metal_submits++;free(cmd);
++}
+ void *hv_phys_ptr(HvMachine *m,uint64_t pa,uint64_t n){
+     (void)m;return pa<=sizeof memory && n<=sizeof memory-pa ? memory+pa : NULL;
+ }
+@@ -38,5 +45,21 @@ int main(void){
+     hv_pvg_lite_apply_link_connected(p,1);assert(word(0x8000,0x200)==3 && irqs==2);
+     p->display_count=1;assert(gfx_read(p,0x122c,4)==1);
+     b[4]=3;hv_pvg_lite_command(p,b,sizeof b);assert(p->displays[1].page==0x8000);
++    // Real PVG ring decoding with only the host Metal driver replaced. A
++    // frozen device cannot move read pointers, create replay, submit or ack.
++    memset(memory,0,sizeof memory);p->layer_lock=(os_unfair_lock)OS_UNFAIR_LOCK_INIT;
++    p->regs[(0x101c-0x1000)/4]=1; /* root records at 0x4000 */
++    p->regs[(0x1030-0x1000)/4]=2; /* completion stamps at 0x8000 */
++    uint32_t *rec=(void *)(memory+0x4400);rec[0]=12;rec[4]=3;
++    uint32_t *table=(void *)(memory+0xc000);table[0]=2;
++    uint32_t *command=(void *)(memory+0x8000);command[0]=0x20;command[1]=12;command[2]=123;
++    p->io_regs[0x18/8]=9;
++    hv_pvg_lite_set_cpu_background(p,1);
++    for(unsigned i=0;i<1000;i++){do_channel(p,1);hv_pvg_lite_poll(p);}
++    assert(hv_pvg_lite_cpu_background(p) && !rec[1] && !metal_submits && !p->metal_tried);
++    assert(p->chan_pending==2 && p->io_regs[0x20/8]==0 && p->vblanks==0);
++    hv_pvg_lite_set_cpu_background(p,0);hv_pvg_lite_poll(p);
++    assert(rec[1]==12 && metal_submits==1 && !p->chan_pending && p->io_regs[0x20/8]==9);
++    hv_pvg_lite_poll(p);assert(metal_submits==1); /* drain exactly once */
+     free(p);puts("PASS production PVG commands: two ports, short swaps, invalid ports, independent ack/mapping, hotplug IRQ, disabled-port guard");return 0;
+ }
 diff --git a/tests/test_resource_policy.c b/tests/test_resource_policy.c
 new file mode 100644
 index 0000000..30d5be7
@@ -6769,7 +7594,7 @@ index 01aead4..b1daca1 100644
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..dcd47a5 100644
+index a13a70d..7a6967e 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
 @@ -3,6 +3,8 @@
@@ -6931,7 +7756,7 @@ index a13a70d..dcd47a5 100644
          henge_vm_mouse_button(1, 1);
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "suspend: %s\n", error);
-@@ -160,18 +251,40 @@ int main(void) {
+@@ -160,18 +251,51 @@ int main(void) {
              fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\n");
              return 1;
          }
@@ -6958,6 +7783,17 @@ index a13a70d..dcd47a5 100644
 +              continued.blocks >= paused.blocks);
          for (int n = 0; n < 1000 && *count == c1; n++) usleep(1000);
          check("continued: the counter moves", *count > c1);
++        check("prepare CPU background preserves running VM", henge_vm_prepare_cpu_background(error,sizeof error)==0 &&
++              henge_vm_state()==1 && henge_vm_cpu_background());
++        uint64_t bg_count=*count;
++        for(int n=0;n<1000 && *count==bg_count;n++)usleep(1000);
++        check("CPU work progresses with graphics gated", *count>bg_count);
++        check("CPU background pauses in memory", henge_vm_pause(error,sizeof error)==0 && henge_vm_state()==4);
++        check("CPU background cannot publish incomplete persistent graphics", henge_vm_save(snap,"test",error,sizeof error)!=0 &&
++              strstr(error,"foreground") && henge_vm_saved_ok(snap,"test",NULL,NULL)==0);
++        check("CPU background continues without a GPU grant", henge_vm_continue()==0 && henge_vm_cpu_background());
++        henge_vm_foreground_graphics();
++        check("foreground restores graphics without changing VM", !henge_vm_cpu_background() && henge_vm_state()==1);
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
 +        if (rc || henge_vm_state() != 4 || !hv_vm_board()->ram) return 1;
          uint64_t c2 = *count;
@@ -6974,7 +7810,7 @@ index a13a70d..dcd47a5 100644
          check("a paused Mac stops", henge_vm_state() == 2 && hv_vm_board()->ram == NULL);
          uint64_t bytes = 0;
          check("the save is whole", henge_vm_saved_ok(snap, "test", &bytes, NULL) == 0 && bytes > 0);
-@@ -183,12 +296,14 @@ int main(void) {
+@@ -183,12 +307,14 @@ int main(void) {
          rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          usleep(30000);
          rc |= henge_vm_suspend(snap, "test", error, sizeof error);
@@ -6989,7 +7825,7 @@ index a13a70d..dcd47a5 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +324,78 @@ int main(void) {
+@@ -209,6 +335,78 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);
@@ -7068,6 +7904,81 @@ index a13a70d..dcd47a5 100644
      }
      hv_vm_destroy();
      atomic_store(&reader_done, 1);
+diff --git a/tests/test_xhci_slots.c b/tests/test_xhci_slots.c
+index 41c2faa..ace367c 100644
+--- a/tests/test_xhci_slots.c
++++ b/tests/test_xhci_slots.c
+@@ -4,10 +4,61 @@
+ static HvMachine machine;
+ static HvXhci controller;
+ static uint8_t memory[16384] __attribute__((aligned(16384)));
++static void gamepad_checks(void) {
++    HvXhci *x=&controller;
++    memset(memory,0,sizeof memory);reset(x);
++    assert(!(x->portsc[2]&PORT_CCS));
++    int16_t axes[4]={1000,-2000,3000,-4000};
++    hv_xhci_gamepad(x,1,1,8,axes,0,255);hv_xhci_poll(x);
++    assert(x->gp_online && (x->portsc[2]&PORT_CCS));
++    x->slots[1].dev=2;
++    uint8_t reply[256],setup[8]={0x81,6,0,0x22,0,0,255,0};
++    int n=control(x,1,setup,reply,sizeof reply);
++    assert(n==(int)sizeof hv_gamepad_descriptor && !memcmp(reply,hv_gamepad_descriptor,n));
++    setup[0]=0xa1;setup[1]=1;setup[2]=0;setup[3]=1;
++    assert(control(x,1,setup,reply,sizeof reply)==HV_GAMEPAD_BYTES);
++    assert(reply[0]==1 && reply[2]==8 && reply[12]==255);
++    // Deliver both press and release through actual guest IN transfer TRBs.
++    hv_xhci_gamepad(x,1,0,8,axes,0,0);
++    assert(x->gp_tail-x->gp_head==2);
++    struct HvXhciIntr *it=&x->intr[0];
++    it->erstsz=1;it->seg_base=0x101000;it->seg_size=8;it->index=0;it->pcs=1;
++    uint32_t *trb=(void *)memory;
++    for(unsigned i=0;i<2;i++){trb[4*i]=0x102000+32*i;trb[4*i+2]=16;trb[4*i+3]=TRB_NORMAL<<10|1;}
++    x->slots[1].ep[3]=(HvXhciRing){.dequeue=0x100000,.ccs=1};
++    x->slots[1].ep_running[3]=1;
++    run_ep_in(x,1);
++    assert(x->gp_delivered==2 && x->gp_head==x->gp_tail);
++    assert(memory[8192]==1 && memory[8224]==0);
++    uint32_t *event=(void *)(memory+4096);
++    assert(event[2]>>24==CC_SHORT_PACKET && (event[2]&0xffffff)==3);
++    // Axes coalesce; button/hat/trigger edges remain ordered. Overflow ends
++    // at the authoritative neutral state, so releases cannot remain stuck.
++    hv_xhci_gamepad(x,1,0,8,axes,0,0);axes[0]++;
++    hv_xhci_gamepad(x,1,0,8,axes,0,0);axes[0]++;
++    hv_xhci_gamepad(x,1,0,8,axes,0,0);
++    assert(x->gp_tail-x->gp_head==1 && x->gp_coalesced);
++    for(unsigned i=0;i<100;i++)hv_xhci_gamepad(x,1,(i&1)?1:2,8,axes,0,0);
++    assert(x->gp_overflow && x->gp_tail-x->gp_head==64);
++    hv_xhci_release_input(x);
++    assert(x->gp_tail-x->gp_head==1 && !x->gp_state[0] && x->gp_state[2]==8);
++    hv_xhci_gamepad(x,0,0,8,axes,0,0);hv_xhci_poll(x);
++    assert(!x->gp_online && !(x->portsc[2]&PORT_CCS));
++    // A remote key-up must not release the same physical key, and rollover
++    // must recover to the real held set when an owner releases its keys.
++    hv_xhci_key_source(x,26,1,0);hv_xhci_key_source(x,26,1,1);
++    hv_xhci_release_source(x,1);assert(x->state[2]==26);
++    hv_xhci_key_source(x,26,0,0);assert(!x->state[2]);
++    for(unsigned k=4;k<11;k++)hv_xhci_key_source(x,k,1,2);
++    assert(x->state[2]==1 && x->state[7]==1);
++    hv_xhci_release_source(x,2);assert(!x->state[2]);
++    puts("PASS xHCI gamepad: hotplug, descriptors, real IN transfers, coalescing, overflow neutral and input ownership");
++}
+ int main(void) {
+     assert(!hv_machine_init(&machine,1<<20));
+     assert(!hv_machine_add_ram(&machine,0x100000,sizeof memory,memory,0));
+     controller.m=&machine;
++    assert(!pthread_mutex_init(&controller.mu,NULL));
+     struct HvXhciIntr *it=&controller.intr[0];
+     unsigned count=0;
+     for(unsigned type=9;type<=23;type++)for(unsigned slot=0;slot<256;slot++) {
+@@ -25,6 +76,8 @@ int main(void) {
+         assert(controller.cmd.dequeue==0x100010);
+         count++;
+     }
++    gamepad_checks();
++    pthread_mutex_destroy(&controller.mu);
+     hv_machine_free(&machine);
+     printf("PASS xHCI: %u invalid-slot command/event-ring cases; enable/no-op exceptions preserved\n",count);
+ }
 diff --git a/tools/build_ios_restore.sh b/tools/build_ios_restore.sh
 index 70d7ccb..e4f9089 100755
 --- a/tools/build_ios_restore.sh
@@ -7089,20 +8000,23 @@ index 70d7ccb..e4f9089 100755
 +test -s "$BUILD/libhengerestore.a"
  ls -la "$BUILD/libhengerestore.a"
 diff --git a/tools/check_host_scheduling.sh b/tools/check_host_scheduling.sh
-index 509bce1..3536c6b 100755
+index 509bce1..159a221 100755
 --- a/tools/check_host_scheduling.sh
 +++ b/tools/check_host_scheduling.sh
-@@ -2,6 +2,9 @@
+@@ -2,6 +2,12 @@
  # Native tests + iPhoneOS SDK type checking. Does not build an app or IPA.
  set -euo pipefail
  cd "$(dirname "$0")/.."
 +python3 tests/test_restore_archive.py
 +python3 tests/test_clipboard_notify.py
 +python3 tests/test_display_pulses.py
++mkdir -p build
++cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Idevices tests/test_gamepad.c -o build/test_gamepad
++build/test_gamepad
  mkdir -p build/scheduling-check
  task_out="$PWD/build/scheduling-check"
  exec > >(tee "$task_out/checks.log") 2>&1
-@@ -9,6 +12,9 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
+@@ -9,6 +15,9 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
  set -x
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread -Ihost \
      host/scheduling.c tests/test_scheduling.c -o "$task_out/test_scheduling"
@@ -7112,7 +8026,7 @@ index 509bce1..3536c6b 100755
  "$task_out/test_scheduling"
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O2 -Ihost -c host/scheduling.c -o "$task_out/scheduling.o"
  swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h \
-@@ -16,6 +22,10 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
+@@ -16,6 +25,10 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
  "$task_out/test_host_bridge"
  swiftc -parse-as-library -swift-version 5 ios/Henge/SessionStatistics.swift tests/test_session_statistics.swift -o "$task_out/test_session_statistics"
  "$task_out/test_session_statistics"
@@ -7123,7 +8037,7 @@ index 509bce1..3536c6b 100755
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -DHV_PROF_TEST -Icore -Ihost -Idevices \
      host/prof_ios.c host/scheduling.c tests/test_prof_ios.c -o "$task_out/test_prof_ios"
  "$task_out/test_prof_ios"
-@@ -28,6 +38,8 @@ xcrun --sdk macosx clang -fobjc-arc -std=c11 -Wall -Wextra -Werror -O2 -Idevices
+@@ -28,6 +41,8 @@ xcrun --sdk macosx clang -fobjc-arc -std=c11 -Wall -Wextra -Werror -O2 -Idevices
  SDK=$(xcrun --sdk iphoneos --show-sdk-path)
  xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot "$SDK" -std=c11 -Wall -Wextra \
      -Icore -Ihost -Idevices -fsyntax-only host/scheduling.c host/vm.c host/prof_ios.c host/usb_host.c
