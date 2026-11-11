@@ -126,8 +126,8 @@ end=t.find("\nfailed:",start)
 if start<0 or end<0: raise SystemExit("Unexpected VM start function layout")
 start_fn=t[start:end]
 if "run_ended = 0;" not in start_fn:
-    t=replace_once(t, "    exit_cb = on_exit;\n    cpu0_ours = cpu0;",
-                   "    exit_cb = on_exit;\n    cpu0_ours = cpu0;\n    pthread_mutex_lock(&pause_mu);\n    run_ended = 0;\n    pthread_mutex_unlock(&pause_mu);",
+    t=replace_once(t, "    exit_cb = on_exit;\n",
+                   "    exit_cb = on_exit;\n    pthread_mutex_lock(&pause_mu);\n    run_ended = 0;\n    pthread_mutex_unlock(&pause_mu);\n",
                    "reset prior-session CPU0 end marker on every new VM start")
 t=replace_once(t, "    run_ended = 1;\n    if (pause_state == 1)",
                "    fprintf(stderr, \"hengevm: CPU0 exit before pause: reason=%d halt=%d pc=%llx pause_state=%d\\n\", r, atomic_load(&cpus[0].halted), (unsigned long long)cpus[0].pc, pause_state);\n    run_ended = 1;\n    if (pause_state == 1)",
