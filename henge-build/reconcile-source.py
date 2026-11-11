@@ -113,6 +113,12 @@ t=replace_once(t,
     "if (run_ended) {\n        pthread_mutex_unlock(&pause_mu);",
     "if (run_ended) {\n        fprintf(stderr, \"hengevm: suspend rejected: CPU0 run already ended\\n\");\n        pthread_mutex_unlock(&pause_mu);",
     "diagnose early stop before suspend")
+# Diagnose the unexpected stop BEFORE the pause request is processed.
+# Logging only; no control-flow or QoS changes.
+t=replace_once(t,
+    "int r = hv_vm_run_cpu0();",
+    "int r = hv_vm_run_cpu0();\n    fprintf(stderr, \"hengevm: cpu0 exited: reason=%d halt=%d pc=0x%llx exit_req=%d\\n\", r, atomic_load(&cpus[0].halted), (unsigned long long)cpus[0].pc, atomic_load(&cpus[0].exit_req));",
+    "trace the VM CPU0 return preceding failed suspend")
 vm.write_text(t)
 
 # The custom VM header adds ticker diagnostics exactly where upstream added
