@@ -1912,7 +1912,7 @@ index 01aead4..b1daca1 100644
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..5978e72 100644
+index a13a70d..678703d 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
 @@ -3,6 +3,7 @@
@@ -2004,11 +2004,19 @@ index a13a70d..5978e72 100644
      pthread_t reader;
      if (pthread_create(&reader, NULL, read_ui, NULL)) return 1;
      /* Warm the process-wide pointer queue before counting worker threads. */
-@@ -150,8 +192,13 @@ int main(void) {
+@@ -150,8 +192,21 @@ int main(void) {
          write_file(rom, code, sizeof code);
          int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          check("resume test boots", rc == 0);
-+        if (getenv("HENGE_TEST_STATS")) usleep(2200000); /* two real reporting intervals */
++        if (getenv("HENGE_TEST_STATS")) {
++            /* A self-chained synthetic loop seldom returns to dispatch's report
++               trigger. Disable chaining only in this quiescent test VM so two
++               wall-clock reporting intervals are actually observed. */
++            if (henge_vm_pause(error, sizeof error)) return 1;
++            hv_vm_machine()->chain = 0;
++            if (henge_vm_continue()) return 1;
++            usleep(2200000);
++        }
          usleep(50000);
          henge_vm_key_hid(0xe4, 1);
 +        henge_vm_key_hid(0xe1, 1);
@@ -2018,7 +2026,7 @@ index a13a70d..5978e72 100644
          henge_vm_mouse_button(1, 1);
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "suspend: %s\n", error);
-@@ -160,18 +207,40 @@ int main(void) {
+@@ -160,18 +215,40 @@ int main(void) {
              fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\n");
              return 1;
          }
@@ -2061,7 +2069,7 @@ index a13a70d..5978e72 100644
          check("a paused Mac stops", henge_vm_state() == 2 && hv_vm_board()->ram == NULL);
          uint64_t bytes = 0;
          check("the save is whole", henge_vm_saved_ok(snap, "test", &bytes, NULL) == 0 && bytes > 0);
-@@ -183,12 +252,14 @@ int main(void) {
+@@ -183,12 +260,14 @@ int main(void) {
          rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          usleep(30000);
          rc |= henge_vm_suspend(snap, "test", error, sizeof error);
@@ -2076,7 +2084,7 @@ index a13a70d..5978e72 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +280,78 @@ int main(void) {
+@@ -209,6 +288,78 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);
