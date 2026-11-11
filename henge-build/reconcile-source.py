@@ -305,3 +305,21 @@ project.write_text(py)
 print("PASS iOS build phases: custom touch helper and upstream Mac-app samples/libraries both retained")
 
 print("PASS custom/upstream reconciliation: dual-port GPU snapshots, VM pause APIs and lifecycle")
+
+# Xcode invokes make with the iPhone SDK in its environment. These bundled
+# guest samples are macOS executables, not iOS host code: scope their SDK.
+p=root/'Makefile'
+s=p.read_text()
+s=replace_once(s,
+    '\tmake -C tl build/hello build/fnd build/swifty build/cxx build/FW.app/Contents/MacOS/fwapp',
+    '\tenv -u IPHONEOS_DEPLOYMENT_TARGET SDKROOT="$$(xcrun --sdk macosx --show-sdk-path)" make -C tl CC="xcrun --sdk macosx clang" build/hello build/fnd build/swifty build/cxx build/FW.app/Contents/MacOS/fwapp',
+    'isolate bundled macOS samples from the enclosing iPhone SDK')
+p.write_text(s)
+
+# A failed suspend is a test failure, not permission to dereference the RAM
+# of a machine whose normal exit callback may already have destroyed it.
+p=root/'tests/test_vm_lifecycle.c'
+s=p.read_text()
+anchor='        check("suspend saves", rc == 0 && henge_vm_state() == 4 && access(snap, F_OK) == 0);'
+s=replace_once(s,anchor,anchor+'\n        if (rc || henge_vm_state() != 4) {\n            fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\\n");\n            return 1;\n        }','fail suspend regression without a secondary test use-after-free')
+p.write_text(s)

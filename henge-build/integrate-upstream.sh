@@ -5,7 +5,7 @@ set -euo pipefail
 root="${GITHUB_WORKSPACE:-$PWD}"
 source_dir="$root/Henge"
 manifest="$root/build-request/henge-build/manifest.json"
-if [ ! -d "$source_dir/.git" ] || [ ! -f "$manifest" ]; then
+if [ ! -e "$source_dir/.git" ] || [ ! -f "$manifest" ]; then
   echo "Missing checked-out Henge or manifest" >&2
   exit 1
 fi
