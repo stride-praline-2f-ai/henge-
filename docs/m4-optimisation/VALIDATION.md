@@ -39,3 +39,9 @@ actual iPhoneOS presenter syntax, production Swift typecheck and complete Releas
 app compile all passed. Packaging was skipped as required.
 The newer event-driven session/boot-display waits, explicit M4 preset, optional
 input ownership and repeated glyph reuse need the next exact-source checkpoint.
+
+Checkpoint43108150736, sourcea57898b084e54f10527793a237985d41858c3549:
+all native/sanitizer checks, new wait and M4 preset tests,64-source production
+Swift SDK typecheck and complete iPhoneOS app compile passed. No IPA packaged.
+The final restore-archive error-propagation change is newer and needs validation;
+local production-block success/failure regression passed.

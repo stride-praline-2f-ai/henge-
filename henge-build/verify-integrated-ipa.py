@@ -21,6 +21,13 @@ with zipfile.ZipFile(ipa) as z:
     plist=plistlib.loads(z.read("Payload/Henge.app/Info.plist"))
 assert plist.get("HengeAuditRepairsSHA256")==manifest["audit_repairs_sha256"], "Incorrect audit repairs"
 assert plist.get("HengeSnapshotSchema")==3, "Incorrect snapshot schema"
+assert plist['CFBundleShortVersionString'] == manifest['app_version'], 'Unexpected app version'
+assert plist['CFBundleVersion'] == manifest['app_build'], 'Unexpected app build'
+if manifest.get('m4_optimisation'):
+    with zipfile.ZipFile(ipa) as archive:
+        binary = archive.read('Payload/Henge.app/Henge')
+    for marker in (b'M4 iPad16,5 ten-core/16GB', b'CAMetalDisplayLink', b'power-state-changed'):
+        assert marker in binary, 'Missing integrated M4 runtime marker: ' + repr(marker)
 sdk=plist.get('DTSDKName', '')
 assert sdk.startswith('iphoneos') and tuple(int(x) for x in sdk[8:].split('.')) >= (27, 1), 'Duo fullscreen requires iOS 27.1+ SDK'
 
@@ -70,6 +77,10 @@ data['packaging_validation'] = dict(architectures=architectures, ios_device_plat
     distribution_signing='ad hoc; installation tool must sign with its own supported profile')
 state=json.loads(Path('build-request/henge-build/optimization-state.json').read_text())
 data['optimization_validation'] = state.get('final_validation')
+if manifest.get('m4_optimisation'):
+    data['m4_optimisation'] = dict(manifest['m4_optimisation'],
+        runtime_markers_verified=True, physical_energy_verified=False,
+        physical_gaming_verified=False, implementation=state['m4_implementation'])
 data["audit_repairs"]={"sha256":manifest["audit_repairs_sha256"],"snapshot_schema":3,"test_allocation_hook_absent":True}
 data["upstream_integration"]={
   **integration,

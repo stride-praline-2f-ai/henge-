@@ -68,3 +68,17 @@ application build remain mandatory.
 - Checkpoint 6edf085a / run 43106141682 passed ALL native checks, sanitizers and
   full iPhoneOS Release app compile. No IPA produced. Later session/input/preset
   and cursor commits still require their own full validation.
+
+Checkpoint a57898b0 / run43108150736 also passed native, sanitizer, SDK and full
+app compilation. Both new session wait races and M4 default tests passed.
+Cloud helper comparison (six samples each): small read12.3455→7.9685ns;
+12KB span221.7045→194.52ns. These are component comparisons, not M4 energy/FPS.
+Fastmem remained slower for several ordinary-hit microbenchmarks and faster for
+conflict-heavy ones; grouped results also vary by code shape. Both remain
+explicit experiments instead of being blindly enabled.
+
+Final integration correction: restore archive failure now propagates and removes
+partial output. Added a production-block failure regression. Exact iOS libzip
+cache keys include host/toolchain, actual vendored sources and build script;
+no app objects or executable JIT state are cached. Next: validate this final
+patch, finish the recorded release gate, then produce the one final IPA.
