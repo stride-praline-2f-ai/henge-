@@ -4351,10 +4351,10 @@ index 81cdb83..e719ce7 100644
  }
 diff --git a/tests/test_runner_agent.m b/tests/test_runner_agent.m
 new file mode 100644
-index 0000000..b1f42f7
+index 0000000..e626030
 --- /dev/null
 +++ b/tests/test_runner_agent.m
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,60 @@
 +#import <AppKit/AppKit.h>
 +#include <assert.h>
 +#include <sys/stat.h>
@@ -4386,6 +4386,16 @@ index 0000000..b1f42f7
 +    NSString *wrapper = [testDirectory stringByAppendingPathComponent:@"run.sh"];
 +    [@"#!/bin/sh\nexec /bin/sleep 30\n" writeToFile:wrapper atomically:YES encoding:NSUTF8StringEncoding error:NULL]; chmod(wrapper.fileSystemRepresentation, 0700);
 +    [@"{\"gitHubUrl\":\"https://github.com/example/repo\"}" writeToFile:[testDirectory stringByAppendingPathComponent:@".runner"] atomically:YES encoding:NSUTF8StringEncoding error:NULL];
++    NSString *marker = [testDirectory stringByAppendingPathComponent:@".henge-install-complete"];
++    [@"verified-test-fixture" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:NULL];
++    NSString *archive = [testDirectory stringByAppendingPathComponent:@"archive"];
++    [@"abc" writeToFile:archive atomically:YES encoding:NSUTF8StringEncoding error:NULL];
++    NSString *digest = @"sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
++    assert(runnerArchiveMatches(archive, digest));
++    [@"tampered" writeToFile:archive atomically:YES encoding:NSUTF8StringEncoding error:NULL];
++    assert(!runnerArchiveMatches(archive, digest));
++    assert(!runnerArchiveMatches(archive, @"sha256:invalid"));
++    assert(!runnerArchiveMatches(@"/nonexistent/henge/runner", digest));
 +    TestRunner *runner = [TestRunner new]; runner.revision = 1;
 +    NSMutableDictionary *command = [@{@"version":@1, @"action":@"start", @"repository":@"https://github.com/example/repo", @"name":@"test", @"token":@"private"} mutableCopy];
 +    dispatch_async(runner.work, ^{ [runner execute:command revision:1]; });
@@ -4398,6 +4408,10 @@ index 0000000..b1f42f7
 +    [runner execute:command revision:3]; waitFor(3); assert(!runner.child);
 +    // Stale queued start cannot restart a stopped session.
 +    [runner execute:command revision:1]; assert(!runner.child);
++    // A partial extraction cannot be executed or overwrite a registration.
++    [NSFileManager.defaultManager removeItemAtPath:marker error:NULL];
++    runner.revision = 4; command[@"repository"] = @"https://github.com/example/repo";
++    [runner execute:command revision:4]; waitFor(3); assert(!runner.child);
 +    [NSFileManager.defaultManager removeItemAtPath:testDirectory error:NULL];
 +    puts("runner agent: real child launch/cancellation, no duplicate listener, secret retirement and repository validation passed");
 +} }
@@ -4903,13 +4917,29 @@ index 62cdaee..94cc8b3 100644
          [NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(NSTimer *timer) { (void)timer; keepMounted(); }];
 diff --git a/tools/henge-runner-agent.h b/tools/henge-runner-agent.h
 new file mode 100644
-index 0000000..f998824
+index 0000000..4915ec9
 --- /dev/null
 +++ b/tools/henge-runner-agent.h
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,178 @@
 +// Included by the existing guest companion: no second launchd job, clipboard
 +// loop or daemon. Only a host command can enable this GitHub Actions runner.
 +#import <CommonCrypto/CommonDigest.h>
++#include <limits.h>
++
++static BOOL runnerArchiveMatches(NSString *path, NSString *digest) {
++    if (![digest isKindOfClass:NSString.class] || ![digest hasPrefix:@"sha256:"] || digest.length != 71) return NO;
++    NSFileHandle *file = [NSFileHandle fileHandleForReadingAtPath:path];
++    if (!file) return NO;
++    CC_SHA256_CTX hash; CC_SHA256_Init(&hash); BOOL ok = YES;
++    @try { for (;;) { @autoreleasepool {
++        NSData *data = [file readDataOfLength:1024*1024]; if (!data.length) break;
++        CC_SHA256_Update(&hash, data.bytes, (CC_LONG)data.length);
++    } } } @catch (NSException *e) { (void)e; ok = NO; }
++    [file closeFile]; unsigned char bytes[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_Final(bytes, &hash);
++    NSMutableString *actual = [NSMutableString string];
++    for (unsigned i=0; i<sizeof bytes; i++) [actual appendFormat:@"%02x", bytes[i]];
++    return ok && [actual isEqualToString:[digest substringFromIndex:7]];
++}
 +
 +@interface HengeRunner : NSObject
 +@property(nonatomic, strong) NSLock *lock;
@@ -4983,17 +5013,16 @@ index 0000000..f998824
 +        ![download isKindOfClass:NSString.class] || ![download hasPrefix:@"https://github.com/actions/runner/releases/download/"]) return NO;
 +    NSString *archive = [self.directory stringByAppendingPathComponent:@"runner.tar.gz.part"];
 +    BOOL ok = [self run:@"/usr/bin/curl" arguments:@[@"--fail", @"--location", @"--proto", @"=https", @"--proto-redir", @"=https", @"--max-time", @"600", @"--output", archive, download] environment:nil revision:revision];
-+    if (ok) {
-+        NSFileHandle *file = [NSFileHandle fileHandleForReadingAtPath:archive];
-+        CC_SHA256_CTX hash; CC_SHA256_Init(&hash);
-+        @try { for (;;) { @autoreleasepool { NSData *data = [file readDataOfLength:1024*1024]; if (!data.length) break; CC_SHA256_Update(&hash, data.bytes, (CC_LONG)data.length); } } }
-+        @catch (NSException *e) { (void)e; ok = NO; }
-+        [file closeFile]; unsigned char bytes[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_Final(bytes, &hash);
-+        NSMutableString *actual = [NSMutableString string]; for (unsigned i=0; i<sizeof bytes; i++) [actual appendFormat:@"%02x", bytes[i]];
-+        ok = ok && file && [actual isEqualToString:[digest substringFromIndex:7]];
-+    }
++    if (ok) ok = runnerArchiveMatches(archive, digest);
 +    if (ok) ok = [self run:@"/usr/bin/tar" arguments:@[@"-xzf", archive, @"-C", self.directory] environment:nil revision:revision];
 +    [NSFileManager.defaultManager removeItemAtPath:archive error:NULL];
++    if (ok) {
++        ok = [NSFileManager.defaultManager isExecutableFileAtPath:[self.directory stringByAppendingPathComponent:@"bin/Runner.Listener"]] &&
++             [NSFileManager.defaultManager isExecutableFileAtPath:[self.directory stringByAppendingPathComponent:@"run.sh"]] && [self current:revision];
++        // Written only after verified extraction is whole. A partial executable
++        // from a cancelled/failed extraction never bypasses verification on retry.
++        if (ok) ok = [digest writeToFile:[self.directory stringByAppendingPathComponent:@".henge-install-complete"] atomically:YES encoding:NSUTF8StringEncoding error:NULL];
++    }
 +    return ok;
 +}
 +- (void)execute:(NSMutableDictionary *)command revision:(unsigned long)revision {
@@ -5011,7 +5040,12 @@ index 0000000..f998824
 +        [NSFileManager.defaultManager createDirectoryAtPath:self.directory withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@0700} error:NULL];
 +        NSString *listener = [self.directory stringByAppendingPathComponent:@"bin/Runner.Listener"];
 +        NSString *configuration = [self.directory stringByAppendingPathComponent:@".runner"];
-+        if (![NSFileManager.defaultManager isExecutableFileAtPath:listener]) {
++        BOOL installed = [NSFileManager.defaultManager isExecutableFileAtPath:listener] &&
++                         [NSFileManager.defaultManager fileExistsAtPath:[self.directory stringByAppendingPathComponent:@".henge-install-complete"]];
++        if (!installed) {
++            // Preserve an existing registration if binaries are damaged. Never
++            // overwrite its credentials or silently re-register it elsewhere.
++            if ([NSFileManager.defaultManager fileExistsAtPath:configuration]) { [self report:3 revision:revision]; return; }
 +            if (resume) { [self report:3 revision:revision]; return; }
 +            [self report:5 revision:revision];
 +            if (![self download:revision]) { [self report:3 revision:revision]; return; }
