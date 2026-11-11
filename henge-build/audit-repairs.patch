@@ -24,7 +24,7 @@ index 81b0736..c9f0915 100644
  
  test-vm-lifecycle: $(B)/test_vm_lifecycle
 diff --git a/core/dispatch.c b/core/dispatch.c
-index 12bd4a9..cab1f73 100644
+index 12bd4a9..aa11efc 100644
 --- a/core/dispatch.c
 +++ b/core/dispatch.c
 @@ -602,16 +602,41 @@ static void print_profile(HvMachine *m) {
@@ -121,14 +121,32 @@ index 12bd4a9..cab1f73 100644
              uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
              uint32_t worst = 0;
              for (uint32_t h = 0; h < HV_BLOCK_HASH; h++) {
-@@ -925,6 +947,7 @@ static void stop_the_world(HvCpu *cpu) {
+@@ -924,7 +946,10 @@ static void stop_the_world(HvCpu *cpu) {
+     }
  }
  
++void hv_dispatch_log_stats(HvCpu *cpu) { print_stats(cpu, 1); }
++
  int hv_run(HvCpu *cpu) {
 +    if (cpu->index == 0) stats_new_run = 1;
      if (cpu->m->wait_stats && cpu->pc_state && !cpu->pc_state->thread) __atomic_store_n(&cpu->pc_state->thread, mach_thread_self(), __ATOMIC_RELEASE);
      hv_big_lock(cpu->m);
      hv_fp_enter(cpu);
+diff --git a/core/dispatch.h b/core/dispatch.h
+index c341d16..fba956a 100644
+--- a/core/dispatch.h
++++ b/core/dispatch.h
+@@ -9,6 +9,10 @@
+ int hv_run(HvCpu *cpu);
+ /* Runs a single block (after interrupt checks). */
+ int hv_run_one(HvCpu *cpu);
++/* Emit diagnostics on the owning CPU thread, e.g. from a debugger stop hook.
++   The first observation establishes its run baseline. Never call from a UI
++   thread while another thread owns this CPU's guest register state. */
++void hv_dispatch_log_stats(HvCpu *cpu);
+ 
+ /* Drops every translated block (the JIT region is reused from the start). */
+ void hv_flush_blocks(HvMachine *m);
 diff --git a/core/memop.c b/core/memop.c
 index bfbac5e..d184b91 100644
 --- a/core/memop.c
@@ -1959,7 +1977,7 @@ index 01aead4..b1daca1 100644
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..8a8691d 100644
+index a13a70d..feaa172 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
 @@ -3,6 +3,8 @@
@@ -1971,7 +1989,7 @@ index a13a70d..8a8691d 100644
  
  #include <fcntl.h>
  #include <mach/mach.h>
-@@ -12,9 +14,13 @@
+@@ -12,13 +14,40 @@
  #include <stdlib.h>
  #include <string.h>
  #include <unistd.h>
@@ -1985,7 +2003,34 @@ index a13a70d..8a8691d 100644
  static HvJitRegion jit;
  static HengeDualMapping mapping;
  static int failures;
-@@ -58,6 +64,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
+ static _Atomic int reader_done;
++static _Atomic int stats_requested, stats_completed;
++static void stats_stop_hook(HvCpu *cpu) {
++    int request = atomic_load(&stats_requested);
++    if (request == atomic_load(&stats_completed)) return;
++    /* Real formatter and Mach thread time on CPU0, never the test/UI thread. */
++    hv_dispatch_log_stats(cpu);
++    atomic_store(&stats_completed, request);
++}
++static void stats_observe(void) {
++    int request = atomic_fetch_add(&stats_requested, 1) + 1;
++    for (int n = 0; n < 5000 && atomic_load(&stats_completed) != request; n++) usleep(1000);
++    if (atomic_load(&stats_completed) != request) {
++        fprintf(stderr, "CPU0 reporting hook timed out: blocks=%llu interval=%d chain=%d index=%u\n",
++                (unsigned long long)hv_vm_machine()->stats.blocks, hv_vm_machine()->stats_interval,
++                hv_vm_machine()->chain, hv_vm_cpu(0)->index);
++        exit(1);
++    }
++}
++static void stats_measure_run(void) {
++    stats_observe(); /* baseline acknowledgement from this actual CPU0 thread */
++    usleep(1100000); /* a deliberate CPU-time measurement interval */
++    stats_observe(); /* do not depend on an aggregate counter hitting a 64K multiple */
++}
+ HengeDualMapping *henge_ios_jit_get_mapping(void) { return &mapping; }
+ void hv_prof_ios_start(void) {}
+ int hv_install_start(HvVirtioUsb *usb, const char *ipsw, const char *work, uint64_t ecid,
+@@ -58,6 +87,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
      if (fd < 0 || (data && write(fd, data, bytes) != (ssize_t)bytes) || ftruncate(fd, bytes)) exit(1);
      close(fd);
  }
@@ -2023,7 +2068,7 @@ index a13a70d..8a8691d 100644
  static void *read_ui(void *unused) {
      (void)unused;
      while (!atomic_load(&reader_done)) {
-@@ -69,6 +106,8 @@ static void *read_ui(void *unused) {
+@@ -69,6 +129,8 @@ static void *read_ui(void *unused) {
          henge_vm_cpus_on();
          henge_vm_link_connected(0);
          henge_vm_gpu_frames();
@@ -2032,7 +2077,7 @@ index a13a70d..8a8691d 100644
          henge_vm_balloon(-1);
          henge_vm_set_display_layer(NULL);
          if (!henge_vm_boot_display(&pixels, &width, &height, &stride)) henge_vm_free_display(pixels);
-@@ -77,7 +116,7 @@ static void *read_ui(void *unused) {
+@@ -77,7 +139,7 @@ static void *read_ui(void *unused) {
      return NULL;
  }
  int main(void) {
@@ -2041,7 +2086,7 @@ index a13a70d..8a8691d 100644
      char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
      if (!mkdtemp(dir) || hv_jit_region_open(&jit, 8 << 20)) return 1;
      snprintf(rom, sizeof rom, "%s/rom", dir);
-@@ -91,6 +130,10 @@ int main(void) {
+@@ -91,6 +153,10 @@ int main(void) {
      write_file(aux, NULL, 1 << 20);
      mapping = (HengeDualMapping){.rx_addr = (uint8_t *)jit.base,
          .rw_addr = (uint8_t *)jit.base + jit.rw_diff, .size = jit.capacity * 4};
@@ -2052,22 +2097,25 @@ index a13a70d..8a8691d 100644
      pthread_t reader;
      if (pthread_create(&reader, NULL, read_ui, NULL)) return 1;
      /* Warm the process-wide pointer queue before counting worker threads. */
-@@ -150,8 +193,25 @@ int main(void) {
+@@ -150,8 +216,28 @@ int main(void) {
          write_file(rom, code, sizeof code);
          int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          check("resume test boots", rc == 0);
 +        if (getenv("HENGE_TEST_STATS")) {
-+            /* A self-chained synthetic loop seldom returns to dispatch's report
-+               trigger. Disable chaining only in this quiescent test VM so two
-+               wall-clock reporting intervals are actually observed. */
++            /* Arrange an actual CPU-thread stop hook at the ROM loop entry.
++               Statistics formatting is tested independently of the dispatch
++               frequency heuristic; publication is acknowledged by CPU0. */
 +            if (henge_vm_pause(error, sizeof error)) return 1;
++            check("statistics enabled on CPU0", hv_vm_machine()->stats_interval == 1 && hv_vm_cpu(0)->index == 0);
 +            hv_vm_machine()->chain = 0;
++            hv_vm_machine()->stop_pc = (hv_vm_cpu(0)->pc & ~0x3fffull) + 4;
++            hv_vm_machine()->stop_hook = stats_stop_hook;
 +            /* The original loop may already have a published self-link. Use
 +               the real quiescent cache flush, rather than only blocking new
 +               links, before restarting the reporting fixture. */
 +            hv_flush_blocks(hv_vm_machine());
 +            if (henge_vm_continue()) return 1;
-+            usleep(2200000);
++            stats_measure_run();
 +        }
          usleep(50000);
          henge_vm_key_hid(0xe4, 1);
@@ -2078,7 +2126,7 @@ index a13a70d..8a8691d 100644
          henge_vm_mouse_button(1, 1);
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "suspend: %s\n", error);
-@@ -160,18 +220,40 @@ int main(void) {
+@@ -160,18 +246,40 @@ int main(void) {
              fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\n");
              return 1;
          }
@@ -2097,7 +2145,7 @@ index a13a70d..8a8691d 100644
 +        usleep(200000); /* intentional delayed-resume coverage while CPUs are already paused */
          check("paused: the counter stands still", c1 > 0 && *count == c1);
          check("continue runs it on", henge_vm_continue() == 0 && henge_vm_state() == 1);
-+        if (getenv("HENGE_TEST_STATS")) usleep(2200000); /* a different CPU0 thread */
++        if (getenv("HENGE_TEST_STATS")) stats_measure_run(); /* a different CPU0 thread */
 +        HengeVmCounters continued;
 +        henge_vm_counters(&continued);
 +        check("continue invalidates rate baseline without changing machine generation",
@@ -2121,7 +2169,7 @@ index a13a70d..8a8691d 100644
          check("a paused Mac stops", henge_vm_state() == 2 && hv_vm_board()->ram == NULL);
          uint64_t bytes = 0;
          check("the save is whole", henge_vm_saved_ok(snap, "test", &bytes, NULL) == 0 && bytes > 0);
-@@ -183,12 +265,14 @@ int main(void) {
+@@ -183,12 +291,14 @@ int main(void) {
          rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          usleep(30000);
          rc |= henge_vm_suspend(snap, "test", error, sizeof error);
@@ -2136,7 +2184,7 @@ index a13a70d..8a8691d 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +293,78 @@ int main(void) {
+@@ -209,6 +319,78 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);

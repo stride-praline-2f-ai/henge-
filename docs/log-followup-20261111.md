@@ -51,7 +51,8 @@ the boolean build_ipa input explicitly true. Shared concurrency and latest-head
 checks are retained. No IPA is requested by this follow-up.
 
 Regression coverage includes real native VM pause/Continue/reboot and retained
-counter totals, recreated CPU0 timing with deep scans off/on, Swift frame and
+counter totals, recreated CPU0 timing through acknowledged real CPU-thread
+stop hooks with deep scans off/on, Swift frame and
 block sampling across observed and unobserved pauses, invalid clock readings,
 counter resets, and profiler off/on/off/on lifecycle transitions. The existing lifecycle,
 Metal, input, networking and sanitizer checks remain mandatory.
