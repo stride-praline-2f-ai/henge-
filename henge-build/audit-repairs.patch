@@ -24,10 +24,10 @@ index 81b0736..c9f0915 100644
  
  test-vm-lifecycle: $(B)/test_vm_lifecycle
 diff --git a/core/dispatch.c b/core/dispatch.c
-index 12bd4a9..5f76a99 100644
+index 12bd4a9..f731a1f 100644
 --- a/core/dispatch.c
 +++ b/core/dispatch.c
-@@ -15,8 +15,10 @@
+@@ -15,8 +15,11 @@
  #include "mmu.h"
  #include "sysreg.h"
  #include "translate.h"
@@ -35,29 +35,34 @@ index 12bd4a9..5f76a99 100644
  
  void hv_flush_blocks(HvMachine *m) {
 +    size_t retired_bytes = (size_t)m->nblocks * sizeof *m->blocks;
++    size_t retired_slots = m->nslots < m->max_slots ? m->nslots : m->max_slots;
      /* Every other CPU is parked (stop_the_world): the one moment the TLB layout can change. */
      if ((hv_knob[HV_K_TLBT] != 0) != hv_tlb_tmajor) {
          hv_tlb_tmajor = hv_knob[HV_K_TLBT] != 0;
-@@ -37,6 +39,18 @@ void hv_flush_blocks(HvMachine *m) {
-         }
-     memset(m->hash, 0, sizeof m->hash);
-     m->nblocks = 0;
+@@ -40,6 +43,22 @@ void hv_flush_blocks(HvMachine *m) {
+     m->nslots = 0;
+     m->nxchained = 0;
+     memset(m->xchain_heads, 0, sizeof m->xchain_heads);
 +    /* The global barrier has retired every reference. Keep address space and
-+       allocation ownership, but let pressure reclaim dead metadata pages.
-+       Future translations overwrite their own complete HvBlock records. */
-+    if (retired_bytes >= (1u << 20)) {
++       ownership; future publication overwrites complete block/exit records. */
++    if (retired_bytes >= (1u << 16)) {
 +        if (hv_self) hv_fp_leave(hv_self);
 +        /* The optional asynchronous profiler can inspect translation metadata.
 +           Its diagnostic run keeps the old payload resident until teardown. */
 +        const char *profile = getenv("HV_PROF_IOS");
-+        if (!profile || !strcmp(profile, "0"))
++        if (!profile || !strcmp(profile, "0")) {
 +            m->stats.metadata_reclaim_bytes += hv_reclaim_retired_pages(m->blocks, retired_bytes);
++#define RECLAIM_SLOTS(member) m->stats.metadata_reclaim_bytes += hv_reclaim_retired_pages(m->member, retired_slots * sizeof *m->member)
++            RECLAIM_SLOTS(slots); RECLAIM_SLOTS(slot_site); RECLAIM_SLOTS(slot_stub);
++            RECLAIM_SLOTS(slot_cond); RECLAIM_SLOTS(slot_xa); RECLAIM_SLOTS(slot_xpa); RECLAIM_SLOTS(xchained);
++#undef RECLAIM_SLOTS
++        }
 +        if (hv_self) hv_fp_enter(hv_self);
 +    }
-     m->nslots = 0;
-     m->nxchained = 0;
-     memset(m->xchain_heads, 0, sizeof m->xchain_heads);
-@@ -602,16 +616,41 @@ static void print_profile(HvMachine *m) {
+     hv_jit_reset(&m->jit);
+     m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0; /* MB of it to use (testing) */
+     /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */
+@@ -602,16 +621,41 @@ static void print_profile(HvMachine *m) {
      }
  }
  
@@ -102,7 +107,7 @@ index 12bd4a9..5f76a99 100644
      if (!force && now - last_t < (uint64_t)m->stats_interval * 24000000ull) {
          hv_fp_enter(cpu);
          return;
-@@ -619,6 +658,8 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -619,6 +663,8 @@ static void print_stats(HvCpu *cpu, int force) {
      double dt = (double)(now - last_t) / 24e6;
      HvStats *s = &m->stats;
  #define RATE(f) ((double)(s->f - last.f) / dt)
@@ -111,7 +116,7 @@ index 12bd4a9..5f76a99 100644
      fprintf(stderr,
              "stats %5.0fs: blocks %.2fM/s, translated %.0f/s (again: va %.0f%% va+pa %.0f%%; %.0f%% of time, %.1f insns, %.1fx), slow mem %.0fK/s, mrs %.0fK/s msr %.0fK/s sys %.0fK/s, "
              "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), blocks held %d (%.0f MB, %llu full flushes), chained %.0f/s ijc fills %.0fK/s resets %.0f/s, el%u pc %llx\n",
-@@ -632,25 +673,20 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -632,25 +678,20 @@ static void print_stats(HvCpu *cpu, int force) {
          double tot = 0;
          for (int k = 0; k < 6; k++) tot += RATE(why[k]);
          /* How much of the interval the CPU thread actually ran: below 100% means the host took it away. */
@@ -149,7 +154,7 @@ index 12bd4a9..5f76a99 100644
          fprintf(stderr, "  whole-TLB flushes/s: TLBI all here %.0f, TLBI all shared %.0f, SCTLR %.0f, TTBR1 %.0f, TCR %.0f, MAIR %.0f, range of all %.0f, requests overflowed %.0f\n",
                  RATE(flush_why[0]), RATE(flush_why[1]), RATE(flush_why[2]), RATE(flush_why[3]), RATE(flush_why[4]), RATE(flush_why[5]),
                  RATE(flush_why[6]), RATE(flush_why[7]));
-@@ -664,7 +700,9 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -664,7 +705,9 @@ static void print_stats(HvCpu *cpu, int force) {
                      RATE(flush_checked), RATE(flush_check_entries), RATE(flush_check_bad), RATE(flush_check_af));
          fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
                  RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
@@ -160,7 +165,7 @@ index 12bd4a9..5f76a99 100644
              uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
              uint32_t worst = 0;
              for (uint32_t h = 0; h < HV_BLOCK_HASH; h++) {
-@@ -924,7 +962,10 @@ static void stop_the_world(HvCpu *cpu) {
+@@ -924,7 +967,10 @@ static void stop_the_world(HvCpu *cpu) {
      }
  }
  
@@ -502,11 +507,41 @@ index 0000000..803678a
 +    return 1;
 +}
 +#endif
+diff --git a/devices/metal_library_cache.h b/devices/metal_library_cache.h
+index 30699bd..025e0c9 100644
+--- a/devices/metal_library_cache.h
++++ b/devices/metal_library_cache.h
+@@ -13,6 +13,7 @@
+ @property(nonatomic, readonly) uint64_t loads;
+ - (instancetype)initWithMaxBytes:(NSUInteger)bytes entries:(NSUInteger)entries;
+ - (id<MTLLibrary>)libraryForData:(NSData *)data loader:(id<MTLLibrary>(^)(void))loader;
++- (void)trim;
+ @end
+ 
+ @implementation HvMetalLibraryCache
+@@ -24,6 +25,7 @@
+     return self;
+ }
+ - (NSUInteger)count { return _libraries.count; }
++- (void)trim { [_libraries removeAllObjects]; [_order removeAllObjects]; _retainedBytes = 0; }
+ - (id<MTLLibrary>)libraryForData:(NSData *)data loader:(id<MTLLibrary>(^)(void))loader {
+     id<MTLLibrary> cached = _libraries[data];
+     if (cached) { _hits++; return cached; }
 diff --git a/devices/pvg_lite.c b/devices/pvg_lite.c
-index 9f6ebcb..1a1a716 100644
+index 9f6ebcb..3ac436c 100644
 --- a/devices/pvg_lite.c
 +++ b/devices/pvg_lite.c
-@@ -878,9 +878,9 @@ int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
+@@ -202,6 +202,9 @@ void hv_pvg_lite_apply_link_connected(HvPvgLite *p,int connected){
+ void hv_pvg_lite_link_connected(HvPvgLite *p,int connected){
+     if(p&&p->metal)hv_pvg_metal_link_connected(p->metal,connected);
+ }
++void hv_pvg_lite_trim_memory(HvPvgLite *p) {
++    if (p && p->metal) hv_pvg_metal_trim_memory(p->metal);
++}
+ 
+ static int task_read(HvPvgLite *p, uint32_t task, uint64_t off, void *to, uint32_t n);
+ static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args) {
+@@ -878,9 +881,9 @@ int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
  }
  
  /* CPUs stopped: the GPU's queued work done, and what only it holds copied into guest memory. */
@@ -518,7 +553,7 @@ index 9f6ebcb..1a1a716 100644
  }
  
  size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
-@@ -889,11 +889,11 @@ size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
+@@ -889,11 +892,11 @@ size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
  }
  
  /* After hv_pvg_lite_set_state: the screen and the pointer as they were, before the guest draws again. */
@@ -534,10 +569,19 @@ index 9f6ebcb..1a1a716 100644
  
  /* Debugging (the Mac runner's devstate): each channel's ring and stamps, to tell work never taken from work never
 diff --git a/devices/pvg_lite.h b/devices/pvg_lite.h
-index 0f68eae..ac454a5 100644
+index 0f68eae..7a4cb98 100644
 --- a/devices/pvg_lite.h
 +++ b/devices/pvg_lite.h
-@@ -72,13 +72,13 @@ void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm);
+@@ -55,6 +55,8 @@ void hv_pvg_lite_link_connected(HvPvgLite *p, int connected);
+ void hv_pvg_lite_apply_link_connected(HvPvgLite *p, int connected);
+ void hv_pvg_metal_link_connected(HvPvgMetal *m, int connected);
+ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m);
++void hv_pvg_lite_trim_memory(HvPvgLite *p);
++void hv_pvg_metal_trim_memory(HvPvgMetal *m);
+ void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *command, uint32_t length);
+ void hv_pvg_lite_complete(HvPvgLite *p, uint32_t channel, uint32_t stamp);
+ 
+@@ -72,13 +74,13 @@ void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm);
  /* Instant resume (host/snapshot.c). State blobs: called with out NULL they return the size needed. */
  size_t hv_pvg_lite_state(HvPvgLite *p, void *out, size_t cap);
  int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len);
@@ -556,7 +600,7 @@ index 0f68eae..ac454a5 100644
  
  #endif
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..4fc507f 100644
+index 9073d22..05bbef5 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -19,6 +19,7 @@
@@ -857,7 +901,19 @@ index 9073d22..4fc507f 100644
          if (r->shot_timer) { dispatch_source_cancel(r->shot_timer); r->shot_timer = nil; }
          if (cp.timer) { dispatch_source_cancel(cp.timer); cp.timer = nil; }
          os_unfair_lock_lock(&r->screen_lock);
-@@ -3120,22 +3144,24 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+@@ -3117,25 +3141,36 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+     if(atomic_exchange(&r->link_cursor_queued,1))return;
+     dispatch_async(r->worker,^{atomic_store(&r->link_cursor_queued,0);if (!atomic_load(&r->stopping)) [r sendLinkMapping:r->link_mapping];});
+ }
++void hv_pvg_metal_trim_memory(HvPvgMetal *m) {
++    if (!m) return;
++    HvReplay *r = (__bridge HvReplay *)m;
++    dispatch_async(r->worker, ^{
++        if (atomic_load(&r->stopping)) return;
++        [r->library_cache trim]; // live shader/pipeline owners retain their libraries
++        fprintf(stderr, "hengevm: memory-pressure: unused Metal library cache released; live surfaces and pipelines retained\n");
++    });
++}
  
  /* Pinned upstream Instant Resume entrypoints, adapted by the custom engine without a second replay. */
  @interface HvReplay (Resume)
@@ -886,7 +942,7 @@ index 9073d22..4fc507f 100644
              for (NSNumber *task in r->tasks) {
                  NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
                  for (NSNumber *ref in objs) {
-@@ -3143,79 +3169,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -3143,79 +3178,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
                      if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
                      if (o->parent && o->parent->heap_whole) continue;
                      if (!cb) cb = [r->queue commandBuffer];
@@ -1236,10 +1292,10 @@ index b7ff92a..73a270b 100644
  void hv_prof_test_counts(uint64_t *samples,uint64_t *dumps,unsigned *ports) {
 diff --git a/host/reclaim_pages.h b/host/reclaim_pages.h
 new file mode 100644
-index 0000000..c48125a
+index 0000000..ef1d8a6
 --- /dev/null
 +++ b/host/reclaim_pages.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,28 @@
 +#ifndef HENGE_RECLAIM_PAGES_H
 +#define HENGE_RECLAIM_PAGES_H
 +#include <stdint.h>
@@ -1256,7 +1312,9 @@ index 0000000..c48125a
 +    uintptr_t first = (uintptr_t)memory;
 +    if (!memory || !page || page == (size_t)-1 || bytes > UINTPTR_MAX - first) return 0;
 +    uintptr_t end = first + bytes;
-+    uintptr_t start = first + ((page - first % page) % page);
++    size_t prefix = (page - first % page) % page;
++    if (prefix >= bytes) return 0;
++    uintptr_t start = first + prefix;
 +    end -= end % page;
 +    if (end <= start) return 0;
 +    return madvise((void *)start, end - start, MADV_FREE) ? 0 : end - start;
@@ -1656,10 +1714,10 @@ index 47b0ced..9a0ec30 100644
              sendTarget()
          }
 diff --git a/ios/Henge/EngineTuning.swift b/ios/Henge/EngineTuning.swift
-index e579188..2c13f3b 100644
+index e579188..2314dca 100644
 --- a/ios/Henge/EngineTuning.swift
 +++ b/ios/Henge/EngineTuning.swift
-@@ -4,6 +4,8 @@ import Foundation
+@@ -4,10 +4,13 @@ import Foundation
  /// then Documents/henge-env.txt (KEY=VALUE per line, # comments; {Documents} in a value is that folder) overrides them all.
  /// Applied at launch and again before each Mac starts, so changes need no relaunch.
  enum EngineTuning {
@@ -1668,7 +1726,12 @@ index e579188..2c13f3b 100644
      static let diagnosticsKey = "henge.perf.cacheDiagnostics"
      static let fastmemKey = "henge.perf.fastmem"
      static let refreshKey = "henge.perf.hz"
-@@ -23,9 +25,12 @@ enum EngineTuning {
+     static let superblocksKey = "henge.perf.superblocks"
++    static let groupsKey = "henge.perf.groupedMemory"
+     static let wfiSpinKey = "henge.perf.wfiSpin"
+     static let fastFlushKey = "henge.perf.fastFlush"
+     static let cpuPolicyKey = "henge.perf.cpuPolicy"
+@@ -23,9 +26,12 @@ enum EngineTuning {
          "HV_RECHECK": "1",    // exact same-page check before full memory helper at page tails
          "HV_STATS": "10",      // seconds between engine stats lines in the log; 0 = off
          "HV_CPU_POLICY": "auto", // responsive vCPUs; utility QoS for noncritical housekeeping
@@ -1681,7 +1744,15 @@ index e579188..2c13f3b 100644
          var env = defaults
          env["HV_FASTMEM"] = UserDefaults.standard.bool(forKey: fastmemKey) ? "1" : "0"
          let d = UserDefaults.standard
-@@ -51,6 +56,11 @@ enum EngineTuning {
+@@ -35,6 +41,7 @@ enum EngineTuning {
+         env["HV_FASTMEM_STATS"] = (d.object(forKey: diagnosticsKey) as? Bool ?? false) ? "1" : "0"
+         if [30, 60, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
+         env["HV_SUPERBLOCKS"] = d.bool(forKey: superblocksKey) ? "1" : "0"
++        env["HV_GROUPS"] = d.bool(forKey: groupsKey) ? "1" : "0"
+         if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
+         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
+         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+@@ -51,6 +58,11 @@ enum EngineTuning {
                      .trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "{Documents}", with: docs.path)
              }
          }
@@ -1714,7 +1785,7 @@ index 94231b2..fa18a3b 100644
          default: throw LinkError.invalid("Unknown control message")
          }
 diff --git a/ios/Henge/Link/LinkService.swift b/ios/Henge/Link/LinkService.swift
-index 07cd331..bbf78a5 100644
+index 07cd331..ecdb133 100644
 --- a/ios/Henge/Link/LinkService.swift
 +++ b/ios/Henge/Link/LinkService.swift
 @@ -74,6 +74,12 @@ final class LinkHostService: ObservableObject {
@@ -1730,8 +1801,16 @@ index 07cd331..bbf78a5 100644
          guard active, henge_vm_state() == 1 else { return }
          switch command.type {
          case "move": henge_vm_mouse_move(Int32(command.x ?? 0), Int32(command.y ?? 0))
+@@ -116,6 +122,7 @@ final class LinkHostService: ObservableObject {
+         catch { status = error.localizedDescription }
+     }
+     func stop() { stopKeepingStatus(); status = "Display link stopped." }
++    func trimMemory() { encoder?.trimMemory() }
+     private func stopKeepingStatus() {
+         token = UUID(); releaseInput()
+         hv_pvg_link_set_frame_handler(nil)
 diff --git a/ios/Henge/Link/LinkVideo.swift b/ios/Henge/Link/LinkVideo.swift
-index f49ac55..655107c 100644
+index f49ac55..a062560 100644
 --- a/ios/Henge/Link/LinkVideo.swift
 +++ b/ios/Henge/Link/LinkVideo.swift
 @@ -21,12 +21,14 @@ final class LinkEncoder {
@@ -1786,12 +1865,21 @@ index f49ac55..655107c 100644
      }
 -    private func encoded(status: OSStatus, sample: CMSampleBuffer?) {
 +    private func encoded(status: OSStatus, sample: CMSampleBuffer?, epoch: UInt64) {
-+        lock.lock(); let active = !stopped && visible && epoch == visibilityEpoch; lock.unlock()
-+        guard active else { slots.signal(); return }
++        lock.lock(); let mayEncode = !stopped && visible && epoch == visibilityEpoch; lock.unlock()
++        guard mayEncode else { slots.signal(); return }
          guard status == noErr, let sample, CMSampleBufferDataIsReady(sample), let format = CMSampleBufferGetFormatDescription(sample), let block = CMSampleBufferGetDataBuffer(sample) else { slots.signal(); report("Hardware encoder produced no frame: \(status)"); return }
          let hevc = CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC
          var sets = [Data]()
-@@ -172,6 +176,11 @@ final class LinkEncoder {
+@@ -155,7 +159,7 @@ final class LinkEncoder {
+         let copied = bytes.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!) }
+         guard copied == noErr else { slots.signal(); return }
+         // VT output is serialized by the encoder when reordering is disabled.
+-        lock.lock(); sequence &+= 1; let n = sequence; let active = !stopped; lock.unlock()
++        lock.lock(); sequence &+= 1; let n = sequence; let active = !stopped && visible && epoch == visibilityEpoch; lock.unlock()
+         guard active else { slots.signal(); return }
+         do {
+             let dimensions = CMVideoFormatDescriptionGetDimensions(format)
+@@ -172,6 +176,17 @@ final class LinkEncoder {
      func acknowledge(_ sequence: UInt64) {
          if let receipt = credits.consumed(sequence) { retire(receipt) }
      }
@@ -1799,6 +1887,12 @@ index f49ac55..655107c 100644
 +        lock.lock()
 +        if visible != value { visible = value; visibilityEpoch &+= 1 }
 +        lock.unlock()
++    }
++    func trimMemory() {
++        work.async { [self] in
++            CVMetalTextureCacheFlush(cache, 0)
++            CVPixelBufferPoolFlush(pool, .excessBuffers)
++        }
 +    }
      private func retire(_ receipt: LinkFrameCredits.Receipt) {
          slots.signal()
@@ -1824,7 +1918,7 @@ index 1bc238f..31eff7e 100644
              else if phase == .active, !connecting { discovery.start(wired: wired) }
              else if phase == .inactive { viewer.send(LinkControl(type: "release")) }
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..ba2f008 100644
+index 34d6a98..beed427 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
 @@ -29,11 +29,21 @@ HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
@@ -1977,7 +2071,7 @@ index 34d6a98..ba2f008 100644
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
-@@ -454,11 +473,25 @@ void henge_vm_set_display_layer(void *layer) {
+@@ -454,11 +473,30 @@ void henge_vm_set_display_layer(void *layer) {
      hv_vm_set_display_layer(layer);
  }
  uint64_t henge_vm_gpu_frames(void) {
@@ -2002,14 +2096,19 @@ index 34d6a98..ba2f008 100644
 +    };
 +    pthread_rwlock_unlock(&api_lock);
 +}
++void henge_vm_trim_memory(void) {
++    pthread_rwlock_rdlock(&api_lock);
++    if (state == 1 || state == 4) hv_pvg_lite_trim_memory(hv_vm_board()->pvg);
++    pthread_rwlock_unlock(&api_lock);
++}
  int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride) {
      if (!lock_running()) return -1;
      HvBootDisplay d;
 diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
-index b8c41fa..b7aecdc 100644
+index b8c41fa..47aed1a 100644
 --- a/ios/Henge/Native/henge-vm.h
 +++ b/ios/Henge/Native/henge-vm.h
-@@ -62,6 +62,14 @@ int henge_vm_knob(const char *name, int value);
+@@ -62,6 +62,15 @@ int henge_vm_knob(const char *name, int value);
  long henge_vm_balloon(long target_mb);
  
  /* Progress, for the session screen. */
@@ -2021,6 +2120,7 @@ index b8c41fa..b7aecdc 100644
 +    int state;
 +} HengeVmCounters;
 +void henge_vm_counters(HengeVmCounters *out);
++void henge_vm_trim_memory(void); /* release disposable caches; preserves guest RAM and live code */
  void henge_vm_log_cache(void);           /* optional per-CPU cache-use diagnostics */
  uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
  uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
@@ -2078,10 +2178,22 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..acd9410 100644
+index f84465e..0a0c149 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
-@@ -732,11 +732,16 @@ struct SessionView: View {
+@@ -217,6 +217,11 @@ struct SessionView: View {
+             if phase == .inactive { InstantResume.pause() }
+             if phase == .background && bootRAM > 0 { InstantResume.suspend(mac, ramMB: bootRAM, cpus: cpus) }
+         }
++        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
++            henge_vm_trim_memory()
++            LinkHostService.shared.trimMemory()
++            HengeLog.logFootprint("memory-warning")
++        }
+         .onChange(of: showDetails) { showing in
+             if showing {
+                 refreshDetails()
+@@ -732,11 +737,16 @@ struct SessionView: View {
          var used = mac
          used.lastUsed = started
          Machines.shared.update(used)
@@ -2101,7 +2213,7 @@ index f84465e..acd9410 100644
              if currentState != state { state = currentState }
              if currentCPUs != cpusOn { cpusOn = currentCPUs }
              if !userCode && henge_vm_guest_el0() != 0 { userCode = true }
-@@ -744,8 +749,14 @@ struct SessionView: View {
+@@ -744,8 +754,14 @@ struct SessionView: View {
                  try? await Task.sleep(nanoseconds: 100_000_000)
                  continue
              }
@@ -2118,7 +2230,7 @@ index f84465e..acd9410 100644
              if showDetails { refreshDetails() }
              let heat = ProcessInfo.processInfo.thermalState
              if heat.rawValue != thermalState.rawValue {
-@@ -771,12 +782,14 @@ struct SessionView: View {
+@@ -771,12 +787,14 @@ struct SessionView: View {
              }
              tick += 1
              if tick % 10 == 0 {
@@ -2138,10 +2250,18 @@ index f84465e..acd9410 100644
              }
              if tick == 60 && !stillWallpaperTipShown { // about when the desktop is up after a login
 diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
-index e1693b0..687f5c2 100644
+index e1693b0..3303959 100644
 --- a/ios/Henge/SettingsView.swift
 +++ b/ios/Henge/SettingsView.swift
-@@ -155,7 +155,7 @@ struct SettingsView: View {
+@@ -18,6 +18,7 @@ struct SettingsView: View {
+     @AppStorage(EngineTuning.fastFlushKey) private var fastFlush = true
+     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
+     @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
++    @AppStorage(EngineTuning.groupsKey) private var groupedMemory = false
+     @AppStorage(EngineTuning.cpuPolicyKey) private var cpuPolicy = "auto"
+     @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
+     @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
+@@ -155,7 +156,7 @@ struct SettingsView: View {
                          Text("60 fps").tag(60)
                          Text("30 fps").tag(30)
                      }
@@ -2150,7 +2270,17 @@ index e1693b0..687f5c2 100644
                          .font(.footnote).foregroundStyle(.secondary)
                      Toggle("Faster disk writes", isOn: $fastFlush)
                      Toggle("Quicker wake from idle", isOn: $wfiSpin)
-@@ -194,7 +194,7 @@ struct SettingsView: View {
+@@ -168,6 +169,9 @@ struct SettingsView: View {
+                     Toggle("Superblocks (experimental)", isOn: $superblocks)
+                     Text("Continues translated code through conditional branches within the same page, bounded to 48 instructions at a conditional exit. May reduce dispatch work but increase code-cache pressure. Off by default; performance on your device is unverified. Applies to a new Mac session.")
+                         .font(.footnote).foregroundStyle(.secondary)
++                    Toggle("Grouped memory accesses (experimental)", isOn: $groupedMemory)
++                    Text("Reuses a checked translation for nearby reads and writes, including address increments. May enlarge compiled code and empty the code cache sooner. Off by default; applies to a new Mac session.")
++                        .font(.footnote).foregroundStyle(.secondary)
+                     Picker("Code cache", selection: $codeCacheMB) {
+                         Text("512 MB").tag(512)
+                         Text("1 GB").tag(1024)
+@@ -194,7 +198,7 @@ struct SettingsView: View {
                  .listRowBackground(Desk.card)
                  Section("Instant Resume") {
                      Toggle("Resume where you left off", isOn: $instantResume)
@@ -2159,6 +2289,82 @@ index e1693b0..687f5c2 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  .listRowBackground(Desk.card)
+diff --git a/ios/scripts/build_app.sh b/ios/scripts/build_app.sh
+new file mode 100644
+index 0000000..d9d7efa
+--- /dev/null
++++ b/ios/scripts/build_app.sh
+@@ -0,0 +1,32 @@
++#!/bin/zsh
++# Compile and inspect the iOS app without signing, staging, zipping or publishing an IPA.
++set -e
++IOS="$(cd "$(dirname "$0")/.." && pwd)"
++[ -d "$IOS/deps/StikJIT.xcframework" ] || "$IOS/scripts/fetch_deps.sh"
++cd "$IOS"
++xcodegen generate >/dev/null
++DD="$IOS/build/DerivedData"
++mkdir -p "$IOS/build"
++xcodebuild -project Henge.xcodeproj -scheme Henge -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
++    -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > "$DD.buildlog" 2>&1 || {
++    # Never package what an older build left behind.
++    grep -E "error:|BUILD" "$DD.buildlog" | sort -u
++    echo "==> the build failed; no app output accepted" >&2
++    exit 1
++}
++grep -E "BUILD" "$DD.buildlog" || true
++APP="$DD/Build/Products/Release-iphoneos/Henge.app"
++# An iPhone Duo gives its whole inner screen only to apps built with the iOS 27.1 SDK or newer (bars otherwise).
++SDK="$(plutil -extract DTSDKName raw "$APP/Info.plist" 2>/dev/null | sed 's/^iphoneos//')"
++case "$SDK" in
++    ''|*[!0-9.]*) ;;
++    *) [ "$(printf '%s\n27.1\n' "$SDK" | sort -V | head -1)" = "27.1" ] || echo "  note     built with the iOS $SDK SDK: an iPhone Duo will not give Henge its whole inner screen (Xcode 27.1 or later does)" ;;
++esac
++rc=0
++for f in "$APP/Henge" "$APP/henge-jit.js" "$APP/PlugIns/HengeJITHelper.appex/HengeJITHelper" \
++         "$APP/Frameworks/StikJIT.framework/StikJIT" "$APP/Frameworks/StikJIT.framework/Info.plist"; do
++    if [ -f "$f" ]; then printf "  ok       %s\n" "${f#$APP/}"; else echo "  MISSING  ${f#$APP/}" >&2; rc=1; fi
++done
++[ $rc -eq 0 ] || { echo "==> bundle is not installable; app validation failed" >&2; exit 1; }
++
++echo "==> app compile verified: $APP (no IPA generated)"
+diff --git a/ios/scripts/package_ipa.sh b/ios/scripts/package_ipa.sh
+index 5b25291..b3bb1a6 100755
+--- a/ios/scripts/package_ipa.sh
++++ b/ios/scripts/package_ipa.sh
+@@ -13,32 +13,9 @@ OUT="$HOME/Desktop/Henge.ipa"
+ [ "$TROLLSTORE" = true ] && OUT="$HOME/Desktop/Henge.tipa"
+ OUT="${HENGE_IPA_OUTPUT:-$OUT}"
+ mkdir -p "$(dirname "$OUT")"
+-[ -d "$IOS/deps/StikJIT.xcframework" ] || "$IOS/scripts/fetch_deps.sh"
+-cd "$IOS"
+-xcodegen generate >/dev/null
++zsh "$IOS/scripts/build_app.sh"
+ DD="$IOS/build/DerivedData"
+-mkdir -p "$IOS/build"
+-xcodebuild -project Henge.xcodeproj -scheme Henge -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+-    -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > "$DD.buildlog" 2>&1 || {
+-    # Never package what an older build left behind.
+-    grep -E "error:|BUILD" "$DD.buildlog" | sort -u
+-    echo "==> the build failed; nothing packaged" >&2
+-    exit 1
+-}
+-grep -E "BUILD" "$DD.buildlog" || true
+ APP="$DD/Build/Products/Release-iphoneos/Henge.app"
+-# An iPhone Duo gives its whole inner screen only to apps built with the iOS 27.1 SDK or newer (bars otherwise).
+-SDK="$(plutil -extract DTSDKName raw "$APP/Info.plist" 2>/dev/null | sed 's/^iphoneos//')"
+-case "$SDK" in
+-    ''|*[!0-9.]*) ;;
+-    *) [ "$(printf '%s\n27.1\n' "$SDK" | sort -V | head -1)" = "27.1" ] || echo "  note     built with the iOS $SDK SDK: an iPhone Duo will not give Henge its whole inner screen (Xcode 27.1 or later does)" ;;
+-esac
+-rc=0
+-for f in "$APP/Henge" "$APP/henge-jit.js" "$APP/PlugIns/HengeJITHelper.appex/HengeJITHelper" \
+-         "$APP/Frameworks/StikJIT.framework/StikJIT" "$APP/Frameworks/StikJIT.framework/Info.plist"; do
+-    if [ -f "$f" ]; then printf "  ok       %s\n" "${f#$APP/}"; else echo "  MISSING  ${f#$APP/}" >&2; rc=1; fi
+-done
+-[ $rc -eq 0 ] || { echo "==> bundle is not installable; refusing to package" >&2; exit 1; }
+ 
+ STAGE="$(mktemp -d "$DD/stage.XXXXXX")"
+ trap 'rm -rf "$STAGE"' EXIT
 diff --git a/tests/audio_test_api.h b/tests/audio_test_api.h
 index 091433d..d5481c3 100644
 --- a/tests/audio_test_api.h
@@ -2208,13 +2414,17 @@ index 0000000..eef5d30
 + subprocess.run(['cc','-O3','-Wall','-Wextra','-Werror','-I'+str(root/'devices'),str(c),'-o',str(exe)],check=True)
 + subprocess.run([str(exe)],check=True)
 diff --git a/tests/mem_programs.S b/tests/mem_programs.S
-index bcbed3f..33fb61a 100644
+index bcbed3f..2b4c47a 100644
 --- a/tests/mem_programs.S
 +++ b/tests/mem_programs.S
-@@ -353,6 +353,20 @@ PROGRAM groups
-     ldp x16, x17, [x12, #-16]
-     // Base overwritten by a load in the group.
+@@ -355,6 +355,26 @@ PROGRAM groups
      ldr x12, [x12, #-8]
+ END groups
+ 
++PROGRAM groups_increment
++    // Warm via a non-groupable base, so the increment group's hot check runs.
++    mov x15, x0
++    ldr x15, [x15]
 +    // Ordinary address increments retain one validated same-page translation.
 +    add x23, x0, #0x200
 +    ldr x19, [x23]
@@ -2229,15 +2439,17 @@ index bcbed3f..33fb61a 100644
 +    ldr x19, [x23]
 +    add x23, x23, #8
 +    ldr x20, [x23]
- END groups
- 
++END groups_increment
++
  PROGRAM mmio
+     str w1, [x0]
+     ldr w2, [x0, #4]
 diff --git a/tests/run_lifecycle_sanitizers.sh b/tests/run_lifecycle_sanitizers.sh
 new file mode 100755
-index 0000000..fd8becd
+index 0000000..6ad7a55
 --- /dev/null
 +++ b/tests/run_lifecycle_sanitizers.sh
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,48 @@
 +#!/bin/bash
 +# Collect independent failures in one diagnostic pass; any failure blocks the IPA.
 +set -uo pipefail
@@ -2259,6 +2471,7 @@ index 0000000..fd8becd
 +flags='-std=c11 -Wall -Wextra -O1 -g -fno-omit-frame-pointer -Icore -Ihost -Idevices'
 +# Separate objects: release code has no sanitizer flags or diagnostic spills.
 +if check make -j3 B=build/asan ASFLAGS=-DHV_SANITIZER_HELPERS=1 CFLAGS="$flags -fsanitize=address,undefined" build/asan/test_vm_lifecycle build/asan/test_pvg_lifecycle build/asan/test_jit build/asan/test_mem; then
++    check env HV_DEADLINE_KICKS=1 ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 build/asan/test_vm_lifecycle
 +    for binary in test_vm_lifecycle test_pvg_lifecycle test_jit test_mem; do
 +        check env ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "build/asan/$binary"
 +    done
@@ -2276,8 +2489,79 @@ index 0000000..fd8becd
 +if check cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -Icore -Ihost -Idevices tests/test_optimization_primitives.c -o build/test_optimization_primitives; then
 +    check build/test_optimization_primitives
 +fi
++if check xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -Idevices tests/test_metal_library_cache.m -framework Foundation -framework Metal -o build/test_metal_library_cache; then
++    check build/test_metal_library_cache build/link/screen.metallib
++fi
++if check make build/test_display_router; then check build/test_display_router; fi
++if check swiftc -parse-as-library -swift-version 5 ios/Henge/EngineTuning.swift tests/test_engine_tuning.swift -o build/test_engine_tuning; then
++    check build/test_engine_tuning
++fi
 +printf '\nExpanded diagnostic pass: %d failed checks\n' "$failures"
 +test "$failures" -eq 0
+diff --git a/tests/test_chain_index.py b/tests/test_chain_index.py
+index 88db6e8..8afb1f9 100644
+--- a/tests/test_chain_index.py
++++ b/tests/test_chain_index.py
+@@ -12,8 +12,10 @@ def function(file, signature):
+   e+=1
+  return s[a:e]
+ preamble=r'''
++#define _DEFAULT_SOURCE
+ #include "machine.h"
+ #include "mmu.h"
++#include "reclaim_pages.h"
+ #include <assert.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -22,6 +24,10 @@ __thread HvCpu *hv_self;
+ int hv_knob[HV_K_COUNT], hv_tlb_tmajor;
+ uint32_t *hv_smc_counts;
+ uint64_t *hv_smc_last, hv_smc_pages, hv_smc_cpu, hv_smc_dma;
++/* This extracted index fixture never owns guest FP state. Native engine tests
++   exercise the real assembly; accidentally reaching it here must fail. */
++void hv_fp_leave(HvCpu *c){(void)c;abort();}
++void hv_fp_enter(HvCpu *c){(void)c;abort();}
+ void hv_jit_write(HvJitRegion *r,uint32_t *p,const void *s,size_t n){(void)r;memcpy(p,s,n);}
+ void hv_jit_finish(HvJitRegion *r,uint32_t *p,size_t n){(void)r;(void)p;(void)n;}
+ void hv_jit_finish_branch(HvJitRegion *r,uint32_t *p){(void)r;(void)p;}
+diff --git a/tests/test_display_router.swift b/tests/test_display_router.swift
+index a8b4506..d7548df 100644
+--- a/tests/test_display_router.swift
++++ b/tests/test_display_router.swift
+@@ -3,13 +3,14 @@ import QuartzCore
+ 
+ /// What the engine was last told to draw into.
+ nonisolated(unsafe) var engineLayer: UnsafeMutableRawPointer?
++nonisolated(unsafe) var engineCalls = 0
+ 
+ @_cdecl("henge_vm_set_display_layer")
+-func recordDisplayLayer(_ layer: UnsafeMutableRawPointer?) { engineLayer = layer }
++func recordDisplayLayer(_ layer: UnsafeMutableRawPointer?) { engineLayer = layer; engineCalls += 1 }
+ 
+ @main
+ struct DisplayRouterTests {
+-    @MainActor static func main() {
++    @MainActor static func main() async {
+         let phoneLayer = CAMetalLayer(), monitorLayer = CAMetalLayer()
+         let phone = UUID(), monitor = UUID()
+         let router = DisplayRouter()
+@@ -30,6 +31,16 @@ struct DisplayRouterTests {
+         // The last monitor going gives the Mac back to the phone, and a late repeat changes nothing.
+         router.disconnect(monitor)
+         precondition(engineShows(phoneLayer) && !router.isExternal)
++        let before = engineCalls
++        for _ in 0..<100 { router.refresh(phone) }
++        precondition(engineCalls == before)
++        for _ in 0..<1000 { if engineCalls != before { break }; await Task.yield() }
++        precondition(engineCalls == before + 1 && engineShows(phoneLayer))
++        router.refresh(phone)
++        router.connect(monitor, layer: monitorLayer, role: .external)
++        let switched = engineCalls
++        for _ in 0..<10 { await Task.yield() }
++        precondition(engineCalls == switched && engineShows(monitorLayer))
+         router.disconnect(monitor)
+         precondition(engineShows(phoneLayer) && !router.isExternal)
+         print("Display router: all checks passed")
 diff --git a/tests/test_display_settings.m b/tests/test_display_settings.m
 index 5bf491f..0c279ab 100644
 --- a/tests/test_display_settings.m
@@ -2340,6 +2624,53 @@ index 0000000..7b09ed0
 +                    '-I'+str(root/'devices'),str(c),'-o',str(binary)],check=True)
 +    subprocess.run([str(binary)],check=True)
 +print('Display snapshot parser: two ports, all header mutations and truncations passed ASan/UBSan')
+diff --git a/tests/test_engine_tuning.swift b/tests/test_engine_tuning.swift
+new file mode 100644
+index 0000000..2b0957a
+--- /dev/null
++++ b/tests/test_engine_tuning.swift
+@@ -0,0 +1,41 @@
++import Foundation
++
++// Redirect only this fixture's Documents lookup; never alter HOME or app data.
++let fixtureDocuments = Foundation.FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++final class FileManager {
++    static let `default` = FileManager()
++    func urls(for directory: Foundation.FileManager.SearchPathDirectory,
++              in domain: Foundation.FileManager.SearchPathDomainMask) -> [URL] { [fixtureDocuments] }
++}
++enum HengeLog { static func log(_ category: String, _ message: String) {} }
++@main struct EngineTuningChecks {
++    static func value(_ key: String) -> String? { getenv(key).map { String(cString:$0) } }
++    static func main() throws {
++        try Foundation.FileManager.default.createDirectory(at: fixtureDocuments, withIntermediateDirectories: true)
++        defer { try? Foundation.FileManager.default.removeItem(at: fixtureDocuments) }
++        let savedGroups = UserDefaults.standard.object(forKey: EngineTuning.groupsKey)
++        let savedSpin = UserDefaults.standard.object(forKey: EngineTuning.wfiSpinKey)
++        defer {
++            for (key, value) in [(EngineTuning.groupsKey, savedGroups), (EngineTuning.wfiSpinKey, savedSpin)] {
++                if let value { UserDefaults.standard.set(value, forKey:key) }
++                else { UserDefaults.standard.removeObject(forKey:key) }
++            }
++        }
++        let url = fixtureDocuments.appendingPathComponent("henge-env.txt")
++        setenv("HV_FIXTURE_FOREIGN", "kept", 1)
++        try "HV_FIXTURE_OVERRIDE=1\nHV_WFI_SPIN=50\nHV_GROUPS=1\n".write(to:url,atomically:true,encoding:.utf8)
++        EngineTuning.apply()
++        precondition(value("HV_FIXTURE_OVERRIDE") == "1" && value("HV_WFI_SPIN") == "50" && value("HV_GROUPS") == "1")
++        precondition(value("HV_DEADLINE_KICKS") == "1" && value("HV_TIMER_DIRECT") == "1")
++        try "".write(to:url,atomically:true,encoding:.utf8)
++        UserDefaults.standard.set(false,forKey:EngineTuning.groupsKey)
++        UserDefaults.standard.set(false,forKey:EngineTuning.wfiSpinKey)
++        EngineTuning.apply()
++        precondition(value("HV_FIXTURE_OVERRIDE") == nil)
++        precondition(value("HV_FIXTURE_FOREIGN") == "kept")
++        precondition(value("HV_WFI_SPIN") == "0" && value("HV_GROUPS") == "0")
++        UserDefaults.standard.removeObject(forKey:EngineTuning.groupsKey)
++        UserDefaults.standard.removeObject(forKey:EngineTuning.wfiSpinKey)
++        print("PASS engine tuning: actual defaults, explicit overrides, removed overrides, foreign environment and grouped-path activation")
++    }
++}
 diff --git a/tests/test_gpu_copy_bounds.py b/tests/test_gpu_copy_bounds.py
 new file mode 100644
 index 0000000..aebcda1
@@ -2439,12 +2770,62 @@ index 0000000..52930cc
 +b=root/'build';b.mkdir(exist_ok=True);c=b/'test_gpu_upload.m';c.write_text(pre+method+post)
 +subprocess.run(['xcrun','--sdk','macosx','clang','-fobjc-arc','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(root/'devices'),str(c),'-framework','Foundation','-framework','Metal','-o',str(b/'test_gpu_upload')],check=True)
 +subprocess.run([str(b/'test_gpu_upload')],check=True)
+diff --git a/tests/test_link.swift b/tests/test_link.swift
+index 1ac8d90..2f52570 100644
+--- a/tests/test_link.swift
++++ b/tests/test_link.swift
+@@ -191,6 +191,12 @@ func mustReject(_ operation: () throws -> Void) {
+         var pixels = [UInt8](repeating: 0, count: mode.width * mode.height * 4)
+         for i in stride(from: 0, to: pixels.count, by: 4) { pixels[i+2] = 255; pixels[i+3] = 255 }
+         texture.replace(region: MTLRegionMake2D(0, 0, mode.width, mode.height), mipmapLevel: 0, withBytes: &pixels, bytesPerRow: mode.width * 4)
++        encoder.setVisible(false)
++        encoder.capture(texture: texture, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero)
++        let hiddenFence = queue.makeCommandBuffer()!; hiddenFence.commit(); hiddenFence.waitUntilCompleted()
++        require(done.wait(timeout: .now() + 0.2) == .timedOut, "Hidden viewer received an encoded frame")
++        encoder.trimMemory()
++        encoder.setVisible(true)
+         encoder.capture(texture: texture, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero)
+         waitFrame()
+         expected = 1
+diff --git a/tests/test_mem.c b/tests/test_mem.c
+index 35ecb46..d2bf9cf 100644
+--- a/tests/test_mem.c
++++ b/tests/test_mem.c
+@@ -16,13 +16,14 @@ DECLARE_PROGRAM(epilogue);
+ DECLARE_PROGRAM(dczva);
+ DECLARE_PROGRAM(pageend);
+ DECLARE_PROGRAM(groups);
++DECLARE_PROGRAM(groups_increment);
+ DECLARE_PROGRAM(mmio);
+ extern const char mem_programs_begin[], mem_programs_finish[];
+ 
+ static const TestProgram programs[] = {
+     TEST_PROGRAM(single), TEST_PROGRAM(stolen_mem), TEST_PROGRAM(pairs),   TEST_PROGRAM(simd_mem),
+     TEST_PROGRAM(exclusive), TEST_PROGRAM(atomics),  TEST_PROGRAM(literal), TEST_PROGRAM(loops), TEST_PROGRAM(epilogue),
+-    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups),
++    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups), TEST_PROGRAM(groups_increment),
+ };
+ 
+ #define DATA_SIZE 65536
+diff --git a/tests/test_metal_library_cache.m b/tests/test_metal_library_cache.m
+index 3462d79..6e35ea5 100644
+--- a/tests/test_metal_library_cache.m
++++ b/tests/test_metal_library_cache.m
+@@ -39,6 +39,8 @@ int main(int argc, const char **argv) { @autoreleasepool {
+     assert(![small libraryForData:k loader:failure]);assert(![small libraryForData:k loader:failure]);
+     assert(failed==2 && !small.count); // errors retry rather than poisoning cache
+     assert([first newFunctionWithName:@"screen_v"]); // evicted libraries held by users stay alive
++    [cache trim]; assert(!cache.count && !cache.retainedBytes);
++    assert([first newFunctionWithName:@"screen_v"]); // pressure purge cannot invalidate a live owner
+     puts("Metal library cache: exact-byte hit, immutable key, FIFO eviction, byte/entry bounds, oversized bypass, failed retry and retained library passed");
+     return 0;
+ } }
 diff --git a/tests/test_optimization_primitives.c b/tests/test_optimization_primitives.c
 new file mode 100644
-index 0000000..c738ad9
+index 0000000..425a58c
 --- /dev/null
 +++ b/tests/test_optimization_primitives.c
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,49 @@
 +#define _DEFAULT_SOURCE
 +#include "mmu.h"
 +#include "cursor_damage.h"
@@ -2485,6 +2866,8 @@ index 0000000..c738ad9
 +    k.position++; k.glyph++; assert(!hv_cursor_damage_changed(&d,k));
 +    k.layer++; assert(hv_cursor_damage_changed(&d,k));
 +    size_t page=(size_t)sysconf(_SC_PAGESIZE);
++    assert(!hv_reclaim_retired_pages((void *)UINTPTR_MAX,0));
++    assert(!hv_reclaim_retired_pages((void *)UINTPTR_MAX,1));
 +    void *p=NULL; assert(!posix_memalign(&p,page,page*4)); memset(p,0x5a,page*4);
 +    size_t advised=hv_reclaim_retired_pages((uint8_t *)p+1,page*4-2);
 +    assert(!advised || advised == page*2);
@@ -2526,7 +2909,7 @@ index 553c4b6..64d0cb9 100644
 + puts("iOS profiler lifecycle: off/on/off/on, port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
  }
 diff --git a/tests/test_pvg_lifecycle.m b/tests/test_pvg_lifecycle.m
-index 81cdb83..eb4c3bb 100644
+index 81cdb83..e719ce7 100644
 --- a/tests/test_pvg_lifecycle.m
 +++ b/tests/test_pvg_lifecycle.m
 @@ -1,6 +1,8 @@
@@ -2538,10 +2921,11 @@ index 81cdb83..eb4c3bb 100644
  #include "vmapple.h"
  #include <stdlib.h>
  #include <unistd.h>
-@@ -27,12 +29,39 @@ int main(void) {
+@@ -27,12 +29,40 @@ int main(void) {
              cmd[0] = 0x43; cmd[1] = 24; cmd[2] = i + 1;
              hv_pvg_metal_submit(metal, board.pvg, 0, cmd, 24);
          }
++        hv_pvg_metal_trim_memory(metal);
 +        if (hv_pvg_metal_quiesce(metal)) return 1;
 +        /* Restore distinct glyphs on both ports through the production serializer.
 +           Readback exercises real Metal textures, including the secondary glyph. */
