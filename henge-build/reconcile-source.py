@@ -104,4 +104,27 @@ t=replace_once(t,"if (sound_on) hv_audio_detach(); /* the host\u0027s player sto
 for dead in ("pthread_join(kicker, NULL)", "if (sound_on) hv_audio_detach();"):
     if dead in t: raise SystemExit("Unreconciled suspend lifecycle: "+dead)
 vm.write_text(t)
-print("PASS custom/upstream reconciliation: two-port PVG state, one GPU timing path, upstream resume methods")
+
+# The custom VM header adds ticker diagnostics exactly where upstream added
+# Instant Resume declarations. The automatic 3-way merge retained the ticker
+# declaration but lost the pause APIs. Install the complete upstream block,
+# including snapshot counter and network helpers, not hand-written stubs.
+header=root/"host/vm.h"
+h=header.read_text()
+upstream_header=subprocess.check_output(
+    ["git","-C",str(root),"show",f"{upstream}:host/vm.h"],text=True)
+start="/* Instant resume (see snapshot.h)."
+end="void hv_vm_flush_disks(void);"
+if upstream_header.count(start)!=1 or upstream_header.count(end)!=1:
+    raise SystemExit("Unexpected pinned upstream VM header layout")
+api=upstream_header[upstream_header.index(start):upstream_header.index(end)]
+if "int hv_vm_pause(void);" not in h:
+    h=replace_once(h,"void hv_vm_log_ticker(void);",
+        "void hv_vm_log_ticker(void);\n"+api.rstrip(),
+        "restore complete Instant Resume API on custom VM header")
+for name in ("int hv_vm_pause(void);","int hv_vm_finish_pause(void);",
+             "int hv_vm_paused(void);","int hv_vm_continue(void);",
+             "int hv_vm_pause_clean(void);","void hv_vm_link_flap(void);"):
+    if h.count(name)!=1: raise SystemExit("Missing or duplicate pause API: "+name)
+header.write_text(h)
+print("PASS custom/upstream reconciliation: dual-port GPU snapshots, VM pause APIs and lifecycle")
