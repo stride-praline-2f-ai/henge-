@@ -10,6 +10,8 @@ Fail closed when upstream changes a source pattern unexpectedly.
 """
 from pathlib import Path
 import sys
+import json
+import subprocess
 
 root=Path(sys.argv[1])
 def replace_once(code, before, after, context):
@@ -68,5 +70,26 @@ s=replace_once(s,
     "No redundant iOS17 automatic shader dump")
 for forbidden in ("loaded_at", "gpu_busy_ns", "gpu_last_end", "commit_time"):
     if forbidden in s: raise SystemExit("Stale GPU code from overlapping features: "+forbidden)
+# Import only the three upstream GPU quiesce/display snapshot entrypoints.
+# The custom renderer already owns Metal replay, cache, display and touch paths,
+# so never import another renderer implementation or duplicate a symbol.
+manifest = json.loads((Path(__file__).with_name("manifest.json")).read_text())
+upstream = manifest["upstream_integration"]["main_sha"]
+original = subprocess.check_output(
+    ["git", "-C", str(root), "show", f"{upstream}:devices/pvg_metal.m"], text=True)
+anchor = "@interface HvReplay (Resume)"
+assert original.count(anchor) == 1, "unexpected upstream snapshot boundary"
+resume = original[original.index(anchor):]
+required = [
+    "void hv_pvg_metal_quiesce(",
+    "size_t hv_pvg_metal_display_state(",
+    "void hv_pvg_metal_set_display_state(",
+]
+for name in required:
+    if original.count(name) != 1: raise SystemExit("Unexpected upstream snapshot function count: " + name)
+    if name in s: raise SystemExit("Duplicate snapshot implementation: " + name)
+if "static void vblank(" in resume:
+    raise SystemExit("Unexpected foreign GPU logic in upstream snapshot segment")
+s += "\n/* Pinned upstream Instant Resume entrypoints, adapted by the custom engine without a second replay. */\n" + resume
 metal.write_text(s)
-print("PASS custom/upstream reconciliation: two-port PVG state, explicit shader dump, one GPU timing path")
+print("PASS custom/upstream reconciliation: two-port PVG state, one GPU timing path, upstream resume methods")
