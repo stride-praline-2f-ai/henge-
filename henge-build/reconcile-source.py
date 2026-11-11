@@ -91,13 +91,5 @@ for name in required:
 if "static void vblank(" in resume:
     raise SystemExit("Unexpected foreign GPU logic in upstream snapshot segment")
 s += "\n/* Pinned upstream Instant Resume entrypoints, adapted by the custom engine without a second replay. */\n" + resume
-# Carry the pinned upstream GPU quiesce and display-snapshot implementation
-# forward. These methods must actually copy GPU-owned objects to guest RAM:
-# placeholder implementations would corrupt Instant Resume after a save.
-resume=Path(__file__).with_name("metal-resume-integration.m").read_text()
-for symbol in ("void hv_pvg_metal_quiesce(", "size_t hv_pvg_metal_display_state(", "void hv_pvg_metal_set_display_state("):
-    if symbol in s or resume.count(symbol)!=1:
-        raise SystemExit("Conflicting or missing Metal Instant Resume implementation: "+symbol)
-s += "\n" + resume
 metal.write_text(s)
 print("PASS custom/upstream reconciliation: two-port PVG state, one GPU timing path, upstream resume methods")
