@@ -37,9 +37,25 @@ git -C "$source_dir" merge-base --is-ancestor "$base" "$upstream" || {
   echo "Pinned source is not an ancestor of upstream main" >&2
   exit 1
 }
-echo "::group::Integrate 22 newer Henge main commits"
+echo "::group::Integrate pinned Henge main commits"
 echo "Applying upstream: $upstream"
-git -C "$source_dir" merge --no-edit --no-ff -X ours "$upstream"
+# The custom iOS 27 Metal replay intentionally removed the old iOS-17-only
+# relabel hook. Upstream now modifies those two files; a modify/delete conflict
+# is expected. Resolve ONLY that exact, reviewed conflict by keeping the custom
+# removal. Any additional unresolved path aborts the build rather than guessing.
+if ! git -C "$source_dir" merge --no-edit --no-ff -X ours "$upstream"; then
+  unresolved="$(git -C "$source_dir" diff --name-only --diff-filter=U)"
+  expected_unresolved="$(printf 'devices/metallib.c\\ndevices/metallib.h')"
+  if [ "$unresolved" != "$expected_unresolved" ]; then
+    echo "Unreviewed upstream merge conflicts:" >&2
+    printf '%s\\n' "$unresolved" >&2
+    exit 1
+  fi
+  git -C "$source_dir" rm -- devices/metallib.c devices/metallib.h
+  test -z "$(git -C "$source_dir" diff --name-only --diff-filter=U)"
+  git -C "$source_dir" -c user.name="$GIT_AUTHOR_NAME" -c user.email="$GIT_AUTHOR_EMAIL" commit --no-edit
+  echo "Intentional iOS 27 renderer choice: old iOS-17 relabel files remain removed."
+fi
 git -C "$source_dir" merge-base --is-ancestor "$upstream" HEAD
 echo "::endgroup::"
 for entry in "${pins[@]:2}"; do
