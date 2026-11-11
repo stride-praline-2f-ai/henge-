@@ -323,3 +323,21 @@ s=p.read_text()
 anchor='        check("suspend saves", rc == 0 && henge_vm_state() == 4 && access(snap, F_OK) == 0);'
 s=replace_once(s,anchor,anchor+'\n        if (rc || henge_vm_state() != 4) {\n            fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\\n");\n            return 1;\n        }','fail suspend regression without a secondary test use-after-free')
 p.write_text(s)
+
+p=root/'host/vm.c'
+s=p.read_text()
+s=replace_once(s,'    atomic_store(&input_stopping, 1);\n    hv_machine_halt(&m, HV_HALT_SAVE);',
+    '    stop_pointer(); /* drain delayed input before CPUs and snapshot stop */\n    hv_machine_halt(&m, HV_HALT_SAVE);','pause drains the one pointer queue')
+s=replace_once(s,'        left_user = left_click = left_sent = 0;\n        os_unfair_lock_lock(&rctrl_lock);',
+    '        if (board.mouse && left_sent) {\n            hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);\n            hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);\n        }\n        left_user = left_click = left_sent = 0;\n        os_unfair_lock_lock(&rctrl_lock);\n        if (board.usb && (rctrl_user || rctrl_click)) hv_xhci_key(board.usb, HID_RIGHT_CONTROL, 0);',
+    'release host-owned guest input before clearing queue ownership')
+p.write_text(s)
+p=root/'tests/test_vm_lifecycle.c'
+s=p.read_text()
+s=replace_once(s,'        rc = henge_vm_suspend(snap, "test", error, sizeof error);',
+    '        henge_vm_key_hid(0xe4, 1);\n        henge_vm_mouse_button(1, 1); /* queued Control-click races pause */\n        rc = henge_vm_suspend(snap, "test", error, sizeof error);',
+    'queue an actual pending Control-click before pause') if s.count('        rc = henge_vm_suspend(snap, "test", error, sizeof error);')==1 else s.replace('        rc = henge_vm_suspend(snap, "test", error, sizeof error);','        henge_vm_key_hid(0xe4, 1);\n        henge_vm_mouse_button(1, 1);\n        rc = henge_vm_suspend(snap, "test", error, sizeof error);',1)
+s=replace_once(s,'        volatile uint64_t *count = (volatile uint64_t *)hv_vm_board()->ram;',
+    '        check("pause releases queued right-Control", !(hv_vm_board()->usb->state[0] & (1u << 4)));\n        volatile uint64_t *count = (volatile uint64_t *)hv_vm_board()->ram;',
+    'verify pending Control-click cannot be frozen into snapshot')
+p.write_text(s)
