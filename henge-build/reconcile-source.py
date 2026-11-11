@@ -206,6 +206,17 @@ if constants:
 for name in ("largeScreen","sideStrip","sideStripCentre","sideStripTop"):
     if h.count(f"static var {name}:") + h.count(f"static let {name}:") != 1:
         raise SystemExit("Duplicate or missing Device member: "+name)
+# Upstream PR108's fittedForStart API needs this name. Reuse the fork's
+# dynamic GuestScreenSize calculation; do not add a second fixed-size fit.
+if "static func fitting(for mac:" not in h:
+    h=replace_once(h,"enum Device {\n",
+        "enum Device {\n    static func fitting(for mac: VirtualMac) -> (width: Int, height: Int) {\n"
+        "        let size = mac.displaySize(in: displayViewport)\n"
+        "        return (size.width, size.height)\n"
+        "    }\n",
+        "map upstream fittedForStart to existing dynamic viewport source")
+if h.count("static func fitting(for mac:")!=1:
+    raise SystemExit("Duplicate or missing Duo fitting entrypoint")
 hardware.write_text(h)
 
 machines=root/"ios/Henge/Machines.swift"
