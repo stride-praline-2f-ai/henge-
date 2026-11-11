@@ -82,3 +82,11 @@ partial output. Added a production-block failure regression. Exact iOS libzip
 cache keys include host/toolchain, actual vendored sources and build script;
 no app objects or executable JIT state are cached. Next: validate this final
 patch, finish the recorded release gate, then produce the one final IPA.
+
+Final default consistency finding: non-M4 hosts still inherited HV_STATS10 despite
+release diagnostics being described as opt-in. Both the base environment and
+statistics preference fallback now default off on every device, including Duo.
+Explicit user preference/cache diagnostics/environment overrides still work.
+This avoids hot-path timing/counter overhead; it is not a measured power result.
+The production preference test now covers unset defaults on both host classes
+and retained explicit opt-in. Validate the amended source before release.
