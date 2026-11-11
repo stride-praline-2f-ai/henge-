@@ -23,6 +23,112 @@ index 81b0736..c9f0915 100644
  	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -lcompression -o $@
  
  test-vm-lifecycle: $(B)/test_vm_lifecycle
+diff --git a/core/dispatch.c b/core/dispatch.c
+index 12bd4a9..cab1f73 100644
+--- a/core/dispatch.c
++++ b/core/dispatch.c
+@@ -602,16 +602,41 @@ static void print_profile(HvMachine *m) {
+     }
+ }
+ 
++/* A new CPU0 thread (Continue) and a new hv_run on the same host thread both
++   need fresh wall, CPU-time and counter baselines. No process-global history. */
++static _Thread_local int stats_new_run;
++static double stats_thread_seconds(void) {
++    thread_basic_info_data_t ti;
++    mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
++    mach_port_t self = mach_thread_self();
++    kern_return_t result = thread_info(self, THREAD_BASIC_INFO, (thread_info_t)&ti, &cnt);
++    mach_port_deallocate(mach_task_self(), self);
++    if (result != KERN_SUCCESS) return -1;
++    return ti.user_time.seconds + ti.user_time.microseconds / 1e6 +
++           ti.system_time.seconds + ti.system_time.microseconds / 1e6;
++}
++
+ static void print_stats(HvCpu *cpu, int force) {
+-    static uint64_t last_t, start_t;
++    static _Thread_local uint64_t last_t, start_t;
++    static _Thread_local double last_busy;
++    static _Thread_local int hash_diagnostics;
+     /* This uses floating point, and the host FP registers hold the guest's state. */
+     hv_fp_leave(cpu);
+     uint64_t zero = 0;
+     __asm__ volatile("msr fpcr, %0" ::"r"(zero));
+-    static HvStats last;
++    static _Thread_local HvStats last;
+     HvMachine *m = cpu->m;
+     uint64_t now = mach_absolute_time();
+-    if (!start_t) start_t = last_t = now;
++    if (stats_new_run || !start_t) {
++        stats_new_run = 0;
++        start_t = last_t = now;
++        last = m->stats;
++        last_busy = stats_thread_seconds();
++        const char *hash = getenv("HV_STATS_HASH");
++        hash_diagnostics = hash && !strcmp(hash, "1");
++        hv_fp_enter(cpu);
++        return;
++    }
+     if (!force && now - last_t < (uint64_t)m->stats_interval * 24000000ull) {
+         hv_fp_enter(cpu);
+         return;
+@@ -632,25 +657,20 @@ static void print_stats(HvCpu *cpu, int force) {
+         double tot = 0;
+         for (int k = 0; k < 6; k++) tot += RATE(why[k]);
+         /* How much of the interval the CPU thread actually ran: below 100% means the host took it away. */
+-        static double last_busy;
+-        thread_basic_info_data_t ti;
+-        mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+-        mach_port_t self = mach_thread_self();
+-        if (thread_info(self, THREAD_BASIC_INFO, (thread_info_t)&ti, &cnt) == KERN_SUCCESS) {
+-            double busy = ti.user_time.seconds + ti.user_time.microseconds / 1e6 + ti.system_time.seconds +
+-                          ti.system_time.microseconds / 1e6;
++        double busy = stats_thread_seconds();
++        if (busy >= 0 && last_busy >= 0 && busy >= last_busy && dt > 0)
+             fprintf(stderr, "  cpu thread ran %.0f%% of the interval\n", 100 * (busy - last_busy) / dt);
+-            if (m->ncpus > 1) {
+-                fprintf(stderr, "  cpus:");
+-                for (int i = 0; i < m->ncpus; i++)
+-                    if (m->cpus[i])
+-                        fprintf(stderr, " [%d] %s el%u pc %llx", i, m->cpus[i]->off ? "off" : "on", m->cpus[i]->el,
+-                                (unsigned long long)m->cpus[i]->pc);
+-                fprintf(stderr, "\n");
+-            }
+-            last_busy = busy;
++        else
++            fprintf(stderr, "  cpu thread timing unavailable (new baseline)\n");
++        last_busy = busy;
++        if (m->ncpus > 1) {
++            fprintf(stderr, "  cpus:");
++            for (int i = 0; i < m->ncpus; i++)
++                if (m->cpus[i])
++                    fprintf(stderr, " [%d] %s el%u pc %llx", i, m->cpus[i]->off ? "off" : "on", m->cpus[i]->el,
++                            (unsigned long long)m->cpus[i]->pc);
++            fprintf(stderr, "\n");
+         }
+-        mach_port_deallocate(mach_task_self(), self);
+         fprintf(stderr, "  whole-TLB flushes/s: TLBI all here %.0f, TLBI all shared %.0f, SCTLR %.0f, TTBR1 %.0f, TCR %.0f, MAIR %.0f, range of all %.0f, requests overflowed %.0f\n",
+                 RATE(flush_why[0]), RATE(flush_why[1]), RATE(flush_why[2]), RATE(flush_why[3]), RATE(flush_why[4]), RATE(flush_why[5]),
+                 RATE(flush_why[6]), RATE(flush_why[7]));
+@@ -664,7 +684,9 @@ static void print_stats(HvCpu *cpu, int force) {
+                     RATE(flush_checked), RATE(flush_check_entries), RATE(flush_check_bad), RATE(flush_check_af));
+         fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
+                 RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
+-        { /* block hash health: chain lengths and how much of it is stale */
++        /* Walking millions of blocks is a diagnostic, not routine telemetry.
++           Keep it explicitly opt-in; ordinary rate counters do not need it. */
++        if (hash_diagnostics) { /* block hash health: chain lengths and stale entries */
+             uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
+             uint32_t worst = 0;
+             for (uint32_t h = 0; h < HV_BLOCK_HASH; h++) {
+@@ -925,6 +947,7 @@ static void stop_the_world(HvCpu *cpu) {
+ }
+ 
+ int hv_run(HvCpu *cpu) {
++    if (cpu->index == 0) stats_new_run = 1;
+     if (cpu->m->wait_stats && cpu->pc_state && !cpu->pc_state->thread) __atomic_store_n(&cpu->pc_state->thread, mach_thread_self(), __ATOMIC_RELEASE);
+     hv_big_lock(cpu->m);
+     hv_fp_enter(cpu);
 diff --git a/core/memop.c b/core/memop.c
 index bfbac5e..d184b91 100644
 --- a/core/memop.c
@@ -188,7 +294,7 @@ index 0f68eae..ac454a5 100644
  
  #endif
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..65d05fd 100644
+index 9073d22..b811439 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -838,15 +838,10 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
@@ -363,7 +469,19 @@ index 9073d22..65d05fd 100644
          }
          [back endEncoding];
      }
-@@ -2319,6 +2322,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2287,6 +2290,11 @@ typedef struct {
+                 library_load_seconds * 1000, library_load_worst * 1000);
+         fprintf(stderr, "hengevm: gpu-pipelines: builds=%llu total_ms=%.2f worst_ms=%.2f (cumulative host pipeline creation, including failures)\n",
+                 (unsigned long long)pipeline_builds, pipeline_seconds * 1000, pipeline_worst_seconds * 1000);
++        /* Constant-time ownership clues alongside the existing report. Includes
++           in-flight allocations; neither a process footprint nor proof of a leak. */
++        fprintf(stderr, "hengevm: gpu-memory: device_allocated=%.1fMiB tasks=%lu surfaces=%lu mapped_textures=%lu planar=%lu (Metal device allocations including in-flight work; not process footprint)\n",
++                (double)device.currentAllocatedSize / (1 << 20), (unsigned long)tasks.count,
++                (unsigned long)surfaces.count, (unsigned long)mapped_textures.count, (unsigned long)planar.count);
+     }
+     return YES;
+ }
+@@ -2319,6 +2327,7 @@ static const uint8_t *half_to_byte(void) {
      memcpy(&hx, (const uint8_t *)a + 0x24, 2), memcpy(&hy, (const uint8_t *)a + 0x26, 2);
      if (!w || !h || w > 512 || h > 512 || stride < (uint64_t)w * 4 || stride > 8192) return;
      uint8_t *bits = malloc((size_t)stride * h);
@@ -371,7 +489,7 @@ index 9073d22..65d05fd 100644
      if (hv_pvg_lite_task_read(lite, 0, off, bits, (uint32_t)stride * h)) {
          free(bits);
          [self complain:@"pointer image unreadable"];
-@@ -2327,6 +2331,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2327,6 +2336,7 @@ static const uint8_t *half_to_byte(void) {
      MTLTextureDescriptor *ct = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
      ct.storageMode = MTLStorageModeShared;
      id<MTLTexture> glyph = [device newTextureWithDescriptor:ct];
@@ -379,7 +497,7 @@ index 9073d22..65d05fd 100644
      [glyph replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
      if (a[0] == 1) {
          link_cursor=glyph;link_cw=w;link_ch=h;link_hx=hx;link_hy=hy;
-@@ -3120,22 +3125,24 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+@@ -3120,22 +3130,24 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
  
  /* Pinned upstream Instant Resume entrypoints, adapted by the custom engine without a second replay. */
  @interface HvReplay (Resume)
@@ -408,7 +526,7 @@ index 9073d22..65d05fd 100644
              for (NSNumber *task in r->tasks) {
                  NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
                  for (NSNumber *ref in objs) {
-@@ -3143,79 +3150,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -3143,79 +3155,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
                      if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
                      if (o->parent && o->parent->heap_whole) continue;
                      if (!cb) cb = [r->queue commandBuffer];
@@ -692,6 +810,36 @@ index cc902ed..15b606f 100644
      ldr x0, [x28, #CPU_SP]
      mov sp, x0
      ldr x0, [x28, #CPU_NZCV]
+diff --git a/host/prof_ios.c b/host/prof_ios.c
+index b7ff92a..8eb24e6 100644
+--- a/host/prof_ios.c
++++ b/host/prof_ios.c
+@@ -183,15 +183,22 @@ static void *sampler(void *unused) {
+     }
+     return NULL;
+ }
+-void hv_prof_ios_start(void) {
+-    static int started;if(started++)return;
+-    if(!getenv("HV_PROF_IOS") || !strcmp(getenv("HV_PROF_IOS"),"0"))return;
++static void start_profiler(void) {
+     words_on = atoi(getenv("HV_PROF_IOS")) >= 2;
+     Dl_info info;if(dladdr((void *)hv_prof_ios_start,&info))image_base=(uintptr_t)info.dli_fbase;
+     if(pthread_key_create(&thread_key,unregister_thread)!=0)return;
+     pthread_t t;
+     if(pthread_create(&t,NULL,sampler,NULL)!=0){pthread_key_delete(thread_key);return;}
+     pthread_detach(t);hv_prof_register=reg;hv_prof_session=session;hv_prof_unregister=leave;
++    fprintf(stderr, "hengevm: profiler enabled: pid=%ld epoch=%ld words=%d (sampling adds overhead; word dumps are timestamped, not a speed benchmark)\n",
++            (long)getpid(), (long)time(NULL), words_on);
++}
++void hv_prof_ios_start(void) {
++    /* An earlier session with profiling off must not consume initialization.
++       Native boot requests can overlap before the bridge acquires api_lock. */
++    if(!getenv("HV_PROF_IOS") || !strcmp(getenv("HV_PROF_IOS"),"0"))return;
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++    pthread_once(&once, start_profiler);
+ }
+ #ifdef HV_PROF_TEST
+ void hv_prof_test_counts(uint64_t *samples,uint64_t *dumps,unsigned *ports) {
 diff --git a/host/snapshot.c b/host/snapshot.c
 index 383ae01..7140036 100644
 --- a/host/snapshot.c
@@ -1007,19 +1155,82 @@ index 47e26eb..8a4a83e 100644
  int hv_vm_disk_identity(char *out, size_t n);
  const char *hv_vm_reason_name(int reason);
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..f8ac1f1 100644
+index 34d6a98..ba2f008 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
-@@ -29,6 +29,8 @@ HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
+@@ -29,11 +29,21 @@ HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
  static _Atomic int state;
  static int exit_reason, exit_outcome;
  static pthread_rwlock_t api_lock = PTHREAD_RWLOCK_INITIALIZER;
 +/* A save reads VM memory, but two writers must not share .part or compression state. */
 +static pthread_mutex_t snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
  static _Atomic uint64_t generation;
++static uint64_t counter_epoch; /* api_lock */
  static int installer_session;
- static uint64_t stopped_blocks, stopped_tx, stopped_rx;
-@@ -140,14 +142,17 @@ int henge_vm_pause(char *err, size_t errlen) {
+-static uint64_t stopped_blocks, stopped_tx, stopped_rx;
++static uint64_t stopped_blocks, stopped_tx, stopped_rx, stopped_gpu_frames;
+ static const char *exit_description(void);
+ static int lock_running(void);
++/* api_lock held; retain final totals before any path releases the board. */
++static void retain_counters(void) {
++    stopped_blocks = hv_vm_machine()->stats.blocks;
++    stopped_tx = hv_net_tx_frames;
++    stopped_rx = hv_net_rx_frames;
++    stopped_gpu_frames = hv_vm_gpu_frames();
++}
+ /* A Mac app ran through the translation layer in this launch (henge-tl.c): it may have remapped part of the JIT region. */
+ _Atomic int henge_tl_ran;
+ 
+@@ -49,9 +59,8 @@ static void on_exit(int reason) {
+     case HV_HALT_HOST: exit_outcome = HENGE_VM_OUTCOME_HOST_STOP; break;
+     case HV_HALT_PANIC: exit_outcome = HENGE_VM_OUTCOME_PANIC; break;
+     }
+-    stopped_blocks = hv_vm_machine()->stats.blocks;
+-    stopped_tx = hv_net_tx_frames;
+-    stopped_rx = hv_net_rx_frames;
++    retain_counters();
++    counter_epoch++;
+     /* The restore stack owns separate USB workers for the installer session.
+        Normal guest sessions release everything before another boot is allowed. */
+     if (!installer_session) hv_vm_destroy();
+@@ -87,7 +96,7 @@ static int failed_start(void) {
+ }
+ 
+ static int started(char *err, size_t errlen) {
+-    stopped_blocks = stopped_tx = stopped_rx = 0;
++    stopped_blocks = stopped_tx = stopped_rx = stopped_gpu_frames = 0;
+     exit_reason = exit_outcome = 0;
+     state = 1;
+     if (hv_vm_start(1, on_exit) != 0) {
+@@ -95,6 +104,7 @@ static int started(char *err, size_t errlen) {
+         return failed_start();
+     }
+     atomic_fetch_add(&generation, 1);
++    counter_epoch++;
+     pthread_rwlock_unlock(&api_lock);
+     return 0;
+ }
+@@ -117,8 +127,10 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
+ }
+ 
+ int henge_vm_pause(char *err, size_t errlen) {
+-    if (state == 4) return 0;
+-    if (!lock_running()) {
++    pthread_rwlock_wrlock(&api_lock);
++    if (state == 4) { pthread_rwlock_unlock(&api_lock); return 0; }
++    if (state != 1) {
++        pthread_rwlock_unlock(&api_lock);
+         snprintf(err, errlen, "No Mac is running.");
+         return -1;
+     }
+@@ -134,20 +146,24 @@ int henge_vm_pause(char *err, size_t errlen) {
+         return -1;
+     }
+     state = 4;
++    counter_epoch++;
+     pthread_rwlock_unlock(&api_lock);
+     fprintf(stderr, "henge: the Mac is paused\n");
+     return 0;
  }
  
  int henge_vm_save(const char *path, const char *ident, char *err, size_t errlen) {
@@ -1037,6 +1248,226 @@ index 34d6a98..f8ac1f1 100644
      fprintf(stderr, "henge: %s\n", r ? err : "the paused Mac is saved");
      return r;
  }
+@@ -166,9 +182,11 @@ int henge_vm_continue(void) {
+         return -1;
+     }
+     state = 1;
++    counter_epoch++;
+     int r = hv_vm_continue();
+     if (r != 0) {
+         /* No threads for its CPUs: it cannot run on. Release it, as a stop would. */
++        retain_counters();
+         hv_vm_destroy();
+         exit_outcome = HENGE_VM_OUTCOME_ERROR;
+         state = 2;
+@@ -293,21 +311,22 @@ static int lock_running(void) {
+     return 0;
+ }
+ void henge_vm_stop(void) {
++    pthread_rwlock_wrlock(&api_lock);
+     if (state == 4) { /* paused: its CPU threads have ended already, so nothing calls on_exit */
+-        pthread_rwlock_wrlock(&api_lock);
+-        if (state == 4) {
+-            hv_vm_destroy();
+-            exit_reason = HV_EXIT_HALT;
+-            exit_outcome = HENGE_VM_OUTCOME_HOST_STOP;
+-            state = 2;
+-            fprintf(stderr, "henge: the paused Mac was stopped and released\n");
+-        }
++        retain_counters();
++        hv_vm_destroy();
++        exit_reason = HV_EXIT_HALT;
++        exit_outcome = HENGE_VM_OUTCOME_HOST_STOP;
++        state = 2;
++        counter_epoch++;
++        fprintf(stderr, "henge: the paused Mac was stopped and released\n");
+         pthread_rwlock_unlock(&api_lock);
+         return;
+     }
+-    if (!lock_running()) return;
++    if (state != 1) { pthread_rwlock_unlock(&api_lock); return; }
+     hv_vm_stop();
+     state = 3;
++    counter_epoch++;
+     pthread_rwlock_unlock(&api_lock);
+ }
+ 
+@@ -344,13 +363,13 @@ void henge_vm_log_cache(void) {
+ 
+ uint64_t henge_vm_blocks(void) {
+     pthread_rwlock_rdlock(&api_lock);
+-    uint64_t result = state == 1 ? hv_vm_machine()->stats.blocks : stopped_blocks;
++    uint64_t result = state == 1 || state == 4 ? hv_vm_machine()->stats.blocks : stopped_blocks;
+     pthread_rwlock_unlock(&api_lock);
+     return result;
+ }
+ uint64_t henge_vm_net_frames(int sent) {
+     pthread_rwlock_rdlock(&api_lock);
+-    uint64_t result = state == 1 ? (sent ? hv_net_tx_frames : hv_net_rx_frames) : (sent ? stopped_tx : stopped_rx);
++    uint64_t result = state == 1 || state == 4 ? (sent ? hv_net_tx_frames : hv_net_rx_frames) : (sent ? stopped_tx : stopped_rx);
+     pthread_rwlock_unlock(&api_lock);
+     return result;
+ }
+@@ -454,11 +473,25 @@ void henge_vm_set_display_layer(void *layer) {
+     hv_vm_set_display_layer(layer);
+ }
+ uint64_t henge_vm_gpu_frames(void) {
+-    if (!lock_running()) return 0;
+-    uint64_t result = hv_vm_gpu_frames();
++    pthread_rwlock_rdlock(&api_lock);
++    uint64_t result = state == 1 || state == 4 ? hv_vm_gpu_frames() : stopped_gpu_frames;
+     pthread_rwlock_unlock(&api_lock);
+     return result;
+ }
++
++void henge_vm_counters(HengeVmCounters *out) {
++    if (!out) return;
++    pthread_rwlock_rdlock(&api_lock);
++    int live = state == 1 || state == 4;
++    *out = (HengeVmCounters){
++        .generation = atomic_load(&generation), .epoch = counter_epoch, .state = state,
++        .blocks = live ? hv_vm_machine()->stats.blocks : stopped_blocks,
++        .gpu_frames = live ? hv_vm_gpu_frames() : stopped_gpu_frames,
++        .tx = live ? hv_net_tx_frames : stopped_tx,
++        .rx = live ? hv_net_rx_frames : stopped_rx
++    };
++    pthread_rwlock_unlock(&api_lock);
++}
+ int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride) {
+     if (!lock_running()) return -1;
+     HvBootDisplay d;
+diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
+index b8c41fa..b7aecdc 100644
+--- a/ios/Henge/Native/henge-vm.h
++++ b/ios/Henge/Native/henge-vm.h
+@@ -62,6 +62,14 @@ int henge_vm_knob(const char *name, int value);
+ long henge_vm_balloon(long target_mb);
+ 
+ /* Progress, for the session screen. */
++/* One lifecycle-consistent observation. epoch changes on boot, pause, continue
++   and stop, including transitions the UI missed while iOS suspended it.
++   Paused/stopped cumulative counters remain readable until the next boot. */
++typedef struct HengeVmCounters {
++    uint64_t generation, epoch, blocks, gpu_frames, tx, rx;
++    int state;
++} HengeVmCounters;
++void henge_vm_counters(HengeVmCounters *out);
+ void henge_vm_log_cache(void);           /* optional per-CPU cache-use diagnostics */
+ uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
+ uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
+diff --git a/ios/Henge/SessionStatistics.swift b/ios/Henge/SessionStatistics.swift
+index 520f70e..4f247af 100644
+--- a/ios/Henge/SessionStatistics.swift
++++ b/ios/Henge/SessionStatistics.swift
+@@ -1,21 +1,39 @@
+ import Foundation
+ 
++/// A counter belongs to one uninterrupted run. A reset, pause/continue, or
++/// invalid timestamp establishes a baseline; it is never an unsigned wrap.
++struct SessionCounter {
++    struct Interval {
++        let count: UInt64
++        let seconds: TimeInterval
++        var perSecond: Double { Double(count) / seconds }
++    }
++    private var previous: (count: UInt64, time: TimeInterval, epoch: UInt64)?
++
++    mutating func reset() { previous = nil }
++
++    mutating func sample(count: UInt64, time: TimeInterval, epoch: UInt64) -> Interval? {
++        guard time.isFinite else { reset(); return nil }
++        defer { previous = (count, time, epoch) }
++        guard let prior = previous, prior.epoch == epoch,
++              count >= prior.count, time > prior.time else { return nil }
++        return Interval(count: count - prior.count, seconds: time - prior.time)
++    }
++}
++
+ /// Main-actor-owned sampling state, deliberately not ObservableObject/@Observable.
+ /// Sampling must not rebuild the display hierarchy while Details is closed.
+ final class SessionStatistics {
+-    private var previousBlocks: UInt64 = 0
+-    private var previousTime: TimeInterval = 0
++    private var counter = SessionCounter()
+     private(set) var blocksPerSecond: Double = 0
+ 
+-    func reset(blocks: UInt64, time: TimeInterval) {
+-        previousBlocks = blocks
+-        previousTime = time
++    func reset(blocks: UInt64, time: TimeInterval, epoch: UInt64 = 0) {
++        counter.reset()
++        _ = counter.sample(count: blocks, time: time, epoch: epoch)
+         blocksPerSecond = 0
+     }
+ 
+-    func sample(blocks: UInt64, time: TimeInterval) {
+-        blocksPerSecond = Double(blocks &- previousBlocks) / max(time - previousTime, 0.001)
+-        previousBlocks = blocks
+-        previousTime = time
++    func sample(blocks: UInt64, time: TimeInterval, epoch: UInt64 = 0) {
++        blocksPerSecond = counter.sample(count: blocks, time: time, epoch: epoch)?.perSecond ?? 0
+     }
+ }
+diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
+index f84465e..acd9410 100644
+--- a/ios/Henge/SessionView.swift
++++ b/ios/Henge/SessionView.swift
+@@ -732,11 +732,16 @@ struct SessionView: View {
+         var used = mac
+         used.lastUsed = started
+         Machines.shared.update(used)
+-        statistics.reset(blocks: henge_vm_blocks(), time: ProcessInfo.processInfo.systemUptime)
+-        var lastGPUFrames = henge_vm_gpu_frames()
++        let wallStart = ProcessInfo.processInfo.systemUptime
++        var counters = HengeVmCounters()
++        henge_vm_counters(&counters)
++        statistics.reset(blocks: counters.blocks, time: wallStart, epoch: counters.epoch)
++        var gpuCounter = SessionCounter()
++        _ = gpuCounter.sample(count: counters.gpu_frames, time: wallStart, epoch: counters.epoch)
+         var tick = 0
+         while !Task.isCancelled {
+-            let currentState = henge_vm_state(), currentCPUs = henge_vm_cpus_on()
++            henge_vm_counters(&counters)
++            let currentState = counters.state, currentCPUs = henge_vm_cpus_on()
+             if currentState != state { state = currentState }
+             if currentCPUs != cpusOn { cpusOn = currentCPUs }
+             if !userCode && henge_vm_guest_el0() != 0 { userCode = true }
+@@ -744,8 +749,14 @@ struct SessionView: View {
+                 try? await Task.sleep(nanoseconds: 100_000_000)
+                 continue
+             }
+-            let now = Date(), blocks = henge_vm_blocks()
+-            statistics.sample(blocks: blocks, time: ProcessInfo.processInfo.systemUptime)
++            let uptime = ProcessInfo.processInfo.systemUptime
++            if state == 4 {
++                statistics.reset(blocks: counters.blocks, time: uptime, epoch: counters.epoch)
++                gpuCounter.reset()
++                try? await Task.sleep(nanoseconds: 1_000_000_000)
++                continue
++            }
++            statistics.sample(blocks: counters.blocks, time: uptime, epoch: counters.epoch)
+             if showDetails { refreshDetails() }
+             let heat = ProcessInfo.processInfo.thermalState
+             if heat.rawValue != thermalState.rawValue {
+@@ -771,12 +782,14 @@ struct SessionView: View {
+             }
+             tick += 1
+             if tick % 10 == 0 {
+-                let gpuFrames = henge_vm_gpu_frames()
+-                HengeLog.log("perf", "guest elapsed \(Int(now.timeIntervalSince(started)))s, blocks/s \(String(format: "%.0f", statistics.blocksPerSecond)), GPU frames/10s \(gpuFrames &- lastGPUFrames), "
+-                             + "network tx \(henge_vm_net_frames(1)), rx \(henge_vm_net_frames(0)), dns \(henge_vm_dns(0)) answered \(henge_vm_dns(2)) unanswered, thermal \(Self.thermalLabel(heat))")
++                let frameInterval = gpuCounter.sample(count: counters.gpu_frames, time: uptime, epoch: counters.epoch)
++                let frameText = frameInterval.map {
++                    "GPU frames \($0.count) in \(String(format: "%.3f", $0.seconds))s (\(String(format: "%.2f", $0.perSecond))/s)"
++                } ?? "GPU frames unavailable (new run baseline)"
++                HengeLog.log("perf", "session wall elapsed \(Int(uptime - wallStart))s, run epoch \(counters.epoch), blocks/s \(String(format: "%.0f", statistics.blocksPerSecond)), \(frameText), "
++                             + "network tx \(counters.tx), rx \(counters.rx), dns answered \(henge_vm_dns(0)) fallback \(henge_vm_dns(1)) timed-out \(henge_vm_dns(2)), thermal \(Self.thermalLabel(heat))")
+                 henge_vm_log_cache()
+                 HengeLog.log("input", HardwareMouse.shared.scrollDiagnostics)
+-                lastGPUFrames = gpuFrames
+                 JITBootstrap.releaseLingeringDebugger()
+             }
+             if tick == 60 && !stillWallpaperTipShown { // about when the desktop is up after a login
 diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
 index e1693b0..be7beea 100644
 --- a/ios/Henge/SettingsView.swift
@@ -1100,10 +1531,10 @@ index 0000000..eef5d30
 + subprocess.run([str(exe)],check=True)
 diff --git a/tests/run_lifecycle_sanitizers.sh b/tests/run_lifecycle_sanitizers.sh
 new file mode 100755
-index 0000000..d22feee
+index 0000000..dc57a10
 --- /dev/null
 +++ b/tests/run_lifecycle_sanitizers.sh
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,37 @@
 +#!/bin/bash
 +# Collect independent failures in one diagnostic pass; any failure blocks the IPA.
 +set -uo pipefail
@@ -1138,6 +1569,7 @@ index 0000000..d22feee
 +check python3 tests/test_gpu_upload.py
 +check python3 tests/test_surface_hash_limit.py
 +check python3 tests/test_display_snapshot.py
++check python3 tests/test_stats_lifecycle.py
 +printf '\nExpanded diagnostic pass: %d failed checks\n' "$failures"
 +test "$failures" -eq 0
 diff --git a/tests/test_display_snapshot.py b/tests/test_display_snapshot.py
@@ -1282,6 +1714,26 @@ index 0000000..52930cc
 +b=root/'build';b.mkdir(exist_ok=True);c=b/'test_gpu_upload.m';c.write_text(pre+method+post)
 +subprocess.run(['xcrun','--sdk','macosx','clang','-fobjc-arc','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(root/'devices'),str(c),'-framework','Foundation','-framework','Metal','-o',str(b/'test_gpu_upload')],check=True)
 +subprocess.run([str(b/'test_gpu_upload')],check=True)
+diff --git a/tests/test_prof_ios.c b/tests/test_prof_ios.c
+index 553c4b6..d1b2cb5 100644
+--- a/tests/test_prof_ios.c
++++ b/tests/test_prof_ios.c
+@@ -17,6 +17,8 @@ static void *worker(void *unused){
+  return NULL;
+ }
+ int main(void){
++ setenv("HV_PROF_IOS","0",1);hv_prof_ios_start();
++ assert(!hv_prof_register && !hv_prof_session);
+  setenv("HV_PROF_IOS","1",1);setenv("HV_PROF_IOS_HZ","100",1);
+  setenv("HV_PROF_IOS_SECS","0",1);setenv("HV_PROF_IOS_DURATION","1",1);
+  hv_prof_ios_start();assert(hv_prof_register&&hv_prof_session);hv_prof_session(1);
+@@ -28,5 +30,5 @@ int main(void){
+  hv_prof_session(1);pthread_t t;pthread_create(&t,NULL,worker,(void*)1);pthread_join(t,NULL);
+  hv_prof_test_counts(&samples,&dumps,&ports);assert(!ports&&samples>stopped);
+  hv_prof_session(0);
+- puts("iOS profiler lifecycle: port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
++ puts("iOS profiler lifecycle: off then enabled, port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
+ }
 diff --git a/tests/test_pvg_lifecycle.m b/tests/test_pvg_lifecycle.m
 index 81cdb83..eb4c3bb 100644
 --- a/tests/test_pvg_lifecycle.m
@@ -1336,6 +1788,82 @@ index 81cdb83..eb4c3bb 100644
 +    puts("Metal lifecycle: 6 cycles, 384 GPU completions drained; both display glyphs restored, malformed input rejected, stale glyphs cleared");
      return 0;
  }
+diff --git a/tests/test_session_statistics.swift b/tests/test_session_statistics.swift
+index 585491b..61015ba 100644
+--- a/tests/test_session_statistics.swift
++++ b/tests/test_session_statistics.swift
+@@ -11,11 +11,38 @@ import Foundation
+         precondition(sample.blocksPerSecond == 500)
+         sample.reset(blocks: UInt64.max - 5, time: 20)
+         sample.sample(blocks: 4, time: 21)
++        precondition(sample.blocksPerSecond == 0) // a reset, never a 2^64 wrap
++        sample.sample(blocks: 14, time: 22)
+         precondition(sample.blocksPerSecond == 10)
+         sample.reset(blocks: 50, time: 0)
+         precondition(sample.blocksPerSecond == 0)
+         sample.sample(blocks: 60, time: 0)
+-        precondition(sample.blocksPerSecond.isFinite && sample.blocksPerSecond == 10000)
+-        print("PASS session sampling: elapsed time, pauses, counter wrap, reset and finite zero-interval handling")
++        precondition(sample.blocksPerSecond == 0)
++        sample.sample(blocks: 70, time: -1)
++        precondition(sample.blocksPerSecond == 0)
++        sample.sample(blocks: 80, time: .nan)
++        precondition(sample.blocksPerSecond == 0)
++        sample.sample(blocks: 90, time: .infinity)
++        precondition(sample.blocksPerSecond == 0)
++        sample.sample(blocks: 100, time: 1)
++        precondition(sample.blocksPerSecond == 0)
++        sample.sample(blocks: 200, time: 2, epoch: 1)
++        precondition(sample.blocksPerSecond == 0)
++        sample.sample(blocks: 300, time: 3, epoch: 1)
++        precondition(sample.blocksPerSecond == 100)
++
++        var frames = SessionCounter()
++        precondition(frames.sample(count: 3871, time: 1, epoch: 1) == nil)
++        precondition(frames.sample(count: 0, time: 11, epoch: 2) == nil)
++        precondition(frames.sample(count: 4000, time: 12, epoch: 3) == nil)
++        let resumed = frames.sample(count: 4200, time: 22, epoch: 3)!
++        precondition(resumed.count == 200 && resumed.seconds == 10 && resumed.perSecond == 20)
++        // Pause and Continue can both occur while the app task is suspended.
++        precondition(frames.sample(count: 4500, time: 287, epoch: 5) == nil)
++        let delayed = frames.sample(count: 4700, time: 307, epoch: 5)!
++        precondition(delayed.seconds == 20 && delayed.perSecond == 10)
++        frames.reset()
++        precondition(frames.sample(count: 0, time: 308, epoch: 6) == nil)
++        print("PASS session sampling: resets, lifecycle epochs, delayed observations, invalid timestamps and resumed frame deltas")
+     }
+ }
+diff --git a/tests/test_stats_lifecycle.py b/tests/test_stats_lifecycle.py
+new file mode 100644
+index 0000000..cac51ee
+--- /dev/null
++++ b/tests/test_stats_lifecycle.py
+@@ -0,0 +1,25 @@
++#!/usr/bin/env python3
++"""Exercise production reporting on recreated CPU0 threads, with deep scans off/on."""
++import os
++from pathlib import Path
++import re
++import subprocess
++
++Path('build').mkdir(exist_ok=True)
++for deep in ('0', '1'):
++    env = {**os.environ, 'HV_STATS': '1', 'HENGE_TEST_STATS': '1', 'HV_STATS_HASH': deep}
++    result = subprocess.run(['build/test_vm_lifecycle'], env=env, text=True,
++                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
++    output = result.stdout
++    Path(f'build/stats-lifecycle-{deep}.log').write_text(output)
++    if result.returncode:
++        print(output)
++        raise SystemExit(result.returncode)
++    percentages = [int(n) for n in re.findall(r'cpu thread ran (-?\d+)%', output)]
++    assert len(percentages) >= 2, ('no actual CPU0 report before/after Continue', percentages)
++    assert all(0 <= n <= 105 for n in percentages), percentages
++    assert not re.search(r'(?:nan|inf)(?:%|/s)', output, flags=re.I), 'nonfinite statistics'
++    rates = re.findall(r'translated ([\d.]+)/s', output)
++    assert rates and all(float(n) < 1e9 for n in rates), 'counter history crossed a machine/run boundary'
++    assert ('block hash:' in output) == (deep == '1'), 'deep hash scan activation mismatch'
++    print(f'PASS native stats: deep={deep}, {len(percentages)} CPU0 reports, range={min(percentages)}..{max(percentages)}%; pause/continue/reboot lifecycle passed')
 diff --git a/tests/test_surface_hash_limit.py b/tests/test_surface_hash_limit.py
 index 01aead4..b1daca1 100644
 --- a/tests/test_surface_hash_limit.py
@@ -1384,7 +1912,7 @@ index 01aead4..b1daca1 100644
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..c5496a4 100644
+index a13a70d..5978e72 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
 @@ -3,6 +3,7 @@
@@ -1447,7 +1975,16 @@ index a13a70d..c5496a4 100644
  static void *read_ui(void *unused) {
      (void)unused;
      while (!atomic_load(&reader_done)) {
-@@ -77,7 +113,7 @@ static void *read_ui(void *unused) {
+@@ -69,6 +105,8 @@ static void *read_ui(void *unused) {
+         henge_vm_cpus_on();
+         henge_vm_link_connected(0);
+         henge_vm_gpu_frames();
++        HengeVmCounters counters;
++        henge_vm_counters(&counters);
+         henge_vm_balloon(-1);
+         henge_vm_set_display_layer(NULL);
+         if (!henge_vm_boot_display(&pixels, &width, &height, &stride)) henge_vm_free_display(pixels);
+@@ -77,7 +115,7 @@ static void *read_ui(void *unused) {
      return NULL;
  }
  int main(void) {
@@ -1456,7 +1993,7 @@ index a13a70d..c5496a4 100644
      char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
      if (!mkdtemp(dir) || hv_jit_region_open(&jit, 8 << 20)) return 1;
      snprintf(rom, sizeof rom, "%s/rom", dir);
-@@ -91,6 +127,10 @@ int main(void) {
+@@ -91,6 +129,10 @@ int main(void) {
      write_file(aux, NULL, 1 << 20);
      mapping = (HengeDualMapping){.rx_addr = (uint8_t *)jit.base,
          .rw_addr = (uint8_t *)jit.base + jit.rw_diff, .size = jit.capacity * 4};
@@ -1467,8 +2004,11 @@ index a13a70d..c5496a4 100644
      pthread_t reader;
      if (pthread_create(&reader, NULL, read_ui, NULL)) return 1;
      /* Warm the process-wide pointer queue before counting worker threads. */
-@@ -152,6 +192,10 @@ int main(void) {
+@@ -150,8 +192,13 @@ int main(void) {
+         write_file(rom, code, sizeof code);
+         int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          check("resume test boots", rc == 0);
++        if (getenv("HENGE_TEST_STATS")) usleep(2200000); /* two real reporting intervals */
          usleep(50000);
          henge_vm_key_hid(0xe4, 1);
 +        henge_vm_key_hid(0xe1, 1);
@@ -1478,7 +2018,7 @@ index a13a70d..c5496a4 100644
          henge_vm_mouse_button(1, 1);
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "suspend: %s\n", error);
-@@ -160,15 +204,18 @@ int main(void) {
+@@ -160,18 +207,40 @@ int main(void) {
              fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\n");
              return 1;
          }
@@ -1486,20 +2026,42 @@ index a13a70d..c5496a4 100644
 +        uint8_t released[8] = {0};
 +        check("pause releases all keys/modifiers", !memcmp(hv_vm_board()->usb->state, released, sizeof released));
 +        check("pause releases touch/button", !hv_vm_board()->usb->tp_button && !hv_vm_board()->usb->tp_fingers[0].in);
++        HengeVmCounters paused;
++        henge_vm_counters(&paused);
++        check("paused counters retain VM totals", paused.state == 4 && paused.blocks > 0 &&
++              paused.blocks == henge_vm_blocks() && paused.gpu_frames == henge_vm_gpu_frames() &&
++              paused.tx == henge_vm_net_frames(1) && paused.rx == henge_vm_net_frames(0));
          volatile uint64_t *count = (volatile uint64_t *)hv_vm_board()->ram;
          uint64_t c1 = *count;
 -        usleep(20000);
 +        usleep(200000); /* intentional delayed-resume coverage while CPUs are already paused */
          check("paused: the counter stands still", c1 > 0 && *count == c1);
          check("continue runs it on", henge_vm_continue() == 0 && henge_vm_state() == 1);
++        if (getenv("HENGE_TEST_STATS")) usleep(2200000); /* a different CPU0 thread */
++        HengeVmCounters continued;
++        henge_vm_counters(&continued);
++        check("continue invalidates rate baseline without changing machine generation",
++              continued.epoch > paused.epoch && continued.generation == paused.generation &&
++              continued.blocks >= paused.blocks);
          for (int n = 0; n < 1000 && *count == c1; n++) usleep(1000);
          check("continued: the counter moves", *count > c1);
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
 +        if (rc || henge_vm_state() != 4 || !hv_vm_board()->ram) return 1;
          uint64_t c2 = *count;
          check("second suspend saves", rc == 0 && c2 > c1);
++        HengeVmCounters second_pause;
++        henge_vm_counters(&second_pause);
++        check("second pause advances counter epoch", second_pause.epoch > continued.epoch);
          henge_vm_stop();
-@@ -183,12 +230,14 @@ int main(void) {
++        HengeVmCounters stopped;
++        henge_vm_counters(&stopped);
++        check("stopped counters survive VM destruction", stopped.state == 2 &&
++              stopped.epoch > second_pause.epoch && stopped.blocks == second_pause.blocks &&
++              stopped.gpu_frames == second_pause.gpu_frames && stopped.tx == second_pause.tx && stopped.rx == second_pause.rx);
+         check("a paused Mac stops", henge_vm_state() == 2 && hv_vm_board()->ram == NULL);
+         uint64_t bytes = 0;
+         check("the save is whole", henge_vm_saved_ok(snap, "test", &bytes, NULL) == 0 && bytes > 0);
+@@ -183,12 +252,14 @@ int main(void) {
          rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          usleep(30000);
          rc |= henge_vm_suspend(snap, "test", error, sizeof error);
@@ -1514,7 +2076,7 @@ index a13a70d..c5496a4 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +258,78 @@ int main(void) {
+@@ -209,6 +280,78 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);
