@@ -1,7 +1,16 @@
 diff --git a/Makefile b/Makefile
-index 81b0736..c9f0915 100644
+index 81b0736..edc2bb8 100644
 --- a/Makefile
 +++ b/Makefile
+@@ -48,7 +48,7 @@ IDR_SRC = $(wildcard third_party/idevicerestore/src/*.c)
+ RESTORE_OBJ = $(patsubst third_party/%.c,$(RB)/%.o,$(IRECV_SRC) $(MUXD_SRC) $(IDR_SRC))
+ 
+ # The helper that runs inside macOS on a virtual Mac (share.c serves it to the guest).
+-$(B)/henge-agent: tools/henge-agent.m
++$(B)/henge-agent: tools/henge-agent.m tools/henge-runner-agent.h
+ 	@mkdir -p $(B)
+ 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit $< -o $@
+ 	codesign -f -s - $@
 @@ -87,7 +87,7 @@ $(B)/%.o: core/%.c core/*.h host/*.h | $(B)
  $(B)/%.o: host/%.c host/*.h core/*.h devices/*.h | $(B)
  	$(CC) $(CFLAGS) -c $< -o $@
@@ -23,6 +32,22 @@ index 81b0736..c9f0915 100644
  	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -lcompression -o $@
  
  test-vm-lifecycle: $(B)/test_vm_lifecycle
+@@ -259,6 +262,15 @@ test-native-touch: $(B)/test_native_touch $(B)/test_native_touch_session
+ 	./$(B)/test_native_touch_session
+ .PHONY: test-native-touch
+ 
++$(B)/test_runner_control: tests/test_runner_control.c host/share.c host/share.h host/native_touch.c | $(B)
++	$(CC) $(CFLAGS) tests/test_runner_control.c host/share.c host/native_touch.c -o $@
++$(B)/test_runner_agent: tests/test_runner_agent.m tools/henge-runner-agent.h | $(B)
++	$(CC) -fobjc-arc -Wall -Wextra -O2 -framework AppKit $< -o $@
++test-runner: $(B)/test_runner_control $(B)/test_runner_agent $(B)/henge-agent
++	./$(B)/test_runner_control
++	./$(B)/test_runner_agent
++.PHONY: test-runner
++
+ # Session-owned display routing, independent of JIT, Metal and a connected monitor.
+ $(B)/test_display_targets: ios/Henge/DisplayTargetSelection.swift tests/test_display_targets.swift | $(B)
+ 	xcrun --sdk macosx swiftc $^ -o $@
 diff --git a/core/dispatch.c b/core/dispatch.c
 index 12bd4a9..171acf7 100644
 --- a/core/dispatch.c
@@ -1420,6 +1445,92 @@ index 0000000..7c5b2e2
 +iOS may suspend/terminate background work; persistent save is atomic but cannot
 +guarantee unlimited background execution. Cloud compilation and microbenchmarks
 +are not evidence of physical-device energy improvement.
+diff --git a/docs/runner-mode.md b/docs/runner-mode.md
+new file mode 100644
+index 0000000..bfafe0f
+--- /dev/null
++++ b/docs/runner-mode.md
+@@ -0,0 +1,80 @@
++# GitHub Runner mode
++
++The Runner tab starts/resumes a selected macOS VM and asks the **existing Mac
++companion** to start GitHub's ARM64 runner. macOS and an unlocked user session
++are still necessary; this does not turn iOS into an Xcode host.
++
++1. In the Mac, install/update the companion once using Henge's Details → Sharing
++   setup command. A companion from an older IPA needs this update. Henge does
++   not blindly open Terminal and submit keystrokes: it cannot reliably identify
++   which guest application has focus.
++2. In Henge's Runner tab select the Mac and repository. For first registration,
++   paste the temporary token from GitHub Settings → Actions → Runners → New
++   self-hosted runner. Start. After registration, leave the token empty.
++3. Install Xcode and its tools inside this Mac for iOS builds. New workflows can
++   use `runs-on: [self-hosted, macOS, ARM64, henge]`. In this fork's existing
++   workflows, manually select `runner_mode: henge`. Push validation continues on
++   the cloud runner, so an offline iPad cannot block all development.
++
++The dashboard shows **listener process state**, not an inferred GitHub online
++state or job success. Check GitHub's runner/job page for those. The Mac companion
++downloads only an official `actions/runner` ARM64 asset whose SHA-256 matches
++the release's digest. Configuration uses an argument array and an environment
++token, not a shell-interpolated command. Token values are never preferences,
++shared-folder files, subprocess output in iOS logs, or status responses. GitHub
++stores its registered credentials in the private guest runner directory:
++`~/Library/Application Support/Henge/ActionsRunner`. A changed repository is
++rejected rather than silently replacing an existing registration. Guest jobs
++run with the user's account privileges, as with any self-hosted runner.
++
++The upstream `run.sh` signal-aware wrapper owns the listener and worker group,
++including self-update restarts. There is one serial runner owner, command
++revision, bounded guest HTTP mailbox, cancellation path and status heartbeat.
++Old-session status reports cannot update a new session. No second launchd
++daemon or repeating Swift timer is introduced. Errors stop startup instead of
++looping downloads/registration. Guest `_diag` logs contain detailed failures.
++
++While the dashboard is visible, Henge detaches the **local presentation layer**.
++The existing renderer retains its current surface; showing the desktop
++reattaches it and presents the latest frame. Guest rendering, Retina, resolution,
++external monitors and port-one Henge Link retain their existing paths. This
++eliminates local drawable/presentation work in runner view; it does not eliminate
++macOS CPU/GPU work or demonstrate a device temperature reduction.
++
++## Background execution and PiP
++
++Background processing is explicit and off initially. On iOS 26+, Henge checks
++hardware GPU support **and the entitlement on the installed signature**, then
++requests `BGContinuedProcessingTaskRequest` with `.gpu` and fail-if-unavailable.
++Only an attached task permits the VM to continue after leaving Henge. Cancellation
++or expiration revokes that permission and queues a real pause, with the existing
++optional Instant Resume save. CPU/GPU quiescence uses the existing serial
++pause/save/continue owner. Returning to Henge resumes through that same queue.
++The boot RAM value is now assigned so an enabled background snapshot is actually
++eligible to save.
++
++The normal/personal signing entitlements are preserved. The user's logs show no
++signed continued-processing GPU entitlement. **This ordinary IPA therefore
++cannot promise background VM execution.** It reports the missing capability
++and force-pauses Runner mode even if persistent Instant Resume is off. Keep
++Henge visible, or use iPad Split View. iOS may terminate the app or end a task;
++neither this API nor a PiP window provides an unlimited server lifetime.
++
++No fake audio/video keepalive or static PiP window is added. AVKit PiP accepts
++video sample-buffer content, but does not grant the separate GPU entitlement
++needed by this Metal VM. A new live capture/encode path would add GPU work
++without resolving the missing execution permission on this installation. A
++future genuine remote-desktop PiP viewer can be added independently if useful.
++
++## Verification
++
++`make test-runner` exercises the real guest HTTP mailbox and a real child runner
++process using an isolated fake runner directory: retry, status bounds, secret
++retirement, stop/cancellation, repository mismatch and stale session rejection.
++DisplayRouter regression covers hidden output, refresh/replacement while hidden
++and restoring the newest layer. Existing native lifecycle/snapshot and sanitizer
++checks remain mandatory, followed by full iOS SDK/app compilation.
++
++Cloud tests cannot validate this device's GPU grant, iOS expiration timing,
++actual GitHub registration with the user's temporary token, or thermal behaviour.
++Those remain clearly separate from process/control correctness and compilation.
 diff --git a/docs/thermal-engineering/architecture.md b/docs/thermal-engineering/architecture.md
 index 55c66e6..fe9dd9e 100644
 --- a/docs/thermal-engineering/architecture.md
@@ -1610,6 +1721,114 @@ index 0000000..ef1d8a6
 +#endif
 +}
 +#endif
+diff --git a/host/share.c b/host/share.c
+index 9c7244a..4bc7a29 100644
+--- a/host/share.c
++++ b/host/share.c
+@@ -39,6 +39,39 @@
+ static char root[PATH_MAX];
+ static char agent_path[PATH_MAX];
+ 
++/* Commands survive a dropped HTTP response until the guest acknowledges them.
++   No token is written into the shared folder, preferences or diagnostic logs. */
++static pthread_mutex_t runner_mu = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t runner_cond = PTHREAD_COND_INITIALIZER;
++static char *runner_command;
++static unsigned long runner_seq;
++static int runner_status;
++static time_t runner_seen;
++static void runner_clear(void) {
++    if (runner_command) { memset(runner_command, 0, strlen(runner_command)); free(runner_command); }
++    runner_command = NULL;
++}
++unsigned long hv_share_runner_set(const char *json) {
++    if (!json || strlen(json) > 8192) return 0;
++    char *copy = strdup(json);
++    if (!copy) return 0;
++    pthread_mutex_lock(&runner_mu);
++    runner_clear(); runner_command = copy;
++    if (++runner_seq == 0) ++runner_seq;
++    runner_status = HV_RUNNER_WAITING; runner_seen = 0;
++    unsigned long seq = runner_seq;
++    pthread_cond_broadcast(&runner_cond);
++    pthread_mutex_unlock(&runner_mu);
++    return seq;
++}
++int hv_share_runner_status(long *ago) {
++    pthread_mutex_lock(&runner_mu);
++    int status = runner_status;
++    if (ago) *ago = runner_seen ? (long)(time(NULL) - runner_seen) : -1;
++    pthread_mutex_unlock(&runner_mu);
++    return status;
++}
++
+ /* ---- the clipboard ---- */
+ 
+ static pthread_mutex_t clip_mu = PTHREAD_MUTEX_INITIALIZER;
+@@ -668,6 +701,45 @@ static int clipboard_put(Conn *c, Request *r) {
+ 
+ static int serve_henge(Conn *c, Request *r) {
+     const char *what = r->path + strlen("/.henge/");
++    if (!strcmp(what, "runner") && !strcmp(r->method, "GET")) {
++        if (body_discard(c, r) != 0) return -1;
++        unsigned long since = 0; char extra;
++        if (sscanf(r->query, "since=%lu%c", &since, &extra) != 1) return respond_empty(c, r, 400, "Bad Request");
++        struct timespec until; clock_gettime(CLOCK_REALTIME, &until); until.tv_sec += 25;
++        pthread_mutex_lock(&runner_mu);
++        while (runner_seq == since && pthread_cond_timedwait(&runner_cond, &runner_mu, &until) != ETIMEDOUT) {}
++        unsigned long seq = runner_seq;
++        char *json = strdup(runner_command ? runner_command : "{\"version\":1,\"action\":\"stop\"}");
++        pthread_mutex_unlock(&runner_mu);
++        char headers[128]; snprintf(headers, sizeof headers, "Content-Type: application/json\r\nCache-Control: no-store\r\nX-Henge-Seq: %lu\r\n", seq);
++        int rc = json ? respond(c, r, 200, "OK", headers, json, strlen(json)) : respond_empty(c, r, 500, "Internal Server Error");
++        if (json) { memset(json, 0, strlen(json)); free(json); }
++        return rc;
++    }
++    if (!strcmp(what, "runner") && !strcmp(r->method, "PUT")) {
++        unsigned long seq; char extra;
++        if (r->chunked || r->length < 1 || r->length > 8 || sscanf(r->query, "seq=%lu%c", &seq, &extra) != 1) {
++            r->close = 1; return respond_empty(c, r, 400, "Bad Request");
++        }
++        size_t n; char *body = body_small(c, r, &n); int value;
++        if (!body) return -1;
++        int valid = n == 1 && body[0] >= '0' && body[0] <= '6';
++        value = valid ? body[0] - '0' : -1; free(body);
++        if (!valid) return respond_empty(c, r, 400, "Bad Request");
++        pthread_mutex_lock(&runner_mu);
++        int current = seq == runner_seq && seq != 0;
++        if (current) {
++            runner_status = value; runner_seen = time(NULL);
++            /* Terminal states no longer need a registration token. Keep the
++               revision: a retried old command must not configure twice. */
++            if (value == HV_RUNNER_LISTENING && runner_command) {
++                runner_clear(); runner_command = strdup("{\"version\":1,\"action\":\"resume\"}");
++            }
++            if (value == HV_RUNNER_FAILED || value == HV_RUNNER_STOPPED) runner_clear();
++        }
++        pthread_mutex_unlock(&runner_mu);
++        return respond_empty(c, r, current ? 204 : 409, current ? "No Content" : "Conflict");
++    }
+     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
+         if (body_discard(c, r) != 0) return -1;
+         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);
+diff --git a/host/share.h b/host/share.h
+index 37b2313..4482d44 100644
+--- a/host/share.h
++++ b/host/share.h
+@@ -16,4 +16,13 @@ char *hv_share_take_clipboard(void);
+ /* Seconds since the helper in macOS was last heard from, or -1 if it never has been. */
+ long hv_share_agent_seen(void);
+ 
++/* Runner control is opt-in, guest-only and RAM-only. Commands are bounded JSON;
++   status is an enum, never arbitrary runner output (which can contain secrets).
++   A new command invalidates all reports from an older session. */
++enum { HV_RUNNER_WAITING, HV_RUNNER_STARTING, HV_RUNNER_LISTENING,
++       HV_RUNNER_FAILED, HV_RUNNER_STOPPED, HV_RUNNER_DOWNLOADING,
++       HV_RUNNER_CONFIGURING };
++unsigned long hv_share_runner_set(const char *json);
++int hv_share_runner_status(long *seconds_ago);
++
+ #endif
 diff --git a/host/snapshot.c b/host/snapshot.c
 index 383ae01..7140036 100644
 --- a/host/snapshot.c
@@ -1967,6 +2186,18 @@ index 47e26eb..8a4a83e 100644
  /* The disk and auxiliary storage files as they are now (inode, size, last change): a saved machine resumes only onto these. */
  int hv_vm_disk_identity(char *out, size_t n);
  const char *hv_vm_reason_name(int reason);
+diff --git a/ios/Henge/BackgroundExecutionStatus.swift b/ios/Henge/BackgroundExecutionStatus.swift
+index b65b6ce..4511710 100644
+--- a/ios/Henge/BackgroundExecutionStatus.swift
++++ b/ios/Henge/BackgroundExecutionStatus.swift
+@@ -17,6 +17,6 @@ enum BackgroundExecutionStatus {
+         Entitlements.has(gpuEntitlement) ? "detected" : "not detected"
+     }
+     static func log() {
+-        HengeLog.log("background", "GPU capability=\(gpuSupport); signed GPU entitlement=\(signedGPUAccess); VM background execution=not implemented; keep Henge visible during builds")
++        HengeLog.log("background", "GPU capability=\(gpuSupport); signed GPU entitlement=\(signedGPUAccess); runner background processing requires an active iOS GPU grant; otherwise keep Henge visible during builds")
+     }
+ }
 diff --git a/ios/Henge/BootDisplay.swift b/ios/Henge/BootDisplay.swift
 index 7392fda..bfda5bd 100644
 --- a/ios/Henge/BootDisplay.swift
@@ -2010,14 +2241,24 @@ index 7392fda..bfda5bd 100644
  
      func makeUIView(context: Context) -> Screen {
 diff --git a/ios/Henge/DisplayRouter.swift b/ios/Henge/DisplayRouter.swift
-index 47b0ced..f6edeb5 100644
+index 47b0ced..af8939d 100644
 --- a/ios/Henge/DisplayRouter.swift
 +++ b/ios/Henge/DisplayRouter.swift
-@@ -10,11 +10,18 @@ final class DisplayRouter: ObservableObject {
+@@ -10,11 +10,28 @@ final class DisplayRouter: ObservableObject {
      private var targets = DisplayTargetSelection()
      private var layers: [UUID: CAMetalLayer] = [:]
      private var selected: UUID?
 +    private var refreshTask: Task<Void, Never>?
++    private var presentationEnabled = true
++
++    /// Runner dashboard needs no local drawable. Guest rendering, resolution,
++    /// Retina and port-one Link output keep their original semantics.
++    func setPresentationEnabled(_ enabled: Bool) {
++        guard presentationEnabled != enabled else { return }
++        presentationEnabled = enabled
++        refreshTask?.cancel(); refreshTask = nil
++        sendTarget()
++    }
  
      func connect(_ id: UUID, layer: CAMetalLayer, role: DisplayTargetSelection.Role) {
 +        let replacedSelected = selected == id && layers[id] !== layer
@@ -2032,7 +2273,7 @@ index 47b0ced..f6edeb5 100644
      }
  
      func disconnect(_ id: UUID) {
-@@ -27,12 +34,19 @@ final class DisplayRouter: ObservableObject {
+@@ -27,12 +44,19 @@ final class DisplayRouter: ObservableObject {
      /// even when macOS is idle and isn't submitting another frame.
      func refresh(_ id: UUID? = nil) {
          guard id == nil || id == selected else { return }
@@ -2053,6 +2294,15 @@ index 47b0ced..f6edeb5 100644
              selected = next
              sendTarget()
          }
+@@ -40,7 +64,7 @@ final class DisplayRouter: ObservableObject {
+     }
+ 
+     private func sendTarget() {
+-        let layer = selected.flatMap { layers[$0] }
++        let layer = presentationEnabled ? selected.flatMap { layers[$0] } : nil
+         henge_vm_set_display_layer(layer.map { Unmanaged.passUnretained($0).toOpaque() })
+     }
+ }
 diff --git a/ios/Henge/EngineTuning.swift b/ios/Henge/EngineTuning.swift
 index e579188..2314dca 100644
 --- a/ios/Henge/EngineTuning.swift
@@ -2104,6 +2354,41 @@ index e579188..2314dca 100644
          for (k, v) in env.sorted(by: { $0.key < $1.key }) {
              setenv(k, v, 1)
              HengeLog.log("tuning", "\(k)=\(v)")
+diff --git a/ios/Henge/HengeApp.swift b/ios/Henge/HengeApp.swift
+index 04b1a49..4687063 100644
+--- a/ios/Henge/HengeApp.swift
++++ b/ios/Henge/HengeApp.swift
+@@ -40,7 +40,7 @@ struct HengeApp: App {
+ }
+ 
+ struct RootView: View {
+-    enum Tab: Hashable { case macs, install, settings }
++    enum Tab: Hashable { case macs, install, runner, settings }
+ 
+     @ObservedObject private var machines = Machines.shared
+     @ObservedObject private var jit = JITCoordinator.shared
+@@ -62,6 +62,9 @@ struct RootView: View {
+                     InstallView()
+                         .tabItem { Label("Install", systemImage: "arrow.down.circle") }
+                         .tag(Tab.install)
++                    RunnerView(running: $running)
++                        .tabItem { Label("Runner", systemImage: "hammer") }
++                        .tag(Tab.runner)
+                     SettingsView()
+                         .tabItem { Label("Settings", systemImage: "gearshape") }
+                         .tag(Tab.settings)
+diff --git a/ios/Henge/HengeBridge.h b/ios/Henge/HengeBridge.h
+index 76630c6..ec21294 100644
+--- a/ios/Henge/HengeBridge.h
++++ b/ios/Henge/HengeBridge.h
+@@ -4,6 +4,7 @@
+ #include "Native/HuskRPPairing.h"
+ #include "hvsparse.h"
+ #include "../../host/scheduling.h"
++#include "../../host/share.h"
+ 
+ #include "native_touch.h"
+ #include "../../devices/pvg_link.h"
 diff --git a/ios/Henge/HengeLog.swift b/ios/Henge/HengeLog.swift
 index 037685f..d91a56f 100644
 --- a/ios/Henge/HengeLog.swift
@@ -2117,6 +2402,21 @@ index 037685f..d91a56f 100644
          log("boot", "Link protocol: 2, decoder-consumption credit window=3; local discovery and opt-in Keychain pairing; three-finger viewer controls; update both devices")
          log("boot", "cache lifecycle: JIT translations and kernel read lookups are RAM-only; no cross-launch executable cache")
          if let source = info["HengeCustomSourceCommit"] as? String {
+diff --git a/ios/Henge/InstantResume.swift b/ios/Henge/InstantResume.swift
+index 8b4bf3b..8476e76 100644
+--- a/ios/Henge/InstantResume.swift
++++ b/ios/Henge/InstantResume.swift
+@@ -44,8 +44,8 @@ enum InstantResume {
+ 
+     /// Henge stopped being active (the app switcher, a call, Control Center, going home): stop the Mac where it is
+     /// while the GPU is still Henge's, so what only the GPU holds goes back into the Mac's memory.
+-    static func pause() {
+-        guard enabled, henge_vm_state() == 1 else { return }
++    static func pause(force: Bool = false) {
++        guard (enabled || force), henge_vm_state() == 1 else { return }
+         queue.async {
+             var buffer = [CChar](repeating: 0, count: 256)
+             if henge_vm_pause(&buffer, buffer.count) != 0 { HengeLog.log("resume", "not paused: \(String(cString: buffer))") }
 diff --git a/ios/Henge/Link/LinkProtocol.swift b/ios/Henge/Link/LinkProtocol.swift
 index 94231b2..427317d 100644
 --- a/ios/Henge/Link/LinkProtocol.swift
@@ -2525,6 +2825,198 @@ index b8c41fa..47aed1a 100644
  void henge_vm_log_cache(void);           /* optional per-CPU cache-use diagnostics */
  uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
  uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
+diff --git a/ios/Henge/Runner/RunnerMode.swift b/ios/Henge/Runner/RunnerMode.swift
+new file mode 100644
+index 0000000..34c84b7
+--- /dev/null
++++ b/ios/Henge/Runner/RunnerMode.swift
+@@ -0,0 +1,127 @@
++import SwiftUI
++import BackgroundTasks
++
++/// One owner for the opt-in guest runner and its iOS execution grant. The
++/// registration token is transient; GitHub stores the runner credential in the
++/// selected guest, never in Henge's shared folder or UserDefaults.
++@MainActor
++final class RunnerMode: ObservableObject {
++    static let shared = RunnerMode()
++    @Published private(set) var active = false
++    @Published private(set) var status = "Not started"
++    @Published private(set) var background = "Keep Henge visible, or use Split View."
++    private var macID: UUID?
++    private var command: String?
++    private var revision: UInt = 0
++    private var continued: AnyObject?
++    private var submitted = false
++    private var registered = false
++    private var expired: (() -> Void)?
++
++    static let repositoryKey = "henge.runner.repository"
++    static let nameKey = "henge.runner.name"
++    static let macKey = "henge.runner.mac"
++    static let backgroundKey = "henge.runner.background"
++    static func valid(repository: String, name: String) -> Bool {
++        repository.range(of: #"\Ahttps://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z"#, options: .regularExpression) != nil &&
++        !name.isEmpty && name.count <= 64 && !name.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
++    }
++    func prepare(mac: VirtualMac, repository: String, name: String, token: String) -> Bool {
++        guard Self.valid(repository: repository, name: name), token.count <= 1024,
++              let data = try? JSONSerialization.data(withJSONObject: ["version": 1, "action": "start", "repository": repository, "name": name, "token": token]),
++              let json = String(data: data, encoding: .utf8) else { return false }
++        end()
++        macID = mac.id; command = json; active = true
++        status = "Waiting for the Mac companion"
++        return true
++    }
++    func booted(_ mac: VirtualMac, expired: @escaping () -> Void) {
++        guard active, macID == mac.id else { return }
++        self.expired = expired
++        if let command { revision = hv_share_runner_set(command); self.command = nil }
++        if revision == 0 { status = "Could not send runner configuration"; return }
++        requestBackground()
++    }
++    /// Uses the existing session heartbeat. No independent UI polling timer.
++    func refresh() {
++        guard active else { return }
++        var age: Int = -1
++        let value = hv_share_runner_status(&age)
++        let labels = ["Waiting for updated Mac companion", "Starting listener", "Listener running — check GitHub for online/job status",
++                      "Runner setup failed — check the guest’s ActionsRunner/_diag logs and registration token", "Runner stopped",
++                      "Downloading and verifying GitHub runner", "Registering with GitHub"]
++        let message = age > 70 ? "Mac companion not responding" : labels.indices.contains(Int(value)) ? labels[Int(value)] : "Unknown runner status"
++        if message != status { status = message }
++    }
++    var mayRunInBackground: Bool { continued != nil }
++    func end() {
++        if active { _ = hv_share_runner_set(#"{"version":1,"action":"stop"}"#) }
++        active = false; macID = nil; command = nil; revision = 0; expired = nil
++        finishBackground(success: true)
++        status = "Not started"
++    }
++    func returnedToForeground() {
++        if active { requestBackground() }
++    }
++    func requestBackground() {
++        guard active, !submitted, continued == nil else { return }
++        guard UserDefaults.standard.bool(forKey: Self.backgroundKey) else {
++            background = "Background processing is off. Keep Henge visible, or use Split View."; return
++        }
++        #if compiler(>=6.2)
++        if #available(iOS 26.0, *) {
++            guard BGTaskScheduler.supportedResources.contains(.gpu), Entitlements.has(BackgroundExecutionStatus.gpuEntitlement) else {
++                background = "This install cannot run the Mac’s GPU in the background. Keep Henge visible or use Split View; PiP does not grant GPU access."; return
++            }
++            let identifier = (Bundle.main.bundleIdentifier ?? "com.henge.app") + ".runner.session"
++            if !registered {
++                registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: .main) { task in
++                    guard let task = task as? BGContinuedProcessingTask else { task.setTaskCompleted(success: false); return }
++                    MainActor.assumeIsolated { RunnerMode.shared.attach(task) }
++                }
++            }
++            guard registered else { background = "iOS refused background task registration. Keep Henge visible."; return }
++            let request = BGContinuedProcessingTaskRequest(identifier: identifier, title: "Henge Mac runner", subtitle: "Running the selected Mac for GitHub Actions")
++            request.strategy = .fail; request.requiredResources = .gpu
++            do {
++                try BGTaskScheduler.shared.submit(request); submitted = true
++                background = "Waiting for iOS background permission. Keep Henge visible until granted."
++            } catch { background = "iOS declined background processing. Keep Henge visible or use Split View." }
++            return
++        }
++        #endif
++        background = "Background GPU processing needs iOS 26 or later and authorised signing."
++    }
++    #if compiler(>=6.2)
++    @available(iOS 26.0, *)
++    private func attach(_ task: BGContinuedProcessingTask) {
++        submitted = false
++        guard active else { task.setTaskCompleted(success: false); return }
++        continued = task
++        // No invented completion percentage for an idle listener. The user or
++        // iOS can end this task at any time; it is not an always-on service.
++        task.progress.totalUnitCount = 1
++        task.expirationHandler = { DispatchQueue.main.async {
++            let owner = RunnerMode.shared
++            guard owner.continued === task else { return }
++            owner.continued = nil
++            task.setTaskCompleted(success: false)
++            owner.background = "iOS ended background processing. The Mac was paused."
++            owner.expired?()
++        } }
++        background = "iOS granted background GPU processing. iOS may end it; this is not unlimited execution."
++    }
++    #endif
++    private func finishBackground(success: Bool) {
++        #if compiler(>=6.2)
++        if #available(iOS 26.0, *), let task = continued as? BGContinuedProcessingTask {
++            if success { task.progress.completedUnitCount = 1 }
++            task.setTaskCompleted(success: success)
++        }
++        if #available(iOS 26.0, *), submitted, let bundle = Bundle.main.bundleIdentifier {
++            BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: bundle + ".runner.session")
++        }
++        #endif
++        continued = nil; submitted = false
++    }
++}
+diff --git a/ios/Henge/Runner/RunnerView.swift b/ios/Henge/Runner/RunnerView.swift
+new file mode 100644
+index 0000000..9113b29
+--- /dev/null
++++ b/ios/Henge/Runner/RunnerView.swift
+@@ -0,0 +1,53 @@
++import SwiftUI
++
++struct RunnerView: View {
++    @ObservedObject private var machines = Machines.shared
++    @ObservedObject private var jit = JITCoordinator.shared
++    @ObservedObject private var runner = RunnerMode.shared
++    @Binding var running: VirtualMac?
++    @AppStorage(RunnerMode.repositoryKey) private var repository = "https://github.com/stride-praline-2f-ai/henge-"
++    @AppStorage(RunnerMode.nameKey) private var name = "Henge-Mac"
++    @AppStorage(RunnerMode.macKey) private var macID = ""
++    @AppStorage(RunnerMode.backgroundKey) private var background = false
++    @State private var token = ""
++    @State private var error: String?
++    private var selected: VirtualMac? { machines.all.first { $0.id.uuidString == macID } ?? machines.all.first }
++    var body: some View {
++        NavigationStack {
++            Form {
++                Section("Mac runner") {
++                    Picker("Mac", selection: $macID) {
++                        ForEach(machines.all) { Text($0.name).tag($0.id.uuidString) }
++                    }
++                    TextField("Repository URL", text: $repository).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
++                    TextField("Runner name", text: $name).autocorrectionDisabled()
++                    SecureField("Temporary registration token (first setup only)", text: $token).textInputAutocapitalization(.never).autocorrectionDisabled()
++                    Text("Get a temporary token from this repository’s Settings › Actions › Runners › New self-hosted runner. Leave it empty after registration. Henge does not save it.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                    Button(JITBootstrap.ready ? "Start Mac and Runner" : "Enable JIT") {
++                        guard JITBootstrap.ready else { jit.enable(); return }
++                        guard let selected else { error = "Install or import a Mac first."; return }
++                        guard UserDefaults.standard.object(forKey: Sharing.enabledKey) as? Bool ?? true else { error = "Enable the shared folder and Mac companion in Settings first."; return }
++                        guard runner.prepare(mac: selected, repository: repository.trimmingCharacters(in: .whitespacesAndNewlines), name: name, token: token) else { error = "Use a GitHub repository URL and a runner name of 1–64 characters."; return }
++                        token = ""; error = nil
++                        running = Machines.shared.fittedForStart(selected)
++                    }.disabled(machines.all.isEmpty)
++                    if let error { Text(error).foregroundStyle(.red) }
++                }
++                Section("Automatic startup") {
++                    Text("Install or update the Mac companion once using Details › Sharing inside the running Mac. Then this button starts or resumes macOS and launches the runner without opening Terminal. The Mac must log in to its user account; unlock FileVault or the login screen if needed.")
++                    Text("Henge installs the official ARM64 GitHub runner after verifying its release SHA-256. Xcode and its command line tools must already be installed in the Mac for iOS builds. Use labels [self-hosted, macOS, ARM64, henge] in your workflow. Hosted xcode-27 workflows remain separate.")
++                }
++                Section("Leaving Henge") {
++                    Toggle("Request background GPU processing", isOn: $background)
++                    Text(runner.background).font(.footnote)
++                    Text("PiP alone does not authorise background Metal work. Without an iOS GPU grant, Henge pauses the Mac when you leave. Split View keeps it visible on iPad. iOS can end background tasks or terminate the app; runner jobs are not guaranteed to survive.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                }
++            }
++            .navigationTitle("GitHub Runner")
++            .onAppear { if macID.isEmpty, let selected { macID = selected.id.uuidString } }
++            .onDisappear { token = "" }
++        }
++    }
++}
 diff --git a/ios/Henge/SessionStatistics.swift b/ios/Henge/SessionStatistics.swift
 index 520f70e..4f247af 100644
 --- a/ios/Henge/SessionStatistics.swift
@@ -2579,22 +3071,123 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..0a0c149 100644
+index f84465e..7fddfd0 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
-@@ -217,6 +217,11 @@ struct SessionView: View {
-             if phase == .inactive { InstantResume.pause() }
-             if phase == .background && bootRAM > 0 { InstantResume.suspend(mac, ramMB: bootRAM, cpus: cpus) }
+@@ -9,6 +9,8 @@ struct SessionView: View {
+     let close: () -> Void
+ 
+     @StateObject private var display = DisplayRouter()
++    @ObservedObject private var runner = RunnerMode.shared
++    @State private var runnerDesktop = false
+     @State private var error: String?
+     @State private var state: Int32 = 0
+     @State private var bootAttempt = 0
+@@ -195,7 +197,7 @@ struct SessionView: View {
+             zoomFollowing = on ? Task { await followPointer() } : nil
          }
+         .onChange(of: display.isExternal) { _, external in
+-            if external { nativeTouch.stop() }
++            if external { nativeTouch.stop() }; updateRunnerDisplay()
+         }
+         .onChange(of: nativeTouch.requested) { _, _ in nativeTouch.changedRequest() }
+         .onChange(of: pointerNeeded) { needed in
+@@ -208,14 +210,44 @@ struct SessionView: View {
+             guard phase != .active else {
+                 display.refresh()
+                 InstantResume.cameBack(mac)
++                runner.returnedToForeground()
+                 return
+             }
+             nativeTouch.stop()
+             HardwareKeys.releaseAll()
+             HardwareMouse.shared.releaseButtons()
+             VolumeClicks.shared.releaseButtons()
+-            if phase == .inactive { InstantResume.pause() }
+-            if phase == .background && bootRAM > 0 { InstantResume.suspend(mac, ramMB: bootRAM, cpus: cpus) }
++            if !runner.mayRunInBackground {
++                if phase == .inactive { InstantResume.pause(force: runner.active) }
++                if phase == .background {
++                    InstantResume.pause(force: runner.active)
++                    if bootRAM > 0 { InstantResume.suspend(mac, ramMB: bootRAM, cpus: cpus) }
++                }
++            }
++        }
++        .onDisappear { runner.end() }
++        .onChange(of: runner.active) { _ in updateRunnerDisplay() }
++        .onChange(of: runnerDesktop) { _ in updateRunnerDisplay() }
++        .overlay {
++            if runner.active && !runnerDesktop {
++                VStack(spacing: 18) {
++                    Image(systemName: "hammer.circle").font(.system(size: 56))
++                    Text("GitHub Runner").font(.largeTitle.bold())
++                    Text(runner.status)
++                    Text(runner.background).font(.footnote).foregroundStyle(.secondary)
++                    Text("Local desktop presentation is stopped while this dashboard is shown. macOS and guest jobs keep running; display resolution and Retina quality are preserved.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                    Button("Show Mac Desktop") { runnerDesktop = true }
++                    Button("Stop Mac and Runner", role: .destructive) { confirmStop = true }
++                }
++                .padding(28).frame(maxWidth: .infinity, maxHeight: .infinity)
++                .background(Desk.page).multilineTextAlignment(.center)
++            }
++        }
 +        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
 +            henge_vm_trim_memory()
 +            LinkHostService.shared.trimMemory()
 +            HengeLog.logFootprint("memory-warning")
-+        }
+         }
          .onChange(of: showDetails) { showing in
              if showing {
-                 refreshDetails()
-@@ -732,11 +737,16 @@ struct SessionView: View {
+@@ -256,7 +288,7 @@ struct SessionView: View {
+     }
+ 
+     /// When there is something of the app's to point at, iPadOS gets its own pointer back.
+-    private var pointerNeeded: Bool { state == 2 || showDetails || confirmStop || error != nil }
++    private var pointerNeeded: Bool { (runner.active && !runnerDesktop) || state == 2 || showDetails || confirmStop || error != nil }
+ 
+     // A fold/rotation after boot must fit the mode the guest actually received,
+     // rather than stretch it by recalculating only the host view's aspect.
+@@ -484,6 +516,7 @@ struct SessionView: View {
+ 
+     /// The controls a column has too.
+     @ViewBuilder private var floatingTools: some View {
++        if runner.active { tool("hammer", "Runner dashboard", tint: .white) { runnerDesktop = false } }
+         tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
+         pasteTool
+         tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
+@@ -583,6 +616,13 @@ struct SessionView: View {
+                     LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
+                     LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
+                 }
++                if runner.active {
++                    Section("GitHub Runner") {
++                        Text(runner.status)
++                        Text(runner.background).font(.footnote)
++                        Button("Runner Dashboard") { runnerDesktop = false; showDetails = false }
++                    }
++                }
+                 Section("Display") {
+                     if LinkHostService.shared.active {
+                         Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
+@@ -723,20 +763,34 @@ struct SessionView: View {
+         catch { self.error = error.localizedDescription; return }
+         let rc = henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus), &buffer, buffer.count)
+         if rc != 0 {
++            runner.end()
+             LinkHostService.shared.stop()
+             error = String(cString: buffer)
+             return
+         }
+         MacPreview.beginSession()
++        bootRAM = ram
++        updateRunnerDisplay()
++        runner.booted(mac) {
++            guard UIApplication.shared.applicationState != .active else { return }
++            InstantResume.pause(force: true)
++            if bootRAM > 0 { InstantResume.suspend(mac, ramMB: bootRAM, cpus: cpus) }
++        }
+         started = Date()
          var used = mac
          used.lastUsed = started
          Machines.shared.update(used)
@@ -2610,11 +3203,12 @@ index f84465e..0a0c149 100644
          while !Task.isCancelled {
 -            let currentState = henge_vm_state(), currentCPUs = henge_vm_cpus_on()
 +            henge_vm_counters(&counters)
++            runner.refresh()
 +            let currentState = counters.state, currentCPUs = henge_vm_cpus_on()
              if currentState != state { state = currentState }
              if currentCPUs != cpusOn { cpusOn = currentCPUs }
              if !userCode && henge_vm_guest_el0() != 0 { userCode = true }
-@@ -744,8 +754,14 @@ struct SessionView: View {
+@@ -744,8 +798,14 @@ struct SessionView: View {
                  try? await Task.sleep(nanoseconds: 100_000_000)
                  continue
              }
@@ -2631,7 +3225,15 @@ index f84465e..0a0c149 100644
              if showDetails { refreshDetails() }
              let heat = ProcessInfo.processInfo.thermalState
              if heat.rawValue != thermalState.rawValue {
-@@ -771,12 +787,14 @@ struct SessionView: View {
+@@ -753,6 +813,7 @@ struct SessionView: View {
+                 HengeLog.log("session", "thermal state: \(Self.thermalLabel(heat))")
+             }
+             if state == 2 {
++                if henge_vm_exit_outcome() != Int32(HENGE_VM_OUTCOME_RESTART.rawValue) { runner.end() }
+                 LinkHostService.shared.stop()
+                 nativeTouch.stop()
+                 typing = false
+@@ -771,12 +832,14 @@ struct SessionView: View {
              }
              tick += 1
              if tick % 10 == 0 {
@@ -2650,6 +3252,30 @@ index f84465e..0a0c149 100644
                  JITBootstrap.releaseLingeringDebugger()
              }
              if tick == 60 && !stillWallpaperTipShown { // about when the desktop is up after a login
+@@ -791,16 +854,21 @@ struct SessionView: View {
+     }
+ 
+     private func stopTapped() {
+-        if state == 1 { confirmStop = true } else { close() }
++        if state == 1 || state == 4 { confirmStop = true } else { close() }
+     }
+ 
+     private func finish() {
++        runner.end()
+         nativeTouch.stop()
+-        if state == 1 {
++        if state == 1 || state == 4 {
+             MacPreview.saveNow(for: mac, aspect: displayAspect)
+             henge_vm_stop()
+         }
+         InstantResume.discard(for: mac) /* turned off: nothing to pick up */
+         close()
+     }
++
++    private func updateRunnerDisplay() {
++        display.setPresentationEnabled(!runner.active || runnerDesktop || display.isExternal)
++    }
+ }
 diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
 index e1693b0..3303959 100644
 --- a/ios/Henge/SettingsView.swift
@@ -3100,7 +3726,7 @@ index bd64ae5..b60f6a1 100644
 +    puts("CPU sync: acknowledgement, parked target, missing notifications, 64 deterministic check-to-syscall races, own requests and multiwindow/PAN clears passed");
  }
 diff --git a/tests/test_display_router.swift b/tests/test_display_router.swift
-index a8b4506..9890251 100644
+index a8b4506..2cbd47f 100644
 --- a/tests/test_display_router.swift
 +++ b/tests/test_display_router.swift
 @@ -3,13 +3,14 @@ import QuartzCore
@@ -3120,7 +3746,7 @@ index a8b4506..9890251 100644
          let phoneLayer = CAMetalLayer(), monitorLayer = CAMetalLayer()
          let phone = UUID(), monitor = UUID()
          let router = DisplayRouter()
-@@ -30,8 +31,24 @@ struct DisplayRouterTests {
+@@ -30,8 +31,37 @@ struct DisplayRouterTests {
          // The last monitor going gives the Mac back to the phone, and a late repeat changes nothing.
          router.disconnect(monitor)
          precondition(engineShows(phoneLayer) && !router.isExternal)
@@ -3142,6 +3768,19 @@ index a8b4506..9890251 100644
 +        precondition(engineShows(replacement) && engineCalls == beforeReplacement + 1)
 +        router.connect(phone, layer: replacement, role: .device)
 +        precondition(engineCalls == beforeReplacement + 1)
++        router.setPresentationEnabled(false)
++        precondition(engineLayer == nil)
++        router.refresh(phone)
++        for _ in 0..<10 { await Task.yield() }
++        precondition(engineLayer == nil)
++        let hiddenReplacement = CAMetalLayer()
++        router.connect(phone, layer: hiddenReplacement, role: .device)
++        precondition(engineLayer == nil)
++        router.setPresentationEnabled(true)
++        precondition(engineShows(hiddenReplacement))
++        let enabled = engineCalls
++        router.setPresentationEnabled(true)
++        precondition(engineCalls == enabled)
          print("Display router: all checks passed")
      }
  }
@@ -3710,6 +4349,122 @@ index 81cdb83..e719ce7 100644
 +    puts("Metal lifecycle: 6 cycles, 384 GPU completions drained; both display glyphs restored, malformed input rejected, stale glyphs cleared");
      return 0;
  }
+diff --git a/tests/test_runner_agent.m b/tests/test_runner_agent.m
+new file mode 100644
+index 0000000..b1f42f7
+--- /dev/null
++++ b/tests/test_runner_agent.m
+@@ -0,0 +1,46 @@
++#import <AppKit/AppKit.h>
++#include <assert.h>
++#include <sys/stat.h>
++#include <unistd.h>
++static NSCondition *condition;
++static int reported;
++static NSData *request(NSString *method, NSString *path, NSData *body, int *status, unsigned long *seq) {
++    (void)method; (void)path; (void)seq;
++    [condition lock]; reported = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding].intValue;
++    [condition broadcast]; [condition unlock]; *status = 204; return [NSData data];
++}
++#include "../tools/henge-runner-agent.h"
++static NSString *testDirectory;
++@interface TestRunner : HengeRunner @end
++@implementation TestRunner
++- (NSString *)directory { return testDirectory; }
++@end
++static void waitFor(int status) {
++    [condition lock]; NSDate *limit = [NSDate dateWithTimeIntervalSinceNow:5];
++    while (reported != status) assert([condition waitUntilDate:limit]);
++    [condition unlock];
++}
++int main(void) { @autoreleasepool {
++    alarm(20); condition = [NSCondition new];
++    testDirectory = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
++    [NSFileManager.defaultManager createDirectoryAtPath:[testDirectory stringByAppendingPathComponent:@"bin"] withIntermediateDirectories:YES attributes:nil error:NULL];
++    NSString *listener = [testDirectory stringByAppendingPathComponent:@"bin/Runner.Listener"];
++    [@"#!/bin/sh\nexec /bin/sleep 30\n" writeToFile:listener atomically:YES encoding:NSUTF8StringEncoding error:NULL]; chmod(listener.fileSystemRepresentation, 0700);
++    NSString *wrapper = [testDirectory stringByAppendingPathComponent:@"run.sh"];
++    [@"#!/bin/sh\nexec /bin/sleep 30\n" writeToFile:wrapper atomically:YES encoding:NSUTF8StringEncoding error:NULL]; chmod(wrapper.fileSystemRepresentation, 0700);
++    [@"{\"gitHubUrl\":\"https://github.com/example/repo\"}" writeToFile:[testDirectory stringByAppendingPathComponent:@".runner"] atomically:YES encoding:NSUTF8StringEncoding error:NULL];
++    TestRunner *runner = [TestRunner new]; runner.revision = 1;
++    NSMutableDictionary *command = [@{@"version":@1, @"action":@"start", @"repository":@"https://github.com/example/repo", @"name":@"test", @"token":@"private"} mutableCopy];
++    dispatch_async(runner.work, ^{ [runner execute:command revision:1]; });
++    waitFor(2); assert([command[@"token"] isEqual:@""]);
++    [runner.lock lock]; runner.revision = 2; [runner.child terminate]; [runner.lock unlock];
++    dispatch_async(runner.work, ^{ [runner execute:[@{@"action":@"stop"} mutableCopy] revision:2]; });
++    waitFor(4); dispatch_sync(runner.work, ^{}); assert(!runner.child);
++    // Repository mismatch never launches/reconfigures an existing runner.
++    runner.revision = 3; command[@"repository"] = @"https://github.com/other/repo";
++    [runner execute:command revision:3]; waitFor(3); assert(!runner.child);
++    // Stale queued start cannot restart a stopped session.
++    [runner execute:command revision:1]; assert(!runner.child);
++    [NSFileManager.defaultManager removeItemAtPath:testDirectory error:NULL];
++    puts("runner agent: real child launch/cancellation, no duplicate listener, secret retirement and repository validation passed");
++} }
+diff --git a/tests/test_runner_control.c b/tests/test_runner_control.c
+new file mode 100644
+index 0000000..0a8447b
+--- /dev/null
++++ b/tests/test_runner_control.c
+@@ -0,0 +1,58 @@
++#include "share.h"
++#include <assert.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++static char socket_path[108];
++static void http(const char *query, const char *body, char *out) {
++    int fd = socket(AF_UNIX, SOCK_STREAM, 0); assert(fd >= 0);
++    struct sockaddr_un address = {.sun_family = AF_UNIX};
++    snprintf(address.sun_path, sizeof address.sun_path, "%s", socket_path);
++    assert(connect(fd, (struct sockaddr *)&address, sizeof address) == 0);
++    char request[1024]; int n = snprintf(request, sizeof request,
++        "%s /.henge/runner?%s HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n%s",
++        body ? "PUT" : "GET", query, body ? strlen(body) : 0, body ? body : "");
++    assert(write(fd, request, (size_t)n) == n);
++    size_t at = 0; ssize_t got;
++    while ((got = read(fd, out+at, 4095-at)) > 0) { at += (size_t)got; assert(at < 4095); }
++    out[at] = 0; close(fd);
++}
++static void *waiting(void *seq) {
++    char query[64], response[4096]; snprintf(query, sizeof query, "since=%lu", *(unsigned long *)seq);
++    http(query, NULL, response);
++    assert(strstr(response, "200 OK") && strstr(response, "\"action\":\"stop\"")); return NULL;
++}
++int main(void) {
++    alarm(15);
++    char folder[] = "/tmp/henge-runner-XXXXXX"; assert(mkdtemp(folder));
++    snprintf(socket_path, sizeof socket_path, "%s/s", folder);
++    assert(hv_share_start(folder, socket_path, NULL) == 0);
++    char response[4096], query[64]; long age;
++    assert(hv_share_runner_status(&age) == HV_RUNNER_WAITING && age == -1);
++    const char *command = "{\"version\":1,\"action\":\"start\",\"token\":\"temporary-secret\"}";
++    unsigned long seq = hv_share_runner_set(command); assert(seq);
++    http("since=0", NULL, response); assert(strstr(response, "temporary-secret"));
++    http("since=0", NULL, response); assert(strstr(response, "temporary-secret")); // dropped response retries
++    snprintf(query, sizeof query, "seq=%lu", seq);
++    http(query, "2", response); assert(strstr(response, "204"));
++    assert(hv_share_runner_status(&age) == HV_RUNNER_LISTENING && age == 0);
++    http("since=0", NULL, response); assert(!strstr(response, "temporary-secret") && strstr(response, "resume"));
++    pthread_t worker; assert(!pthread_create(&worker, NULL, waiting, &seq));
++    unsigned long newer = hv_share_runner_set("{\"version\":1,\"action\":\"stop\"}"); assert(newer != seq);
++    assert(!pthread_join(worker, NULL));
++    http(query, "2", response); assert(strstr(response, "409")); // old guest/session can't overwrite state
++    assert(hv_share_runner_status(&age) == HV_RUNNER_WAITING && age == -1);
++    snprintf(query, sizeof query, "seq=%lu", newer);
++    http(query, "4\n", response); assert(strstr(response, "400"));
++    http(query, "4", response); assert(strstr(response, "204"));
++    http("seq=garbage", "2", response); assert(strstr(response, "400"));
++    char too_large[8194]; memset(too_large, 'x', sizeof too_large-1); too_large[sizeof too_large-1] = 0;
++    assert(!hv_share_runner_set(too_large));
++    unlink(socket_path); rmdir(folder);
++    puts("runner control: bounded HTTP, retry, secret retirement, stale reports and wakeup passed");
++}
 diff --git a/tests/test_session_statistics.swift b/tests/test_session_statistics.swift
 index 585491b..61015ba 100644
 --- a/tests/test_session_statistics.swift
@@ -4124,6 +4879,192 @@ index a13a70d..7beea4f 100644
      }
      hv_vm_destroy();
      atomic_store(&reader_done, 1);
+diff --git a/tools/henge-agent.m b/tools/henge-agent.m
+index 62cdaee..94cc8b3 100644
+--- a/tools/henge-agent.m
++++ b/tools/henge-agent.m
+@@ -59,6 +59,8 @@ static NSData *request(NSString *method, NSString *path, NSData *body, int *stat
+     return [all subdataWithRange:NSMakeRange(start, all.length - start)];
+ }
+ 
++#include "henge-runner-agent.h"
++
+ static NSInteger lastChange;
+ 
+ // The device's clipboard, as it changes. The server holds each request until there is something new.
+@@ -132,6 +134,8 @@ int main(void) {
+         }
+         lastChange = NSPasteboard.generalPasteboard.changeCount;
+         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ followDevice(); });
++        HengeRunner *runner = [HengeRunner new];
++        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ [runner follow]; });
+         keepMounted();
+         [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) { (void)timer; checkClipboard(); }];
+         [NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(NSTimer *timer) { (void)timer; keepMounted(); }];
+diff --git a/tools/henge-runner-agent.h b/tools/henge-runner-agent.h
+new file mode 100644
+index 0000000..f998824
+--- /dev/null
++++ b/tools/henge-runner-agent.h
+@@ -0,0 +1,158 @@
++// Included by the existing guest companion: no second launchd job, clipboard
++// loop or daemon. Only a host command can enable this GitHub Actions runner.
++#import <CommonCrypto/CommonDigest.h>
++
++@interface HengeRunner : NSObject
++@property(nonatomic, strong) NSLock *lock;
++@property(nonatomic, strong) dispatch_queue_t work;
++@property(nonatomic, strong) NSTask *child;
++@property(nonatomic) unsigned long revision;
++@property(nonatomic) int state;
++@end
++
++@implementation HengeRunner
++- (instancetype)init {
++    if ((self = [super init])) {
++        _lock = [NSLock new]; _work = dispatch_queue_create("henge.runner", DISPATCH_QUEUE_SERIAL);
++        _state = 4;
++    }
++    return self;
++}
++- (NSString *)directory {
++    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/Henge/ActionsRunner"];
++}
++- (BOOL)current:(unsigned long)revision {
++    [self.lock lock]; BOOL current = self.revision == revision; [self.lock unlock]; return current;
++}
++- (void)report:(int)state revision:(unsigned long)revision {
++    [self.lock lock]; BOOL current = self.revision == revision; if (current) self.state = state; [self.lock unlock];
++    if (!current) return;
++    int status = 0;
++    request(@"PUT", [NSString stringWithFormat:@"/.henge/runner?seq=%lu", revision],
++            [[NSString stringWithFormat:@"%d", state] dataUsingEncoding:NSUTF8StringEncoding], &status, NULL);
++}
++- (BOOL)run:(NSString *)executable arguments:(NSArray *)arguments environment:(NSDictionary *)environment revision:(unsigned long)revision {
++    NSTask *task = [NSTask new];
++    task.executableURL = [NSURL fileURLWithPath:executable]; task.arguments = arguments;
++    task.currentDirectoryURL = [NSURL fileURLWithPath:self.directory];
++    if (environment) { NSMutableDictionary *env = [NSProcessInfo.processInfo.environment mutableCopy]; [env addEntriesFromDictionary:environment]; task.environment = env; }
++    // Runner diagnostics stay in its private guest _diag directory. Never send
++    // subprocess output to iOS logs, where a registration token could leak.
++    task.standardOutput = NSFileHandle.fileHandleWithNullDevice;
++    task.standardError = NSFileHandle.fileHandleWithNullDevice;
++    task.standardInput = NSFileHandle.fileHandleWithNullDevice;
++    [self.lock lock];
++    if (self.revision != revision) { [self.lock unlock]; return NO; }
++    self.child = task;
++    BOOL launched = [task launchAndReturnError:NULL];
++    [self.lock unlock];
++    if (launched) [task waitUntilExit];
++    [self.lock lock]; if (self.child == task) self.child = nil; [self.lock unlock];
++    return launched && task.terminationStatus == 0 && [self current:revision];
++}
++- (BOOL)download:(unsigned long)revision {
++    // Official release metadata supplies the asset's SHA-256. Refuse downloads
++    // without it, and never execute an unverified archive or a user-supplied URL.
++    NSURL *url = [NSURL URLWithString:@"https://api.github.com/repos/actions/runner/releases/latest"];
++    NSMutableURLRequest *query = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:30];
++    [query setValue:@"Henge-runner-setup" forHTTPHeaderField:@"User-Agent"];
++    NSURLResponse *response; NSError *error;
++    NSData *metadata = [NSURLConnection sendSynchronousRequest:query returningResponse:&response error:&error];
++    if (metadata.length > 2 * 1024 * 1024 || ![response isKindOfClass:NSHTTPURLResponse.class] || ((NSHTTPURLResponse *)response).statusCode != 200) return NO;
++    NSDictionary *release = metadata ? [NSJSONSerialization JSONObjectWithData:metadata options:0 error:NULL] : nil;
++    if (![release isKindOfClass:NSDictionary.class]) return NO;
++    NSArray *assets = release[@"assets"];
++    if (![assets isKindOfClass:NSArray.class]) return NO;
++    NSDictionary *chosen = nil;
++    for (id asset in assets) {
++        if (![asset isKindOfClass:NSDictionary.class]) continue;
++        NSString *name = asset[@"name"];
++        if ([name isKindOfClass:NSString.class] && [name hasPrefix:@"actions-runner-osx-arm64-"] && [name hasSuffix:@".tar.gz"]) { chosen = asset; break; }
++    }
++    NSString *digest = chosen[@"digest"], *download = chosen[@"browser_download_url"];
++    if (![digest isKindOfClass:NSString.class] || ![digest hasPrefix:@"sha256:"] || digest.length != 71 ||
++        ![download isKindOfClass:NSString.class] || ![download hasPrefix:@"https://github.com/actions/runner/releases/download/"]) return NO;
++    NSString *archive = [self.directory stringByAppendingPathComponent:@"runner.tar.gz.part"];
++    BOOL ok = [self run:@"/usr/bin/curl" arguments:@[@"--fail", @"--location", @"--proto", @"=https", @"--proto-redir", @"=https", @"--max-time", @"600", @"--output", archive, download] environment:nil revision:revision];
++    if (ok) {
++        NSFileHandle *file = [NSFileHandle fileHandleForReadingAtPath:archive];
++        CC_SHA256_CTX hash; CC_SHA256_Init(&hash);
++        @try { for (;;) { @autoreleasepool { NSData *data = [file readDataOfLength:1024*1024]; if (!data.length) break; CC_SHA256_Update(&hash, data.bytes, (CC_LONG)data.length); } } }
++        @catch (NSException *e) { (void)e; ok = NO; }
++        [file closeFile]; unsigned char bytes[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_Final(bytes, &hash);
++        NSMutableString *actual = [NSMutableString string]; for (unsigned i=0; i<sizeof bytes; i++) [actual appendFormat:@"%02x", bytes[i]];
++        ok = ok && file && [actual isEqualToString:[digest substringFromIndex:7]];
++    }
++    if (ok) ok = [self run:@"/usr/bin/tar" arguments:@[@"-xzf", archive, @"-C", self.directory] environment:nil revision:revision];
++    [NSFileManager.defaultManager removeItemAtPath:archive error:NULL];
++    return ok;
++}
++- (void)execute:(NSMutableDictionary *)command revision:(unsigned long)revision {
++    @autoreleasepool {
++        if (![self current:revision]) return;
++        NSString *action = command[@"action"];
++        if ([action isEqual:@"stop"]) { [self report:4 revision:revision]; return; }
++        NSString *repository = command[@"repository"], *name = command[@"name"], *token = command[@"token"];
++        BOOL resume = [action isEqual:@"resume"];
++        if (!resume && (![repository isKindOfClass:NSString.class] || ![name isKindOfClass:NSString.class] || ![token isKindOfClass:NSString.class])) { [self report:3 revision:revision]; return; }
++        if (!resume) {
++            NSRegularExpression *repo = [NSRegularExpression regularExpressionWithPattern:@"^https://github[.]com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" options:0 error:NULL];
++            if (!name.length || name.length > 64 || token.length > 1024 || [repo numberOfMatchesInString:repository options:0 range:NSMakeRange(0, repository.length)] != 1) { [self report:3 revision:revision]; return; }
++        }
++        [NSFileManager.defaultManager createDirectoryAtPath:self.directory withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@0700} error:NULL];
++        NSString *listener = [self.directory stringByAppendingPathComponent:@"bin/Runner.Listener"];
++        NSString *configuration = [self.directory stringByAppendingPathComponent:@".runner"];
++        if (![NSFileManager.defaultManager isExecutableFileAtPath:listener]) {
++            if (resume) { [self report:3 revision:revision]; return; }
++            [self report:5 revision:revision];
++            if (![self download:revision]) { [self report:3 revision:revision]; return; }
++        }
++        if ([NSFileManager.defaultManager fileExistsAtPath:configuration]) {
++            NSData *data = [NSData dataWithContentsOfFile:configuration];
++            NSDictionary *saved = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
++            if (![saved isKindOfClass:NSDictionary.class] || (!resume && ![saved[@"gitHubUrl"] isEqual:repository])) { [self report:3 revision:revision]; return; }
++        } else {
++            if (resume || !token.length) { [self report:3 revision:revision]; return; }
++            [self report:6 revision:revision];
++            if (![self run:listener arguments:@[@"configure", @"--unattended", @"--url", repository, @"--name", name, @"--labels", @"henge", @"--work", @"_work"]
++                environment:@{@"ACTIONS_RUNNER_INPUT_TOKEN":token} revision:revision]) { [self report:3 revision:revision]; return; }
++        }
++        command[@"token"] = @""; token = nil;
++        // This means the listener process was launched, not that GitHub has
++        // authenticated it or assigned a job. GitHub's runner page is authoritative.
++        [self report:1 revision:revision];
++        NSTask *task = [NSTask new]; task.executableURL = [NSURL fileURLWithPath:[self.directory stringByAppendingPathComponent:@"run.sh"]]; task.arguments = @[];
++        NSMutableDictionary *environment = [NSProcessInfo.processInfo.environment mutableCopy];
++        environment[@"RUNNER_MANUALLY_TRAP_SIG"] = @"1"; task.environment = environment;
++        task.currentDirectoryURL = [NSURL fileURLWithPath:self.directory];
++        task.standardOutput = task.standardError = NSFileHandle.fileHandleWithNullDevice;
++        task.standardInput = NSFileHandle.fileHandleWithNullDevice;
++        [self.lock lock];
++        if (self.revision != revision) { [self.lock unlock]; return; }
++        self.child = task; BOOL started = [task launchAndReturnError:NULL]; [self.lock unlock];
++        if (started) { [self report:2 revision:revision]; [task waitUntilExit]; }
++        [self.lock lock]; if (self.child == task) self.child = nil; [self.lock unlock];
++        [self report:started && task.terminationStatus == 0 ? 4 : 3 revision:revision];
++    }
++}
++- (void)follow {
++    unsigned long seen = ULONG_MAX;
++    for (;;) { @autoreleasepool {
++        int status = 0; unsigned long revision = seen;
++        NSData *data = request(@"GET", [NSString stringWithFormat:@"/.henge/runner?since=%lu", seen], nil, &status, &revision);
++        if (!data || status != 200) { sleep(5); continue; }
++        if (revision == seen) {
++            [self.lock lock]; int state = self.state; [self.lock unlock];
++            [self report:state revision:revision]; continue;
++        }
++        NSMutableDictionary *command = [[NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] mutableCopy];
++        if (![command isKindOfClass:NSDictionary.class] || ![command[@"version"] isEqual:@1] ||
++            ![@[@"start", @"stop", @"resume"] containsObject:command[@"action"] ?: @""]) { sleep(5); continue; }
++        seen = revision;
++        [self.lock lock]; self.revision = revision;
++        if (self.child.running) [self.child terminate];
++        [self.lock unlock];
++        dispatch_async(self.work, ^{ [self execute:command revision:revision]; });
++    } }
++}
++@end
 diff --git a/tools/link/check.sh b/tools/link/check.sh
 index c88ebe4..e1bd426 100755
 --- a/tools/link/check.sh

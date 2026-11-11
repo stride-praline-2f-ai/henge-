@@ -23,4 +23,6 @@ assert validation.get('patch_sha256') == manifest['audit_repairs_sha256'], 'Fina
 assert validation.get('native_regressions') == 'passed' and validation.get('sanitizers') == 'passed', 'Native correctness checks incomplete'
 assert validation.get('ios_app_compile') == 'passed', 'Full iOS app compilation incomplete'
 assert isinstance(validation.get('run_id'), int) and len(validation.get('source_commit', '')) == 40, 'Missing traceable validation source'
+runner = state.get('runner_mode', {})
+assert runner.get('state') == 'verified' and runner.get('evidence'), 'Runner-mode validation incomplete'
 print('PASS complete implementation gate:',  manifest['audit_repairs_sha256'])
