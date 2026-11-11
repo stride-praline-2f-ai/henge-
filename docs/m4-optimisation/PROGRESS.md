@@ -30,3 +30,18 @@ required. The complete M4 plan is NOT finished; packaging remains disabled.
   drains presentation before GPU snapshot quiescence; Continue rearms it.
   This new display path is NOT yet SDK/runtime validated. Next action: add the
   controlled-queue regression, then compile against the real iPhoneOS SDK.
+
+- First M4 cloud checkpoint 43104343753 passed JIT/MMU/superblock tests, VM
+  lifecycle, graphics/concurrency diagnostics and complete production Swift SDK
+  typechecking. Full application compilation was correctly withheld after a
+  benchmark reference patch failed to apply. Updated that reference to remove
+  the complete current helper-read shortcut; the comparator still exercises the
+  old translation behavior, not a disabled benchmark.
+- Guest-to-host clipboard delivery is now event-driven and coalesced; removed
+  its 500ms polling task. ASan/UBSan passed 4000 concurrent guest updates,
+  callback reentry, pending delivery and handler removal.
+- Added controlled-queue tests of the production display-link methods and an
+  explicit production iPhoneOS Metal syntax check. Await cloud execution.
+- New Duo capture/user Low Power Mode observation is useful evidence about OS
+  power policy, not proof of unchanged watts/workload. Added event-only launch
+  and Low Power Mode transition records. No automatic refresh reduction added.

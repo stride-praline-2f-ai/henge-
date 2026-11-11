@@ -810,7 +810,7 @@ index 0f68eae..2c1b4a9 100644
  
  #endif
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..b80abf2 100644
+index 9073d22..faea803 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -1216,7 +1216,7 @@ index 9073d22..b80abf2 100644
 +/* screen_lock held. Preflight stays on the existing presenter; display-link
 +   ownership stays on main. The same encoder consumes the supplied drawable. */
 +- (void)requestDisplayPulse {
-+    if (display_arm_pending || display_quiesced || !display_scene_active || !layer || !screen_dirty) return;
++    if (atomic_load(&stopping) || display_arm_pending || display_quiesced || !display_scene_active || !layer || !screen_dirty) return;
 +    display_arm_pending = YES;
 +    uint64_t generation = layer_generation;
 +    CAMetalLayer *target = layer;
@@ -1845,10 +1845,10 @@ index 0000000..17638b3
 +No new IPA is requested by this checkpoint.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
-index 0000000..457b893
+index 0000000..5e88365
 --- /dev/null
 +++ b/docs/m4-optimisation/PROGRESS.md
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,47 @@
 +# Current checkpoint
 +
 +- Reconstructed source inherited at wrapper commit 343d2d84, patch 9ee35476;
@@ -1881,6 +1881,21 @@ index 0000000..457b893
 +  drains presentation before GPU snapshot quiescence; Continue rearms it.
 +  This new display path is NOT yet SDK/runtime validated. Next action: add the
 +  controlled-queue regression, then compile against the real iPhoneOS SDK.
++
++- First M4 cloud checkpoint 43104343753 passed JIT/MMU/superblock tests, VM
++  lifecycle, graphics/concurrency diagnostics and complete production Swift SDK
++  typechecking. Full application compilation was correctly withheld after a
++  benchmark reference patch failed to apply. Updated that reference to remove
++  the complete current helper-read shortcut; the comparator still exercises the
++  old translation behavior, not a disabled benchmark.
++- Guest-to-host clipboard delivery is now event-driven and coalesced; removed
++  its 500ms polling task. ASan/UBSan passed 4000 concurrent guest updates,
++  callback reentry, pending delivery and handler removal.
++- Added controlled-queue tests of the production display-link methods and an
++  explicit production iPhoneOS Metal syntax check. Await cloud execution.
++- New Duo capture/user Low Power Mode observation is useful evidence about OS
++  power policy, not proof of unchanged watts/workload. Added event-only launch
++  and Low Power Mode transition records. No automatic refresh reduction added.
 diff --git a/docs/m4-optimisation/SPEC.md b/docs/m4-optimisation/SPEC.md
 new file mode 100644
 index 0000000..9182252
@@ -1909,10 +1924,10 @@ index 0000000..9182252
 +maintenance; optional diagnostics; defaults/integration; correctness/release.
 diff --git a/docs/m4-optimisation/VALIDATION.md b/docs/m4-optimisation/VALIDATION.md
 new file mode 100644
-index 0000000..2f7ff35
+index 0000000..2238ad0
 --- /dev/null
 +++ b/docs/m4-optimisation/VALIDATION.md
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,31 @@
 +# Validation
 +
 +Passed locally: production scheduling policy/detection regression compiled with
@@ -1935,6 +1950,15 @@ index 0000000..2f7ff35
 +vCPUs and 6/8/10/12GB guest RAM separately, then 1GB/1.5GB JIT. Record sustained
 +task time, frame-time behaviour, process footprint/headroom and thermal category.
 +No whole-app speed, temperature, energy, battery or gaming gain is yet measured.
++
++Update: cloud 43104343753 assigned a GitHub-hosted ARM64 Xcode27 runner.
++JIT/MMU/superblocks, lifecycle/snapshots, concurrency/Metal diagnostics and actual
++Swift/iPhoneOS typecheck passed. Failure was benchmark fixture patch drift,
++now repaired; full app compilation remains pending. Existing self-hosted runner
++mode remains supported but its availability is not established.
++Local clipboard ASan/UBSan regression passed 4000 concurrent publications.
++Display-pulse controlled-queue regression and explicit iPhoneOS Metal syntax
++check are new and pending; do not infer a green M4 release from prior checks.
 diff --git a/docs/optimization-integration.md b/docs/optimization-integration.md
 new file mode 100644
 index 0000000..7c5b2e2
@@ -2385,7 +2409,7 @@ index 083d66e..d51f8b2 100644
  
  typedef struct {
 diff --git a/host/share.c b/host/share.c
-index 9c7244a..5fd44a3 100644
+index 9c7244a..d1ea7d8 100644
 --- a/host/share.c
 +++ b/host/share.c
 @@ -39,6 +39,39 @@
@@ -2428,7 +2452,31 @@ index 9c7244a..5fd44a3 100644
  /* ---- the clipboard ---- */
  
  static pthread_mutex_t clip_mu = PTHREAD_MUTEX_INITIALIZER;
-@@ -668,6 +701,45 @@ static int clipboard_put(Conn *c, Request *r) {
+@@ -47,6 +80,15 @@ static char *device_clip; /* the device's, for the guest */
+ static unsigned long device_seq;
+ static char *guest_clip; /* the guest's, until the device takes it */
+ static time_t agent_seen;
++static void (*clipboard_notify)(void);
++
++void hv_share_set_clipboard_notify(void (*notify)(void)) {
++    pthread_mutex_lock(&clip_mu);
++    clipboard_notify = notify;
++    int pending = guest_clip != NULL;
++    pthread_mutex_unlock(&clip_mu);
++    if (notify && pending) notify();
++}
+ 
+ void hv_share_set_clipboard(const char *text) {
+     pthread_mutex_lock(&clip_mu);
+@@ -662,12 +704,53 @@ static int clipboard_put(Conn *c, Request *r) {
+     free(guest_clip);
+     guest_clip = text;
+     agent_seen = time(NULL);
++    void (*notify)(void) = clipboard_notify;
+     pthread_mutex_unlock(&clip_mu);
++    if (notify) notify();
+     return respond_empty(c, r, 204, "No Content");
+ }
  
  static int serve_henge(Conn *c, Request *r) {
      const char *what = r->path + strlen("/.henge/");
@@ -2475,10 +2523,17 @@ index 9c7244a..5fd44a3 100644
          if (body_discard(c, r) != 0) return -1;
          return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);
 diff --git a/host/share.h b/host/share.h
-index 37b2313..4482d44 100644
+index 37b2313..da6d7a1 100644
 --- a/host/share.h
 +++ b/host/share.h
-@@ -16,4 +16,13 @@ char *hv_share_take_clipboard(void);
+@@ -13,7 +13,20 @@ int hv_share_start(const char *folder, const char *socket_path, const char *agen
+ void hv_share_set_clipboard(const char *text);
+ /* What the guest last copied, once: a malloc'd string, or NULL if nothing is new. */
+ char *hv_share_take_clipboard(void);
++/* Called after a guest update, outside the clipboard lock, on the server thread.
++   Must return promptly; UI clients enqueue work. Setting a handler also signals
++   an already pending value. A captured static handler may finish after removal. */
++void hv_share_set_clipboard_notify(void (*notify)(void));
  /* Seconds since the helper in macOS was last heard from, or -1 if it never has been. */
  long hv_share_agent_seen(void);
  
@@ -2859,10 +2914,19 @@ index 47e26eb..8a4a83e 100644
  int hv_vm_disk_identity(char *out, size_t n);
  const char *hv_vm_reason_name(int reason);
 diff --git a/ios/Henge/Autopilot.swift b/ios/Henge/Autopilot.swift
-index 6a0a9cc..7fe3eff 100644
+index 6a0a9cc..e01a852 100644
 --- a/ios/Henge/Autopilot.swift
 +++ b/ios/Henge/Autopilot.swift
-@@ -121,7 +121,7 @@ enum Autopilot {
+@@ -16,7 +16,7 @@ import UIKit
+ ///   move X Y, click X Y  the pointer to a spot on the Mac's screen (its pixels), and a click there
+ ///   pointer            where the pointer is now, into the log
+ ///   knob NAME VALUE    a translation knob (core/machine.h)
+-///   cpus N             the CPUs setting (1-6) for the next Mac started; it stays, so set it back afterwards
++///   cpus N             the CPUs setting (1–8 on the high-memory M4, otherwise 1–6) for the next Mac started; it stays, so set it back afterwards
+ ///   env NAME [VALUE]   set (or unset) an engine environment setting for the next Mac started
+ ///   balloon MB         ask the Mac for that much of its memory back (HV_BALLOON set), log what it gave
+ ///   snap [NAME]        the Mac's screen (1920x1080) into Documents/NAME.jpg (snap.jpg)
+@@ -121,11 +121,11 @@ enum Autopilot {
                  HengeLog.log("autopilot", "snap: no screen to read")
              }
          case "cpus": // "cpus 2": the CPU count the next Mac started gets (the CPUs setting, kept: put it back after a test)
@@ -2871,6 +2935,11 @@ index 6a0a9cc..7fe3eff 100644
                  UserDefaults.standard.set(n, forKey: "henge.cpus")
                  HengeLog.log("autopilot", "cpus \(n) for the next start")
              } else {
+-                HengeLog.log("autopilot", "cpus wants 1 to 6")
++                HengeLog.log("autopilot", "cpus wants 1 to \(M4Performance.maximumGuestCPUs)")
+             }
+         case "env": // "env HV_QOS ui": an engine setting read when the next Mac starts (one not in henge-env.txt, which wins)
+             let kv = arg.split(separator: " ", maxSplits: 1).map(String.init)
 diff --git a/ios/Henge/BackgroundExecutionStatus.swift b/ios/Henge/BackgroundExecutionStatus.swift
 index b65b6ce..4511710 100644
 --- a/ios/Henge/BackgroundExecutionStatus.swift
@@ -3095,10 +3164,33 @@ index 76630c6..ec21294 100644
  #include "native_touch.h"
  #include "../../devices/pvg_link.h"
 diff --git a/ios/Henge/HengeLog.swift b/ios/Henge/HengeLog.swift
-index 037685f..d91a56f 100644
+index 037685f..bbea374 100644
 --- a/ios/Henge/HengeLog.swift
 +++ b/ios/Henge/HengeLog.swift
-@@ -338,7 +338,7 @@ enum HengeLog {
+@@ -42,6 +42,7 @@ enum HengeLog {
+     private static var consoleFD: Int32 = -1
+     private static var consoleFilter: String?
+     private static var started = false
++    private static var powerObserver: NSObjectProtocol?
+     private static let writeLock = NSLock()
+     private static let startTime = Date()
+ 
+@@ -88,6 +89,14 @@ enum HengeLog {
+         installCrashHandlers()
+         logBanner()
+         replayPreviousNativeLog()
++        logPowerState("app-launch")
++        powerObserver = NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChange,
++            object: nil, queue: nil) { _ in logPowerState("power-state-changed") }
++    }
++
++    private static func logPowerState(_ reason: String) {
++        let process = ProcessInfo.processInfo
++        log("power", "\(reason): low-power=\(process.isLowPowerModeEnabled ? "on" : "off") thermal-category=\(process.thermalState.rawValue) (OS policy/category; not watts or temperature)")
+     }
+ 
+     /// Put the last run's native output into this run's log.
+@@ -338,7 +347,7 @@ enum HengeLog {
          if let upstream = info["HengeUpstreamCommit"] as? String {
              log("boot", "upstream main: \(upstream)")
          }
@@ -3902,7 +3994,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..2744162 100644
+index f84465e..2ac75e4 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,8 @@ struct SessionView: View {
@@ -3998,7 +4090,28 @@ index f84465e..2744162 100644
          }
          .onChange(of: showDetails) { showing in
              if showing {
-@@ -256,7 +304,7 @@ struct SessionView: View {
+@@ -228,10 +276,12 @@ struct SessionView: View {
+         }
+         .onAppear {
+             UIApplication.shared.isIdleTimerDisabled = true
++            Sharing.startFollowingClipboard()
+             HardwareMouse.shared.start()
+             VolumeClicks.shared.start()
+         }
+         .onDisappear {
++            Sharing.stopFollowingClipboard()
+             LinkHostService.shared.stop()
+             nativeTouch.stop()
+             UIApplication.shared.isIdleTimerDisabled = false
+@@ -242,7 +292,6 @@ struct SessionView: View {
+             VolumeClicks.shared.stop()
+         }
+         .modifier(ExternalMacDisplayModifier(presentation: MacPresentation(display: display, aspect: displayAspect)))
+-        .task { await Sharing.followMacClipboard() }
+         .task(id: nativeTouch.requested && Sharing.enabledForSession) {
+             defer { nativeTouch.stop() }
+             guard nativeTouch.requested && Sharing.enabledForSession else { return }
+@@ -256,7 +305,7 @@ struct SessionView: View {
      }
  
      /// When there is something of the app's to point at, iPadOS gets its own pointer back.
@@ -4007,7 +4120,7 @@ index f84465e..2744162 100644
  
      // A fold/rotation after boot must fit the mode the guest actually received,
      // rather than stretch it by recalculating only the host view's aspect.
-@@ -484,6 +532,7 @@ struct SessionView: View {
+@@ -484,6 +533,7 @@ struct SessionView: View {
  
      /// The controls a column has too.
      @ViewBuilder private var floatingTools: some View {
@@ -4015,7 +4128,7 @@ index f84465e..2744162 100644
          tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
          pasteTool
          tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
-@@ -545,6 +594,9 @@ struct SessionView: View {
+@@ -545,6 +595,9 @@ struct SessionView: View {
          VStack(alignment: .leading, spacing: 10) {
              Text("This Mac could not start").font(.system(size: 17, weight: .semibold))
              Text(text).font(.system(size: 14)).foregroundStyle(Desk.dim)
@@ -4025,7 +4138,7 @@ index f84465e..2744162 100644
              Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
          }
          .padding(18)
-@@ -583,6 +635,13 @@ struct SessionView: View {
+@@ -583,6 +636,13 @@ struct SessionView: View {
                      LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
                      LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
                  }
@@ -4039,7 +4152,7 @@ index f84465e..2744162 100644
                  Section("Display") {
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
-@@ -699,7 +758,9 @@ struct SessionView: View {
+@@ -699,7 +759,9 @@ struct SessionView: View {
          guard !Task.isCancelled else { return }
          UIApplication.shared.isIdleTimerDisabled = true
          HardwareMouse.shared.start()
@@ -4050,7 +4163,7 @@ index f84465e..2744162 100644
          runningScreen = screen
          let ram = GuestMemory.prepare(mac)
          HengeLog.log("session", "available memory \(henge_available_memory() >> 20) MB")
-@@ -721,22 +782,43 @@ struct SessionView: View {
+@@ -721,22 +783,43 @@ struct SessionView: View {
          HengeLog.log("display", "screen-fit: selected=\(mac.fitsDeviceScreen) viewport=\(viewport.width)x\(viewport.height) stored=\(mac.screenWidth ?? 1920)x\(mac.screenHeight ?? 1080) chosen=\(screen.width)x\(screen.height) aspect=\(screen.aspect)")
          do { try LinkHostService.shared.prepareBoot() }
          catch { self.error = error.localizedDescription; return }
@@ -4099,7 +4212,7 @@ index f84465e..2744162 100644
              if currentState != state { state = currentState }
              if currentCPUs != cpusOn { cpusOn = currentCPUs }
              if !userCode && henge_vm_guest_el0() != 0 { userCode = true }
-@@ -744,15 +826,18 @@ struct SessionView: View {
+@@ -744,15 +827,18 @@ struct SessionView: View {
                  try? await Task.sleep(nanoseconds: 100_000_000)
                  continue
              }
@@ -4125,7 +4238,7 @@ index f84465e..2744162 100644
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
                  typing = false
-@@ -770,13 +855,15 @@ struct SessionView: View {
+@@ -770,13 +856,15 @@ struct SessionView: View {
                  break
              }
              tick += 1
@@ -4146,7 +4259,7 @@ index f84465e..2744162 100644
                  JITBootstrap.releaseLingeringDebugger()
              }
              if tick == 60 && !stillWallpaperTipShown { // about when the desktop is up after a login
-@@ -784,23 +871,28 @@ struct SessionView: View {
+@@ -784,23 +872,28 @@ struct SessionView: View {
                  showWallpaperTip = true
                  DispatchQueue.main.asyncAfter(deadline: .now() + 10) { showWallpaperTip = false }
              }
@@ -4249,6 +4362,66 @@ index e1693b0..da02bd7 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  .listRowBackground(Desk.card)
+diff --git a/ios/Henge/Sharing.swift b/ios/Henge/Sharing.swift
+index eb316cc..0d1a62e 100644
+--- a/ios/Henge/Sharing.swift
++++ b/ios/Henge/Sharing.swift
+@@ -6,6 +6,15 @@ import UIKit
+ enum Sharing {
+     static let enabledKey = "henge.sharing.enabled"
+     private(set) static var enabledForSession = false
++    private static var followingClipboard = false
++    // Dispatch merges guest updates before the main queue drains them. This has
++    // no timer and owns no VM memory; delayed events are harmless after leaving.
++    private static let clipboardEvents: DispatchSourceUserDataAdd = {
++        let events = DispatchSource.makeUserDataAddSource(queue: .main)
++        events.setEventHandler { consumeMacClipboard() }
++        events.resume()
++        return events
++    }()
+     static var folder: URL {
+         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("Shared", isDirectory: true)
+     }
+@@ -15,6 +24,12 @@ enum Sharing {
+     /// Before a Mac starts.
+     static func prepare() {
+         enabledForSession = UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
++        _ = clipboardEvents
++        if enabledForSession {
++            hv_share_set_clipboard_notify { Sharing.clipboardEvents.add(data: 1) }
++        } else {
++            hv_share_set_clipboard_notify(nil)
++        }
+         HengeLog.log("sharing", enabledForSession
+                      ? "guest folder and clipboard bridge enabled (local virtual address 10.0.2.4)"
+                      : "guest folder and automatic clipboard bridge disabled for this launch")
+@@ -34,14 +49,18 @@ enum Sharing {
+ 
+     /// What is copied on the Mac is copied here too. The other way needs the system's paste button: iOS
+     /// asks for permission whenever an app reads the clipboard on its own.
+-    static func followMacClipboard() async {
+-        while !Task.isCancelled {
+-            if enabledForSession, let text = henge_share_take_clipboard() {
+-                UIPasteboard.general.string = String(cString: text)
+-                free(text)
+-            }
+-            try? await Task.sleep(nanoseconds: 500_000_000)
+-        }
++    static func startFollowingClipboard() {
++        followingClipboard = true
++        consumeMacClipboard()
++    }
++
++    static func stopFollowingClipboard() { followingClipboard = false }
++
++    private static func consumeMacClipboard() {
++        guard followingClipboard, enabledForSession,
++              let text = henge_share_take_clipboard() else { return }
++        UIPasteboard.general.string = String(cString: text)
++        free(text)
+     }
+ 
+     /// Text from this device, pasted at the Mac's cursor. Without the helper it is typed, as far as the keyboard can.
 diff --git a/ios/scripts/build_app.sh b/ios/scripts/build_app.sh
 new file mode 100644
 index 0000000..d9d7efa
@@ -4438,30 +4611,37 @@ index 0000000..eef5d30
 + subprocess.run([str(exe)],check=True)
 diff --git a/tests/helper-read-baseline.patch b/tests/helper-read-baseline.patch
 new file mode 100644
-index 0000000..df20122
+index 0000000..5e76514
 --- /dev/null
 +++ b/tests/helper-read-baseline.patch
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,39 @@
 +--- a/core/memop.c
 ++++ b/core/memop.c
-+@@ -298,16 +298,6 @@
++@@ -296,23 +296,8 @@
++                 (unsigned long long)cpu->x[30]);
++     }
 +     while (len) {
++-        /* A live read tag validates the entire ordinary-RAM TLB granule.
++-           Coalesce reads across internal 4K boundaries only after this check.
++-           Misses and every write retain the precise 4K fallback below. */
++-        uint32_t span = (1u << HV_TLB_PAGE_BITS) - (uint32_t)(va & ((1u << HV_TLB_PAGE_BITS) - 1));
++-        if (span > len) span = len;
++-        const void *cached = write ? NULL : hv_tlb_read_span(cpu, va, span, el);
++-        if (cached) {
++-            if (cpu->m->stats_interval) cpu->m->stats.vmem_read_reuses++;
++-            memcpy(b, cached, span);
++-            va += span; b += span; len -= span;
++-            continue;
++-        }
 +         uint32_t chunk = 4096 - (uint32_t)(va & 4095);
 +         if (chunk > len) chunk = len;
 +-        /* Plain reads can use the exact RAM span the JIT's TLB already checked.
 +-           Stores retain hv_phys_write's ROM, watch and code-invalidation path.
 +-           A miss still splits at 4K so smaller guest granules fault precisely. */
-+-        const void *cached = write ? NULL : hv_tlb_read_span(cpu, va, chunk, el);
-+-        if (cached) {
-+-            if (cpu->m->stats_interval) cpu->m->stats.vmem_read_reuses++;
-+-            memcpy(b, cached, chunk);
-+-            va += chunk; b += chunk; len -= chunk;
-+-            continue;
-+-        }
 +         uint64_t pa;
 +         int had_entry = 0;
 +         if (cpu->m->stats_interval) { /* --stats: was the TLB entry there before this access? */
-+@@ -345,10 +335,8 @@
++@@ -350,10 +335,8 @@
 +                 }
 +             }
 +         }
@@ -4602,6 +4782,81 @@ index 88db6e8..8afb1f9 100644
  void hv_jit_write(HvJitRegion *r,uint32_t *p,const void *s,size_t n){(void)r;memcpy(p,s,n);}
  void hv_jit_finish(HvJitRegion *r,uint32_t *p,size_t n){(void)r;(void)p;(void)n;}
  void hv_jit_finish_branch(HvJitRegion *r,uint32_t *p){(void)r;(void)p;}
+diff --git a/tests/test_clipboard_notify.py b/tests/test_clipboard_notify.py
+new file mode 100644
+index 0000000..3f68b13
+--- /dev/null
++++ b/tests/test_clipboard_notify.py
+@@ -0,0 +1,69 @@
++"""Execute production clipboard publication/notification under concurrent updates.
++Only the HTTP body/response are fixtures; locks, ownership and callbacks are real.
++"""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[1]
++source = (root / 'host/share.c').read_text()
++clipboard = source[source.index('static pthread_mutex_t clip_mu'):source.index('/* ---- connections ---- */')]
++start = source.index('static int clipboard_put(')
++end = source.index('\nstatic int serve_henge(', start)
++fixture = r'''
++#define _POSIX_C_SOURCE 200809L
++#include <assert.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++typedef struct Conn { const char *text; } Conn;
++typedef struct Request { int unused; } Request;
++static char *body_small(Conn *c, Request *r, size_t *len) {
++    (void)r; *len = strlen(c->text); return strdup(c->text);
++}
++static int respond_empty(Conn *c, Request *r, int code, const char *reason) {
++    (void)c; (void)r; assert(code == 204 && !strcmp(reason, "No Content")); return 0;
++}
++CLIPBOARD
++PUT
++static _Atomic unsigned calls;
++static void consume(void) {
++    atomic_fetch_add(&calls, 1);
++    // Reentry must be safe: callbacks run after releasing clip_mu.
++    free(hv_share_take_clipboard());
++    hv_share_set_clipboard("device response");
++}
++static void put(const char *text) { Conn c = {text}; Request r = {0}; assert(!clipboard_put(&c, &r)); }
++static void *writer(void *unused) {
++    (void)unused;
++    for (int i=0; i<1000; ++i) put("concurrent guest clipboard");
++    return NULL;
++}
++int main(void) {
++    put("pending before registration"); assert(atomic_load(&calls)==0);
++    hv_share_set_clipboard_notify(consume); assert(atomic_load(&calls)==1);
++    assert(!hv_share_take_clipboard());
++    hv_share_set_clipboard("device update"); assert(atomic_load(&calls)==1);
++    put("guest update"); assert(atomic_load(&calls)==2);
++    hv_share_set_clipboard_notify(NULL);
++    put("keep until next visible session"); assert(atomic_load(&calls)==2);
++    char *text=hv_share_take_clipboard(); assert(text && !strcmp(text,"keep until next visible session")); free(text);
++    hv_share_set_clipboard_notify(consume); assert(atomic_load(&calls)==2);
++    pthread_t workers[4];
++    for(int i=0;i<4;++i) assert(!pthread_create(&workers[i],NULL,writer,NULL));
++    for(int i=0;i<4;++i) assert(!pthread_join(workers[i],NULL));
++    assert(atomic_load(&calls)==4002); assert(!hv_share_take_clipboard());
++    hv_share_set_clipboard_notify(NULL); free(device_clip);
++    puts("clipboard notifications: pending catchup, removal, reentry, 4000 concurrent updates passed");
++}
++'''.replace('CLIPBOARD', clipboard).replace('PUT', source[start:end])
++with tempfile.TemporaryDirectory(prefix='henge-clipboard-') as folder:
++    path = Path(folder)
++    (path/'test.c').write_text(fixture)
++    subprocess.run([os.environ.get('CC','cc'),'-std=c11','-Wall','-Wextra','-Werror','-g','-O1',
++                    '-fsanitize=address,undefined','-pthread',str(path/'test.c'),'-o',str(path/'check')],check=True)
++    subprocess.run([str(path/'check')],check=True,timeout=20)
 diff --git a/tests/test_cpu_sync.c b/tests/test_cpu_sync.c
 index bd64ae5..b60f6a1 100644
 --- a/tests/test_cpu_sync.c
@@ -4658,6 +4913,172 @@ index bd64ae5..b60f6a1 100644
 -    puts("CPU sync: spinning/sleeping, acknowledgement, parked target, missed notification, own requests and tagged multiwindow/PAN cache clears passed");
 +    puts("CPU sync: acknowledgement, parked target, missing notifications, 64 deterministic check-to-syscall races, own requests and multiwindow/PAN clears passed");
  }
+diff --git a/tests/test_display_pulses.py b/tests/test_display_pulses.py
+new file mode 100644
+index 0000000..96d67e8
+--- /dev/null
++++ b/tests/test_display_pulses.py
+@@ -0,0 +1,160 @@
++"""Run production Metal display-link arming/callbacks with controlled queues.
++The macOS fixture supplies UIKit visibility and a display-link stand-in; queue
++ordering, generation checks, coalescing and production pacing are exercised.
++"""
++from pathlib import Path
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[1]
++source = (root/'devices/pvg_metal.m').read_text()
++start = source.index('- (void)requestDisplayPulse {')
++end = source.index('\n#endif', start)
++methods = source[start:end]
++fixture = r'''
++#import <Foundation/Foundation.h>
++#import <QuartzCore/QuartzCore.h>
++#include <os/lock.h>
++#include <stdatomic.h>
++#include <assert.h>
++#include <math.h>
++#include "frame_pacing.h"
++static double now_seconds(void) { return 100; }
++static NSMutableArray *presenterTasks, *mainTasks;
++static dispatch_queue_t presenterQueue;
++static void enqueue(dispatch_queue_t queue, dispatch_block_t task) {
++    [(queue == presenterQueue ? presenterTasks : mainTasks) addObject:[task copy]];
++}
++static void drainOne(NSMutableArray *tasks) {
++    assert(tasks.count); dispatch_block_t task = tasks.firstObject;
++    [tasks removeObjectAtIndex:0]; task();
++}
++@interface TestScene : NSObject
++@property NSInteger activationState;
++@end
++@implementation TestScene @end
++@interface TestScreen : NSObject
++@property NSInteger maximumFramesPerSecond;
++@end
++@implementation TestScreen @end
++@interface TestWindow : NSObject
++@property (nonatomic, strong) TestScene *windowScene;
++@property (nonatomic, strong) TestScreen *screen;
++@end
++@implementation TestWindow @end
++@interface TestView : NSObject
++@property (nonatomic, strong) TestWindow *window;
++@property BOOL hidden;
++@property double alpha;
++@end
++@implementation TestView @end
++@class HvReplay;
++@interface HvDisplayPulse : NSObject
++@property (weak) HvReplay *owner;
++@end
++@implementation HvDisplayPulse @end
++@interface TestLink : NSObject
++@property BOOL paused, invalidated;
++@property (weak) HvDisplayPulse *delegate;
++@property CAFrameRateRange preferredFrameRateRange;
++- (instancetype)initWithMetalLayer:(CAMetalLayer *)layer;
++- (void)addToRunLoop:(NSRunLoop *)runLoop forMode:(NSString *)mode;
++- (void)invalidate;
++@end
++@implementation TestLink
++- (instancetype)initWithMetalLayer:(CAMetalLayer *)layer { (void)layer; return [super init]; }
++- (void)addToRunLoop:(NSRunLoop *)runLoop forMode:(NSString *)mode { (void)runLoop;(void)mode; }
++- (void)invalidate { self.invalidated=YES; self.paused=YES; }
++@end
++@interface TestUpdate : NSObject
++@property (nonatomic, strong) id drawable;
++@end
++@implementation TestUpdate @end
++@interface HvReplay : NSObject {
++@public
++    os_unfair_lock screen_lock;
++    atomic_int stopping;
++    BOOL display_arm_pending, display_quiesced, display_scene_active, screen_dirty;
++    uint64_t layer_generation, display_link_generation;
++    uint32_t screen_w, screen_h;
++    dispatch_queue_t presenter;
++    CAMetalLayer *layer;
++    __weak CAMetalLayer *display_link_layer;
++    TestLink *display_link;
++    id display_delegate, display_drawable;
++    int pacing_fps, presents, preflights;
++    HvFramePacing frame_pacing;
++}
++- (BOOL)prepareScreenForLayer:(CAMetalLayer *)target;
++- (void)updatePacingPolicy;
++- (void)kickPresenter:(BOOL)fresh;
++- (void)requestDisplayPulse;
++- (void)displayPulse:(TestLink *)link update:(TestUpdate *)update;
++@end
++#define UIView TestView
++#define UIWindowScene TestScene
++#define UISceneActivationStateForegroundActive 0
++#define CAMetalDisplayLink TestLink
++#define CAMetalDisplayLinkUpdate TestUpdate
++#define dispatch_async enqueue
++@implementation HvReplay
++- (BOOL)prepareScreenForLayer:(CAMetalLayer *)target { (void)target; preflights++; return YES; }
++- (void)updatePacingPolicy {}
++- (void)kickPresenter:(BOOL)fresh { (void)fresh; assert(display_drawable); presents++; screen_dirty=NO; }
++METHODS
++@end
++static void request(HvReplay *r) {
++    os_unfair_lock_lock(&r->screen_lock); [r requestDisplayPulse]; os_unfair_lock_unlock(&r->screen_lock);
++}
++int main(void) { @autoreleasepool {
++    presenterTasks=[NSMutableArray new]; mainTasks=[NSMutableArray new];
++    presenterQueue=dispatch_queue_create("test.presenter",NULL);
++    TestView *view=[TestView new]; view.alpha=1;
++    view.window=[TestWindow new];view.window.windowScene=[TestScene new];
++    view.window.screen=[TestScreen new];view.window.screen.maximumFramesPerSecond=120;
++    HvReplay *r=[HvReplay new];r->screen_lock=(os_unfair_lock)OS_UNFAIR_LOCK_INIT;r->presenter=presenterQueue;
++    r->display_scene_active=YES;r->screen_dirty=YES;r->screen_w=2752;r->screen_h=2064;
++    r->layer=[CAMetalLayer layer];r->layer.delegate=(id)view;r->layer_generation=1;
++    for(int i=0;i<100;++i)request(r);
++    assert(presenterTasks.count==1);drainOne(presenterTasks);
++    assert(mainTasks.count==1 && r->preflights==1);
++    // A newer target gets its own arm while the old main task is queued.
++    CAMetalLayer *old=r->layer;r->layer=[CAMetalLayer layer];r->layer.delegate=(id)view;
++    r->layer_generation++;r->display_arm_pending=NO;request(r);
++    drainOne(mainTasks);assert(r->display_arm_pending && !r->display_link);
++    drainOne(presenterTasks);drainOne(mainTasks);
++    assert(r->display_link && !r->display_link.paused && !r->display_arm_pending);
++    assert(r->display_link.preferredFrameRateRange.maximum==120);
++    assert(r->layer.drawableSize.width==2752 && old.drawableSize.width==2752);
++    TestLink *current=r->display_link;TestUpdate *update=[TestUpdate new];update.drawable=[NSObject new];
++    [r displayPulse:[TestLink new] update:update];assert(!r->presents);
++    r->display_quiesced=YES;[r displayPulse:current update:update];assert(!r->presents);
++    r->display_quiesced=NO;r->display_scene_active=NO;
++    [r displayPulse:current update:update];assert(!r->presents);
++    r->display_scene_active=YES;r->display_link_generation--;
++    [r displayPulse:current update:update];assert(!r->presents);
++    r->display_link_generation=r->layer_generation;
++    [r displayPulse:current update:update];assert(r->presents==1 && r->display_drawable==update.drawable);
++    [r displayPulse:current update:update];assert(r->presents==1); // no damage, no duplicate
++    // Replacing a layer retires the link and honours the new screen's maximum.
++    r->screen_dirty=YES;r->layer=[CAMetalLayer layer];r->layer.delegate=(id)view;r->layer_generation++;
++    view.window.screen.maximumFramesPerSecond=60;request(r);drainOne(presenterTasks);drainOne(mainTasks);
++    assert(current.invalidated && r->display_link!=current && r->display_link.preferredFrameRateRange.maximum==60);
++    // A detached view is never treated as an active scene (nil enum is zero).
++    view.window=nil;request(r);drainOne(presenterTasks);drainOne(mainTasks);
++    assert(!r->display_scene_active && !r->display_arm_pending);
++    request(r);assert(!presenterTasks.count && !mainTasks.count);
++    // A cap waits on a display pulse; it does not deliver early or schedule a timer.
++    r->display_scene_active=YES;r->pacing_fps=30;r->frame_pacing.next=101;
++    [r displayPulse:r->display_link update:update];assert(r->presents==1 && presenterTasks.count==1);
++    drainOne(presenterTasks);drainOne(mainTasks);
++    atomic_store(&r->stopping,1);request(r);assert(!presenterTasks.count);
++    puts("display pulses: coalescing, retired generations, scenes, pause, refresh and damage passed");
++} }
++'''.replace('METHODS',methods)
++with tempfile.TemporaryDirectory(prefix='henge-display-pulses-') as folder:
++    path=Path(folder);(path/'test.m').write_text(fixture)
++    subprocess.run(['xcrun','--sdk','macosx','clang','-fobjc-arc','-std=c11','-Wall','-Wextra','-Werror',
++                    '-fsanitize=address,undefined','-I'+str(root/'devices'),str(path/'test.m'),
++                    '-framework','Foundation','-framework','QuartzCore','-o',str(path/'check')],check=True)
++    subprocess.run([str(path/'check')],check=True,timeout=20)
 diff --git a/tests/test_display_router.swift b/tests/test_display_router.swift
 index a8b4506..2cbd47f 100644
 --- a/tests/test_display_router.swift
@@ -6016,10 +6437,19 @@ index a13a70d..7beea4f 100644
      hv_vm_destroy();
      atomic_store(&reader_done, 1);
 diff --git a/tools/check_host_scheduling.sh b/tools/check_host_scheduling.sh
-index 509bce1..fd59fbc 100755
+index 509bce1..439e137 100755
 --- a/tools/check_host_scheduling.sh
 +++ b/tools/check_host_scheduling.sh
-@@ -9,6 +9,9 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
+@@ -2,6 +2,8 @@
+ # Native tests + iPhoneOS SDK type checking. Does not build an app or IPA.
+ set -euo pipefail
+ cd "$(dirname "$0")/.."
++python3 tests/test_clipboard_notify.py
++python3 tests/test_display_pulses.py
+ mkdir -p build/scheduling-check
+ task_out="$PWD/build/scheduling-check"
+ exec > >(tee "$task_out/checks.log") 2>&1
+@@ -9,6 +11,9 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
  set -x
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread -Ihost \
      host/scheduling.c tests/test_scheduling.c -o "$task_out/test_scheduling"
@@ -6029,6 +6459,15 @@ index 509bce1..fd59fbc 100755
  "$task_out/test_scheduling"
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O2 -Ihost -c host/scheduling.c -o "$task_out/scheduling.o"
  swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h \
+@@ -28,6 +33,8 @@ xcrun --sdk macosx clang -fobjc-arc -std=c11 -Wall -Wextra -Werror -O2 -Idevices
+ SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+ xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot "$SDK" -std=c11 -Wall -Wextra \
+     -Icore -Ihost -Idevices -fsyntax-only host/scheduling.c host/vm.c host/prof_ios.c host/usb_host.c
++xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot "$SDK" -std=c11 -Wall -Wextra \
++    -fobjc-arc -Icore -Ihost -Idevices -fsyntax-only devices/pvg_metal.m
+ # Typecheck the actual app, not a rewritten Settings/Session fixture. There is
+ # no linking, .app output, packaging, signing, new entitlement or simulator job.
+ python3 - "$SDK" <<'PY'
 diff --git a/tools/henge-agent.m b/tools/henge-agent.m
 index 62cdaee..61301ea 100644
 --- a/tools/henge-agent.m
