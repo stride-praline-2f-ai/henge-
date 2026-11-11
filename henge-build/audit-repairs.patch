@@ -1,0 +1,653 @@
+diff --git a/Makefile b/Makefile
+index 81b0736..97ba397 100644
+--- a/Makefile
++++ b/Makefile
+@@ -107,7 +107,10 @@ $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
+ $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
+ 	$(CC) $(CFLAGS) $^ -o $@
+ 
+-$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/snapshot.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/native_touch.o $(B)/usb_host.o
++$(B)/snapshot_test.o: host/snapshot.c | $(B)
++	$(CC) $(CFLAGS) -DHV_SNAPSHOT_TESTING=1 -c $< -o $@
++
++$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/snapshot_test.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/native_touch.o $(B)/usb_host.o
+ 	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -lcompression -o $@
+ 
+ test-vm-lifecycle: $(B)/test_vm_lifecycle
+diff --git a/devices/display_snapshot.h b/devices/display_snapshot.h
+new file mode 100644
+index 0000000..57303a2
+--- /dev/null
++++ b/devices/display_snapshot.h
+@@ -0,0 +1,35 @@
++#ifndef HV_DISPLAY_SNAPSHOT_H
++#define HV_DISPLAY_SNAPSHOT_H
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++#define HV_DISPLAY_SNAPSHOT_VERSION 2u
++#define HV_DISPLAY_SNAPSHOT_PORTS 2u
++typedef struct HvDisplaySnapshotPort {
++    uint64_t mapping;
++    uint32_t width, height, stride, shown;
++    int32_t hot_x, hot_y;
++} HvDisplaySnapshotPort;
++typedef struct HvDisplaySnapshot {
++    uint32_t version, ports;
++    HvDisplaySnapshotPort port[HV_DISPLAY_SNAPSHOT_PORTS];
++} HvDisplaySnapshot;
++/* Validate before allocating or touching any live renderer state. */
++static inline int hv_display_snapshot_parse(const void *in, size_t len,
++                                            HvDisplaySnapshot *out, size_t bytes[2]) {
++    if (!in || len < sizeof *out) return -1;
++    memcpy(out, in, sizeof *out);
++    if (out->version != HV_DISPLAY_SNAPSHOT_VERSION || out->ports != 2) return -1;
++    size_t total = sizeof *out;
++    for (unsigned p = 0; p < 2; p++) {
++        const HvDisplaySnapshotPort *d = &out->port[p];
++        if (d->shown > 1 || d->width > 512 || d->height > 512 || d->stride > 8192) return -1;
++        if ((!d->width || !d->height) && (d->width || d->height || d->stride)) return -1;
++        if (d->stride < d->width * 4) return -1;
++        bytes[p] = (size_t)d->stride * d->height;
++        if (bytes[p] > len - total) return -1;
++        total += bytes[p];
++    }
++    return total == len ? 0 : -1;
++}
++#endif
+diff --git a/devices/pvg_lite.c b/devices/pvg_lite.c
+index 9f6ebcb..629b4f8 100644
+--- a/devices/pvg_lite.c
++++ b/devices/pvg_lite.c
+@@ -889,11 +889,11 @@ size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
+ }
+ 
+ /* After hv_pvg_lite_set_state: the screen and the pointer as they were, before the guest draws again. */
+-void hv_pvg_lite_set_display_state(HvPvgLite *p, const void *in, size_t len) {
+-    if (!p || !len) return;
++int hv_pvg_lite_set_display_state(HvPvgLite *p, const void *in, size_t len) {
++    if (!p || !len) return -1;
+     ensure_metal(p);
+     HvPvgMetal *metal = atomic_load_explicit(&p->metal, memory_order_acquire);
+-    if (metal) hv_pvg_metal_set_display_state(metal, in, len);
++    return metal ? hv_pvg_metal_set_display_state(metal, in, len) : -1;
+ }
+ 
+ /* Debugging (the Mac runner's devstate): each channel's ring and stamps, to tell work never taken from work never
+diff --git a/devices/pvg_lite.h b/devices/pvg_lite.h
+index 0f68eae..999da98 100644
+--- a/devices/pvg_lite.h
++++ b/devices/pvg_lite.h
+@@ -74,11 +74,11 @@ size_t hv_pvg_lite_state(HvPvgLite *p, void *out, size_t cap);
+ int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len);
+ void hv_pvg_lite_quiesce(HvPvgLite *p);
+ size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap);
+-void hv_pvg_lite_set_display_state(HvPvgLite *p, const void *in, size_t len);
++int hv_pvg_lite_set_display_state(HvPvgLite *p, const void *in, size_t len);
+ #include <stdio.h>
+ void hv_pvg_lite_debug(HvPvgLite *p, FILE *f);
+ void hv_pvg_metal_quiesce(HvPvgMetal *m);
+ size_t hv_pvg_metal_display_state(HvPvgMetal *m, void *out, size_t cap);
+-void hv_pvg_metal_set_display_state(HvPvgMetal *m, const void *in, size_t len);
++int hv_pvg_metal_set_display_state(HvPvgMetal *m, const void *in, size_t len);
+ 
+ #endif
+diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
+index 9073d22..5f44bce 100644
+--- a/devices/pvg_metal.m
++++ b/devices/pvg_metal.m
+@@ -838,15 +838,9 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
+     return made;
+ }
+ 
+-/* A sample of every 64th byte, to tell cheaply whether pixels changed. */
++#include "surface_hash.h"
+ static uint64_t hash_bytes(const uint8_t *from, uint64_t len) {
+-    uint64_t hash = 0xcbf29ce484222325ull;
+-    for (uint64_t i = 0; i + 8 <= len; i += 64) {
+-        uint64_t v;
+-        memcpy(&v, from + i, 8);
+-        hash = (hash ^ v) * 0x100000001b3ull;
+-    }
+-    return hash;
++    return hv_surface_hash(from, len);
+ }
+ 
+ static uint64_t guest_hash(HvObject *s) { return hash_bytes(s->mapped + s->first, s->alloc); }
+@@ -3159,63 +3153,80 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+     }
+ }
+ 
+-typedef struct DisplayState {
+-    uint64_t on_screen;
+-    uint32_t cursor_w, cursor_h, cursor_stride, cursor_shown;
+-    int32_t hot_x, hot_y;
+-} DisplayState;
++#include "display_snapshot.h"
+ 
+ size_t hv_pvg_metal_display_state(HvPvgMetal *m, void *out, size_t cap) {
++    if (!m) return 0;
+     HvReplay *r = (__bridge HvReplay *)m;
+     __block size_t need = 0;
+     dispatch_sync(r->worker, ^{
+         os_unfair_lock_lock(&r->screen_lock);
+-        size_t bits = r->cursor ? (size_t)r->cursor_stride * r->cursor_h : 0;
+-        need = sizeof(DisplayState) + bits;
++        size_t primary = r->cursor ? (size_t)r->cursor_stride * r->cursor_h : 0;
++        size_t secondary = r->link_cursor ? (size_t)r->link_cw * 4 * r->link_ch : 0;
++        need = sizeof(HvDisplaySnapshot) + primary + secondary;
+         if (out && cap >= need) {
+-            DisplayState d = {.on_screen = r->on_screen, .cursor_w = bits ? r->cursor_w : 0, .cursor_h = bits ? r->cursor_h : 0,
+-                              .cursor_stride = bits ? r->cursor_stride : 0, .cursor_shown = r->cursor_shown,
+-                              .hot_x = r->cursor_hot_x, .hot_y = r->cursor_hot_y};
++            HvDisplaySnapshot d = {.version = HV_DISPLAY_SNAPSHOT_VERSION, .ports = 2};
++            d.port[0] = (HvDisplaySnapshotPort){r->on_screen,
++                primary ? r->cursor_w : 0, primary ? r->cursor_h : 0,
++                primary ? r->cursor_stride : 0, r->cursor_shown != 0,
++                r->cursor_hot_x, r->cursor_hot_y};
++            d.port[1] = (HvDisplaySnapshotPort){r->link_mapping,
++                secondary ? r->link_cw : 0, secondary ? r->link_ch : 0,
++                secondary ? r->link_cw * 4 : 0, r->link_cursor_shown != 0,
++                (int32_t)r->link_hx, (int32_t)r->link_hy};
+             memcpy(out, &d, sizeof d);
+-            if (bits) memcpy((uint8_t *)out + sizeof d, r->cursor, bits);
++            uint8_t *pixels = (uint8_t *)out + sizeof d;
++            if (primary) memcpy(pixels, r->cursor, primary);
++            if (secondary) [r->link_cursor getBytes:pixels + primary bytesPerRow:d.port[1].stride
++                fromRegion:MTLRegionMake2D(0, 0, d.port[1].width, d.port[1].height) mipmapLevel:0];
+         }
+         os_unfair_lock_unlock(&r->screen_lock);
+     });
+     return need;
+ }
+ 
+-void hv_pvg_metal_set_display_state(HvPvgMetal *m, const void *in, size_t len) {
+-    if (!m || len < sizeof(DisplayState)) return;
++int hv_pvg_metal_set_display_state(HvPvgMetal *m, const void *in, size_t len) {
++    HvDisplaySnapshot d;
++    size_t bytes[2];
++    if (!m || hv_display_snapshot_parse(in, len, &d, bytes)) return -1;
++    uint8_t *copy = bytes[0] ? malloc(bytes[0]) : NULL;
++    if (bytes[0] && !copy) return -1;
++    const size_t *sizes = bytes;
++    const uint8_t *pixels = (const uint8_t *)in + sizeof d;
++    if (copy) memcpy(copy, pixels, bytes[0]);
+     HvReplay *r = (__bridge HvReplay *)m;
+-    DisplayState d;
+-    memcpy(&d, in, sizeof d);
+-    size_t bits = (size_t)d.cursor_stride * d.cursor_h;
+-    if (len < sizeof d + bits || d.cursor_w > 512 || d.cursor_h > 512 || (bits && d.cursor_stride < d.cursor_w * 4)) bits = 0;
+-    uint8_t *copy = bits ? malloc(bits) : NULL;
+-    if (copy) memcpy(copy, (const uint8_t *)in + sizeof d, bits);
++    __block int failed = 0;
+     dispatch_sync(r->worker, ^{
+         @autoreleasepool {
+-            id<MTLTexture> glyph = nil;
+-            if (copy) {
++            id<MTLTexture> glyphs[2] = {nil, nil};
++            for (unsigned p = 0; p < 2; p++) if (sizes[p]) {
++                const HvDisplaySnapshotPort *port = &d.port[p];
+                 MTLTextureDescriptor *ct = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+-                                                                                              width:d.cursor_w height:d.cursor_h mipmapped:NO];
++                    width:port->width height:port->height mipmapped:NO];
+                 ct.storageMode = MTLStorageModeShared;
+-                glyph = [r->device newTextureWithDescriptor:ct];
+-                [glyph replaceRegion:MTLRegionMake2D(0, 0, d.cursor_w, d.cursor_h) mipmapLevel:0 withBytes:copy bytesPerRow:d.cursor_stride];
++                glyphs[p] = [r->device newTextureWithDescriptor:ct];
++                if (!glyphs[p]) { failed = 1; return; }
++                [glyphs[p] replaceRegion:MTLRegionMake2D(0, 0, port->width, port->height) mipmapLevel:0
++                    withBytes:pixels + (p ? sizes[0] : 0) bytesPerRow:port->stride];
+             }
+             os_unfair_lock_lock(&r->screen_lock);
+-            if (copy) {
+-                free(r->cursor);
+-                r->cursor = copy, r->cursor_w = d.cursor_w, r->cursor_h = d.cursor_h, r->cursor_stride = d.cursor_stride;
+-                r->cursor_hot_x = d.hot_x, r->cursor_hot_y = d.hot_y;
+-                r->cursor_tex = glyph;
+-            }
+-            r->cursor_shown = d.cursor_shown != 0;
++            free(r->cursor);
++            r->cursor = copy;
++            r->cursor_w = d.port[0].width; r->cursor_h = d.port[0].height;
++            r->cursor_stride = d.port[0].stride;
++            r->cursor_hot_x = d.port[0].hot_x; r->cursor_hot_y = d.port[0].hot_y;
++            r->cursor_shown = d.port[0].shown; r->cursor_tex = glyphs[0];
++            r->link_cursor = glyphs[1];
++            r->link_cw = d.port[1].width; r->link_ch = d.port[1].height;
++            r->link_hx = d.port[1].hot_x; r->link_hy = d.port[1].hot_y;
++            r->link_cursor_shown = d.port[1].shown;
+             os_unfair_lock_unlock(&r->screen_lock);
+-            r->on_screen = d.on_screen;
+-            if (d.on_screen) [r present:d.on_screen];
++            r->on_screen = d.port[0].mapping; r->link_mapping = d.port[1].mapping;
++            if (r->on_screen) [r present:r->on_screen];
+             [r drawCursor];
++            /* The transport remains disconnected until its normal new-session handshake. */
+         }
+     });
+-    fprintf(stderr, "hengevm: pvg-metal: screen %llu and a %ux%u pointer restored\n", (unsigned long long)d.on_screen, d.cursor_w, d.cursor_h);
++    if (failed) free(copy);
++    return failed ? -1 : 0;
+ }
+diff --git a/devices/surface_hash.h b/devices/surface_hash.h
+new file mode 100644
+index 0000000..c550603
+--- /dev/null
++++ b/devices/surface_hash.h
+@@ -0,0 +1,21 @@
++#ifndef HENGE_SURFACE_HASH_H
++#define HENGE_SURFACE_HASH_H
++#include <stdint.h>
++#include <string.h>
++/* Full-byte content signature. Independent lanes avoid one serial multiply
++   per word. Unaligned reads and tails are safe; never sample/skip pixels. */
++static uint64_t hv_surface_hash(const uint8_t *p, uint64_t n) {
++    uint64_t a=0xcbf29ce484222325ull, b=0x9e3779b97f4a7c15ull;
++    uint64_t c=0x94d049bb133111ebull, d=0x2545f4914f6cdd1dull;
++    uint64_t left=n;
++    while (left>=32) {
++        uint64_t v[4]; memcpy(v,p,32);
++        a=(a^v[0])*0x100000001b3ull; b=(b^v[1])*0x100000001b3ull;
++        c=(c^v[2])*0x100000001b3ull; d=(d^v[3])*0x100000001b3ull;
++        p+=32; left-=32;
++    }
++    uint64_t h=a ^ (b<<13|b>>51) ^ (c<<29|c>>35) ^ (d<<47|d>>17) ^ n;
++    while (left--) h=(h^*p++)*0x100000001b3ull;
++    return h;
++}
++#endif
+diff --git a/host/snapshot.c b/host/snapshot.c
+index 383ae01..964f501 100644
+--- a/host/snapshot.c
++++ b/host/snapshot.c
+@@ -30,8 +30,20 @@
+ #include "sysreg.h"
+ #include "vm.h"
+ 
++/* Native regression builds inject one allocation failure at a time. Release
++   binaries have neither this hook nor a per-allocation diagnostic branch. */
++#ifdef HV_SNAPSHOT_TESTING
++static int snapshot_fail_after = -1;
++void hv_snapshot_test_fail_after(int n) { snapshot_fail_after = n; }
++static void *snapshot_malloc(size_t n) {
++    if (snapshot_fail_after >= 0 && snapshot_fail_after-- == 0) return NULL;
++    return malloc(n);
++}
++#define malloc snapshot_malloc
++#endif
++
+ #define SNAP_MAGIC "HENGESN1"
+-#define SNAP_VERSION 1
++#define SNAP_VERSION 2
+ #define PAGE 0x4000ull
+ #define CHUNK_PAGES 256u
+ #define CHUNK_BYTES ((uint64_t)CHUNK_PAGES * PAGE)
+@@ -392,6 +404,12 @@ static int chunk_unpack(Slot *s, uint8_t *base, uint64_t size) {
+     uint64_t from = (uint64_t)s->h.index * CHUNK_BYTES;
+     if (from >= size) return -1;
+     uint32_t pages = (uint32_t)((size - from < CHUNK_BYTES ? size - from : CHUNK_BYTES) / PAGE);
++    unsigned marked = 0;
++    for (unsigned i = 0; i < CHUNK_PAGES; i++) if (s->h.bitmap[i / 8] & (1u << (i % 8))) {
++        if (i >= pages) return -1;
++        marked++;
++    }
++    if (marked != s->h.stored || s->h.raw > 1 || (!marked && s->h.bytes)) return -1;
+     size_t raw = (size_t)s->h.stored * PAGE;
+     const uint8_t *src = s->out;
+     if (!s->h.raw) {
+@@ -442,7 +460,7 @@ static int load_ram(R *r, HvRam *ram) {
+         dispatch_group_async(unpacking, q, ^{
+             double t1 = mono();
+             dispatch_apply(n, q, ^(size_t k) {
+-                if (sl[k].h.stored && chunk_unpack(&sl[k], base, size)) bad = 1;
++                if (chunk_unpack(&sl[k], base, size)) bad = 1;
+             });
+             unpacked += mono() - t1;
+         });
+@@ -529,12 +547,16 @@ static void save_devices(W *w, HvVmapple *b) {
+     }
+     size_t pn = hv_pvg_lite_state(b->pvg, NULL, 0);
+     uint8_t *pb = malloc(pn);
++    if (pn && b->pvg && !pb) { w->err = ENOMEM; return; }
+     if (pb && b->pvg) hv_pvg_lite_state(b->pvg, pb, pn);
+     w_section(w, TAG('P', 'V', 'G', 'L'), pb, pb && b->pvg ? pn : 0);
+     free(pb);
+     size_t dn = b->pvg ? hv_pvg_lite_display_state(b->pvg, NULL, 0) : 0;
+     uint8_t *db = dn ? malloc(dn) : NULL;
+-    if (db) hv_pvg_lite_display_state(b->pvg, db, dn);
++    if (dn && !db) { w->err = ENOMEM; return; }
++    if (db && hv_pvg_lite_display_state(b->pvg, db, dn) != dn) {
++        free(db); w->err = EINVAL; return;
++    }
+     w_section(w, TAG('P', 'V', 'G', 'D'), db, db ? dn : 0);
+     free(db);
+ }
+@@ -728,7 +750,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
+     if (!bad) bad = r_raw(&r, &t, sizeof t) || t.tag != TAG('E', 'N', 'D', ' ');
+     free(r.buf);
+     close(fd);
+-    if (!bad && b->pvg && display_len) hv_pvg_lite_set_display_state(b->pvg, display, (size_t)display_len);
++    if (!bad && b->pvg && display_len) bad = hv_pvg_lite_set_display_state(b->pvg, display, (size_t)display_len);
+     free(display);
+     if (bad) return fail(err, errlen, "The saved Mac could not be read (%s).", strerror(r.err ? r.err : EINVAL));
+     /* The guest's clock goes on as far as the wall clock went since it stopped (see hv_vm_resume_counter). */
+diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
+index 34d6a98..f8ac1f1 100644
+--- a/ios/Henge/Native/henge-vm.c
++++ b/ios/Henge/Native/henge-vm.c
+@@ -29,6 +29,8 @@ HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
+ static _Atomic int state;
+ static int exit_reason, exit_outcome;
+ static pthread_rwlock_t api_lock = PTHREAD_RWLOCK_INITIALIZER;
++/* A save reads VM memory, but two writers must not share .part or compression state. */
++static pthread_mutex_t snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
+ static _Atomic uint64_t generation;
+ static int installer_session;
+ static uint64_t stopped_blocks, stopped_tx, stopped_rx;
+@@ -140,14 +142,17 @@ int henge_vm_pause(char *err, size_t errlen) {
+ }
+ 
+ int henge_vm_save(const char *path, const char *ident, char *err, size_t errlen) {
++    pthread_mutex_lock(&snapshot_lock);
+     pthread_rwlock_rdlock(&api_lock);
+     if (state != 4) {
+         pthread_rwlock_unlock(&api_lock);
++        pthread_mutex_unlock(&snapshot_lock);
+         snprintf(err, errlen, "The Mac is not paused.");
+         return -1;
+     }
+     int r = hv_snapshot_save(path, ident, err, errlen);
+     pthread_rwlock_unlock(&api_lock);
++    pthread_mutex_unlock(&snapshot_lock);
+     fprintf(stderr, "henge: %s\n", r ? err : "the paused Mac is saved");
+     return r;
+ }
+diff --git a/tests/benchmark_surface_hash.py b/tests/benchmark_surface_hash.py
+new file mode 100644
+index 0000000..eef5d30
+--- /dev/null
++++ b/tests/benchmark_surface_hash.py
+@@ -0,0 +1,28 @@
++"""Report full-content scan cost; this is bandwidth work, not an energy measurement."""
++from pathlib import Path
++import subprocess, tempfile
++root=Path(__file__).resolve().parents[1]
++source=r'''
++#define _POSIX_C_SOURCE 200809L
++#include "surface_hash.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
++static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
++__attribute__((noinline)) static uint64_t scan(const uint8_t *p, size_t n) { return hv_surface_hash(p,n); }
++int main(void) {
++ for (unsigned mb=1;mb<=64;mb*=4) {
++  size_t n=(size_t)mb<<20; uint8_t *p=calloc(1,n); if(!p)return 1;
++  uint64_t sum=0; double begin=now(); unsigned repeats=256/mb;
++  for(unsigned i=0;i<repeats;i++){ p[i%n]^=1; sum^=scan(p,n); }
++  double seconds=now()-begin;
++  printf("full-surface-hash: size=%uMiB ms/scan=%.3f GiB/s=%.3f signature=%llx\n",
++   mb,seconds*1000/repeats,(double)n*repeats/seconds/(1ull<<30),(unsigned long long)sum);
++  free(p);
++ }
++ return 0;
++}'''
++with tempfile.TemporaryDirectory() as tmp:
++ c=Path(tmp)/'bench.c';c.write_text(source);exe=Path(tmp)/'bench'
++ subprocess.run(['cc','-O3','-Wall','-Wextra','-Werror','-I'+str(root/'devices'),str(c),'-o',str(exe)],check=True)
++ subprocess.run([str(exe)],check=True)
+diff --git a/tests/test_display_snapshot.py b/tests/test_display_snapshot.py
+new file mode 100644
+index 0000000..7b09ed0
+--- /dev/null
++++ b/tests/test_display_snapshot.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python3
++"""Production parser fuzz/bounds checks under address and undefined sanitizers."""
++import pathlib, subprocess, tempfile
++root = pathlib.Path(__file__).resolve().parents[1]
++source = r'''#include "display_snapshot.h"
++#include <assert.h>
++#include <stdlib.h>
++int main(void) {
++    unsigned char data[sizeof(HvDisplaySnapshot) + 128] = {0};
++    HvDisplaySnapshot d = {.version=HV_DISPLAY_SNAPSHOT_VERSION,.ports=2}, out;
++    size_t bytes[2];
++    memcpy(data, &d, sizeof d);
++    assert(!hv_display_snapshot_parse(data, sizeof d, &out, bytes));
++    for (size_t n=0;n<sizeof d;n++) assert(hv_display_snapshot_parse(data,n,&out,bytes));
++    d.port[0]=(HvDisplaySnapshotPort){.width=4,.height=4,.stride=16};
++    d.port[1]=d.port[0]; memcpy(data,&d,sizeof d);
++    assert(!hv_display_snapshot_parse(data,sizeof data,&out,bytes));
++    for (size_t i=0;i<sizeof d;i++) {
++        unsigned char saved=data[i];
++        for (unsigned value=0;value<256;value++) {
++            data[i]=value;
++            for (size_t n=0;n<=sizeof data;n++)
++                (void)hv_display_snapshot_parse(data,n,&out,bytes);
++        }
++        data[i]=saved;
++    }
++    d.port[1].stride=UINT32_MAX; memcpy(data,&d,sizeof d);
++    assert(hv_display_snapshot_parse(data,sizeof data,&out,bytes));
++    return 0;
++}'''
++with tempfile.TemporaryDirectory() as tmp:
++    c=pathlib.Path(tmp)/'parser.c'; c.write_text(source)
++    binary=pathlib.Path(tmp)/'parser'
++    subprocess.run(['cc','-O1','-g','-fsanitize=address,undefined','-Wall','-Wextra','-Werror',
++                    '-I'+str(root/'devices'),str(c),'-o',str(binary)],check=True)
++    subprocess.run([str(binary)],check=True)
++print('Display snapshot parser: two ports, all header mutations and truncations passed ASan/UBSan')
+diff --git a/tests/test_pvg_lifecycle.m b/tests/test_pvg_lifecycle.m
+index 81cdb83..6dc9cba 100644
+--- a/tests/test_pvg_lifecycle.m
++++ b/tests/test_pvg_lifecycle.m
+@@ -1,6 +1,8 @@
+ #import <Foundation/Foundation.h>
+ #import <QuartzCore/CAMetalLayer.h>
+ #include "pvg_lite.h"
++#include "display_snapshot.h"
++#include <string.h>
+ #include "vmapple.h"
+ #include <stdlib.h>
+ #include <unistd.h>
+@@ -27,12 +29,39 @@ int main(void) {
+             cmd[0] = 0x43; cmd[1] = 24; cmd[2] = i + 1;
+             hv_pvg_metal_submit(metal, board.pvg, 0, cmd, 24);
+         }
++        hv_pvg_metal_quiesce(metal);
++        /* Restore distinct glyphs on both ports through the production serializer.
++           Readback exercises real Metal textures, including the secondary glyph. */
++        size_t size = sizeof(HvDisplaySnapshot) + 2 * 64;
++        uint8_t *saved = calloc(1, size), *readback = calloc(1, size);
++        if (!saved || !readback) return 1;
++        HvDisplaySnapshot *state = (HvDisplaySnapshot *)saved;
++        state->version = HV_DISPLAY_SNAPSHOT_VERSION; state->ports = 2;
++        for (unsigned port = 0; port < 2; port++) {
++            state->port[port] = (HvDisplaySnapshotPort){.width=4,.height=4,.stride=16,
++                .shown=1,.hot_x=(int)port,.hot_y=2};
++            memset(saved + sizeof *state + port * 64, 0x35 + port, 64);
++        }
++        if (hv_pvg_metal_set_display_state(metal, saved, size) ||
++            hv_pvg_metal_display_state(metal, readback, size) != size || memcmp(saved, readback, size)) {
++            fprintf(stderr, "Two-display glyph roundtrip failed\n"); return 1;
++        }
++        state->port[1].stride = UINT32_MAX;
++        if (!hv_pvg_metal_set_display_state(metal, saved, size) ||
++            !hv_pvg_metal_set_display_state(metal, readback, size - 1)) return 1;
++        /* Invalid input must leave the live renderer untouched. */
++        state->port[1].stride = 16;
++        if (hv_pvg_metal_display_state(metal, saved, size) != size || memcmp(saved, readback, size)) return 1;
++        HvDisplaySnapshot empty = {.version=HV_DISPLAY_SNAPSHOT_VERSION,.ports=2};
++        if (hv_pvg_metal_set_display_state(metal, &empty, sizeof empty) ||
++            hv_pvg_metal_display_state(metal, NULL, 0) != sizeof empty) return 1;
++        free(saved); free(readback);
+         hv_pvg_metal_cursor_moved(metal);
+         hv_pvg_metal_set_layer(metal, NULL);
+         hv_pvg_metal_destroy(metal);
+         hv_vmapple_destroy(&board);
+         hv_machine_free(&machine);
+     }
+-    puts("Metal lifecycle: 6 cycles, 384 GPU completions drained");
++    puts("Metal lifecycle: 6 cycles, 384 GPU completions drained; both display glyphs restored, malformed input rejected, stale glyphs cleared");
+     return 0;
+ }
+diff --git a/tests/test_surface_hash_limit.py b/tests/test_surface_hash_limit.py
+index 01aead4..b1daca1 100644
+--- a/tests/test_surface_hash_limit.py
++++ b/tests/test_surface_hash_limit.py
+@@ -1,22 +1,23 @@
+-"""Reproduce an inherited sampled-hash limitation; this is not a rendering correctness pass."""
++"""Regression for formerly invisible pixel/tail changes; production full hash."""
+ from pathlib import Path
+ import subprocess
+-r=Path(__file__).resolve().parents[1];s=(r/'devices/pvg_metal.m').read_text();a=s.index('static uint64_t guest_hash(');i=s.index('{',a)+1;depth=1
+-while depth:
+- if s[i]=='{':depth+=1
+- if s[i]=='}':depth-=1
+- i+=1
+-a0=s.index('static uint64_t hash_bytes(');b0=s.index('static uint64_t guest_hash(',a0)
+-source='''#include <stdint.h>
+-#include <string.h>
+-#include <stdio.h>
++r=Path(__file__).resolve().parents[1]; b=r/'build'; b.mkdir(exist_ok=True)
++p=b/'test_surface_hash.c'
++p.write_text(r'''
++#include "surface_hash.h"
+ #include <assert.h>
+-typedef struct HvObject {uint8_t *mapped;uint64_t first,alloc;} HvObject;
+-'''+s[a0:b0]+s[a:i]+'''
+-int main(void){uint8_t bytes[128]={0},snapshot[128]={0};HvObject s={bytes,0,sizeof bytes};uint64_t before=guest_hash(&s);
+- bytes[9]=1;assert(memcmp(bytes,snapshot,sizeof bytes)!=0);assert(guest_hash(&s)==before);
+- puts("KNOWN INHERITED LIMITATION: an unsampled-byte pixel change is missed by guest_hash; sampled equality is not pixel identity. Dirty tracking remains unresolved.");}
+-'''
+-b=r/'build';b.mkdir(exist_ok=True);p=b/'test_surface_hash_limit.c';p.write_text(source)
+-subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror',str(p),'-o',str(b/'test_surface_hash_limit')],check=True)
+-subprocess.run([str(b/'test_surface_hash_limit')],check=True)
++#include <stdio.h>
++#include <stdlib.h>
++int main(void) {
++ uint8_t *p=calloc(1,65536+8);assert(p);
++ for(unsigned off=0;off<8;off++)for(unsigned n=0;n<260;n++) {
++  uint64_t before=hv_surface_hash(p+off,n);
++  for(unsigned i=0;i<n;i++) {p[off+i]=1;assert(hv_surface_hash(p+off,n)!=before);p[off+i]=0;}
++ }
++ uint64_t before=hv_surface_hash(p,65536);
++ for(unsigned i=0;i<65536;i+=17){p[i]=0x80;assert(hv_surface_hash(p,65536)!=before);p[i]=0;}
++ free(p);puts("Full surface hash: every byte/tail/alignment mutation detected; former byte9 regression fixed");
++}
++''')
++subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
++subprocess.run([str(b/'test_surface_hash')],check=True)
+diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
+index a13a70d..d023f82 100644
+--- a/tests/test_vm_lifecycle.c
++++ b/tests/test_vm_lifecycle.c
+@@ -12,9 +12,11 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <sys/stat.h>
+ 
+ /* Real native bridge and device workers; only the debugger allocation and
+    unused installer entry point are replaced. No Apple ROM or disk needed. */
++extern void hv_snapshot_test_fail_after(int n);
+ static HvJitRegion jit;
+ static HengeDualMapping mapping;
+ static int failures;
+@@ -77,7 +79,7 @@ static void *read_ui(void *unused) {
+     return NULL;
+ }
+ int main(void) {
+-    alarm(60);
++    alarm(120);
+     char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
+     if (!mkdtemp(dir) || hv_jit_region_open(&jit, 8 << 20)) return 1;
+     snprintf(rom, sizeof rom, "%s/rom", dir);
+@@ -169,6 +171,7 @@ int main(void) {
+         for (int n = 0; n < 1000 && *count == c1; n++) usleep(1000);
+         check("continued: the counter moves", *count > c1);
+         rc = henge_vm_suspend(snap, "test", error, sizeof error);
++        if (rc || henge_vm_state() != 4 || !hv_vm_board()->ram) return 1;
+         uint64_t c2 = *count;
+         check("second suspend saves", rc == 0 && c2 > c1);
+         henge_vm_stop();
+@@ -183,12 +186,14 @@ int main(void) {
+         rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
+         usleep(30000);
+         rc |= henge_vm_suspend(snap, "test", error, sizeof error);
++        if (rc || henge_vm_state() != 4 || !hv_vm_board()->ram) return 1;
+         c2 = *(volatile uint64_t *)hv_vm_board()->ram;
+         henge_vm_stop();
+         rc |= henge_vm_resume(rom, disk, aux, 1, 0, 64, 2, snap, "test", error, sizeof error);
+         if (rc) fprintf(stderr, "resume: %s\n", error);
+         check("resume starts the saved Mac", rc == 0 && henge_vm_state() == 1);
+         check("the file is used once", access(snap, F_OK) != 0);
++        if (rc || henge_vm_state() != 1 || !hv_vm_board()->ram) return 1;
+         count = (volatile uint64_t *)hv_vm_board()->ram;
+         check("resumed: the counter is where it was", *count >= c2);
+         for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
+@@ -209,6 +214,50 @@ int main(void) {
+         check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
+         check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
+         unlink(snap);
++        /* Repeat real pause/continue without depending on a timing sleep to enter
++           pause; the API itself waits for CPU, disk and graphics quiescence. */
++        if (henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error)) return 1;
++        for (int cycle = 0; cycle < 8; cycle++) {
++            if (henge_vm_suspend(snap, "test", error, sizeof error) || henge_vm_state() != 4) return 1;
++            volatile uint64_t *paused_count = (volatile uint64_t *)hv_vm_board()->ram;
++            uint64_t value = *paused_count;
++            for (int n = 0; n < 10000; n++) if (*paused_count != value) return 1;
++            check("repeated snapshot valid", henge_vm_saved_ok(snap, "test", NULL, NULL) == 0);
++            if (henge_vm_continue()) return 1;
++        }
++        /* A real filesystem failure must preserve an existing good snapshot and
++           leave the machine paused and resumable. No fake successful save. */
++        char blocked[320]; snprintf(blocked, sizeof blocked, "%s.part", snap);
++        unlink(blocked);
++        if (mkdir(blocked, 0700)) return 1;
++        rc = henge_vm_suspend(snap, "test", error, sizeof error);
++        check("failed suspend reports error and resumes", rc != 0 && henge_vm_state() == 1);
++        check("failed replacement preserves prior save", henge_vm_saved_ok(snap, "test", NULL, NULL) == 0);
++        rmdir(blocked);
++        check("running after failed save", henge_vm_state() == 1);
++        if (henge_vm_suspend(snap, "test", error, sizeof error)) return 1;
++        for (int allocation = 0; allocation < 7; allocation++) {
++            hv_snapshot_test_fail_after(allocation);
++            rc = henge_vm_save(snap, "test", error, sizeof error);
++            hv_snapshot_test_fail_after(-1);
++            check("allocation failure reported and stays paused", rc != 0 && henge_vm_state() == 4);
++            check("allocation failure preserves good save", henge_vm_saved_ok(snap, "test", NULL, NULL) == 0);
++            check("allocation failure removes partial save", access(blocked, F_OK) != 0);
++        }
++        if (henge_vm_continue() || henge_vm_suspend(snap, "test", error, sizeof error)) return 1;
++        henge_vm_stop();
++        /* Truncation and old schema must be rejected before starting CPUs. */
++        int sf = open(snap, O_RDWR); uint32_t old = 1;
++        if (sf < 0 || pwrite(sf, &old, sizeof old, 8) != sizeof old) return 1;
++        close(sf);
++        check("old snapshot schema rejected", henge_vm_saved_ok(snap, "test", NULL, NULL) != 0);
++        rc = henge_vm_resume(rom, disk, aux, 1, 0, 64, 2, snap, "test", error, sizeof error);
++        check("old schema leaves cold boot available", rc != 0 && henge_vm_can_start());
++        write_file(snap, "HENGESN1", 8);
++        check("truncated save rejected", henge_vm_saved_ok(snap, "test", NULL, NULL) != 0);
++        rc = henge_vm_resume(rom, disk, aux, 1, 0, 64, 2, snap, "test", error, sizeof error);
++        check("truncation leaves cold boot available", rc != 0 && henge_vm_can_start());
++        unlink(snap);
+     }
+     hv_vm_destroy();
+     atomic_store(&reader_done, 1);
+diff --git a/tools/link/check.sh b/tools/link/check.sh
+index c88ebe4..e1bd426 100755
+--- a/tools/link/check.sh
++++ b/tools/link/check.sh
+@@ -7,6 +7,7 @@ build/link/test_pvg_display
+ make build/pvg_lite.o build/pvg_metal.o
+ python3 tests/test_surface_sync.py
+ python3 tests/test_surface_hash_limit.py
++python3 tests/test_display_snapshot.py
+ xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -Idevices tests/test_planar_registry.m -framework Foundation -framework IOSurface -framework Metal -o build/link/test_planar_registry
+ build/link/test_planar_registry
+ cc -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined -Idevices -Icore -Ihost tests/test_pvg_ports.c -framework CoreFoundation -Wl,-dead_strip -o build/link/test_pvg_ports

@@ -73,6 +73,14 @@ for entry in "${pins[@]:2}"; do
   echo "::endgroup::"
 done
 python3 "$root/build-request/henge-build/reconcile-source.py" "$source_dir"
+python3 - "$root/build-request/henge-build/audit-repairs.patch" "$manifest" "$source_dir" <<'PYREPAIR'
+import hashlib, json, subprocess, sys
+from pathlib import Path
+patch=Path(sys.argv[1]); manifest=json.loads(Path(sys.argv[2]).read_text())
+assert hashlib.sha256(patch.read_bytes()).hexdigest() == manifest['audit_repairs_sha256'], 'Unreviewed audit repair patch'
+subprocess.run(['git','-C',sys.argv[3],'apply','--check',str(patch)],check=True)
+subprocess.run(['git','-C',sys.argv[3],'apply',str(patch)],check=True)
+PYREPAIR
 python3 - "$source_dir/ios/Henge/Info.plist" "$manifest" <<'PY'
 import json, plistlib, sys
 from pathlib import Path
