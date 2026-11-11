@@ -125,6 +125,17 @@ start=t.index("int hv_vm_start(int cpu0, void (*on_exit)(int reason))")
 end=t.find("\nfailed:",start)
 if start<0 or end<0: raise SystemExit("Unexpected VM start function layout")
 start_fn=t[start:end]
+# The upstream VM's CPU0 owner flag was lost because the fork inserted
+# its scheduler policy in the same merge hunk as the new upstream assignment.
+# Without this, "Continue" restarts with cpu0=0, leaving the resumed Mac idle,
+# and the next Suspend waits forever for a CPU0 thread that does not exist.
+if "cpu0_ours = cpu0;" not in start_fn:
+    t=replace_once(t,"    exit_cb = on_exit;\n",
+        "    exit_cb = on_exit;\n    cpu0_ours = cpu0;\n",
+        "retain CPU0 thread ownership across suspend/continue")
+    start_fn=t[start:t.find("\nfailed:",start)]
+if start_fn.count("cpu0_ours = cpu0;")!=1:
+    raise SystemExit("Missing or duplicated CPU0 ownership assignment in merged VM")
 if "run_ended = 0;" not in start_fn:
     t=replace_once(t, "    exit_cb = on_exit;\n",
                    "    exit_cb = on_exit;\n    pthread_mutex_lock(&pause_mu);\n    run_ended = 0;\n    pthread_mutex_unlock(&pause_mu);\n",
