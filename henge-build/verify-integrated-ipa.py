@@ -4,8 +4,11 @@ import hashlib
 import json
 import os
 import plistlib
+import subprocess
 import zipfile
 from pathlib import Path
+latest=subprocess.check_output(["git","-C","build-request","ls-remote","origin","refs/heads/feature/duo-efficiency"],text=True).split()[0]
+assert latest==os.environ["GITHUB_SHA"], "Superseded source must not publish a release artifact"
 manifest=json.loads(Path("build-request/henge-build/manifest.json").read_text())
 integration=manifest["upstream_integration"]
 ipa=Path(os.environ["HENGE_IPA_OUTPUT"])

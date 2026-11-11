@@ -660,10 +660,20 @@ index 383ae01..5b32be2 100644
      if (bad) return fail(err, errlen, "The saved Mac could not be read (%s).", strerror(r.err ? r.err : EINVAL));
      /* The guest's clock goes on as far as the wall clock went since it stopped (see hv_vm_resume_counter). */
 diff --git a/host/vm.c b/host/vm.c
-index db95c05..d934106 100644
+index db95c05..1f1bc3d 100644
 --- a/host/vm.c
 +++ b/host/vm.c
-@@ -398,7 +398,12 @@ void hv_vm_prepare_cpu_thread(void) {
+@@ -386,7 +386,8 @@ static pthread_key_t signal_stack_key;
+ static pthread_once_t signal_stack_once = PTHREAD_ONCE_INIT;
+ static int signal_stack_key_ready;
+ static void release_signal_stack(void *p) {
+-    stack_t disabled = {.ss_flags = SS_DISABLE};
++    /* Darwin's wrapper still validates stack size on SS_DISABLE. */
++    stack_t disabled = {.ss_sp = p, .ss_size = 1u << 16, .ss_flags = SS_DISABLE};
+     if (sigaltstack(&disabled, NULL) == 0) free(p);
+ }
+ static void make_signal_stack_key(void) {
+@@ -398,7 +399,12 @@ void hv_vm_prepare_cpu_thread(void) {
      static __thread int done;
      if (done) return;
      done = 1;
@@ -677,7 +687,7 @@ index db95c05..d934106 100644
      if (ss.ss_sp) {
          if (sigaltstack(&ss, NULL) != 0) free(ss.ss_sp);
          else {
-@@ -512,12 +517,13 @@ int hv_vm_finish_pause(void) {
+@@ -512,12 +518,13 @@ int hv_vm_finish_pause(void) {
      hv_virtio_blk_stop(board.root_blk);
      hv_virtio_blk_stop(board.aux_blk);
      /* hv_vm_run_cpu0 already detached board.snd under the device lock. */
@@ -693,7 +703,7 @@ index db95c05..d934106 100644
      hv_vm_flush_disks();
      set_pause_state(2);
      return 0;
-@@ -702,9 +708,13 @@ static void stop_pointer(void) {
+@@ -702,9 +709,13 @@ static void stop_pointer(void) {
              hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);
              hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
          }
@@ -963,7 +973,7 @@ index 01aead4..b1daca1 100644
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..6747e68 100644
+index a13a70d..abf4e0c 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
 @@ -12,9 +12,13 @@
@@ -1001,7 +1011,7 @@ index a13a70d..6747e68 100644
 +    if (bad) fprintf(stderr, "signal stack changed: before=%p/%zu flags=%x after=%p/%zu flags=%x\n",
 +                     before.ss_sp, before.ss_size, before.ss_flags, after.ss_sp, after.ss_size, after.ss_flags);
 +    if (owned) {
-+        stack_t disabled = {.ss_flags=SS_DISABLE};
++        stack_t disabled = {.ss_sp=owned,.ss_size=65536,.ss_flags=SS_DISABLE};
 +        if (sigaltstack(&disabled, NULL)) { perror("disable foreign signal stack"); bad = 15; }
 +        else if (munmap(owned, 65536)) { perror("unmap foreign signal stack"); bad = 16; }
 +    }
