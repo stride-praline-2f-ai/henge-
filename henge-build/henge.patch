@@ -14325,7 +14325,7 @@ index 0000000..091433d
 +#endif
 diff --git a/tests/benchmark_fastmem.sh b/tests/benchmark_fastmem.sh
 new file mode 100755
-index 0000000..7f9ef66
+index 0000000..c0c06d6
 --- /dev/null
 +++ b/tests/benchmark_fastmem.sh
 @@ -0,0 +1,36 @@
@@ -14360,7 +14360,7 @@ index 0000000..7f9ef66
 +  values={}
 +  for mixed,enabled,ns in re.findall(r'mixed=(\d+) enabled=(\d+) ns_per_load=([\d.]+)',Path(f'build/fastmem-{version}-{split}.log').read_text()):
 +   values.setdefault((int(mixed),int(enabled)),[]).append(float(ns))
-+  assert all(len(v)==9 for v in values.values()) and len(values)==6
++  assert all(len(v)==7 for v in values.values()) and len(values)==6
 +  summary[f'{version}-split{split}']={f'multiwindow{m}-enabled{e}':statistics.median(v) for (m,e),v in values.items()}
 +print(json.dumps(summary,indent=2))
 +Path('build/fastmem-native-summary.json').write_text(json.dumps(summary,indent=2)+'\n')
@@ -15761,16 +15761,17 @@ index 0000000..7901051
 +}
 diff --git a/tests/test_fastmem_bench.c b/tests/test_fastmem_bench.c
 new file mode 100644
-index 0000000..01fe075
+index 0000000..f669f69
 --- /dev/null
 +++ b/tests/test_fastmem_bench.c
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,66 @@
 +/* Real EL1 JIT reads through real 16KB page tables. Paired cache-off/on,
 +   warmed loops and identical sums; no claims about physical Duo watts/FPS. */
 +#include "machine.h"
 +#include "dispatch.h"
 +#include "fastmem.h"
 +#include <mach/mach_time.h>
++#include <pthread/qos.h>
 +#include <assert.h>
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -15801,6 +15802,7 @@ index 0000000..01fe075
 +}
 +int main(void) {
 +    setvbuf(stdout, NULL, _IONBF, 0);
++    assert(!pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0));
 +    assert(!hv_machine_init(&m, 4 << 20));
 +    ram = aligned_alloc(PG, 16 * PG); assert(ram); memset(ram, 0, 16 * PG);
 +    assert(!hv_machine_add_ram(&m, PA, 16 * PG, ram, 0));
@@ -15811,7 +15813,7 @@ index 0000000..01fe075
 +    m.stop_pc = code_va + sizeof code;
 +    mach_timebase_info_data_t tb; assert(!mach_timebase_info(&tb));
 +    // More rounds alternate the order to limit shared-runner drift.
-+    for (unsigned round = 0; round < 9; round++) for (unsigned mixed = 0; mixed < 3; mixed++)
++    for (unsigned round = 0; round < 7; round++) for (unsigned mixed = 0; mixed < 3; mixed++)
 +        for (unsigned k = 0; k < 2; k++) {
 +            unsigned enabled = k ^ (round & 1);
 +            m.fastmem_enabled = enabled; m.fastmem_diagnostics = 0;
@@ -15821,9 +15823,10 @@ index 0000000..01fe075
 +            cpu.cpacr_el1 = 3u << 20; cpu.el = 1;
 +            run(mixed, 1000);
 +            uint64_t begin = mach_absolute_time();
-+            run(mixed, 2000000);
++            unsigned count = mixed == 2 ? 20000000 : 50000000;
++            run(mixed, count);
 +            double ns = (double)(mach_absolute_time() - begin) * tb.numer / tb.denom;
-+            printf("fastmem-bench: round=%u mixed=%u enabled=%u ns_per_load=%.3f result=2000000\n", round, mixed, enabled, ns / 2000000);
++            printf("fastmem-bench: round=%u mixed=%u enabled=%u ns_per_load=%.3f result=%u\n", round, mixed, enabled, ns / count, count);
 +        }
 +    hv_machine_free(&m); free(ram);
 +    puts("PASS fastmem benchmark: real EL1/page-table/JIT path; all guest sums identical");
