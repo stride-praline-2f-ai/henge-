@@ -1447,10 +1447,10 @@ index 0000000..7c5b2e2
 +are not evidence of physical-device energy improvement.
 diff --git a/docs/runner-mode.md b/docs/runner-mode.md
 new file mode 100644
-index 0000000..bfafe0f
+index 0000000..4f7f433
 --- /dev/null
 +++ b/docs/runner-mode.md
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,86 @@
 +# GitHub Runner mode
 +
 +The Runner tab starts/resumes a selected macOS VM and asks the **existing Mac
@@ -1485,7 +1485,9 @@ index 0000000..bfafe0f
 +revision, bounded guest HTTP mailbox, cancellation path and status heartbeat.
 +Old-session status reports cannot update a new session. No second launchd
 +daemon or repeating Swift timer is introduced. Errors stop startup instead of
-+looping downloads/registration. Guest `_diag` logs contain detailed failures.
++looping downloads/registration. Guest `_diag` logs contain detailed failures. A configured runner with damaged
++binaries is preserved and reported for explicit recovery instead of overwriting
++its credentials.
 +
 +While the dashboard is visible, Henge detaches the **local presentation layer**.
 +The existing renderer retains its current surface; showing the desktop
@@ -1504,7 +1506,11 @@ index 0000000..bfafe0f
 +optional Instant Resume save. CPU/GPU quiescence uses the existing serial
 +pause/save/continue owner. Returning to Henge resumes through that same queue.
 +The boot RAM value is now assigned so an enabled background snapshot is actually
-+eligible to save.
++eligible to save. Startup now selects the real native restore path for a valid
++saved Mac, rather than always cold-booting. Invalid build/settings saves are
++rejected with explicit discard-and-start recovery. Snapshot identity and restore
++use the actual saved display dimensions, preserving them across a fold/window
++change.
 +
 +The normal/personal signing entitlements are preserved. The user's logs show no
 +signed continued-processing GPU entitlement. **This ordinary IPA therefore
@@ -2402,11 +2408,68 @@ index 037685f..d91a56f 100644
          log("boot", "Link protocol: 2, decoder-consumption credit window=3; local discovery and opt-in Keychain pairing; three-finger viewer controls; update both devices")
          log("boot", "cache lifecycle: JIT translations and kernel read lookups are RAM-only; no cross-launch executable cache")
          if let source = info["HengeCustomSourceCommit"] as? String {
+diff --git a/ios/Henge/Info.plist b/ios/Henge/Info.plist
+index e029f7d..5265296 100644
+--- a/ios/Henge/Info.plist
++++ b/ios/Henge/Info.plist
+@@ -24,7 +24,7 @@
+ 	<key>CFBundlePackageType</key>
+ 	<string>APPL</string>
+ 	<key>CFBundleShortVersionString</key>
+-	<string>0.3.0</string>
++	<string>0.3.1</string>
+ 	<key>CFBundleURLTypes</key>
+ 	<array>
+ 		<dict>
+@@ -37,7 +37,7 @@
+ 		</dict>
+ 	</array>
+ 	<key>CFBundleVersion</key>
+-	<string>101</string>
++	<string>102</string>
+ 	<key>HengeIntegratedPullRequestHeads</key>
+ 	<array>
+ 		<string>6d17b5a4f1078c544850c840e9afbbffc031d03d</string>
 diff --git a/ios/Henge/InstantResume.swift b/ios/Henge/InstantResume.swift
-index 8b4bf3b..8476e76 100644
+index 8b4bf3b..bae95c5 100644
 --- a/ios/Henge/InstantResume.swift
 +++ b/ios/Henge/InstantResume.swift
-@@ -44,8 +44,8 @@ enum InstantResume {
+@@ -23,7 +23,7 @@ enum InstantResume {
+         let commit = info["HengeBuildCommit"] as? String ?? "unstamped"
+         let stamp = info["HengeBuildDate"] as? String ?? "?"
+         return "Henge \(version) (\(build)) \(commit) \(stamp) mac \(mac.id.uuidString) ram \(ramMB) cpus \(cpus) "
+-            + "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina)"
++            + "screen \(mac.screenWidth ?? 1920)x\(mac.screenHeight ?? 1080) retina \(mac.isRetina)"
+     }
+ 
+     /// A whole saved Mac for these settings, and when it was saved.
+@@ -36,6 +36,25 @@ enum InstantResume {
+     /// Whether a file is there at all (the Home screen's hint; the start checks it properly).
+     static func hasSave(for mac: VirtualMac) -> Bool { FileManager.default.fileExists(atPath: file(for: mac).path) }
+ 
++    /// One launch decision for desktop and Runner mode. A save must never be
++    /// silently ignored by calling cold boot, nor discarded just because its
++    /// build/settings no longer match. The UI offers explicit recovery.
++    static func start(_ mac: VirtualMac, ramMB: UInt64, cpus: Int, error: UnsafeMutablePointer<CChar>, capacity: Int) -> Int32 {
++        if enabled && hasSave(for: mac) {
++            guard saved(for: mac, ramMB: ramMB, cpus: cpus) != nil else {
++                let message = Array("The saved Mac does not match this Henge build or its settings. Discard the saved state to start fresh; your Mac’s disk is kept.".utf8CString)
++                if capacity > 0 {
++                    for i in 0..<min(message.count - 1, capacity - 1) { error[i] = message[i] }
++                    error[min(message.count - 1, capacity - 1)] = 0
++                }
++                return -1
++            }
++            return henge_vm_resume(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ramMB, Int32(cpus),
++                                   file(for: mac).path, ident(for: mac, ramMB: ramMB, cpus: cpus), error, capacity)
++        }
++        return henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ramMB, Int32(cpus), error, capacity)
++    }
++
+     /// The file, and a half-written one from a save iOS cut short (the engine writes beside it, then renames).
+     static func discard(for mac: VirtualMac) {
+         try? FileManager.default.removeItem(at: file(for: mac))
+@@ -44,8 +63,8 @@ enum InstantResume {
  
      /// Henge stopped being active (the app switcher, a call, Control Center, going home): stop the Mac where it is
      /// while the GPU is still Henge's, so what only the GPU holds goes back into the Mac's memory.
@@ -3071,7 +3134,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..7fddfd0 100644
+index f84465e..3ce246a 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,8 @@ struct SessionView: View {
@@ -3083,7 +3146,28 @@ index f84465e..7fddfd0 100644
      @State private var error: String?
      @State private var state: Int32 = 0
      @State private var bootAttempt = 0
-@@ -195,7 +197,7 @@ struct SessionView: View {
+@@ -45,6 +47,8 @@ struct SessionView: View {
+     @AppStorage("henge.tips.stillWallpaperShown") private var stillWallpaperTipShown = false
+     @State private var showWallpaperTip = false
+     @State private var confirmStop = false
++    @State private var confirmDiscardSave = false
++    @State private var bootMac: VirtualMac?
+     @State private var zoomCentre = CGPoint(x: 0.5, y: 0.5) // where the zoomed view is, 0...1 of the Mac's screen
+     @State private var map: UIImage?
+     @State private var zoomFollowing: Task<Void, Never>?
+@@ -190,12 +194,19 @@ struct SessionView: View {
+         } message: {
+             Text("This turns the Mac off at once. Anything not saved on it is lost.")
+         }
++        .confirmationDialog("Discard saved Mac state?", isPresented: $confirmDiscardSave, titleVisibility: .visible) {
++            Button("Discard State and Start Fresh", role: .destructive) {
++                InstantResume.discard(for: mac); bootAttempt += 1
++            }
++        } message: {
++            Text("This loses unsaved work in the saved memory. The Mac’s disk is kept.")
++        }
+         .onChange(of: zoomed) { on in
+             zoomFollowing?.cancel()
              zoomFollowing = on ? Task { await followPointer() } : nil
          }
          .onChange(of: display.isExternal) { _, external in
@@ -3092,7 +3176,7 @@ index f84465e..7fddfd0 100644
          }
          .onChange(of: nativeTouch.requested) { _, _ in nativeTouch.changedRequest() }
          .onChange(of: pointerNeeded) { needed in
-@@ -208,14 +210,44 @@ struct SessionView: View {
+@@ -208,14 +219,44 @@ struct SessionView: View {
              guard phase != .active else {
                  display.refresh()
                  InstantResume.cameBack(mac)
@@ -3109,7 +3193,7 @@ index f84465e..7fddfd0 100644
 +                if phase == .inactive { InstantResume.pause(force: runner.active) }
 +                if phase == .background {
 +                    InstantResume.pause(force: runner.active)
-+                    if bootRAM > 0 { InstantResume.suspend(mac, ramMB: bootRAM, cpus: cpus) }
++                    if bootRAM > 0 { InstantResume.suspend(bootMac ?? mac, ramMB: bootRAM, cpus: cpus) }
 +                }
 +            }
 +        }
@@ -3139,7 +3223,7 @@ index f84465e..7fddfd0 100644
          }
          .onChange(of: showDetails) { showing in
              if showing {
-@@ -256,7 +288,7 @@ struct SessionView: View {
+@@ -256,7 +297,7 @@ struct SessionView: View {
      }
  
      /// When there is something of the app's to point at, iPadOS gets its own pointer back.
@@ -3148,7 +3232,7 @@ index f84465e..7fddfd0 100644
  
      // A fold/rotation after boot must fit the mode the guest actually received,
      // rather than stretch it by recalculating only the host view's aspect.
-@@ -484,6 +516,7 @@ struct SessionView: View {
+@@ -484,6 +525,7 @@ struct SessionView: View {
  
      /// The controls a column has too.
      @ViewBuilder private var floatingTools: some View {
@@ -3156,7 +3240,17 @@ index f84465e..7fddfd0 100644
          tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
          pasteTool
          tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
-@@ -583,6 +616,13 @@ struct SessionView: View {
+@@ -545,6 +587,9 @@ struct SessionView: View {
+         VStack(alignment: .leading, spacing: 10) {
+             Text("This Mac could not start").font(.system(size: 17, weight: .semibold))
+             Text(text).font(.system(size: 14)).foregroundStyle(Desk.dim)
++            if InstantResume.hasSave(for: mac) {
++                Button("Discard Saved State…", role: .destructive) { confirmDiscardSave = true }
++            }
+             Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
+         }
+         .padding(18)
+@@ -583,6 +628,13 @@ struct SessionView: View {
                      LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
                      LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
                  }
@@ -3170,9 +3264,23 @@ index f84465e..7fddfd0 100644
                  Section("Display") {
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
-@@ -723,20 +763,34 @@ struct SessionView: View {
+@@ -699,7 +751,9 @@ struct SessionView: View {
+         guard !Task.isCancelled else { return }
+         UIApplication.shared.isIdleTimerDisabled = true
+         HardwareMouse.shared.start()
+-        let screen = mac.displaySize(in: viewport)
++        let screen = InstantResume.enabled && InstantResume.hasSave(for: mac)
++            ? GuestScreenSize(width: mac.screenWidth ?? 1920, height: mac.screenHeight ?? 1080)
++            : mac.displaySize(in: viewport)
+         runningScreen = screen
+         let ram = GuestMemory.prepare(mac)
+         HengeLog.log("session", "available memory \(henge_available_memory() >> 20) MB")
+@@ -721,22 +775,39 @@ struct SessionView: View {
+         HengeLog.log("display", "screen-fit: selected=\(mac.fitsDeviceScreen) viewport=\(viewport.width)x\(viewport.height) stored=\(mac.screenWidth ?? 1920)x\(mac.screenHeight ?? 1080) chosen=\(screen.width)x\(screen.height) aspect=\(screen.aspect)")
+         do { try LinkHostService.shared.prepareBoot() }
          catch { self.error = error.localizedDescription; return }
-         let rc = henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus), &buffer, buffer.count)
+-        let rc = henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus), &buffer, buffer.count)
++        let rc = InstantResume.start(mac, ramMB: ram, cpus: cpus, error: &buffer, capacity: buffer.count)
          if rc != 0 {
 +            runner.end()
              LinkHostService.shared.stop()
@@ -3181,14 +3289,18 @@ index f84465e..7fddfd0 100644
          }
          MacPreview.beginSession()
 +        bootRAM = ram
++        var sessionMac = mac
++        sessionMac.screenWidth = screen.width; sessionMac.screenHeight = screen.height
++        bootMac = sessionMac
 +        updateRunnerDisplay()
 +        runner.booted(mac) {
 +            guard UIApplication.shared.applicationState != .active else { return }
 +            InstantResume.pause(force: true)
-+            if bootRAM > 0 { InstantResume.suspend(mac, ramMB: bootRAM, cpus: cpus) }
++            if bootRAM > 0 { InstantResume.suspend(bootMac ?? mac, ramMB: bootRAM, cpus: cpus) }
 +        }
          started = Date()
-         var used = mac
+-        var used = mac
++        var used = sessionMac
          used.lastUsed = started
          Machines.shared.update(used)
 -        statistics.reset(blocks: henge_vm_blocks(), time: ProcessInfo.processInfo.systemUptime)
@@ -3208,7 +3320,7 @@ index f84465e..7fddfd0 100644
              if currentState != state { state = currentState }
              if currentCPUs != cpusOn { cpusOn = currentCPUs }
              if !userCode && henge_vm_guest_el0() != 0 { userCode = true }
-@@ -744,8 +798,14 @@ struct SessionView: View {
+@@ -744,8 +815,14 @@ struct SessionView: View {
                  try? await Task.sleep(nanoseconds: 100_000_000)
                  continue
              }
@@ -3225,7 +3337,7 @@ index f84465e..7fddfd0 100644
              if showDetails { refreshDetails() }
              let heat = ProcessInfo.processInfo.thermalState
              if heat.rawValue != thermalState.rawValue {
-@@ -753,6 +813,7 @@ struct SessionView: View {
+@@ -753,6 +830,7 @@ struct SessionView: View {
                  HengeLog.log("session", "thermal state: \(Self.thermalLabel(heat))")
              }
              if state == 2 {
@@ -3233,7 +3345,7 @@ index f84465e..7fddfd0 100644
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
                  typing = false
-@@ -771,12 +832,14 @@ struct SessionView: View {
+@@ -771,12 +849,14 @@ struct SessionView: View {
              }
              tick += 1
              if tick % 10 == 0 {
@@ -3252,7 +3364,7 @@ index f84465e..7fddfd0 100644
                  JITBootstrap.releaseLingeringDebugger()
              }
              if tick == 60 && !stillWallpaperTipShown { // about when the desktop is up after a login
-@@ -791,16 +854,21 @@ struct SessionView: View {
+@@ -791,16 +871,21 @@ struct SessionView: View {
      }
  
      private func stopTapped() {
@@ -4479,6 +4591,87 @@ index 0000000..0a8447b
 +    unlink(socket_path); rmdir(folder);
 +    puts("runner control: bounded HTTP, retry, secret retirement, stale reports and wakeup passed");
 +}
+diff --git a/tests/test_session_resume.py b/tests/test_session_resume.py
+new file mode 100644
+index 0000000..2ee6557
+--- /dev/null
++++ b/tests/test_session_resume.py
+@@ -0,0 +1,75 @@
++"""Exercise production Swift launch/pause decisions, with native API fixtures.
++The native lifecycle suite separately exercises real snapshots, threads and GPU.
++"""
++from pathlib import Path
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[1]
++source = (root / 'ios/Henge/InstantResume.swift').read_text()
++
++def member(token):
++    start = source.index(token)
++    brace = source.index('{', start)
++    depth, end = 1, brace + 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++fixture = r'''
++import Foundation
++struct VirtualMac {
++ let rom=URL(fileURLWithPath:"/rom"), disk=URL(fileURLWithPath:"/disk"), aux=URL(fileURLWithPath:"/aux")
++ let ecid:UInt64=1, seed:UInt64=2
++}
++var boots=0, restores=0, pauses=0, state:Int32=1
++func henge_vm_state()->Int32 { state }
++func henge_vm_pause(_ error:UnsafeMutablePointer<CChar>,_ capacity:Int)->Int32 { pauses+=1;state=4;return 0 }
++func henge_vm_boot(_ a:String,_ b:String,_ c:String,_ d:UInt64,_ e:UInt64,_ f:UInt64,_ g:Int32,_ h:UnsafeMutablePointer<CChar>,_ i:Int)->Int32 { boots+=1;return 11 }
++func henge_vm_resume(_ a:String,_ b:String,_ c:String,_ d:UInt64,_ e:UInt64,_ f:UInt64,_ g:Int32,_ path:String,_ ident:String,_ h:UnsafeMutablePointer<CChar>,_ i:Int)->Int32 {
++ precondition(path=="/snapshot" && ident=="expected-ident");restores+=1;return 22
++}
++enum HengeLog { static func log(_ a:String,_ b:String) {} }
++enum InstantResume {
++ static var enabled=false, exists=false, compatible=false
++ static let queue=DispatchQueue(label:"test.resume")
++ static func hasSave(for mac:VirtualMac)->Bool { exists }
++ static func saved(for mac:VirtualMac,ramMB:UInt64,cpus:Int)->Date? { compatible ? Date() : nil }
++ static func file(for mac:VirtualMac)->URL { URL(fileURLWithPath:"/snapshot") }
++ static func ident(for mac:VirtualMac,ramMB:UInt64,cpus:Int)->String { "expected-ident" }
++ START
++ PAUSE
++}
++@main struct Check {
++ static func main() {
++  var error=[CChar](repeating:0,count:256);let mac=VirtualMac()
++  func start()->Int32 { InstantResume.start(mac,ramMB:8192,cpus:4,error:&error,capacity:error.count) }
++  precondition(start()==11 && boots==1 && restores==0)
++  InstantResume.enabled=true;InstantResume.exists=true;InstantResume.compatible=true
++  precondition(start()==22 && boots==1 && restores==1)
++  InstantResume.compatible=false
++  precondition(start()==(-1) && boots==1 && restores==1)
++  precondition(String(cString:error).contains("saved Mac"))
++  // Invalid saves are preserved; a launch decision never discards them.
++  precondition(InstantResume.exists)
++  InstantResume.enabled=false
++  InstantResume.pause();InstantResume.queue.sync {}
++  precondition(pauses==0 && state==1)
++  InstantResume.pause(force:true);InstantResume.queue.sync {}
++  precondition(pauses==1 && state==4)
++  InstantResume.pause(force:true);InstantResume.queue.sync {}
++  precondition(pauses==1)
++  state=1;InstantResume.enabled=true
++  InstantResume.pause();InstantResume.queue.sync {}
++  precondition(pauses==2 && state==4)
++  print("session resume: production restore/cold-boot/reject paths and forced runner pause passed")
++ }
++}
++'''
++fixture = fixture.replace(' START', member('static func start(')).replace(' PAUSE', member('static func pause('))
++with tempfile.TemporaryDirectory(prefix='henge-session-resume-') as folder:
++    folder = Path(folder)
++    (folder / 'main.swift').write_text(fixture)
++    subprocess.run(['swiftc', '-parse-as-library', '-swift-version', '5', str(folder / 'main.swift'), '-o', str(folder / 'check')], check=True)
++    subprocess.run([str(folder / 'check')], check=True, timeout=10)
 diff --git a/tests/test_session_statistics.swift b/tests/test_session_statistics.swift
 index 585491b..61015ba 100644
 --- a/tests/test_session_statistics.swift
