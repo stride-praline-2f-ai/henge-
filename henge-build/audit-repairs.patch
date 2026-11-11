@@ -2562,6 +2562,34 @@ index b4f57c2..0245150 100644
  // An interpreter loop: a jump table and BR, 300000 times.
  PROGRAM bench_dispatch
      adr x10, 7f
+diff --git a/tests/benchmark_fastmem.sh b/tests/benchmark_fastmem.sh
+index 3b77608..4e63a87 100755
+--- a/tests/benchmark_fastmem.sh
++++ b/tests/benchmark_fastmem.sh
+@@ -9,7 +9,7 @@ cp -R core host "$task_base/"
+ cp Makefile "$task_base/"
+ ln -s "$PWD/devices" "$task_base/devices"
+ ln -s "$PWD/tests" "$task_base/tests"
+-(cd "$task_base" && patch -p1 < tests/fastmem-baseline.patch && make -j4 build/test_fastmem_bench)
++(cd "$task_base" && patch -p1 < tests/fastmem-baseline.patch && patch -p1 < tests/helper-read-baseline.patch && make -j4 build/test_fastmem_bench)
+ make -j4 build/test_fastmem_bench
+ for split in 0 1; do
+     if [ "$split" = 0 ]; then
+@@ -31,6 +31,14 @@ for split in range(2):
+    values.setdefault((int(mixed),int(enabled)),[]).append(float(ns))
+   assert all(len(v)==7 for v in values.values()) and len(values)==8
+   summary[f'{version}-split{split}']={f'multiwindow{m}-enabled{e}':statistics.median(v) for (m,e),v in values.items()}
++helpers={}
++for version in ('before','after'):
++ samples=[]
++ for split in range(2):
++  samples += [float(x) for x in re.findall(r'helper-read-bench: round=\d+ ns_per_read=([\d.]+)',Path(f'build/fastmem-{version}-{split}.log').read_text())]
++ assert len(samples)==6
++ helpers[version]=dict(median_ns=statistics.median(samples),samples=len(samples))
++summary['complete_helper_read']=helpers
+ print(json.dumps(summary,indent=2))
+ Path('build/fastmem-native-summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+ PY
 diff --git a/tests/benchmark_surface_hash.py b/tests/benchmark_surface_hash.py
 new file mode 100644
 index 0000000..eef5d30
@@ -2596,6 +2624,44 @@ index 0000000..eef5d30
 + c=Path(tmp)/'bench.c';c.write_text(source);exe=Path(tmp)/'bench'
 + subprocess.run(['cc','-O3','-Wall','-Wextra','-Werror','-I'+str(root/'devices'),str(c),'-o',str(exe)],check=True)
 + subprocess.run([str(exe)],check=True)
+diff --git a/tests/helper-read-baseline.patch b/tests/helper-read-baseline.patch
+new file mode 100644
+index 0000000..df20122
+--- /dev/null
++++ b/tests/helper-read-baseline.patch
+@@ -0,0 +1,32 @@
++--- a/core/memop.c
+++++ b/core/memop.c
++@@ -298,16 +298,6 @@
++     while (len) {
++         uint32_t chunk = 4096 - (uint32_t)(va & 4095);
++         if (chunk > len) chunk = len;
++-        /* Plain reads can use the exact RAM span the JIT's TLB already checked.
++-           Stores retain hv_phys_write's ROM, watch and code-invalidation path.
++-           A miss still splits at 4K so smaller guest granules fault precisely. */
++-        const void *cached = write ? NULL : hv_tlb_read_span(cpu, va, chunk, el);
++-        if (cached) {
++-            if (cpu->m->stats_interval) cpu->m->stats.vmem_read_reuses++;
++-            memcpy(b, cached, chunk);
++-            va += chunk; b += chunk; len -= chunk;
++-            continue;
++-        }
++         uint64_t pa;
++         int had_entry = 0;
++         if (cpu->m->stats_interval) { /* --stats: was the TLB entry there before this access? */
++@@ -345,10 +335,8 @@
++                 }
++             }
++         }
++-        const void *ram_bytes = hv_phys_ptr(cpu->m, pa, chunk);
++-        if (ram_bytes) {
++-            if (write) rc = hv_phys_write(cpu->m, pa, b, chunk);
++-            else memcpy(b, ram_bytes, chunk); /* resolve this physical span once */
+++        if (hv_phys_ptr(cpu->m, pa, chunk)) {
+++            rc = write ? hv_phys_write(cpu->m, pa, b, chunk) : hv_phys_read(cpu->m, pa, b, chunk);
++         } else {
++             for (uint32_t off = 0; off < chunk && !rc; off += 8) { /* MMIO: at most 8 bytes at a time */
++                 uint32_t piece = chunk - off < 8 ? chunk - off : 8;
 diff --git a/tests/mem_programs.S b/tests/mem_programs.S
 index bcbed3f..2b4c47a 100644
 --- a/tests/mem_programs.S
@@ -2880,7 +2946,7 @@ index 0000000..2b0957a
 +    }
 +}
 diff --git a/tests/test_fastmem_bench.c b/tests/test_fastmem_bench.c
-index a801c82..5a5660d 100644
+index a801c82..be3929e 100644
 --- a/tests/test_fastmem_bench.c
 +++ b/tests/test_fastmem_bench.c
 @@ -3,6 +3,8 @@
@@ -2892,30 +2958,27 @@ index a801c82..5a5660d 100644
  #include <mach/mach_time.h>
  #include <pthread/qos.h>
  #include <assert.h>
-@@ -65,6 +67,27 @@ int main(void) {
+@@ -65,6 +67,24 @@ int main(void) {
              double ns = (double)(mach_absolute_time() - begin) * tb.numer / tb.denom;
              printf("fastmem-bench: round=%u mixed=%u enabled=%u ns_per_load=%.3f result=%u\n", round, mixed, enabled, ns / count, count);
          }
-+    /* Isolate the redundant helper work removed by checked host-span reuse.
-+       Same real mappings/permissions, same reads/checksum, alternating order. */
++    /* The isolated before/after builds execute this SAME complete helper.
++       tests/helper-read-baseline.patch restores only the old helper's RAM
++       resolution path in the isolated before fixture, never the app. */
 +    m.stats_interval = 0;
 +    run(0, 1000);
-+    for (unsigned round = 0; round < 3; round++) for (unsigned k = 0; k < 2; k++) {
-+        unsigned reused = k ^ (round & 1), count = 500000;
++    for (unsigned round = 0; round < 3; round++) {
++        unsigned count = 500000;
 +        uint64_t sum = 0, begin = mach_absolute_time();
 +        for (unsigned i = 0; i < count; i++) {
-+            uint64_t value, pa;
-+            if (reused) assert(!hv_vmem_xfer(&cpu, data_a, &value, sizeof value, 0, 1, 0));
-+            else {
-+                assert(!hv_mmu_access(&cpu, data_a, HV_ACC_READ, 1, &pa));
-+                assert(!hv_phys_read(&m, pa, &value, sizeof value));
-+            }
++            uint64_t value;
++            assert(!hv_vmem_xfer(&cpu, data_a, &value, sizeof value, 0, 1, 0));
 +            sum += value;
 +        }
 +        double ns = (double)(mach_absolute_time() - begin) * tb.numer / tb.denom;
 +        assert(sum == count);
-+        printf("helper-read-bench: round=%u span_reuse=%u ns_per_read=%.3f checksum=%llu\n",
-+               round, reused, ns / count, (unsigned long long)sum);
++        printf("helper-read-bench: round=%u ns_per_read=%.3f checksum=%llu\n",
++               round, ns / count, (unsigned long long)sum);
 +    }
      hv_machine_free(&m); free(ram);
      puts("PASS fastmem benchmark: real EL1/page-table/JIT path; all guest sums identical");
