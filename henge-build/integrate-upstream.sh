@@ -13,7 +13,8 @@ export GIT_AUTHOR_NAME='Henge CI'
 export GIT_AUTHOR_EMAIL='henge-ci@users.noreply.github.com'
 export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
 export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
-readarray -t pins < <(python3 - "$manifest" <<'PY'
+pins=()
+while IFS= read -r entry; do pins+=("$entry"); done < <(python3 - "$manifest" <<'PY'
 import json, sys
 m = json.load(open(sys.argv[1]))
 i = m["upstream_integration"]
