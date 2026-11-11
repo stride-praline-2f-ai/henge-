@@ -24,10 +24,40 @@ index 81b0736..c9f0915 100644
  
  test-vm-lifecycle: $(B)/test_vm_lifecycle
 diff --git a/core/dispatch.c b/core/dispatch.c
-index 12bd4a9..aa11efc 100644
+index 12bd4a9..5f76a99 100644
 --- a/core/dispatch.c
 +++ b/core/dispatch.c
-@@ -602,16 +602,41 @@ static void print_profile(HvMachine *m) {
+@@ -15,8 +15,10 @@
+ #include "mmu.h"
+ #include "sysreg.h"
+ #include "translate.h"
++#include "reclaim_pages.h"
+ 
+ void hv_flush_blocks(HvMachine *m) {
++    size_t retired_bytes = (size_t)m->nblocks * sizeof *m->blocks;
+     /* Every other CPU is parked (stop_the_world): the one moment the TLB layout can change. */
+     if ((hv_knob[HV_K_TLBT] != 0) != hv_tlb_tmajor) {
+         hv_tlb_tmajor = hv_knob[HV_K_TLBT] != 0;
+@@ -37,6 +39,18 @@ void hv_flush_blocks(HvMachine *m) {
+         }
+     memset(m->hash, 0, sizeof m->hash);
+     m->nblocks = 0;
++    /* The global barrier has retired every reference. Keep address space and
++       allocation ownership, but let pressure reclaim dead metadata pages.
++       Future translations overwrite their own complete HvBlock records. */
++    if (retired_bytes >= (1u << 20)) {
++        if (hv_self) hv_fp_leave(hv_self);
++        /* The optional asynchronous profiler can inspect translation metadata.
++           Its diagnostic run keeps the old payload resident until teardown. */
++        const char *profile = getenv("HV_PROF_IOS");
++        if (!profile || !strcmp(profile, "0"))
++            m->stats.metadata_reclaim_bytes += hv_reclaim_retired_pages(m->blocks, retired_bytes);
++        if (hv_self) hv_fp_enter(hv_self);
++    }
+     m->nslots = 0;
+     m->nxchained = 0;
+     memset(m->xchain_heads, 0, sizeof m->xchain_heads);
+@@ -602,16 +616,41 @@ static void print_profile(HvMachine *m) {
      }
  }
  
@@ -72,7 +102,16 @@ index 12bd4a9..aa11efc 100644
      if (!force && now - last_t < (uint64_t)m->stats_interval * 24000000ull) {
          hv_fp_enter(cpu);
          return;
-@@ -632,25 +657,20 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -619,6 +658,8 @@ static void print_stats(HvCpu *cpu, int force) {
+     double dt = (double)(now - last_t) / 24e6;
+     HvStats *s = &m->stats;
+ #define RATE(f) ((double)(s->f - last.f) / dt)
++    fprintf(stderr, "memory-reuse: cached_read_spans=%.0f/s retired_metadata_advised=%.1fMiB (advisory reclaim after full quiescence; not executable memory)\n",
++            RATE(vmem_read_reuses), (double)s->metadata_reclaim_bytes / (1 << 20));
+     fprintf(stderr,
+             "stats %5.0fs: blocks %.2fM/s, translated %.0f/s (again: va %.0f%% va+pa %.0f%%; %.0f%% of time, %.1f insns, %.1fx), slow mem %.0fK/s, mrs %.0fK/s msr %.0fK/s sys %.0fK/s, "
+             "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), blocks held %d (%.0f MB, %llu full flushes), chained %.0f/s ijc fills %.0fK/s resets %.0f/s, el%u pc %llx\n",
+@@ -632,25 +673,20 @@ static void print_stats(HvCpu *cpu, int force) {
          double tot = 0;
          for (int k = 0; k < 6; k++) tot += RATE(why[k]);
          /* How much of the interval the CPU thread actually ran: below 100% means the host took it away. */
@@ -110,7 +149,7 @@ index 12bd4a9..aa11efc 100644
          fprintf(stderr, "  whole-TLB flushes/s: TLBI all here %.0f, TLBI all shared %.0f, SCTLR %.0f, TTBR1 %.0f, TCR %.0f, MAIR %.0f, range of all %.0f, requests overflowed %.0f\n",
                  RATE(flush_why[0]), RATE(flush_why[1]), RATE(flush_why[2]), RATE(flush_why[3]), RATE(flush_why[4]), RATE(flush_why[5]),
                  RATE(flush_why[6]), RATE(flush_why[7]));
-@@ -664,7 +684,9 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -664,7 +700,9 @@ static void print_stats(HvCpu *cpu, int force) {
                      RATE(flush_checked), RATE(flush_check_entries), RATE(flush_check_bad), RATE(flush_check_af));
          fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
                  RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
@@ -121,7 +160,7 @@ index 12bd4a9..aa11efc 100644
              uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
              uint32_t worst = 0;
              for (uint32_t h = 0; h < HV_BLOCK_HASH; h++) {
-@@ -924,7 +946,10 @@ static void stop_the_world(HvCpu *cpu) {
+@@ -924,7 +962,10 @@ static void stop_the_world(HvCpu *cpu) {
      }
  }
  
@@ -147,8 +186,43 @@ index c341d16..fba956a 100644
  
  /* Drops every translated block (the JIT region is reused from the start). */
  void hv_flush_blocks(HvMachine *m);
+diff --git a/core/machine.c b/core/machine.c
+index 7a01fdc..2bdf71c 100644
+--- a/core/machine.c
++++ b/core/machine.c
+@@ -622,6 +622,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
+ 
+ /* MMIO is accessed in naturally sized pieces of at most 8 bytes. */
+ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
++    if (!len) return 0;
+     void *p = hv_phys_ptr(m, pa, len);
+     if (p) {
+         memcpy(buf, p, len);
+@@ -640,8 +641,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
+ }
+ 
+ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
++    if (!len) return 0;
+     HvRam *r = hv_ram_lookup(m, pa);
+-    if (r && pa + len - r->pa <= r->size) {
++    if (r && len <= r->size - (pa - r->pa)) {
+         if (r->readonly) return 0; /* ROM: writes are ignored */
+         uint64_t off = pa - r->pa;
+         uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
+diff --git a/core/machine.h b/core/machine.h
+index cafe156..d4afed7 100644
+--- a/core/machine.h
++++ b/core/machine.h
+@@ -127,6 +127,7 @@ typedef struct HvStats {
+     uint64_t helper[12];      /* by HV_OP_* */
+     uint64_t tlb_flushes, fetch_walks, exceptions, interrupts;
+     uint64_t wfi, wfi_ticks;  /* WFI exits, host ticks spent asleep */
++    uint64_t vmem_read_reuses, metadata_reclaim_bytes;
+ } HvStats;
+ 
+ #define HV_MAX_CPUS 8
 diff --git a/core/memop.c b/core/memop.c
-index bfbac5e..d184b91 100644
+index bfbac5e..a638d30 100644
 --- a/core/memop.c
 +++ b/core/memop.c
 @@ -187,7 +187,7 @@ int hv_mem_decode(uint32_t insn, HvMemOp *op) {
@@ -160,8 +234,61 @@ index bfbac5e..d184b91 100644
          op->mode = mode == 1 ? HV_ADDR_POST : mode == 3 ? HV_ADDR_PRE : HV_ADDR_OFFSET;
          op->bytes = 2u << op->size;
          return 0;
+@@ -298,6 +298,16 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
+     while (len) {
+         uint32_t chunk = 4096 - (uint32_t)(va & 4095);
+         if (chunk > len) chunk = len;
++        /* Plain reads can use the exact RAM span the JIT's TLB already checked.
++           Stores retain hv_phys_write's ROM, watch and code-invalidation path.
++           A miss still splits at 4K so smaller guest granules fault precisely. */
++        const void *cached = write ? NULL : hv_tlb_read_span(cpu, va, chunk, el);
++        if (cached) {
++            if (cpu->m->stats_interval) cpu->m->stats.vmem_read_reuses++;
++            memcpy(b, cached, chunk);
++            va += chunk; b += chunk; len -= chunk;
++            continue;
++        }
+         uint64_t pa;
+         int had_entry = 0;
+         if (cpu->m->stats_interval) { /* --stats: was the TLB entry there before this access? */
+@@ -335,8 +345,10 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
+                 }
+             }
+         }
+-        if (hv_phys_ptr(cpu->m, pa, chunk)) {
+-            rc = write ? hv_phys_write(cpu->m, pa, b, chunk) : hv_phys_read(cpu->m, pa, b, chunk);
++        const void *ram_bytes = hv_phys_ptr(cpu->m, pa, chunk);
++        if (ram_bytes) {
++            if (write) rc = hv_phys_write(cpu->m, pa, b, chunk);
++            else memcpy(b, ram_bytes, chunk); /* resolve this physical span once */
+         } else {
+             for (uint32_t off = 0; off < chunk && !rc; off += 8) { /* MMIO: at most 8 bytes at a time */
+                 uint32_t piece = chunk - off < 8 ? chunk - off : 8;
+diff --git a/core/mmu.h b/core/mmu.h
+index 3a4ee8f..89ad6ac 100644
+--- a/core/mmu.h
++++ b/core/mmu.h
+@@ -83,6 +83,18 @@ void hv_tlb_protect_code_page(HvCpu *cpu, struct HvRam *ram, uint64_t pg); /* th
+    fault status code. */
+ uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *pa);
+ 
++/* Reuse the owner's already validated RAM translation. No independent cache:
++   every existing TLBI, PAN view and code-page protection rule still applies.
++   A complete span is required, including accesses in the final 15 bytes. */
++static inline const void *hv_tlb_read_span(HvCpu *cpu, uint64_t va, uint32_t bytes, int el) {
++    const uint64_t mask = (1ull << HV_TLB_PAGE_BITS) - 1;
++    if (!bytes || bytes > (mask + 1) - (va & mask)) return NULL;
++    const HvTlbEntry *entry = hv_tlb_ent(cpu, (uint32_t)(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), hv_tlb_table(cpu, el));
++    uint64_t tag = entry->read_tag;
++    if (tag == HV_TLB_INVALID || tag + HV_TLB_ADJ != (va & ~mask)) return NULL;
++    return (const void *)(uintptr_t)(va + (uint64_t)entry->addend);
++}
++
+ /* For the dispatcher: host pointer to the guest instructions at va and how many
+    can be read before the page ends. On a fault, the instruction abort is taken
+    and NULL is returned. */
 diff --git a/core/translate.c b/core/translate.c
-index cebfb7d..a6d1b00 100644
+index cebfb7d..a9026d1 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -811,7 +811,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
@@ -191,6 +318,123 @@ index cebfb7d..a6d1b00 100644
      uint32_t bare = tb ? insn & ~(0x3fffu << 5) : insn & ~(0x7ffffu << 5);
      int rt = insn & 0x1f;
      if (!is_stolen(rt)) {
+@@ -1915,6 +1915,22 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+         if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) break;
+         if (kind == HV_INSN_COPY && (insn & 0xfffff01fu) == 0xd503201fu) continue; /* hints (NOP, BTI): no register */
+         if (kind == HV_INSN_COPY || kind == HV_INSN_PCREL || kind == HV_INSN_LOAD_LITERAL) {
++            /* ADD/SUB Xn, Xn, #imm changes only the address origin, not the
++               validated translation. Include its delta in the group's extent.
++               Exclude flag-setting and 32-bit forms (zero-extension), and any
++               overflow of the planner's signed offsets. The fallback copy
++               executes the original ALU instruction just like the hot path. */
++            if (kind == HV_INSN_COPY && (insn & 0xbf800000u) == 0x91000000u &&
++                (insn & 31) == ((insn >> 5) & 31)) {
++                unsigned r = insn & 31;
++                int64_t amount = (int64_t)((insn >> 10) & 4095) << ((insn & (1u << 22)) ? 12 : 0);
++                if (insn & (1u << 30)) amount = -amount;
++                int64_t updated = delta[r] + amount;
++                if (cur[r] >= 0 && updated >= INT32_MIN && updated <= INT32_MAX) {
++                    delta[r] = updated;
++                    continue;
++                }
++            }
+             KILL(insn);
+             continue;
+         }
+diff --git a/devices/cursor_damage.h b/devices/cursor_damage.h
+new file mode 100644
+index 0000000..eca2756
+--- /dev/null
++++ b/devices/cursor_damage.h
+@@ -0,0 +1,20 @@
++#ifndef HENGE_CURSOR_DAMAGE_H
++#define HENGE_CURSOR_DAMAGE_H
++#include <stdint.h>
++typedef struct HvCursorDamageKey {
++    uint64_t layer, glyph;
++    uint32_t position, width, height, settings;
++    int hot_x, hot_y, visible;
++} HvCursorDamageKey;
++typedef struct HvCursorDamage { HvCursorDamageKey prior; int valid; uint64_t suppressed; } HvCursorDamage;
++static inline int hv_cursor_damage_changed(HvCursorDamage *state, HvCursorDamageKey next) {
++    if (!next.visible) next = (HvCursorDamageKey){.layer=next.layer};
++    HvCursorDamageKey *p = &state->prior;
++    if (state->valid && p->layer == next.layer && p->glyph == next.glyph &&
++        p->position == next.position && p->width == next.width && p->height == next.height &&
++        p->settings == next.settings && p->hot_x == next.hot_x && p->hot_y == next.hot_y && p->visible == next.visible) {
++        state->suppressed++; return 0;
++    }
++    state->valid = 1; state->prior = next; return 1;
++}
++#endif
+diff --git a/devices/display_settings.h b/devices/display_settings.h
+index c3c0a3d..7e399f1 100644
+--- a/devices/display_settings.h
++++ b/devices/display_settings.h
+@@ -2,6 +2,9 @@
+ #define HENGE_DISPLAY_SETTINGS_H
+ #import <Foundation/Foundation.h>
+ #import <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++#import <UIKit/UIApplication.h>
++#endif
+ #include <stdatomic.h>
+ #include <os/lock.h>
+ #include <sys/utsname.h>
+@@ -9,7 +12,7 @@
+ 
+ /* The presenter and Link worker read one coherent word, with no preferences
+    access or polling timer in a frame. Notifications preserve live settings. */
+-typedef struct { unsigned scale; BOOL sharp; } HvDisplaySettings;
++typedef struct { unsigned scale; BOOL sharp; int presentation_cap, thermal; BOOL thermal_protection; } HvDisplaySettings;
+ static _Atomic unsigned hv_display_settings_word;
+ static os_unfair_lock hv_display_settings_lock = OS_UNFAIR_LOCK_INIT;
+ static unsigned hv_display_default_scale __attribute__((unused)) = 1;
+@@ -22,8 +25,15 @@ static void hv_display_settings_refresh(void) {
+     scale = saved >= 1 && saved <= 3 ? (unsigned)saved : hv_display_default_scale;
+ #endif
+     id sharp = [prefs objectForKey:@"henge.cursor.sharp"];
+-    atomic_store_explicit(&hv_display_settings_word, scale | ((!sharp || [sharp boolValue]) ? 4u : 0u), memory_order_release);
++    NSInteger selected = [prefs integerForKey:@"henge.perf.presentationCap"];
++    unsigned cap = selected == 30 ? 1 : selected == 60 ? 2 : 0;
++    unsigned thermal = (unsigned)NSProcessInfo.processInfo.thermalState;
++    unsigned word = scale | ((!sharp || [sharp boolValue]) ? 4u : 0u) | cap << 3 |
++                    ([prefs boolForKey:@"henge.perf.thermalProtection"] ? 32u : 0u) | ((thermal & 3u) << 6);
++    unsigned previous = atomic_exchange_explicit(&hv_display_settings_word, word, memory_order_acq_rel);
+     os_unfair_lock_unlock(&hv_display_settings_lock);
++    if (previous && previous != word)
++        [NSNotificationCenter.defaultCenter postNotificationName:@"HengeDisplaySettingsDidChange" object:nil];
+ }
+ static HvDisplaySettings hv_display_settings_get(void) {
+     static dispatch_once_t once;
+@@ -34,13 +44,25 @@ static HvDisplaySettings hv_display_settings_get(void) {
+ #endif
+         /* Process-lifetime cache, shared by this translation unit's replay
+            instances; the observer captures no replay or display resources. */
+-        static id observer;
++        static id observer, thermalObserver;
+         observer = [NSNotificationCenter.defaultCenter addObserverForName:NSUserDefaultsDidChangeNotification
+             object:nil queue:nil usingBlock:^(NSNotification *note) { (void)note; hv_display_settings_refresh(); }];
+         (void)observer;
++        thermalObserver = [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification
++            object:nil queue:nil usingBlock:^(NSNotification *note) { (void)note; hv_display_settings_refresh(); }];
++        (void)thermalObserver;
++#if TARGET_OS_IPHONE
++        static id foregroundObserver;
++        foregroundObserver = [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
++            object:nil queue:nil usingBlock:^(NSNotification *note) { (void)note; hv_display_settings_refresh(); }];
++        (void)foregroundObserver;
++#endif
+         hv_display_settings_refresh();
+     });
+     unsigned word = atomic_load_explicit(&hv_display_settings_word,memory_order_acquire);
+-    return (HvDisplaySettings){word & 3u,(word & 4u) != 0};
++    unsigned cap = (word >> 3) & 3u;
++    return (HvDisplaySettings){.scale=word & 3u,.sharp=(word & 4u) != 0,
++        .presentation_cap=cap == 1 ? 30 : cap == 2 ? 60 : 0,
++        .thermal=(int)((word >> 6) & 3u),.thermal_protection=(word & 32u) != 0};
+ }
+ #endif
 diff --git a/devices/display_snapshot.h b/devices/display_snapshot.h
 new file mode 100644
 index 0000000..57303a2
@@ -312,10 +556,36 @@ index 0f68eae..ac454a5 100644
  
  #endif
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..b811439 100644
+index 9073d22..4fc507f 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
-@@ -838,15 +838,10 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
+@@ -19,6 +19,7 @@
+ #include <sys/utsname.h>
+ #include "trace_gate.h"
+ #include "frame_pacing.h"
++#include "cursor_damage.h"
+ #include "frame_metrics.h"
+ #include "gpu_epoch_cache.h"
+ #include "planar_registry.h"
+@@ -167,7 +168,6 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+     _Atomic uint64_t gpu_completed, gpu_duration_ns, gpu_max_ns, gpu_timing_missing;
+     HvFramePacing frame_pacing;
+     BOOL pacing_pending;
+-    double pacing_policy_poll;
+     int pacing_fps;
+     BOOL pacing_policy_logged;
+ 
+@@ -216,6 +216,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+     BOOL drawable_retry_pending;
+     double drawable_retry_cooldown; /* fresh work coalesces one wake at its expiry */
+     uint64_t screen_requests; /* fresh frames/cursor changes, not automatic retries */
++    uint64_t cursor_revision;
++    HvCursorDamage cursor_damage;
++    id settings_observer;
+     double drawable_retry_deadline; /* at most two seconds of retrying an unavailable target */
+     uint32_t screen_w, screen_h;
+     id<MTLBuffer> test_readback; /* HV_PVG_GPU_TEST: the drawable's pixels for screenshots */
+@@ -838,15 +841,10 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
      return made;
  }
  
@@ -334,7 +604,7 @@ index 9073d22..b811439 100644
  }
  
  static uint64_t guest_hash(HvObject *s) { return hash_bytes(s->mapped + s->first, s->alloc); }
-@@ -863,7 +858,7 @@ static void sync_iosurface(HvObject *s) {
+@@ -863,7 +861,7 @@ static void sync_iosurface(HvObject *s) {
      if (!s->iosurface) return;
      const uint8_t *from = s->mapped + s->first;
      BOOL by_plane = s->plane_count && IOSurfaceGetPlaneCount(s->iosurface) >= s->plane_count;
@@ -343,7 +613,7 @@ index 9073d22..b811439 100644
      uint32_t changed = 0;
      uint64_t *have = s->shared_hashes ? (uint64_t *)s->shared_hashes.mutableBytes : s->plane_hash;
      if (by_plane) {
-@@ -876,9 +871,9 @@ static void sync_iosurface(HvObject *s) {
+@@ -876,9 +874,9 @@ static void sync_iosurface(HvObject *s) {
      } else {
          uint64_t hash = guest_hash(s);
          if (hash == s->content_hash) return;
@@ -355,7 +625,7 @@ index 9073d22..b811439 100644
      /* HV_PVG_HOST_DUMP=prefix (debugging): the host surface as it is just before the guest's pixels go over it,
         for the first few multi-plane surfaces, with its layout in a .txt beside it: did the GPU draw something here
         that this copy throws away? */
-@@ -907,7 +902,6 @@ static void sync_iosurface(HvObject *s) {
+@@ -907,7 +905,6 @@ static void sync_iosurface(HvObject *s) {
             requested. Copy each changed video plane through its actual host layout. */
          for (uint32_t i = 0; i < s->plane_count && i < 4; i++) {
              if (!(changed & 1u << i)) continue;
@@ -363,7 +633,7 @@ index 9073d22..b811439 100644
              uint8_t *dst = IOSurfaceGetBaseAddressOfPlane(s->iosurface, i);
              size_t dst_row = IOSurfaceGetBytesPerRowOfPlane(s->iosurface, i);
              size_t rows = MIN((size_t)s->plane_h[i], IOSurfaceGetHeightOfPlane(s->iosurface, i));
-@@ -916,10 +910,13 @@ static void sync_iosurface(HvObject *s) {
+@@ -916,10 +913,13 @@ static void sync_iosurface(HvObject *s) {
              size_t bytes = MIN((size_t)src_row, dst_row);
              for (size_t y = 0; y < rows; y++)
                  memcpy(dst + y * dst_row, from + src_off + y * src_row, bytes);
@@ -378,7 +648,7 @@ index 9073d22..b811439 100644
      }
      IOSurfaceUnlock(s->iosurface, 0, NULL);
      const char *dump = getenv("HV_PVG_SURFACE_DUMP");
-@@ -988,18 +985,18 @@ static void sync_surface_once(HvReplay *r, HvObject *s, uint64_t epoch) {
+@@ -988,18 +988,18 @@ static void sync_surface_once(HvReplay *r, HvObject *s, uint64_t epoch) {
      }
      surface->surface_w = (uint32_t)sw, surface->surface_h = (uint32_t)sh;
      uint64_t n = surface->length >> 14;
@@ -401,7 +671,7 @@ index 9073d22..b811439 100644
          vm_prot_t cur, max;
          vm_remap(mach_task_self(), &to, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
      }
-@@ -1233,30 +1230,38 @@ static BOOL has_guest_pages(HvObject *o) {
+@@ -1233,30 +1233,38 @@ static BOOL has_guest_pages(HvObject *o) {
  }
  
  /* Between guest memory and the GPU's own copy, in the layout the guest was told. */
@@ -449,7 +719,7 @@ index 9073d22..b811439 100644
              if (down)
                  [*blit copyFromTexture:tex sourceSlice:s sourceLevel:m sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, d)
                                toBuffer:copy destinationOffset:from destinationBytesPerRow:row destinationBytesPerImage:image];
-@@ -1264,6 +1269,7 @@ static BOOL has_guest_pages(HvObject *o) {
+@@ -1264,6 +1272,7 @@ static BOOL has_guest_pages(HvObject *o) {
                  [*blit copyFromBuffer:copy sourceOffset:from sourceBytesPerRow:row sourceBytesPerImage:image
                             sourceSize:MTLSizeMake(w, h, d) toTexture:tex destinationSlice:s destinationLevel:m destinationOrigin:MTLOriginMake(0, 0, 0)];
          }
@@ -457,7 +727,7 @@ index 9073d22..b811439 100644
  }
  
  /* The guest asks to see what the GPU made: {task, count, refs}. */
-@@ -1278,8 +1284,7 @@ static BOOL has_guest_pages(HvObject *o) {
+@@ -1278,8 +1287,7 @@ static BOOL has_guest_pages(HvObject *o) {
          HvObject *o = objs[@(a[2 + i])];
          if (!o || !o->guest_backed || !o->host_valid) continue;
          if (!cb) cb = [queue commandBuffer];
@@ -467,7 +737,7 @@ index 9073d22..b811439 100644
      }
      [blit endEncoding];
      if (cb) {
-@@ -2169,8 +2174,7 @@ typedef struct {
+@@ -2169,8 +2177,7 @@ typedef struct {
          }
          if (res[i * 2 + 1] & 1) o->guest_stale = NO, o->host_valid = NO; /* the guest wrote it */
          if (o->guest_backed && !o->host_valid) {
@@ -477,7 +747,7 @@ index 9073d22..b811439 100644
          }
          if (res[i * 2 + 1] & 4) sync_after = YES;
      }
-@@ -2254,8 +2258,7 @@ typedef struct {
+@@ -2254,8 +2261,7 @@ typedef struct {
              if (!(res[i * 2 + 1] & 4)) continue;
              HvObject *o = [self object:res[i * 2] task:task];
              if (!o || !o->guest_backed) continue;
@@ -487,7 +757,7 @@ index 9073d22..b811439 100644
          }
          [back endEncoding];
      }
-@@ -2287,6 +2290,11 @@ typedef struct {
+@@ -2287,6 +2293,16 @@ typedef struct {
                  library_load_seconds * 1000, library_load_worst * 1000);
          fprintf(stderr, "hengevm: gpu-pipelines: builds=%llu total_ms=%.2f worst_ms=%.2f (cumulative host pipeline creation, including failures)\n",
                  (unsigned long long)pipeline_builds, pipeline_seconds * 1000, pipeline_worst_seconds * 1000);
@@ -496,10 +766,15 @@ index 9073d22..b811439 100644
 +        fprintf(stderr, "hengevm: gpu-memory: device_allocated=%.1fMiB tasks=%lu surfaces=%lu mapped_textures=%lu planar=%lu (Metal device allocations including in-flight work; not process footprint)\n",
 +                (double)device.currentAllocatedSize / (1 << 20), (unsigned long)tasks.count,
 +                (unsigned long)surfaces.count, (unsigned long)mapped_textures.count, (unsigned long)planar.count);
++        os_unfair_lock_lock(&screen_lock);
++        uint64_t suppressed = cursor_damage.suppressed, coalesced = frame_pacing.coalesced;
++        os_unfair_lock_unlock(&screen_lock);
++        fprintf(stderr, "hengevm: presentation-work: unchanged_cursor_suppressed=%llu frames_coalesced=%llu (exact cursor state; guest swaps remain authoritative)\n",
++                (unsigned long long)suppressed, (unsigned long long)coalesced);
      }
      return YES;
  }
-@@ -2319,6 +2327,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2319,6 +2335,7 @@ static const uint8_t *half_to_byte(void) {
      memcpy(&hx, (const uint8_t *)a + 0x24, 2), memcpy(&hy, (const uint8_t *)a + 0x26, 2);
      if (!w || !h || w > 512 || h > 512 || stride < (uint64_t)w * 4 || stride > 8192) return;
      uint8_t *bits = malloc((size_t)stride * h);
@@ -507,7 +782,7 @@ index 9073d22..b811439 100644
      if (hv_pvg_lite_task_read(lite, 0, off, bits, (uint32_t)stride * h)) {
          free(bits);
          [self complain:@"pointer image unreadable"];
-@@ -2327,6 +2336,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2327,6 +2344,7 @@ static const uint8_t *half_to_byte(void) {
      MTLTextureDescriptor *ct = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
      ct.storageMode = MTLStorageModeShared;
      id<MTLTexture> glyph = [device newTextureWithDescriptor:ct];
@@ -515,7 +790,74 @@ index 9073d22..b811439 100644
      [glyph replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
      if (a[0] == 1) {
          link_cursor=glyph;link_cw=w;link_ch=h;link_hx=hx;link_hy=hy;
-@@ -3120,22 +3130,24 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+@@ -2336,6 +2354,7 @@ static const uint8_t *half_to_byte(void) {
+     os_unfair_lock_lock(&screen_lock);
+     cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
+     cursor_tex = glyph;
++    cursor_revision++;
+     os_unfair_lock_unlock(&screen_lock);
+     if (getenv("HV_PVG_CURSOR_LOG")) fprintf(stderr, "pvgcursor glyph %ux%u hot %d,%d stride %u first alpha %u\n", w, h, hx, hy, (uint32_t)stride, bits[(size_t)(h / 2) * stride + (size_t)(w / 2) * 4 + 3]);
+     [self drawCursor];
+@@ -2439,20 +2458,13 @@ static const uint8_t *half_to_byte(void) {
+    refresh, so that happens on a thread of its own and never holds up the guest's GPU work:
+    this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
+ - (void)updatePacingPolicy {
+-    double now = now_seconds();
+-    if (now >= pacing_policy_poll) {
+-        pacing_policy_poll = now + 1;
+-        NSUserDefaults *prefs = NSUserDefaults.standardUserDefaults;
+-        id protection = [prefs objectForKey:@"henge.perf.thermalProtection"];
+-        int cap = hv_pacing_fps((int)[prefs integerForKey:@"henge.perf.presentationCap"],
+-                               (int)NSProcessInfo.processInfo.thermalState,
+-                               protection && [protection boolValue]);
++    HvDisplaySettings settings = hv_display_settings_get();
++        int cap = hv_pacing_fps(settings.presentation_cap, settings.thermal, settings.thermal_protection);
+         if (!pacing_policy_logged || cap != pacing_fps) {
+             pacing_policy_logged = YES;
+-            fprintf(stderr, "hengevm: display-pacing: cap=%d thermal=%ld resolution=unchanged guest-rendering=unchanged\n", cap, (long)NSProcessInfo.processInfo.thermalState);
++            fprintf(stderr, "hengevm: display-pacing: cap=%d thermal=%d resolution=unchanged guest-rendering=unchanged\n", cap, settings.thermal);
+             pacing_fps = cap;
+         }
+-    }
+ }
+ 
+ - (void)kickPresenter:(BOOL)fresh {
+@@ -2552,7 +2564,15 @@ static const uint8_t *half_to_byte(void) {
+ /* The pointer moved or changed: the screen again, with no need to go through the GPU queue's worker. */
+ - (void)screenChanged {
+     os_unfair_lock_lock(&screen_lock);
+-    if (screen_tex) {
++    if (screen_tex && !atomic_load(&stopping)) {
++        const uint8_t *page = hv_pvg_lite_display_page(lite);
++        uint32_t position = page ? __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE) : UINT32_MAX;
++        HvDisplaySettings settings = hv_display_settings_get();
++        HvCursorDamageKey key = {.layer=layer_generation,.glyph=cursor_revision,
++            .position=position,.width=cursor_w,.height=cursor_h,.hot_x=cursor_hot_x,.hot_y=cursor_hot_y,
++            .settings=settings.scale | (settings.sharp ? 4u : 0u),
++            .visible=page && position != UINT32_MAX && cursor_tex && (cursor_shown || page[0xe04])};
++        if (!hv_cursor_damage_changed(&cursor_damage, key)) { os_unfair_lock_unlock(&screen_lock); return; }
+         screen_dirty = YES;
+         [self kickPresenter:YES];
+     }
+@@ -2864,6 +2884,9 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+             r->shot_timer = timer;
+         }
+ #endif
++        __weak HvReplay *weakReplay = r;
++        r->settings_observer = [NSNotificationCenter.defaultCenter addObserverForName:@"HengeDisplaySettingsDidChange"
++            object:nil queue:nil usingBlock:^(NSNotification *note) { (void)note; [weakReplay screenChanged]; }];
+         fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
+         return (HvPvgMetal *)CFBridgingRetain(r);
+     }
+@@ -2874,6 +2897,7 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
+     @autoreleasepool {
+         HvReplay *r = CFBridgingRelease(m);
+         atomic_store(&r->stopping, 1);
++        if (r->settings_observer) { [NSNotificationCenter.defaultCenter removeObserver:r->settings_observer]; r->settings_observer = nil; }
+         if (r->shot_timer) { dispatch_source_cancel(r->shot_timer); r->shot_timer = nil; }
+         if (cp.timer) { dispatch_source_cancel(cp.timer); cp.timer = nil; }
+         os_unfair_lock_lock(&r->screen_lock);
+@@ -3120,22 +3144,24 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
  
  /* Pinned upstream Instant Resume entrypoints, adapted by the custom engine without a second replay. */
  @interface HvReplay (Resume)
@@ -544,7 +886,7 @@ index 9073d22..b811439 100644
              for (NSNumber *task in r->tasks) {
                  NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
                  for (NSNumber *ref in objs) {
-@@ -3143,79 +3155,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -3143,79 +3169,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
                      if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
                      if (o->parent && o->parent->heap_whole) continue;
                      if (!cb) cb = [r->queue commandBuffer];
@@ -664,7 +1006,7 @@ index 9073d22..b811439 100644
 +            r->cursor_w = d.port[0].width; r->cursor_h = d.port[0].height;
 +            r->cursor_stride = d.port[0].stride;
 +            r->cursor_hot_x = d.port[0].hot_x; r->cursor_hot_y = d.port[0].hot_y;
-+            r->cursor_shown = d.port[0].shown; r->cursor_tex = glyphs[0];
++            r->cursor_shown = d.port[0].shown; r->cursor_tex = glyphs[0]; r->cursor_revision++;
 +            r->link_cursor = glyphs[1];
 +            r->link_cw = d.port[1].width; r->link_ch = d.port[1].height;
 +            r->link_hx = d.port[1].hot_x; r->link_hy = d.port[1].hot_y;
@@ -892,6 +1234,38 @@ index b7ff92a..73a270b 100644
  }
  #ifdef HV_PROF_TEST
  void hv_prof_test_counts(uint64_t *samples,uint64_t *dumps,unsigned *ports) {
+diff --git a/host/reclaim_pages.h b/host/reclaim_pages.h
+new file mode 100644
+index 0000000..c48125a
+--- /dev/null
++++ b/host/reclaim_pages.h
+@@ -0,0 +1,26 @@
++#ifndef HENGE_RECLAIM_PAGES_H
++#define HENGE_RECLAIM_PAGES_H
++#include <stdint.h>
++#include <stddef.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++/* Only dead payload after a global quiescent reset. Keep partial allocation
++   pages untouched: they can share allocator metadata or another allocation.
++   Never use this on executable aliases or live translation structures. */
++static inline size_t hv_reclaim_retired_pages(void *memory, size_t bytes) {
++#if defined(MADV_FREE)
++    size_t page = (size_t)sysconf(_SC_PAGESIZE);
++    uintptr_t first = (uintptr_t)memory;
++    if (!memory || !page || page == (size_t)-1 || bytes > UINTPTR_MAX - first) return 0;
++    uintptr_t end = first + bytes;
++    uintptr_t start = first + ((page - first % page) % page);
++    end -= end % page;
++    if (end <= start) return 0;
++    return madvise((void *)start, end - start, MADV_FREE) ? 0 : end - start;
++#else
++    (void)memory; (void)bytes;
++    return 0;
++#endif
++}
++#endif
 diff --git a/host/snapshot.c b/host/snapshot.c
 index 383ae01..7140036 100644
 --- a/host/snapshot.c
@@ -1206,6 +1580,249 @@ index 47e26eb..8a4a83e 100644
  /* The disk and auxiliary storage files as they are now (inode, size, last change): a saved machine resumes only onto these. */
  int hv_vm_disk_identity(char *out, size_t n);
  const char *hv_vm_reason_name(int reason);
+diff --git a/ios/Henge/BootDisplay.swift b/ios/Henge/BootDisplay.swift
+index 7392fda..bfda5bd 100644
+--- a/ios/Henge/BootDisplay.swift
++++ b/ios/Henge/BootDisplay.swift
+@@ -101,6 +101,8 @@ private struct GPUScreen: UIViewRepresentable {
+         private let role: DisplayTargetSelection.Role
+         private var attached = false
+         private var lastSize: CGSize = .zero
++        private var lastWindow: ObjectIdentifier?
++        private var lastScale: CGFloat = 0
+ 
+         init(display: DisplayRouter, role: DisplayTargetSelection.Role, surface: UUID) {
+             self.id = surface
+@@ -131,10 +133,14 @@ private struct GPUScreen: UIViewRepresentable {
+             if !attached {
+                 attached = true
+                 lastSize = bounds.size
++                lastWindow = ObjectIdentifier(window); lastScale = window.screen.scale
++                metal.contentsScale = lastScale
+                 HengeLog.log("display", "display-viewport: role=\(role) window=\(window.bounds.width)x\(window.bounds.height) layer=\(bounds.width)x\(bounds.height) scale=\(window.screen.scale)")
+                 display.connect(id, layer: metal, role: role)
+-            } else if lastSize != bounds.size {
++            } else if lastSize != bounds.size || lastWindow != ObjectIdentifier(window) || lastScale != window.screen.scale {
+                 lastSize = bounds.size
++                lastWindow = ObjectIdentifier(window); lastScale = window.screen.scale
++                metal.contentsScale = lastScale
+                 display.refresh(id)
+             }
+         }
+@@ -150,8 +156,10 @@ private struct GPUScreen: UIViewRepresentable {
+         let metalLayer = view.layer as! CAMetalLayer
+         // The guest's display profile is sRGB, and the presenter writes sRGB
+         // values. A nil colorspace skips matching on wide-gamut iPad screens.
+-        metalLayer.colorspace = matchScreenColors ? Self.srgb : nil
+-        view.alpha = CGFloat(min(max(brightness, 0.4), 1))
++        let desired = matchScreenColors ? Self.srgb : nil
++        if metalLayer.colorspace !== desired { metalLayer.colorspace = desired }
++        let alpha = CGFloat(min(max(brightness, 0.4), 1))
++        if view.alpha != alpha { view.alpha = alpha }
+     }
+ 
+     func makeUIView(context: Context) -> Screen {
+diff --git a/ios/Henge/DisplayRouter.swift b/ios/Henge/DisplayRouter.swift
+index 47b0ced..9a0ec30 100644
+--- a/ios/Henge/DisplayRouter.swift
++++ b/ios/Henge/DisplayRouter.swift
+@@ -10,6 +10,7 @@ final class DisplayRouter: ObservableObject {
+     private var targets = DisplayTargetSelection()
+     private var layers: [UUID: CAMetalLayer] = [:]
+     private var selected: UUID?
++    private var refreshTask: Task<Void, Never>?
+ 
+     func connect(_ id: UUID, layer: CAMetalLayer, role: DisplayTargetSelection.Role) {
+         layers[id] = layer
+@@ -27,12 +28,19 @@ final class DisplayRouter: ObservableObject {
+     /// even when macOS is idle and isn't submitting another frame.
+     func refresh(_ id: UUID? = nil) {
+         guard id == nil || id == selected else { return }
+-        sendTarget()
++        guard refreshTask == nil else { return }
++        refreshTask = Task { @MainActor [weak self] in
++            await Task.yield() // fold/rotation layout can publish several sizes in one turn
++            guard !Task.isCancelled, let self else { return }
++            self.refreshTask = nil
++            self.sendTarget()
++        }
+     }
+ 
+     private func updateTarget() {
+         let next = targets.selected
+         if next != selected {
++            refreshTask?.cancel(); refreshTask = nil
+             selected = next
+             sendTarget()
+         }
+diff --git a/ios/Henge/EngineTuning.swift b/ios/Henge/EngineTuning.swift
+index e579188..2c13f3b 100644
+--- a/ios/Henge/EngineTuning.swift
++++ b/ios/Henge/EngineTuning.swift
+@@ -4,6 +4,8 @@ import Foundation
+ /// then Documents/henge-env.txt (KEY=VALUE per line, # comments; {Documents} in a value is that folder) overrides them all.
+ /// Applied at launch and again before each Mac starts, so changes need no relaunch.
+ enum EngineTuning {
++    private static let applyLock = NSLock()
++    private static var appliedKeys = Set<String>()
+     static let diagnosticsKey = "henge.perf.cacheDiagnostics"
+     static let fastmemKey = "henge.perf.fastmem"
+     static let refreshKey = "henge.perf.hz"
+@@ -23,9 +25,12 @@ enum EngineTuning {
+         "HV_RECHECK": "1",    // exact same-page check before full memory helper at page tails
+         "HV_STATS": "10",      // seconds between engine stats lines in the log; 0 = off
+         "HV_CPU_POLICY": "auto", // responsive vCPUs; utility QoS for noncritical housekeeping
++        "HV_TIMER_DIRECT": "1", // timer register writes update the local timer directly
++        "HV_DEADLINE_KICKS": "1", // preserve CPU0 I/O polling; secondary CPUs need only due timers
+     ]
+ 
+     static func apply() {
++        applyLock.lock(); defer { applyLock.unlock() }
+         var env = defaults
+         env["HV_FASTMEM"] = UserDefaults.standard.bool(forKey: fastmemKey) ? "1" : "0"
+         let d = UserDefaults.standard
+@@ -51,6 +56,11 @@ enum EngineTuning {
+                     .trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "{Documents}", with: docs.path)
+             }
+         }
++        for key in appliedKeys.subtracting(env.keys) {
++            unsetenv(key)
++            HengeLog.log("tuning", "\(key)=<removed override>")
++        }
++        appliedKeys = Set(env.keys)
+         for (k, v) in env.sorted(by: { $0.key < $1.key }) {
+             setenv(k, v, 1)
+             HengeLog.log("tuning", "\(k)=\(v)")
+diff --git a/ios/Henge/Link/LinkProtocol.swift b/ios/Henge/Link/LinkProtocol.swift
+index 94231b2..fa18a3b 100644
+--- a/ios/Henge/Link/LinkProtocol.swift
++++ b/ios/Henge/Link/LinkProtocol.swift
+@@ -23,6 +23,7 @@ struct LinkControl: Codable {
+     var mode: LinkMode? = nil
+     var x: Int? = nil, y: Int? = nil, code: Int? = nil, down: Bool? = nil
+     var sequence: UInt64? = nil
++    var visible: Bool? = nil
+     func validate() throws {
+         guard version == Self.currentVersion else { throw LinkError.invalid("Update Henge on both devices: different Link protocol version") }
+         switch type {
+@@ -31,6 +32,7 @@ struct LinkControl: Codable {
+         case "button": guard let code, (0...2).contains(code), down != nil else { throw LinkError.invalid("Invalid button") }
+         case "key": guard let code, (4...231).contains(code), down != nil else { throw LinkError.invalid("Invalid HID key") }
+         case "videoAck": guard let sequence, sequence > 0 else { throw LinkError.invalid("Invalid video acknowledgement") }
++        case "visibility": guard visible != nil else { throw LinkError.invalid("Missing viewer visibility") }
+         case "ping", "pong", "bye", "release": break
+         default: throw LinkError.invalid("Unknown control message")
+         }
+diff --git a/ios/Henge/Link/LinkService.swift b/ios/Henge/Link/LinkService.swift
+index 07cd331..bbf78a5 100644
+--- a/ios/Henge/Link/LinkService.swift
++++ b/ios/Henge/Link/LinkService.swift
+@@ -74,6 +74,12 @@ final class LinkHostService: ObservableObject {
+             } catch { status = error.localizedDescription; HengeLog.log("link", status); stopKeepingStatus() }
+             return
+         }
++        if command.type == "visibility", let visible = command.visible {
++            encoder?.setVisible(visible)
++            if !visible { releaseInput() }
++            else if active { henge_vm_link_connected(1) } // request the latest frame even when the guest is idle
++            return
++        }
+         guard active, henge_vm_state() == 1 else { return }
+         switch command.type {
+         case "move": henge_vm_mouse_move(Int32(command.x ?? 0), Int32(command.y ?? 0))
+diff --git a/ios/Henge/Link/LinkVideo.swift b/ios/Henge/Link/LinkVideo.swift
+index f49ac55..655107c 100644
+--- a/ios/Henge/Link/LinkVideo.swift
++++ b/ios/Henge/Link/LinkVideo.swift
+@@ -21,12 +21,14 @@ final class LinkEncoder {
+     private var cache: CVMetalTextureCache
+     private let lock = NSLock()
+     private var stopped = false, captured: UInt64 = 0, congested: UInt64 = 0
++    private var visible = true, visibilityEpoch: UInt64 = 0
+     private var sequence: UInt64 = 0
+     private let send: (Data, @escaping (Bool) -> Void) -> Void
+     private let report: (String) -> Void
+     private final class Ticket {
+         let owner: LinkEncoder
+-        init(_ owner: LinkEncoder) { self.owner = owner }
++        let epoch: UInt64
++        init(_ owner: LinkEncoder, epoch: UInt64) { self.owner = owner; self.epoch = epoch }
+     }
+     init(mode: LinkMode, library: MTLLibrary? = nil, send: @escaping (Data, @escaping (Bool) -> Void) -> Void, report: @escaping (String) -> Void) throws {
+         guard #available(iOS 17.4, *) else { throw LinkError.invalid("Henge Link hardware encoding requires iOS/iPadOS 17.4 or later") }
+@@ -65,7 +67,7 @@ final class LinkEncoder {
+                 outputCallback: { _, source, status, _, sample in
+                     guard let source else { return }
+                     let ticket = Unmanaged<Ticket>.fromOpaque(source).takeRetainedValue()
+-                    ticket.owner.work.async { ticket.owner.encoded(status: status, sample: sample) }
++                    ticket.owner.work.async { ticket.owner.encoded(status: status, sample: sample, epoch: ticket.epoch) }
+                 }, refcon: nil, compressionSessionOut: &candidate)
+             guard status == noErr, let candidate else { continue }
+             func set(_ key: CFString, _ value: CFTypeRef) -> Bool {
+@@ -89,7 +91,7 @@ final class LinkEncoder {
+     /// Called synchronously by the serial guest GPU worker. Commit on its queue
+     /// before returning so later guest writes cannot overtake this snapshot.
+     func capture(texture: MTLTexture, queue: MTLCommandQueue, halfMode: UInt32, cursorTexture: MTLTexture?, rect: SIMD4<Float>) {
+-        lock.lock(); let active = !stopped; lock.unlock(); guard active else { return }
++        lock.lock(); let active = !stopped && visible; let epoch = visibilityEpoch; lock.unlock(); guard active else { return }
+         guard texture.width == mode.width, texture.height == mode.height else { return }
+         guard slots.wait(timeout: .now()) == .success else {
+             lock.lock(); congested &+= 1; let n = congested; lock.unlock()
+@@ -127,9 +129,9 @@ final class LinkEncoder {
+             _ = cvTexture; _ = texture; _ = cursorTexture // keep aliased resources alive until the GPU completes
+             guard done.status == .completed else { slots.signal(); report("Link GPU snapshot failed"); return }
+             work.async { [self] in
+-                lock.lock(); let active = !stopped; lock.unlock()
++                lock.lock(); let active = !stopped && visible && epoch == visibilityEpoch; lock.unlock()
+                 guard active, let session else { slots.signal(); return }
+-                let ticket = Unmanaged.passRetained(Ticket(self))
++                let ticket = Unmanaged.passRetained(Ticket(self, epoch: epoch))
+                 let status = VTCompressionSessionEncodeFrame(session, imageBuffer: pixel, presentationTimeStamp: stamp, duration: CMTime(value: 1, timescale: Int32(mode.hz)), frameProperties: nil, sourceFrameRefcon: ticket.toOpaque(), infoFlagsOut: nil)
+                 if status != noErr { ticket.release(); slots.signal(); report("Hardware encode failed: \(status)") }
+             }
+@@ -138,7 +140,9 @@ final class LinkEncoder {
+         lock.lock(); captured &+= 1; let n = captured; lock.unlock()
+         if n == 1 { report("first independent port-1 Metal frame captured") }
+     }
+-    private func encoded(status: OSStatus, sample: CMSampleBuffer?) {
++    private func encoded(status: OSStatus, sample: CMSampleBuffer?, epoch: UInt64) {
++        lock.lock(); let active = !stopped && visible && epoch == visibilityEpoch; lock.unlock()
++        guard active else { slots.signal(); return }
+         guard status == noErr, let sample, CMSampleBufferDataIsReady(sample), let format = CMSampleBufferGetFormatDescription(sample), let block = CMSampleBufferGetDataBuffer(sample) else { slots.signal(); report("Hardware encoder produced no frame: \(status)"); return }
+         let hevc = CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC
+         var sets = [Data]()
+@@ -172,6 +176,11 @@ final class LinkEncoder {
+     func acknowledge(_ sequence: UInt64) {
+         if let receipt = credits.consumed(sequence) { retire(receipt) }
+     }
++    func setVisible(_ value: Bool) {
++        lock.lock()
++        if visible != value { visible = value; visibilityEpoch &+= 1 }
++        lock.unlock()
++    }
+     private func retire(_ receipt: LinkFrameCredits.Receipt) {
+         slots.signal()
+         guard receipt.consumed else { return }
+diff --git a/ios/Henge/Link/LinkViews.swift b/ios/Henge/Link/LinkViews.swift
+index 1bc238f..31eff7e 100644
+--- a/ios/Henge/Link/LinkViews.swift
++++ b/ios/Henge/Link/LinkViews.swift
+@@ -162,6 +162,7 @@ struct LinkViewerView: View {
+             }
+         }
+         .onChange(of: viewer.ready) { _, ready in
++            if ready { viewer.send(LinkControl(type: "visibility", visible: phase == .active)) }
+             UIApplication.shared.isIdleTimerDisabled = ready
+             // Reveal a real connection failure rather than leaving a hidden
+             // error above a frozen last frame. It can still be hidden again.
+@@ -169,6 +170,7 @@ struct LinkViewerView: View {
+         }
+         .statusBarHidden(connecting && controlsHidden)
+         .onChange(of: phase) { _, phase in
++            viewer.send(LinkControl(type: "visibility", visible: phase == .active))
+             if phase == .background { viewer.disconnect(); connecting = false; discovery.stop(); UIApplication.shared.isIdleTimerDisabled = false }
+             else if phase == .active, !connecting { discovery.start(wired: wired) }
+             else if phase == .inactive { viewer.send(LinkControl(type: "release")) }
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
 index 34d6a98..ba2f008 100644
 --- a/ios/Henge/Native/henge-vm.c
@@ -1521,9 +2138,18 @@ index f84465e..acd9410 100644
              }
              if tick == 60 && !stillWallpaperTipShown { // about when the desktop is up after a login
 diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
-index e1693b0..be7beea 100644
+index e1693b0..687f5c2 100644
 --- a/ios/Henge/SettingsView.swift
 +++ b/ios/Henge/SettingsView.swift
+@@ -155,7 +155,7 @@ struct SettingsView: View {
+                         Text("60 fps").tag(60)
+                         Text("30 fps").tag(30)
+                     }
+-                    Text("Optional power controls; disabled by default. Keeps Retina. Thermal protection limits presentation to 30 fps when hot and 20 fps in critical heat. This reduces display compositing; the guest may still render faster. Choose a 30 Hz Mac refresh rate before restarting to also reduce guest animation work. Presentation changes apply within about a second while frames arrive.")
++                    Text("Optional power controls; disabled by default. Keeps Retina. Thermal protection limits presentation to 30 fps when hot and 20 fps in critical heat. This reduces display compositing; the guest may still render faster. Choose a 30 Hz Mac refresh rate before restarting to also reduce guest animation work. Presentation and thermal changes are applied through notifications.")
+                         .font(.footnote).foregroundStyle(.secondary)
+                     Toggle("Faster disk writes", isOn: $fastFlush)
+                     Toggle("Quicker wake from idle", isOn: $wfiSpin)
 @@ -194,7 +194,7 @@ struct SettingsView: View {
                  .listRowBackground(Desk.card)
                  Section("Instant Resume") {
@@ -1581,12 +2207,37 @@ index 0000000..eef5d30
 + c=Path(tmp)/'bench.c';c.write_text(source);exe=Path(tmp)/'bench'
 + subprocess.run(['cc','-O3','-Wall','-Wextra','-Werror','-I'+str(root/'devices'),str(c),'-o',str(exe)],check=True)
 + subprocess.run([str(exe)],check=True)
+diff --git a/tests/mem_programs.S b/tests/mem_programs.S
+index bcbed3f..33fb61a 100644
+--- a/tests/mem_programs.S
++++ b/tests/mem_programs.S
+@@ -353,6 +353,20 @@ PROGRAM groups
+     ldp x16, x17, [x12, #-16]
+     // Base overwritten by a load in the group.
+     ldr x12, [x12, #-8]
++    // Ordinary address increments retain one validated same-page translation.
++    add x23, x0, #0x200
++    ldr x19, [x23]
++    add x23, x23, #16
++    ldr w20, [x23]
++    sub x23, x23, #8
++    ldp x21, x22, [x23]
++    str x19, [x23, #24]
++    // The same pattern across a page boundary must use the plain fallback.
++    add x23, x0, #0x4000
++    sub x23, x23, #8
++    ldr x19, [x23]
++    add x23, x23, #8
++    ldr x20, [x23]
+ END groups
+ 
+ PROGRAM mmio
 diff --git a/tests/run_lifecycle_sanitizers.sh b/tests/run_lifecycle_sanitizers.sh
 new file mode 100755
-index 0000000..dc57a10
+index 0000000..fd8becd
 --- /dev/null
 +++ b/tests/run_lifecycle_sanitizers.sh
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,40 @@
 +#!/bin/bash
 +# Collect independent failures in one diagnostic pass; any failure blocks the IPA.
 +set -uo pipefail
@@ -1622,8 +2273,30 @@ index 0000000..dc57a10
 +check python3 tests/test_surface_hash_limit.py
 +check python3 tests/test_display_snapshot.py
 +check python3 tests/test_stats_lifecycle.py
++if check cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -Icore -Ihost -Idevices tests/test_optimization_primitives.c -o build/test_optimization_primitives; then
++    check build/test_optimization_primitives
++fi
 +printf '\nExpanded diagnostic pass: %d failed checks\n' "$failures"
 +test "$failures" -eq 0
+diff --git a/tests/test_display_settings.m b/tests/test_display_settings.m
+index 5bf491f..0c279ab 100644
+--- a/tests/test_display_settings.m
++++ b/tests/test_display_settings.m
+@@ -47,6 +47,14 @@ int main(void) { @autoreleasepool {
+     assert(atomic_load(&reads)==before); /* zero defaults reads on the render path */
+     [p setBool:NO forKey:@"henge.cursor.sharp"];notify();assert(!hv_display_settings_get().sharp);
+     [p removeObjectForKey:@"henge.cursor.sharp"];notify();assert(hv_display_settings_get().sharp);
++    [p setInteger:60 forKey:@"henge.perf.presentationCap"];
++    [p setBool:YES forKey:@"henge.perf.thermalProtection"];notify();
++    assert(hv_display_settings_get().presentation_cap == 60 && hv_display_settings_get().thermal_protection);
++    [p setInteger:30 forKey:@"henge.perf.presentationCap"];notify();
++    assert(hv_display_settings_get().presentation_cap == 30);
++    [p removeObjectForKey:@"henge.perf.presentationCap"];
++    [p removeObjectForKey:@"henge.perf.thermalProtection"];notify();
++    assert(hv_display_settings_get().presentation_cap == 0 && !hv_display_settings_get().thermal_protection);
+     pthread_t threads[4];
+     for(unsigned i=0;i<4;i++)assert(!pthread_create(&threads[i],NULL,reader,NULL));
+     for(unsigned i=0;i<1000;i++){[p setBool:(i&1) forKey:@"henge.cursor.sharp"];notify();}
 diff --git a/tests/test_display_snapshot.py b/tests/test_display_snapshot.py
 new file mode 100644
 index 0000000..7b09ed0
@@ -1766,6 +2439,59 @@ index 0000000..52930cc
 +b=root/'build';b.mkdir(exist_ok=True);c=b/'test_gpu_upload.m';c.write_text(pre+method+post)
 +subprocess.run(['xcrun','--sdk','macosx','clang','-fobjc-arc','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(root/'devices'),str(c),'-framework','Foundation','-framework','Metal','-o',str(b/'test_gpu_upload')],check=True)
 +subprocess.run([str(b/'test_gpu_upload')],check=True)
+diff --git a/tests/test_optimization_primitives.c b/tests/test_optimization_primitives.c
+new file mode 100644
+index 0000000..c738ad9
+--- /dev/null
++++ b/tests/test_optimization_primitives.c
+@@ -0,0 +1,47 @@
++#define _DEFAULT_SOURCE
++#include "mmu.h"
++#include "cursor_damage.h"
++#include "reclaim_pages.h"
++#include <assert.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++int hv_tlb_tmajor;
++int main(void) {
++    HvCpu *cpu = calloc(1, sizeof *cpu);
++    uint8_t *ram = calloc(1, 32768);
++    assert(cpu && ram);
++    memset(cpu->tlb, 0x80, sizeof cpu->tlb);
++    uint64_t va = 0x10000;
++    HvTlbEntry *e = hv_tlb_ent(cpu, (va >> 14) & (HV_TLB_SIZE - 1), 0);
++    e->read_tag = va - HV_TLB_ADJ; e->addend = (uintptr_t)ram - va;
++    assert(hv_tlb_read_span(cpu, va + 16376, 8, 0) == ram + 16376);
++    assert(!hv_tlb_read_span(cpu, va + 16376, 16, 0));
++    assert(!hv_tlb_read_span(cpu, va, 0, 0));
++    assert(!hv_tlb_read_span(cpu, va, 8, 1));
++    cpu->pstate_extra = HV_PSTATE_PAN;
++    HvTlbEntry *pan = hv_tlb_ent(cpu, (va >> 14) & (HV_TLB_SIZE - 1), 2);
++    pan->read_tag = va - HV_TLB_ADJ; pan->addend = (uintptr_t)ram - va;
++    assert(hv_tlb_read_span(cpu, va, 8, 1) == ram);
++    cpu->pstate_extra = 0;
++    assert(!hv_tlb_read_span(cpu, va, 8, 1));
++    e->read_tag = HV_TLB_INVALID;
++    assert(!hv_tlb_read_span(cpu, va, 8, 0));
++    free(cpu); free(ram);
++    HvCursorDamage d = {0};
++    HvCursorDamageKey k = {.layer=1,.glyph=1,.position=100,.visible=1,.settings=3};
++    assert(hv_cursor_damage_changed(&d,k)); assert(!hv_cursor_damage_changed(&d,k));
++    k.position++; assert(hv_cursor_damage_changed(&d,k));
++    k.glyph++; assert(hv_cursor_damage_changed(&d,k));
++    k.settings++; assert(hv_cursor_damage_changed(&d,k));
++    k.visible=0; assert(hv_cursor_damage_changed(&d,k));
++    k.position++; k.glyph++; assert(!hv_cursor_damage_changed(&d,k));
++    k.layer++; assert(hv_cursor_damage_changed(&d,k));
++    size_t page=(size_t)sysconf(_SC_PAGESIZE);
++    void *p=NULL; assert(!posix_memalign(&p,page,page*4)); memset(p,0x5a,page*4);
++    size_t advised=hv_reclaim_retired_pages((uint8_t *)p+1,page*4-2);
++    assert(!advised || advised == page*2);
++    assert(((uint8_t *)p)[0]==0x5a && ((uint8_t *)p)[page*4-1]==0x5a);
++    memset(p,0xa5,page*4); assert(((uint8_t *)p)[page*2]==0xa5); free(p);
++    puts("PASS TLB span permissions/bounds, exact cursor damage, retired-page boundaries and reuse");
++}
 diff --git a/tests/test_prof_ios.c b/tests/test_prof_ios.c
 index 553c4b6..64d0cb9 100644
 --- a/tests/test_prof_ios.c
