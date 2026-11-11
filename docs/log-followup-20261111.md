@@ -35,7 +35,9 @@ upload and cannot rank this session's hot functions.
   and default reporting remain available. This eliminates that diagnostic walk;
   its device power/latency effect has not been measured.
 * An earlier session with HV_PROF_IOS=0 no longer permanently consumes profiler
-  initialization. Actual initialization is serialized and logged with process
+  initialization. Turning it off again prevents sampling and thread registration
+  in subsequent sessions; mode changes are respected at session start. Actual
+  initialization is serialized and logged with process
   and timestamp. Profiling remains opt-in and perturbs timing.
 * Existing GPU report intervals now include device allocation size and constant
   time collection counts. These include in-flight work and are not a process
@@ -51,7 +53,7 @@ checks are retained. No IPA is requested by this follow-up.
 Regression coverage includes real native VM pause/Continue/reboot and retained
 counter totals, recreated CPU0 timing with deep scans off/on, Swift frame and
 block sampling across observed and unobserved pauses, invalid clock readings,
-counter resets, and profiler off-then-on initialization. The existing lifecycle,
+counter resets, and profiler off/on/off/on lifecycle transitions. The existing lifecycle,
 Metal, input, networking and sanitizer checks remain mandatory.
 
 Heat, memory ownership, cache pressure and optimal CPU count are still open.

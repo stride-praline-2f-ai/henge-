@@ -811,10 +811,43 @@ index cc902ed..15b606f 100644
      mov sp, x0
      ldr x0, [x28, #CPU_NZCV]
 diff --git a/host/prof_ios.c b/host/prof_ios.c
-index b7ff92a..a919b06 100644
+index b7ff92a..73a270b 100644
 --- a/host/prof_ios.c
 +++ b/host/prof_ios.c
-@@ -183,15 +183,22 @@ static void *sampler(void *unused) {
+@@ -27,7 +27,12 @@ static struct { uintptr_t off; uint32_t n; } slots[SLOTS];
+ static uint64_t total, idle, jit, other_image, unknown;
+ static _Atomic uint64_t all_samples, all_dumps;
+ static uintptr_t image_base;
+-static int words_on;
++static _Atomic int words_on;
++
++static int profiler_mode(void) {
++    const char *mode = getenv("HV_PROF_IOS");
++    return !mode || !strcmp(mode, "0") ? 0 : atoi(mode) >= 2 ? 2 : 1;
++}
+ 
+ /* HV_PROF_IOS=2: the translated instruction under each JIT sample, by its encoding */
+ #define WORD_SLOTS 16384
+@@ -79,6 +84,7 @@ static void unregister_thread(void *value) {
+     if(port)mach_port_deallocate(mach_task_self(),port);
+ }
+ static void reg(void) {
++    if (!profiler_mode()) return;
+     if(pthread_getspecific(thread_key))return;
+     thread_act_t port=mach_thread_self();
+     pthread_mutex_lock(&registry_mu);
+@@ -95,7 +101,10 @@ static void leave(void) {
+     unregister_thread(value);
+ }
+ static void session(int on) {
++    int mode = profiler_mode();
++    on = on && mode != 0;
+     pthread_mutex_lock(&registry_mu);active=on;generation++;
++    if (on) atomic_store(&words_on, mode >= 2);
+     pthread_cond_broadcast(&registry_cv);
+     while (!on && sampling) pthread_cond_wait(&registry_cv, &registry_mu);
+     pthread_mutex_unlock(&registry_mu);
+@@ -183,15 +192,22 @@ static void *sampler(void *unused) {
      }
      return NULL;
  }
@@ -835,7 +868,7 @@ index b7ff92a..a919b06 100644
 +void hv_prof_ios_start(void) {
 +    /* An earlier session with profiling off must not consume initialization.
 +       Native boot requests can overlap before the bridge acquires api_lock. */
-+    if(!getenv("HV_PROF_IOS") || !strcmp(getenv("HV_PROF_IOS"),"0"))return;
++    if(!profiler_mode())return;
 +    static pthread_once_t once = PTHREAD_ONCE_INIT;
 +    pthread_once(&once, start_profiler);
  }
@@ -1716,24 +1749,37 @@ index 0000000..52930cc
 +subprocess.run(['xcrun','--sdk','macosx','clang','-fobjc-arc','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(root/'devices'),str(c),'-framework','Foundation','-framework','Metal','-o',str(b/'test_gpu_upload')],check=True)
 +subprocess.run([str(b/'test_gpu_upload')],check=True)
 diff --git a/tests/test_prof_ios.c b/tests/test_prof_ios.c
-index 553c4b6..d1b2cb5 100644
+index 553c4b6..64d0cb9 100644
 --- a/tests/test_prof_ios.c
 +++ b/tests/test_prof_ios.c
-@@ -17,6 +17,8 @@ static void *worker(void *unused){
+@@ -16,7 +16,14 @@ static void *worker(void *unused){
+  usleep(unused?100000:25000);if(unused){hv_prof_unregister();hv_prof_test_counts(&samples,&dumps,&ports);assert(!ports);}
   return NULL;
  }
++static void *disabled_worker(void *unused){
++ (void)unused;hv_prof_register();
++ uint64_t samples,dumps;unsigned ports;hv_prof_test_counts(&samples,&dumps,&ports);assert(!ports);
++ usleep(30000);hv_prof_unregister();return NULL;
++}
  int main(void){
 + setenv("HV_PROF_IOS","0",1);hv_prof_ios_start();
 + assert(!hv_prof_register && !hv_prof_session);
   setenv("HV_PROF_IOS","1",1);setenv("HV_PROF_IOS_HZ","100",1);
   setenv("HV_PROF_IOS_SECS","0",1);setenv("HV_PROF_IOS_DURATION","1",1);
   hv_prof_ios_start();assert(hv_prof_register&&hv_prof_session);hv_prof_session(1);
-@@ -28,5 +30,5 @@ int main(void){
+@@ -28,5 +35,12 @@ int main(void){
   hv_prof_session(1);pthread_t t;pthread_create(&t,NULL,worker,(void*)1);pthread_join(t,NULL);
   hv_prof_test_counts(&samples,&dumps,&ports);assert(!ports&&samples>stopped);
   hv_prof_session(0);
 - puts("iOS profiler lifecycle: port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
-+ puts("iOS profiler lifecycle: off then enabled, port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
++ setenv("HV_PROF_IOS","0",1);hv_prof_ios_start();hv_prof_session(1);
++ hv_prof_test_counts(&stopped,&dumps,&ports);assert(!ports);
++ pthread_create(&t,NULL,disabled_worker,NULL);pthread_join(t,NULL);
++ hv_prof_test_counts(&samples,&dumps,&ports);assert(samples==stopped && !ports);
++ setenv("HV_PROF_IOS","1",1);hv_prof_ios_start();hv_prof_session(1);
++ pthread_create(&t,NULL,worker,(void*)1);pthread_join(t,NULL);hv_prof_session(0);
++ hv_prof_test_counts(&samples,&dumps,&ports);assert(samples>stopped && !ports);
++ puts("iOS profiler lifecycle: off/on/off/on, port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
  }
 diff --git a/tests/test_pvg_lifecycle.m b/tests/test_pvg_lifecycle.m
 index 81cdb83..eb4c3bb 100644
