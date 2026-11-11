@@ -187,4 +187,79 @@ m=replace_once(m,"$(METAL_LIBS) -framework AudioToolbox -o $@",
                "include Compression in lifecycle test link")
 makefile.write_text(m)
 
+
+# PR #108 (Duo inner screen / optional status strip) is adapted to the
+# fork's better source-of-truth, GuestScreenSize and key-window viewport.
+# Its default remains full-screen. No second screen-fit setting or boot
+# path: the selected Fit preset already recomputes at launch.
+hardware=root/"ios/Henge/Hardware.swift"
+h=hardware.read_text()
+constants=[]
+if "static var largeScreen:" not in h:
+    constants.append("    static var largeScreen: Bool { !isPad && min(displayViewport.width, displayViewport.height) >= 600 }")
+for name,value in (("sideStrip","84"),("sideStripCentre","47.5"),("sideStripTop","114")):
+    if f"static let {name}:" not in h:
+        constants.append(f"    static let {name}: CGFloat = {value}")
+if constants:
+    h=replace_once(h,"enum Device {\n","enum Device {\n"+ "\n".join(constants)+"\n",
+                   "one dynamic Duo-screen policy with status-strip geometry")
+for name in ("largeScreen","sideStrip","sideStripCentre","sideStripTop"):
+    if h.count(f"static var {name}:") + h.count(f"static let {name}:") != 1:
+        raise SystemExit("Duplicate or missing Device member: "+name)
+hardware.write_text(h)
+
+machines=root/"ios/Henge/Machines.swift"
+mm=machines.read_text()
+if "var fillScreen: Bool?" not in mm:
+    mm=replace_once(mm,"    var fitScreen: Bool?\n",
+        "    var fitScreen: Bool?\n    var fillScreen: Bool?\n",
+        "optional Duo strip preference in saved Mac model")
+mm=replace_once(mm,"if fitsDeviceScreen { return GuestScreenSize.fitting(in: viewport) }",
+    "if fitsDeviceScreen {\n"
+    "            var area = viewport\n"
+    "            if Device.largeScreen && !(fillScreen ?? true) {\n"
+    "                if area.width >= area.height { area.width -= Device.sideStrip }\n"
+    "                else { area.height -= Device.sideStrip }\n"
+    "            }\n"
+    "            return GuestScreenSize.fitting(in: area)\n"
+    "        }",
+    "single dynamic Fit mode calculates optional Duo side strip at boot")
+machines.write_text(mm)
+
+session=root/"ios/Henge/SessionView.swift"
+sv=session.read_text()
+sv=replace_once(sv,
+    "centre: zoomCentre, aspect: displayAspect)",
+    "centre: zoomCentre, aspect: displayAspect,\n"
+    "                                strip: Device.largeScreen && !(mac.fillScreen ?? true) ? Device.sideStrip : 0)",
+    "Pass Duo strip to one source-of-truth layout for display and touch")
+sv=replace_once(sv,
+    "private var onLargeScreen: Bool { !Device.isPad && horizontalSize == .regular && verticalSize == .regular }",
+    "private var onLargeScreen: Bool { Device.largeScreen }",
+    "Observe physical window viewport rather than conflicting size-class state")
+if "horizontalSize" in sv or "verticalSize" in sv:
+    raise SystemExit("Stale size-class based Duo display activation")
+session.write_text(sv)
+
+settings=root/"ios/Henge/MacSettingsView.swift"
+ms=settings.read_text()
+if 'Toggle("Fill the whole screen"' not in ms:
+    start=ms.find('Picker("Screen"')
+    if start<0: raise SystemExit("Screen selection settings not found")
+    pos=ms.find("                        .pickerStyle(.segmented)\n",start)
+    if pos<0: raise SystemExit("Expected segmented Screen picker not found")
+    pos+=len("                        .pickerStyle(.segmented)\n")
+    option=(
+        '                        if Device.largeScreen {\n'
+        '                            Toggle("Fill the whole screen", isOn: Binding(get: { mac.fillScreen ?? true }, set: { value in\n'
+        '                                mac.fillScreen = value\n'
+        '                                save()\n'
+        '                            }))\n'
+        '                            Text("Off leaves room beside the Mac for the status bar and controls. Fit adapts to the current Duo screen when the Mac starts.")\n'
+        '                                .font(.system(size: 13)).foregroundStyle(Desk.dim)\n'
+        '                        }\n')
+    ms=ms[:pos]+option+ms[pos:]
+settings.write_text(ms)
+print("PASS Duo PR #108 integrated into existing dynamic Fit and touch geometry; single activation toggle")
+
 print("PASS custom/upstream reconciliation: dual-port GPU snapshots, VM pause APIs and lifecycle")
