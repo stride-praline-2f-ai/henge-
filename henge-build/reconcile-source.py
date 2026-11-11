@@ -127,4 +127,24 @@ for name in ("int hv_vm_pause(void);","int hv_vm_finish_pause(void);",
              "int hv_vm_pause_clean(void);","void hv_vm_link_flap(void);"):
     if h.count(name)!=1: raise SystemExit("Missing or duplicate pause API: "+name)
 header.write_text(h)
+# Build upstream Instant Resume with one VM and one renderer in all targets.
+makefile=root/"Makefile"
+m=makefile.read_text()
+m=replace_once(m,"host/scheduling.c host/vm.c host/net_slirp.c",
+               "host/scheduling.c host/vm.c host/snapshot.c host/net_slirp.c",
+               "include real snapshot module in iOS static archive")
+assert m.count("$(B)/vm.o $(B)/usb_host.o")==2, "unexpected CLI targets"
+m=m.replace("$(B)/vm.o $(B)/usb_host.o",
+            "$(B)/vm.o $(B)/snapshot.o $(B)/usb_host.o")
+m=replace_once(m,"$(B)/vm.o $(B)/audio_mac.o",
+               "$(B)/vm.o $(B)/snapshot.o $(B)/audio_mac.o",
+               "link snapshot implementation into lifecycle tests")
+m=replace_once(m,"-lz -framework Foundation -framework CFNetwork",
+               "-lz -lcompression -framework Foundation -framework CFNetwork",
+               "include Compression in Henge CLI link")
+m=replace_once(m,"$(METAL_LIBS) -framework AudioToolbox -o $@",
+               "$(METAL_LIBS) -framework AudioToolbox -lcompression -o $@",
+               "include Compression in lifecycle test link")
+makefile.write_text(m)
+
 print("PASS custom/upstream reconciliation: dual-port GPU snapshots, VM pause APIs and lifecycle")
