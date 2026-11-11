@@ -45,10 +45,10 @@ echo "Applying upstream: $upstream"
 # removal. Any additional unresolved path aborts the build rather than guessing.
 if ! git -C "$source_dir" merge --no-edit --no-ff -X ours "$upstream"; then
   unresolved="$(git -C "$source_dir" diff --name-only --diff-filter=U)"
-  expected_unresolved="$(printf 'devices/metallib.c\\ndevices/metallib.h')"
+  expected_unresolved="$(printf 'devices/metallib.c\ndevices/metallib.h')"
   if [ "$unresolved" != "$expected_unresolved" ]; then
     echo "Unreviewed upstream merge conflicts:" >&2
-    printf '%s\\n' "$unresolved" >&2
+    printf '%s\n' "$unresolved" >&2
     exit 1
   fi
   git -C "$source_dir" rm -- devices/metallib.c devices/metallib.h
