@@ -25,4 +25,7 @@ assert validation.get('ios_app_compile') == 'passed', 'Full iOS app compilation 
 assert isinstance(validation.get('run_id'), int) and len(validation.get('source_commit', '')) == 40, 'Missing traceable validation source'
 runner = state.get('runner_mode', {})
 assert runner.get('state') == 'verified' and runner.get('evidence'), 'Runner-mode validation incomplete'
+m4 = state.get('m4_implementation')
+if m4 is not None:
+    assert m4.get('complete') is True and all(x.get('state') in ('verified', 'verified_with_safe_alternative') and x.get('evidence') for x in m4['workstreams']), 'M4 engineering gate incomplete'
 print('PASS complete implementation gate:',  manifest['audit_repairs_sha256'])

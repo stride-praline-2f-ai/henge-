@@ -8,7 +8,9 @@ import subprocess
 import zipfile
 import tempfile
 from pathlib import Path
-latest=subprocess.check_output(["git","-C","build-request","ls-remote","origin","refs/heads/feature/duo-efficiency"],text=True).split()[0]
+release_manifest=json.loads(Path("build-request/henge-build/manifest.json").read_text())
+release_branch=release_manifest.get("release_branch", "feature/duo-efficiency")
+latest=subprocess.check_output(["git","-C","build-request","ls-remote","origin","refs/heads/"+release_branch],text=True).split()[0]
 assert latest==os.environ["GITHUB_SHA"], "Superseded source must not publish a release artifact"
 manifest=json.loads(Path("build-request/henge-build/manifest.json").read_text())
 integration=manifest["upstream_integration"]
