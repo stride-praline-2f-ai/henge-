@@ -22,3 +22,11 @@
 Next: implement demand-driven display refresh coordination; finish dynamic memory
 UI/budget integration and the remaining CPU/JIT/idle/input/gaming reconciliation. Native ARM64/MMU, Metal and full app validation are still
 required. The complete M4 plan is NOT finished; packaging remains disabled.
+
+- In progress: M4 CAMetalDisplayLink supplies damage-driven drawables to the one
+  existing screen/cursor encoder, pauses between updates, uses runtime display
+  maximum and requested presentation cap, and rejects retired target generations.
+  Main-thread scene lifecycle disables inactive targets. VM pause now stops and
+  drains presentation before GPU snapshot quiescence; Continue rearms it.
+  This new display path is NOT yet SDK/runtime validated. Next action: add the
+  controlled-queue regression, then compile against the real iPhoneOS SDK.

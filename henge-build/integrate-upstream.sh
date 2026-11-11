@@ -92,7 +92,15 @@ p["HengeSnapshotSchema"]=3
 p["HengeMergedUpstreamCommit"]=i["main_sha"]
 p["HengeIntegratedPullRequests"]=[int(x["number"]) for x in i["pull_requests"]]
 p["HengeIntegratedPullRequestHeads"]=[str(x["sha"]) for x in i["pull_requests"]]
+version_manifest=json.loads(Path(sys.argv[2]).read_text())
+p["CFBundleShortVersionString"]=version_manifest.get("app_version", p["CFBundleShortVersionString"])
+p["CFBundleVersion"]=version_manifest.get("app_build", p["CFBundleVersion"])
 with path.open("wb") as f: plistlib.dump(p,f)
+helper=path.parent.parent / "HengeJITHelper" / "Info.plist"
+with helper.open("rb") as f: helper_info=plistlib.load(f)
+helper_info["CFBundleShortVersionString"]=p["CFBundleShortVersionString"]
+helper_info["CFBundleVersion"]=p["CFBundleVersion"]
+with helper.open("wb") as f: plistlib.dump(helper_info,f)
 PY
 echo "Integrated upstream and selected PR heads:"
 git -C "$source_dir" --no-pager log -1 --oneline
