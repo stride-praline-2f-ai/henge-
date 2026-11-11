@@ -2074,7 +2074,7 @@ index 0000000..c550603
 +}
 +#endif
 diff --git a/devices/xhci.c b/devices/xhci.c
-index c355628..ff98ede 100644
+index c355628..91d40af 100644
 --- a/devices/xhci.c
 +++ b/devices/xhci.c
 @@ -133,9 +133,20 @@ struct HvXhciDev {
@@ -2245,7 +2245,7 @@ index c355628..ff98ede 100644
      /* QEMU's xHCI IDs. Class 0x0c0330 with revision 0: macOS's IOPCIClassMatch compares all 32 bits. */
      hv_pci_init(&x->pci, 0x1b36, 0x000d, 0x0c033000, 0x1af4, 0x1100);
      x->pci.opaque = x;
-@@ -1137,3 +1177,48 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
+@@ -1137,3 +1177,49 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
      reset(x);
      return x;
  }
@@ -2264,6 +2264,7 @@ index c355628..ff98ede 100644
 +    for (int i = 0; i < HV_TP_FINGERS; i++) if (x->tp_fingers[i].in) x->tp_fingers[i].state = 7;
 +    tp_queue(x, 0);
 +    hv_gamepad_neutral(x->gp_state);
++    x->gp_desired=0; /* virtual control surface is released across VM pause/stop */
 +    x->gp_head=x->gp_tail;
 +    memcpy(x->gp_reports[x->gp_tail++%64],x->gp_state,HV_GAMEPAD_BYTES);
 +    memset(x->tp_fingers, 0, sizeof x->tp_fingers);
@@ -4335,7 +4336,7 @@ index 94231b2..b1a53e8 100644
          default: throw LinkError.invalid("Unknown control message")
          }
 diff --git a/ios/Henge/Link/LinkService.swift b/ios/Henge/Link/LinkService.swift
-index 07cd331..7b8dc28 100644
+index 07cd331..7b42d12 100644
 --- a/ios/Henge/Link/LinkService.swift
 +++ b/ios/Henge/Link/LinkService.swift
 @@ -14,13 +14,14 @@ final class LinkHostService: ObservableObject {
@@ -4382,7 +4383,7 @@ index 07cd331..7b8dc28 100644
              do {
                  guard let transport else { return }
                  let created = try LinkEncoder(mode: proposed, send: { [weak transport] data, done in
-@@ -68,25 +78,33 @@ final class LinkHostService: ObservableObject {
+@@ -68,25 +78,35 @@ final class LinkHostService: ObservableObject {
                  })
                  encoder = created; mode = proposed
                  transport.onVideoAcknowledged = { [weak created] sequence in created?.acknowledge(sequence) }
@@ -4400,7 +4401,9 @@ index 07cd331..7b8dc28 100644
 +            else if active { henge_vm_link_connected(1) } // request the latest frame even when the guest is idle
 +            return
 +        }
-+        guard (active || controlOnly), henge_vm_state() == 1 else { return }
++        if command.type == "bye" { stop(); return }
++        if command.type == "release" { releaseInput(); return }
++        guard (active || controlOnly), henge_vm_state() == 1, henge_vm_cpu_background() == 0 else { return }
          switch command.type {
          case "move": henge_vm_mouse_move(Int32(command.x ?? 0), Int32(command.y ?? 0))
          case "scroll": henge_vm_mouse_scroll(Int32(command.x ?? 0), Int32(command.y ?? 0))
@@ -4420,7 +4423,7 @@ index 07cd331..7b8dc28 100644
          case "bye": stop()
          default: break
          }
-@@ -111,22 +129,23 @@ final class LinkHostService: ObservableObject {
+@@ -111,22 +131,23 @@ final class LinkHostService: ObservableObject {
          }
      }
      func forgetPairing() {
@@ -4448,7 +4451,7 @@ index 07cd331..7b8dc28 100644
          keys.removeAll(); buttons.removeAll()
      }
  }
-@@ -135,14 +154,19 @@ final class LinkHostService: ObservableObject {
+@@ -135,14 +156,19 @@ final class LinkHostService: ObservableObject {
  final class LinkViewerService: ObservableObject {
      @Published private(set) var status = "Select a local iPad or enter its address manually."
      @Published private(set) var ready = false
@@ -4470,7 +4473,7 @@ index 07cd331..7b8dc28 100644
          let channel = transport
          let mailbox = LinkPixelMailbox { [weak self] pixel in
              guard let self, self.generation == g else { return }
-@@ -152,27 +176,38 @@ final class LinkViewerService: ObservableObject {
+@@ -152,27 +178,38 @@ final class LinkViewerService: ObservableObject {
              }
              self.onPixel?(pixel)
          }
@@ -4515,7 +4518,7 @@ index 07cd331..7b8dc28 100644
                  worker.consume(packet.payload, generation: decodeGeneration, consumed: { [weak channel] sequence in
                      // Runs after the decode slot is free, independently of UI work.
                      channel?.sendControl(LinkControl(type: "videoAck", sequence: sequence))
-@@ -187,9 +222,16 @@ final class LinkViewerService: ObservableObject {
+@@ -187,9 +224,16 @@ final class LinkViewerService: ObservableObject {
          if let peer { transport.connect(peer: peer, key: secret, wired: wired) }
          else { transport.connect(host: host.trimmingCharacters(in: .whitespacesAndNewlines), key: secret, wired: wired, port: port) }
      }
@@ -5759,7 +5762,7 @@ index 0000000..ae7bf9f
 +}
 diff --git a/ios/Henge/SessionDiagnosticCapture.swift b/ios/Henge/SessionDiagnosticCapture.swift
 new file mode 100644
-index 0000000..568af3f
+index 0000000..67868a3
 --- /dev/null
 +++ b/ios/Henge/SessionDiagnosticCapture.swift
 @@ -0,0 +1,72 @@
@@ -5779,7 +5782,7 @@ index 0000000..568af3f
 +        let now = ProcessInfo.processInfo.systemUptime
 +        active = true; end = now+30; nextDeadline = now; previous = nil
 +        henge_vm_capture_timing(1)
-+        HengeLog.log("capture","BEGIN 30s; aggregate process CPU, VM/JIT/memory/network/presentation; no per-access counters enabled")
++        HengeLog.log("capture","BEGIN 30s; aggregate process CPU, VM/JIT/memory/network/presentation; replay GPU buffer durations may overlap and exclude other GPU users; no per-access counters enabled")
 +    }
 +    func stop() {
 +        guard active else { return }
@@ -8967,7 +8970,7 @@ index a13a70d..522e75b 100644
      hv_vm_destroy();
      atomic_store(&reader_done, 1);
 diff --git a/tests/test_xhci_slots.c b/tests/test_xhci_slots.c
-index 41c2faa..ace367c 100644
+index 41c2faa..17720fb 100644
 --- a/tests/test_xhci_slots.c
 +++ b/tests/test_xhci_slots.c
 @@ -4,10 +4,61 @@
@@ -9011,7 +9014,7 @@ index 41c2faa..ace367c 100644
 +    for(unsigned i=0;i<100;i++)hv_xhci_gamepad(x,1,(i&1)?1:2,8,axes,0,0);
 +    assert(x->gp_overflow && x->gp_tail-x->gp_head==64);
 +    hv_xhci_release_input(x);
-+    assert(x->gp_tail-x->gp_head==1 && !x->gp_state[0] && x->gp_state[2]==8);
++    assert(x->gp_tail-x->gp_head==1 && !x->gp_state[0] && x->gp_state[2]==8 && !x->gp_desired);
 +    hv_xhci_gamepad(x,0,0,8,axes,0,0);hv_xhci_poll(x);
 +    assert(!x->gp_online && !(x->portsc[2]&PORT_CCS));
 +    // A remote key-up must not release the same physical key, and rollover
