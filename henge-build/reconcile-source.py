@@ -103,6 +103,16 @@ t=replace_once(t,"if (kicker_started) pthread_join(kicker, NULL);","hv_idle_tick
 t=replace_once(t,"if (sound_on) hv_audio_detach(); /* the host\u0027s player stops; the stream\u0027s state stays in the device */","/* hv_vm_run_cpu0 already detached board.snd under the device lock. */","do not double-detach audio at pause")
 for dead in ("pthread_join(kicker, NULL)", "if (sound_on) hv_audio_detach();"):
     if dead in t: raise SystemExit("Unreconciled suspend lifecycle: "+dead)
+# One-shot failure diagnostics for the upstream pause handshake.
+# No new threads, polling loops or runtime options.
+t=replace_once(t,
+    "if (!all_saving()) return -1;",
+    "if (!all_saving()) {\n        fprintf(stderr, \"hengevm: suspend rejected: non-SAVE halt; cpus=%d\\n\", ncpus);\n        for (int i=0;i<ncpus;i++) fprintf(stderr, \"hengevm: suspend cpu[%d] halted=%d pc=%llx\\n\", i, atomic_load(&cpus[i].halted), (unsigned long long)cpus[i].pc);\n        return -1;\n    }",
+    "debug only the failed all-CPU-save handshake")
+t=replace_once(t,
+    "if (run_ended) {\n        pthread_mutex_unlock(&pause_mu);",
+    "if (run_ended) {\n        fprintf(stderr, \"hengevm: suspend rejected: CPU0 run already ended\\n\");\n        pthread_mutex_unlock(&pause_mu);",
+    "diagnose early stop before suspend")
 vm.write_text(t)
 
 # The custom VM header adds ticker diagnostics exactly where upstream added
