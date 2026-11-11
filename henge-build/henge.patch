@@ -14325,7 +14325,7 @@ index 0000000..091433d
 +#endif
 diff --git a/tests/benchmark_fastmem.sh b/tests/benchmark_fastmem.sh
 new file mode 100755
-index 0000000..543b7a7
+index 0000000..7f9ef66
 --- /dev/null
 +++ b/tests/benchmark_fastmem.sh
 @@ -0,0 +1,36 @@
@@ -14360,7 +14360,7 @@ index 0000000..543b7a7
 +  values={}
 +  for mixed,enabled,ns in re.findall(r'mixed=(\d+) enabled=(\d+) ns_per_load=([\d.]+)',Path(f'build/fastmem-{version}-{split}.log').read_text()):
 +   values.setdefault((int(mixed),int(enabled)),[]).append(float(ns))
-+  assert all(len(v)==9 for v in values.values()) and len(values)==4
++  assert all(len(v)==9 for v in values.values()) and len(values)==6
 +  summary[f'{version}-split{split}']={f'multiwindow{m}-enabled{e}':statistics.median(v) for (m,e),v in values.items()}
 +print(json.dumps(summary,indent=2))
 +Path('build/fastmem-native-summary.json').write_text(json.dumps(summary,indent=2)+'\n')
@@ -15409,6 +15409,43 @@ index 0000000..5bf491f
 +    method_setImplementation(om,(IMP)real_object);method_setImplementation(im,(IMP)real_integer);
 +    puts("PASS display settings: 200000 frame reads -> zero preferences lookups; live notifications, defaults and concurrent readers preserved; no polling timer");
 +} }
+diff --git a/tests/test_dns_lifecycle.c b/tests/test_dns_lifecycle.c
+index 18f0c34..20866b9 100644
+--- a/tests/test_dns_lifecycle.c
++++ b/tests/test_dns_lifecycle.c
+@@ -16,7 +16,7 @@ typedef struct {
+     void *context;
+ } Resolver;
+ static atomic_int immediate, active, started, sent, block_send, release_send, stopped;
+-static atomic_int fail_lookup;
++static atomic_int fail_lookup, forwarded;
+ static int failures;
+ /* The standalone resolver test supplies the engine's runtime settings. */
+ int hv_knob[HV_K_COUNT];
+@@ -52,7 +52,14 @@ void DNSServiceRefDeallocate(DNSServiceRef ref) {
+     atomic_fetch_sub(&active, 1);
+ }
+ static void send_frame(const uint8_t *frame, uint32_t len, int to_guest) {
+-    if (!to_guest || len < 54 || !(frame[44] & 0x80)) exit(1);
++    if (len < 54) exit(1);
++    if (to_guest) { if (!(frame[44] & 0x80)) exit(1); }
++    else {
++        // The custom resolver preserves the original query via libslirp;
++        // it must not fabricate a guest reply when the system resolver fails.
++        if (frame[44] & 0x80) exit(1);
++        atomic_fetch_add(&forwarded, 1);
++    }
+     atomic_fetch_add(&sent, 1);
+     while (atomic_load(&block_send) && !atomic_load(&release_send)) usleep(1000);
+ }
+@@ -148,6 +155,7 @@ int main(void) {
+     check("restart after fallback gets a fresh failure streak", hv_dns_proxy_on());
+     hv_dns_proxy_stop();
+     check("fallback session releases every resolver", atomic_load(&active) == 0);
++    check("failed queries use libslirp rather than SERVFAIL replies", atomic_load(&forwarded) == 17);
+     printf("DNS lifecycle: %d failures\n", failures);
+     return failures != 0;
+ }
 diff --git a/tests/test_dns_proxy.c b/tests/test_dns_proxy.c
 new file mode 100644
 index 0000000..4a5a6ea
@@ -15724,10 +15761,10 @@ index 0000000..7901051
 +}
 diff --git a/tests/test_fastmem_bench.c b/tests/test_fastmem_bench.c
 new file mode 100644
-index 0000000..7af1a8a
+index 0000000..01fe075
 --- /dev/null
 +++ b/tests/test_fastmem_bench.c
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,63 @@
 +/* Real EL1 JIT reads through real 16KB page tables. Paired cache-off/on,
 +   warmed loops and identical sums; no claims about physical Duo watts/FPS. */
 +#include "machine.h"
@@ -15747,6 +15784,7 @@ index 0000000..7af1a8a
 +static unsigned next = 1;
 +static const uint64_t code_va = 0xfffffe0000100000ull;
 +static const uint64_t data_a = 0xfffffe0000200000ull, data_b = 0xfffffc0400204000ull;
++static const uint64_t data_c = 0xfffffe0010200000ull; // same ordinary TLB slot, different cache slot
 +static uint64_t *tab(unsigned p) { return (uint64_t *)(ram + p * PG); }
 +static void map(uint64_t va, unsigned physical) {
 +    uint64_t *l2 = &tab(0)[(va >> 36) & 63];
@@ -15756,7 +15794,7 @@ index 0000000..7af1a8a
 +    tab((unsigned)((*l3 & ~0x3fffull) - PA) / PG)[(va >> 14) & 2047] = (PA + physical * PG) | 3 | (1u << 10);
 +}
 +static void run(unsigned mixed, unsigned count) {
-+    cpu.pc = code_va; cpu.x[0] = data_a; cpu.x[4] = mixed ? data_a ^ data_b : 0;
++    cpu.pc = code_va; cpu.x[0] = data_a; cpu.x[4] = mixed ? data_a ^ (mixed == 2 ? data_c : data_b) : 0;
 +    cpu.x[2] = 0; cpu.x[3] = count;
 +    assert(hv_run(&cpu) == HV_EXIT_HALT);
 +    assert(cpu.x[2] == count && cpu.x[3] == 0);
@@ -15768,12 +15806,12 @@ index 0000000..7af1a8a
 +    assert(!hv_machine_add_ram(&m, PA, 16 * PG, ram, 0));
 +    const uint32_t code[] = {0xf9400001, 0xca040000, 0x8b010042, 0xf1000463, 0x54ffff81};
 +    memcpy(ram + 10 * PG, code, sizeof code);
-+    *(uint64_t *)(ram + 11 * PG) = *(uint64_t *)(ram + 12 * PG) = 1;
-+    map(code_va, 10); map(data_a, 11); map(data_b, 12);
++    *(uint64_t *)(ram + 11 * PG) = *(uint64_t *)(ram + 12 * PG) = *(uint64_t *)(ram + 13 * PG) = 1;
++    map(code_va, 10); map(data_a, 11); map(data_b, 12); map(data_c, 13);
 +    m.stop_pc = code_va + sizeof code;
 +    mach_timebase_info_data_t tb; assert(!mach_timebase_info(&tb));
 +    // More rounds alternate the order to limit shared-runner drift.
-+    for (unsigned round = 0; round < 9; round++) for (unsigned mixed = 0; mixed < 2; mixed++)
++    for (unsigned round = 0; round < 9; round++) for (unsigned mixed = 0; mixed < 3; mixed++)
 +        for (unsigned k = 0; k < 2; k++) {
 +            unsigned enabled = k ^ (round & 1);
 +            m.fastmem_enabled = enabled; m.fastmem_diagnostics = 0;
