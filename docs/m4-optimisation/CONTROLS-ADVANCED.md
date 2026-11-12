@@ -45,3 +45,11 @@ XCTest screenshots and logs are artifacts; no IPA is produced by this workflow.
 Existing IPA workflows retain shared henge-custom-ipa cancellation. Each new
 preview run cancels older previews on the same branch; native/simulator matrix
 jobs may run in parallel. No unrelated workflows are cancelled.
+
+Follow-up: CoreGraphics imports are explicit for native macOS geometry checks.
+Simulator selection tries compatible installed device/runtime pairs and records
+fallbacks/errors. Ordinary SwiftUI relayout preserves held fingers when bounds
+are unchanged. The shipping Link keyboard/trackpad surface is extracted with
+callback injection and shared by both production and previews, including real
+software keyboard and pointer gesture checks; no placeholder input panel is
+used. Transport ownership and the protocol remain unchanged.

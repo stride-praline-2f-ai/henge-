@@ -475,7 +475,7 @@ index 3a4ee8f..89ad6ac 100644
     can be read before the page ends. On a fault, the instruction abort is taken
     and NULL is returned. */
 diff --git a/core/translate.c b/core/translate.c
-index cebfb7d..f6508c5 100644
+index cebfb7d..0afb579 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -811,7 +811,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
@@ -556,6 +556,19 @@ index cebfb7d..f6508c5 100644
              e->cur_pc = va + 4ull * i;
              e->cur_i = i;
              e->u_prev = e->u_live = 0;
+@@ -2119,7 +2149,11 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
+     uint64_t gen = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST);
+     if (chunk.m != m || chunk.gen != gen || !chunk.hot || (size_t)(chunk.cold - chunk.hot) < (size_t)hot + cold) {
+         size_t want = JIT_CHUNK_WORDS;
+-        if (want > m->jit.capacity) want = m->jit.capacity;
++        // Respect the effective comparison-cache bound before asking for a
++        // chunk. Otherwise a sub-chunk limit fails while usable space exists.
++        size_t capacity = m->jit.limit && m->jit.limit < m->jit.capacity ? m->jit.limit : m->jit.capacity;
++        capacity &= ~(size_t)1; // reserve and placement require 8-byte alignment
++        if (want > capacity) want = capacity;
+         if (want < (size_t)hot + cold) want = (size_t)hot + cold;
+         uint32_t *p = hv_jit_reserve(&m->jit, want);
+         if (!p && m->jit_tail_enabled && want > (size_t)hot + cold) {
 diff --git a/devices/cursor_damage.h b/devices/cursor_damage.h
 new file mode 100644
 index 0000000..eca2756
@@ -2759,10 +2772,10 @@ index 0000000..17638b3
 +No new IPA is requested by this checkpoint.
 diff --git a/docs/m4-optimisation/CONTROLS-ADVANCED.md b/docs/m4-optimisation/CONTROLS-ADVANCED.md
 new file mode 100644
-index 0000000..dd85fdb
+index 0000000..34a26b5
 --- /dev/null
 +++ b/docs/m4-optimisation/CONTROLS-ADVANCED.md
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,55 @@
 +# Advanced controls integration
 +
 +One native UIKit multitouch surface and one PadInput model serve the local
@@ -2810,6 +2823,14 @@ index 0000000..dd85fdb
 +Existing IPA workflows retain shared henge-custom-ipa cancellation. Each new
 +preview run cancels older previews on the same branch; native/simulator matrix
 +jobs may run in parallel. No unrelated workflows are cancelled.
++
++Follow-up: CoreGraphics imports are explicit for native macOS geometry checks.
++Simulator selection tries compatible installed device/runtime pairs and records
++fallbacks/errors. Ordinary SwiftUI relayout preserves held fingers when bounds
++are unchanged. The shipping Link keyboard/trackpad surface is extracted with
++callback injection and shared by both production and previews, including real
++software keyboard and pointer gesture checks; no placeholder input panel is
++used. Transport ownership and the protocol remain unchanged.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
 index 0000000..00c2479
@@ -2930,6 +2951,53 @@ index 0000000..87f0a22
 +- Physical comparisons keep workload, Retina/refresh, brightness and diagnostics
 +  equal. Test CPU, RAM and JIT settings separately; record task time/frame times,
 +  headroom and thermal category over sustained runs. No optimum is invented.
+diff --git a/docs/m4-optimisation/UPSTREAM-2026-11-12.md b/docs/m4-optimisation/UPSTREAM-2026-11-12.md
+new file mode 100644
+index 0000000..98fbd1b
+--- /dev/null
++++ b/docs/m4-optimisation/UPSTREAM-2026-11-12.md
+@@ -0,0 +1,41 @@
++# Upstream selection: 12 November 2026
++
++Reviewed main `1812892e129c149cf68cfa0f5e26de7f92e94fba` against the
++integrated VM base `8048e4a91450e1aa40bf8e6972b76c73921e038b`.
++The intervening changes leave core/, devices/ and host/ unchanged. They add
++Mac-app loader/AppKit/Chromium reservations, window presentation and input.
++The shared iOS JIT edits reserve high virtual-address blocks for Chromium,
++release them before VM allocation and reposition the writable alias when needed.
++They do not reduce VM instruction count, software MMU lookups or guest shader
++compilation. Do not reserve those blocks for a VM-only speed claim or replace
++our validated VM renderer with the AppKit image presentation path.
++
++PR #51 (`2ad95c2365f3358c28c8fc5087ed955ed5f2afcf`) contains an applicable
++chunk-capacity fix. Ported it into our existing tail-recovery allocator, with
++8-byte alignment for odd limits. The regression reproduces rejection of usable
++space before the fix, passes after it, and retains concurrent allocation,
++overflow, generation and tail tests under ASan/UBSan. This fixes HV_JIT_CAP
++comparisons; it is not a measured desktop throughput improvement.
++
++Do not import the complete experimental Rosetta engine for native ARM speed.
++Its parity/adjust flags and software TSO implement Intel compatibility, with
++additional barriers; the 4 KB software cache quarters coverage at equal entry
++count and increases per-physical-page metadata. It is a separate compatibility
++project, not a supported improvement for this native 16 KB desktop workload.
++
++PR #112 (`8dff7fd8cf2bced01b98a58a6e738e0d5ec51156`) still updates a shared
++non-atomic gpu_last_end from completion handlers and assumes arrival order.
++Retain our optional synchronized timing counters; durations are not utilization.
++PR #117 (`bc51b56e9e91e27d13ff4f1f48deb9a81360dd6f`) selected store-action
++correction remains integrated and regression tested. Do not import its alternate
++shader toolchain into the iOS 27 native replay path.
++PR #32 (`385a4f6e4c60916ccff70ef736eda9d6cabe2932`) remains guest native-touch
++compatibility rather than CPU translation optimisation; our sharing isolation
++and optional, entitlement-gated touch path remain intact.
++PR #80 aggressive QoS, #81 default superblocks, #78 larger fallback cache and
++#92 full-surface hashing do not establish a win for the already cooled desktop.
++Retain user choices, conservative defaults, zero-copy/damage-driven presentation
++and bounded caches. No default CPU/RAM/refresh/Retina reduction or boost added.
++
++Review is pinned and selective, not a claim of merging all upstream main/PRs.
++Physical Duo/M4 desktop warmup and game performance still require comparison.
 diff --git a/docs/m4-optimisation/VALIDATION.md b/docs/m4-optimisation/VALIDATION.md
 new file mode 100644
 index 0000000..c5781b7
@@ -4478,10 +4546,10 @@ index 0000000..77e4f94
 +}
 diff --git a/ios/Henge/Controls/GamepadSurface.swift b/ios/Henge/Controls/GamepadSurface.swift
 new file mode 100644
-index 0000000..3fd63c0
+index 0000000..c2afec8
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadSurface.swift
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,122 @@
 +import SwiftUI
 +import UIKit
 +
@@ -4500,6 +4568,7 @@ index 0000000..3fd63c0
 +final class PadView: UIView {
 +    var send: ((GamepadState) -> Void)?
 +    private var input = PadInput()
++    private var previousBounds = CGRect.null
 +    private var tuning = GamepadTuning()
 +    private var lastSent = GamepadState.off
 +    private var current = GamepadState()
@@ -4522,7 +4591,15 @@ index 0000000..3fd63c0
 +        guard bounds.contains(point) else { return false }
 +        return PadControl.allCases.contains { layout.rect($0).contains(point) }
 +    }
-+    override func layoutSubviews() { super.layoutSubviews(); if !input.fingers.isEmpty { cancelTouches() }; setNeedsDisplay() }
++    override func layoutSubviews() {
++        super.layoutSubviews()
++        // SwiftUI may lay out again after an input callback. Preserve held
++        // fingers unless the actual geometry changes (rotation/unfold/resize).
++        guard bounds != previousBounds else { return }
++        previousBounds = bounds
++        if !input.fingers.isEmpty { cancelTouches() }
++        setNeedsDisplay()
++    }
 +    private func active(_ control: PadControl) -> PadInput.Finger? { input.active(control) }
 +    private func trigger(_ control: PadControl) -> CGFloat { input.trigger(control,layout:layout) }
 +    private func drawText(_ text: String, in rect: CGRect, color: UIColor = .white, size: CGFloat = 14) {
@@ -4825,6 +4902,124 @@ index 0000000..2806113
 +                    .font(.footnote).foregroundStyle(.secondary)
 +            }
 +        }
++    }
++}
+diff --git a/ios/Henge/Controls/WirelessInputSurface.swift b/ios/Henge/Controls/WirelessInputSurface.swift
+new file mode 100644
+index 0000000..3c6f98f
+--- /dev/null
++++ b/ios/Henge/Controls/WirelessInputSurface.swift
+@@ -0,0 +1,112 @@
++import SwiftUI
++import UIKit
++
++// Shipping Link input surface shared with controls-only views and UI fixtures.
++class LinkInputView: UIView, UIGestureRecognizerDelegate, UIKeyInput {
++    var send: ((LinkControl) -> Void)?
++    var rejectedPaste: (() -> Void)?
++    var toggleControls: (() -> Void)?
++    // The surface is a remote trackpad, not a text editor. Keep iOS's system
++    // three-finger editing menu from taking the local controls gesture.
++    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
++    override var canBecomeFirstResponder: Bool { true }
++    private var heldKeys = Set<Int>()
++    var keyboardEnabled = false {
++        didSet { if oldValue != keyboardEnabled { releaseInput(); reloadInputViews(); if window != nil { becomeFirstResponder() } } }
++    }
++    override var inputView: UIView? { keyboardEnabled ? nil : UIView(frame:.zero) }
++    var hasText: Bool { true }
++    var autocorrectionType: UITextAutocorrectionType = .no
++    var autocapitalizationType: UITextAutocapitalizationType = .none
++    var keyboardType: UIKeyboardType = .asciiCapable
++    var keyboardAppearance: UIKeyboardAppearance = .dark
++    func releaseInput() { heldKeys.removeAll(); send?(LinkControl(type:"release")) }
++    func deleteBackward() { stroke(42,shift:false) }
++    private func stroke(_ key: Int,shift: Bool) {
++        let shifted = heldKeys.contains(225)
++        if shift && !shifted { send?(LinkControl(type:"key",code:225,down:true)) }
++        if heldKeys.contains(key) { send?(LinkControl(type:"key",code:key,down:false)) }
++        send?(LinkControl(type:"key",code:key,down:true))
++        if !heldKeys.contains(key) { send?(LinkControl(type:"key",code:key,down:false)) }
++        if shift && !shifted { send?(LinkControl(type:"key",code:225,down:false)) }
++    }
++    func insertText(_ text: String) {
++        // Bound pastes and keep enough queue capacity for releases. The
++        // software keyboard is explicit US ASCII; no text enters diagnostics.
++        let plain = Array("abcdefghijklmnopqrstuvwxyz1234567890\n\u{1b}\u{8}\t -=[]\\;’`,./")
++        let shifted = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()")
++        var mapping: [Character:(Int,Bool)] = [:]
++        for (i,c) in plain.prefix(36).enumerated() { mapping[c]=(i<26 ? 4+i : 30+i-26,false) }
++        for (i,c) in shifted.enumerated() { mapping[c]=(i<26 ? 4+i : 30+i-26,true) }
++        mapping["\n"]=(40,false);mapping["\t"]=(43,false);mapping[" "]=(44,false)
++        let punctuation: [(Character,Int)] = [("-",45),("=",46),("[",47),("]",48),("\\",49),(";",51),("'",52),("`",53),(",",54),(".",55),("/",56)]
++        for (c,k) in punctuation { mapping[c]=(k,false) }
++        let upper = Array(#"_+{}|:"~<>?"#)
++        for ((_,k),c) in zip(punctuation,upper) { mapping[c]=(k,true) }
++        guard text.count <= 16 else { rejectedPaste?(); return }
++        for c in text { if let (key,shift)=mapping[c] { stroke(key,shift:shift) } }
++    }
++    override init(frame: CGRect) {
++        super.init(frame: frame)
++        backgroundColor = .clear
++        accessibilityIdentifier = "wireless-input-surface"
++        isAccessibilityElement = true
++        accessibilityLabel = "Wireless keyboard and touchpad"
++        let controls = UITapGestureRecognizer(target: self, action: #selector(toggleViewerControls))
++        controls.numberOfTouchesRequired = 3; controls.numberOfTapsRequired = 1
++        addGestureRecognizer(controls)
++        let pointer = UIPanGestureRecognizer(target: self, action: #selector(pointerPan(_:))); pointer.maximumNumberOfTouches = 1; addGestureRecognizer(pointer)
++        let scroll = UIPanGestureRecognizer(target: self, action: #selector(scroll(_:))); scroll.minimumNumberOfTouches = 2; scroll.maximumNumberOfTouches = 2; addGestureRecognizer(scroll)
++        let click = UITapGestureRecognizer(target: self, action: #selector(click)); addGestureRecognizer(click); click.require(toFail: pointer)
++        let right = UITapGestureRecognizer(target: self, action: #selector(rightClick)); right.numberOfTouchesRequired = 2; addGestureRecognizer(right); right.require(toFail: scroll)
++        let hold = UILongPressGestureRecognizer(target: self, action: #selector(holdButton(_:)))
++        hold.minimumPressDuration = 0.35; hold.delegate = self; addGestureRecognizer(hold)
++    }
++    override func didMoveToWindow() { super.didMoveToWindow(); if window != nil { becomeFirstResponder() } else { releaseInput() } }
++    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
++        gestureRecognizer is UILongPressGestureRecognizer || other is UILongPressGestureRecognizer
++    }
++    @objc private func toggleViewerControls() { toggleControls?() }
++    @objc private func holdButton(_ hold: UILongPressGestureRecognizer) {
++        if hold.state == .began { send?(LinkControl(type: "button", code: 0, down: true)) }
++        if hold.state == .ended || hold.state == .cancelled || hold.state == .failed { send?(LinkControl(type: "button", code: 0, down: false)) }
++    }
++    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
++    @objc private func pointerPan(_ pan: UIPanGestureRecognizer) {
++        let p = pan.translation(in: self)
++        let dx = max(-4096, min(4096, Int(p.x * contentScaleFactor))), dy = max(-4096, min(4096, Int(p.y * contentScaleFactor)))
++        pan.setTranslation(CGPoint(x: p.x - CGFloat(dx) / contentScaleFactor, y: p.y - CGFloat(dy) / contentScaleFactor), in: self)
++        if dx != 0 || dy != 0 { send?(LinkControl(type: "move", x: dx, y: dy)) }
++    }
++    @objc private func scroll(_ pan: UIPanGestureRecognizer) {
++        let p = pan.translation(in: self)
++        let x = Int(p.x / 6), y = Int(p.y / 6)
++        if x != 0 || y != 0 { pan.setTranslation(CGPoint(x: p.x - CGFloat(x * 6), y: p.y - CGFloat(y * 6)), in: self); send?(LinkControl(type: "scroll", x: max(-4096, min(4096, x)), y: max(-4096, min(4096, y)))) }
++    }
++    private func button(_ n: Int) { send?(LinkControl(type: "button", code: n, down: true)); send?(LinkControl(type: "button", code: n, down: false)) }
++    @objc private func click() { button(0) }
++    @objc private func rightClick() { button(1) }
++    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
++        for press in presses { if let key = press.key, (4...231).contains(key.keyCode.rawValue) { heldKeys.insert(key.keyCode.rawValue); send?(LinkControl(type: "key", code: key.keyCode.rawValue, down: true)) } }
++    }
++    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
++        for press in presses { if let key = press.key, (4...231).contains(key.keyCode.rawValue) { heldKeys.remove(key.keyCode.rawValue); send?(LinkControl(type: "key", code: key.keyCode.rawValue, down: false)) } }
++    }
++    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) { pressesEnded(presses, with: event) }
++}
++
++struct WirelessInputSurface: UIViewRepresentable {
++    let keyboard: Bool
++    let send: (LinkControl) -> Void
++    var rejectedPaste: () -> Void = {}
++    func makeUIView(context: Context) -> LinkInputView {
++        let view = LinkInputView();view.send = send;view.rejectedPaste = rejectedPaste
++        view.keyboardEnabled = keyboard;return view
++    }
++    func updateUIView(_ view: LinkInputView,context: Context) {
++        view.send = send;view.rejectedPaste = rejectedPaste;view.keyboardEnabled = keyboard
++    }
++    static func dismantleUIView(_ view: LinkInputView,coordinator: ()) {
++        view.releaseInput();view.resignFirstResponder();view.send = nil;view.rejectedPaste = nil
 +    }
 +}
 diff --git a/ios/Henge/DisplayRouter.swift b/ios/Henge/DisplayRouter.swift
@@ -5509,7 +5704,7 @@ index f49ac55..a062560 100644
          slots.signal()
          guard receipt.consumed else { return }
 diff --git a/ios/Henge/Link/LinkViews.swift b/ios/Henge/Link/LinkViews.swift
-index 1bc238f..e8ebb39 100644
+index 1bc238f..454b340 100644
 --- a/ios/Henge/Link/LinkViews.swift
 +++ b/ios/Henge/Link/LinkViews.swift
 @@ -47,7 +47,10 @@ struct LinkHostView: View {
@@ -5610,128 +5805,87 @@ index 1bc238f..e8ebb39 100644
              if phase == .background { viewer.disconnect(); connecting = false; discovery.stop(); UIApplication.shared.isIdleTimerDisabled = false }
              else if phase == .active, !connecting { discovery.start(wired: wired) }
              else if phase == .inactive { viewer.send(LinkControl(type: "release")) }
-@@ -204,18 +222,52 @@ private struct LinkVideoSurface: UIViewRepresentable {
+@@ -196,6 +214,7 @@ private struct LinkVideoSurface: UIViewRepresentable {
+     let toggleControls: () -> Void
+     func makeUIView(context: Context) -> LinkVideoView {
+         let view = LinkVideoView()
++        view.rejectedPaste = { HengeLog.log("link-input","Paste rejected: use up to 16 ASCII characters at a time") }
+         view.send = { [weak viewer] in viewer?.send($0) }
+         view.toggleControls = toggleControls
+         viewer.onPixel = { [weak view] pixel in view?.show(pixel) }
+@@ -204,37 +223,10 @@ private struct LinkVideoSurface: UIViewRepresentable {
      func updateUIView(_ view: LinkVideoView, context: Context) { view.toggleControls = toggleControls }
      static func dismantleUIView(_ view: LinkVideoView, coordinator: ()) { view.send = nil; view.toggleControls = nil; view.videoLayer.flushAndRemoveImage() }
  }
 -private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
--    override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
--    var videoLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
-+private class LinkInputView: UIView, UIGestureRecognizerDelegate, UIKeyInput {
-     var send: ((LinkControl) -> Void)?
-     var toggleControls: (() -> Void)?
-     // The surface is a remote trackpad, not a text editor. Keep iOS's system
-     // three-finger editing menu from taking the local controls gesture.
-     override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
-     override var canBecomeFirstResponder: Bool { true }
-+    private var heldKeys = Set<Int>()
-+    var keyboardEnabled = false {
-+        didSet { if oldValue != keyboardEnabled { releaseInput(); reloadInputViews(); if window != nil { becomeFirstResponder() } } }
-+    }
-+    override var inputView: UIView? { keyboardEnabled ? nil : UIView(frame:.zero) }
-+    var hasText: Bool { true }
-+    var autocorrectionType: UITextAutocorrectionType = .no
-+    var autocapitalizationType: UITextAutocapitalizationType = .none
-+    var keyboardType: UIKeyboardType = .asciiCapable
-+    var keyboardAppearance: UIKeyboardAppearance = .dark
-+    func releaseInput() { heldKeys.removeAll(); send?(LinkControl(type:"release")) }
-+    func deleteBackward() { stroke(42,shift:false) }
-+    private func stroke(_ key: Int,shift: Bool) {
-+        let shifted = heldKeys.contains(225)
-+        if shift && !shifted { send?(LinkControl(type:"key",code:225,down:true)) }
-+        if heldKeys.contains(key) { send?(LinkControl(type:"key",code:key,down:false)) }
-+        send?(LinkControl(type:"key",code:key,down:true))
-+        if !heldKeys.contains(key) { send?(LinkControl(type:"key",code:key,down:false)) }
-+        if shift && !shifted { send?(LinkControl(type:"key",code:225,down:false)) }
-+    }
-+    func insertText(_ text: String) {
-+        // Bound pastes and keep enough queue capacity for releases. The
-+        // software keyboard is explicit US ASCII; no text enters diagnostics.
-+        let plain = Array("abcdefghijklmnopqrstuvwxyz1234567890\n\u{1b}\u{8}\t -=[]\\;’`,./")
-+        let shifted = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()")
-+        var mapping: [Character:(Int,Bool)] = [:]
-+        for (i,c) in plain.prefix(36).enumerated() { mapping[c]=(i<26 ? 4+i : 30+i-26,false) }
-+        for (i,c) in shifted.enumerated() { mapping[c]=(i<26 ? 4+i : 30+i-26,true) }
-+        mapping["\n"]=(40,false);mapping["\t"]=(43,false);mapping[" "]=(44,false)
-+        let punctuation: [(Character,Int)] = [("-",45),("=",46),("[",47),("]",48),("\\",49),(";",51),("'",52),("`",53),(",",54),(".",55),("/",56)]
-+        for (c,k) in punctuation { mapping[c]=(k,false) }
-+        let upper = Array(#"_+{}|:"~<>?"#)
-+        for ((_,k),c) in zip(punctuation,upper) { mapping[c]=(k,true) }
-+        guard text.count <= 16 else { HengeLog.log("link-input","Paste rejected: use up to 16 ASCII characters at a time"); return }
-+        for c in text { if let (key,shift)=mapping[c] { stroke(key,shift:shift) } }
-+    }
-     override init(frame: CGRect) {
-         super.init(frame: frame)
--        videoLayer.videoGravity = .resizeAspect; backgroundColor = .black
-+        backgroundColor = .clear
-         let controls = UITapGestureRecognizer(target: self, action: #selector(toggleViewerControls))
-         controls.numberOfTouchesRequired = 3; controls.numberOfTapsRequired = 1
-         addGestureRecognizer(controls)
-@@ -226,7 +278,7 @@ private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
-         let hold = UILongPressGestureRecognizer(target: self, action: #selector(holdButton(_:)))
-         hold.minimumPressDuration = 0.35; hold.delegate = self; addGestureRecognizer(hold)
-     }
--    override func didMoveToWindow() { super.didMoveToWindow(); if window != nil { becomeFirstResponder() } }
-+    override func didMoveToWindow() { super.didMoveToWindow(); if window != nil { becomeFirstResponder() } else { releaseInput() } }
-     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-         gestureRecognizer is UILongPressGestureRecognizer || other is UILongPressGestureRecognizer
-     }
-@@ -236,15 +288,6 @@ private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
-         if hold.state == .ended || hold.state == .cancelled || hold.state == .failed { send?(LinkControl(type: "button", code: 0, down: false)) }
-     }
-     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
--    func show(_ pixel: CVPixelBuffer) {
--        var format: CMVideoFormatDescription?, sample: CMSampleBuffer?
--        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixel, formatDescriptionOut: &format) == noErr, let format else { return }
--        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
--        guard CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pixel, formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample) == noErr, let sample else { return }
--        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) as? [NSMutableDictionary], let first = attachments.first { first[kCMSampleAttachmentKey_DisplayImmediately] = true }
--        if videoLayer.status == .failed { videoLayer.flush() }
--        if videoLayer.isReadyForMoreMediaData { videoLayer.enqueue(sample) }
--    }
-     @objc private func pointerPan(_ pan: UIPanGestureRecognizer) {
-         let p = pan.translation(in: self)
-         let dx = max(-4096, min(4096, Int(p.x * contentScaleFactor))), dy = max(-4096, min(4096, Int(p.y * contentScaleFactor)))
-@@ -260,10 +303,64 @@ private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
-     @objc private func click() { button(0) }
-     @objc private func rightClick() { button(1) }
-     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
--        for press in presses { if let key = press.key, (4...231).contains(key.keyCode.rawValue) { send?(LinkControl(type: "key", code: key.keyCode.rawValue, down: true)) } }
-+        for press in presses { if let key = press.key, (4...231).contains(key.keyCode.rawValue) { heldKeys.insert(key.keyCode.rawValue); send?(LinkControl(type: "key", code: key.keyCode.rawValue, down: true)) } }
-     }
-     override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
--        for press in presses { if let key = press.key, (4...231).contains(key.keyCode.rawValue) { send?(LinkControl(type: "key", code: key.keyCode.rawValue, down: false)) } }
-+        for press in presses { if let key = press.key, (4...231).contains(key.keyCode.rawValue) { heldKeys.remove(key.keyCode.rawValue); send?(LinkControl(type: "key", code: key.keyCode.rawValue, down: false)) } }
-     }
-     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) { pressesEnded(presses, with: event) }
- }
-+
 +private final class LinkVideoView: LinkInputView {
-+    override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
-+    var videoLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
+     override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
+     var videoLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
+-    var send: ((LinkControl) -> Void)?
+-    var toggleControls: (() -> Void)?
+-    // The surface is a remote trackpad, not a text editor. Keep iOS's system
+-    // three-finger editing menu from taking the local controls gesture.
+-    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
+-    override var canBecomeFirstResponder: Bool { true }
+-    override init(frame: CGRect) {
+-        super.init(frame: frame)
+-        videoLayer.videoGravity = .resizeAspect; backgroundColor = .black
+-        let controls = UITapGestureRecognizer(target: self, action: #selector(toggleViewerControls))
+-        controls.numberOfTouchesRequired = 3; controls.numberOfTapsRequired = 1
+-        addGestureRecognizer(controls)
+-        let pointer = UIPanGestureRecognizer(target: self, action: #selector(pointerPan(_:))); pointer.maximumNumberOfTouches = 1; addGestureRecognizer(pointer)
+-        let scroll = UIPanGestureRecognizer(target: self, action: #selector(scroll(_:))); scroll.minimumNumberOfTouches = 2; scroll.maximumNumberOfTouches = 2; addGestureRecognizer(scroll)
+-        let click = UITapGestureRecognizer(target: self, action: #selector(click)); addGestureRecognizer(click); click.require(toFail: pointer)
+-        let right = UITapGestureRecognizer(target: self, action: #selector(rightClick)); right.numberOfTouchesRequired = 2; addGestureRecognizer(right); right.require(toFail: scroll)
+-        let hold = UILongPressGestureRecognizer(target: self, action: #selector(holdButton(_:)))
+-        hold.minimumPressDuration = 0.35; hold.delegate = self; addGestureRecognizer(hold)
+-    }
+-    override func didMoveToWindow() { super.didMoveToWindow(); if window != nil { becomeFirstResponder() } }
+-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+-        gestureRecognizer is UILongPressGestureRecognizer || other is UILongPressGestureRecognizer
+-    }
+-    @objc private func toggleViewerControls() { toggleControls?() }
+-    @objc private func holdButton(_ hold: UILongPressGestureRecognizer) {
+-        if hold.state == .began { send?(LinkControl(type: "button", code: 0, down: true)) }
+-        if hold.state == .ended || hold.state == .cancelled || hold.state == .failed { send?(LinkControl(type: "button", code: 0, down: false)) }
+-    }
 +    override init(frame: CGRect) { super.init(frame:frame); videoLayer.videoGravity = .resizeAspect; backgroundColor = .black }
-+    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
-+    func show(_ pixel: CVPixelBuffer) {
-+        var format: CMVideoFormatDescription?, sample: CMSampleBuffer?
-+        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixel, formatDescriptionOut: &format) == noErr, let format else { return }
-+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
-+        guard CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pixel, formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample) == noErr, let sample else { return }
-+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) as? [NSMutableDictionary], let first = attachments.first { first[kCMSampleAttachmentKey_DisplayImmediately] = true }
-+        if videoLayer.status == .failed { videoLayer.flush() }
-+        if videoLayer.isReadyForMoreMediaData { videoLayer.enqueue(sample) }
-+    }
+     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+     func show(_ pixel: CVPixelBuffer) {
+         var format: CMVideoFormatDescription?, sample: CMSampleBuffer?
+@@ -245,25 +237,41 @@ private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
+         if videoLayer.status == .failed { videoLayer.flush() }
+         if videoLayer.isReadyForMoreMediaData { videoLayer.enqueue(sample) }
+     }
+-    @objc private func pointerPan(_ pan: UIPanGestureRecognizer) {
+-        let p = pan.translation(in: self)
+-        let dx = max(-4096, min(4096, Int(p.x * contentScaleFactor))), dy = max(-4096, min(4096, Int(p.y * contentScaleFactor)))
+-        pan.setTranslation(CGPoint(x: p.x - CGFloat(dx) / contentScaleFactor, y: p.y - CGFloat(dy) / contentScaleFactor), in: self)
+-        if dx != 0 || dy != 0 { send?(LinkControl(type: "move", x: dx, y: dy)) }
+-    }
+-    @objc private func scroll(_ pan: UIPanGestureRecognizer) {
+-        let p = pan.translation(in: self)
+-        let x = Int(p.x / 6), y = Int(p.y / 6)
+-        if x != 0 || y != 0 { pan.setTranslation(CGPoint(x: p.x - CGFloat(x * 6), y: p.y - CGFloat(y * 6)), in: self); send?(LinkControl(type: "scroll", x: max(-4096, min(4096, x)), y: max(-4096, min(4096, y)))) }
+-    }
+-    private func button(_ n: Int) { send?(LinkControl(type: "button", code: n, down: true)); send?(LinkControl(type: "button", code: n, down: false)) }
+-    @objc private func click() { button(0) }
+-    @objc private func rightClick() { button(1) }
+-    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+-        for press in presses { if let key = press.key, (4...231).contains(key.keyCode.rawValue) { send?(LinkControl(type: "key", code: key.keyCode.rawValue, down: true)) } }
 +
 +}
 +
-+private struct LinkInputSurface: UIViewRepresentable {
++private struct LinkInputSurface: View {
 +    let viewer: LinkViewerService
 +    let keyboard: Bool
-+    func makeUIView(context: Context) -> LinkInputView {
-+        let view = LinkInputView(); view.send = { [weak viewer] in viewer?.send($0) }
-+        view.keyboardEnabled = keyboard; return view
-+    }
-+    func updateUIView(_ view: LinkInputView,context:Context) { view.keyboardEnabled = keyboard }
-+    static func dismantleUIView(_ view: LinkInputView,coordinator:()) { view.releaseInput();view.resignFirstResponder();view.send = nil }
++    var body: some View {
++        WirelessInputSurface(keyboard:keyboard,send:{[weak viewer] in viewer?.send($0)},rejectedPaste:{
++            HengeLog.log("link-input","Paste rejected: use up to 16 ASCII characters at a time")
++        })
+     }
+-    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+-        for press in presses { if let key = press.key, (4...231).contains(key.keyCode.rawValue) { send?(LinkControl(type: "key", code: key.keyCode.rawValue, down: false)) } }
 +}
 +
 +struct WirelessControlsHostView: View {
@@ -5757,8 +5911,9 @@ index 1bc238f..e8ebb39 100644
 +            }.navigationTitle("Wireless Controls")
 +                .toolbar { ToolbarItem(placement:.confirmationAction) { Button("Done") { dismiss() } } }
 +        }
-+    }
-+}
+     }
+-    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) { pressesEnded(presses, with: event) }
+ }
 diff --git a/ios/Henge/M4Performance.swift b/ios/Henge/M4Performance.swift
 new file mode 100644
 index 0000000..f98dda5
@@ -7629,10 +7784,10 @@ index 0000000..5435674
 +HengeGamepadPreview.xcodeproj/
 diff --git a/tests/gamepad-preview/App.swift b/tests/gamepad-preview/App.swift
 new file mode 100644
-index 0000000..031002b
+index 0000000..ed1819a
 --- /dev/null
 +++ b/tests/gamepad-preview/App.swift
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,69 @@
 +import SwiftUI
 +import Metal
 +
@@ -7642,10 +7797,16 @@ index 0000000..031002b
 +}
 +
 +struct PreviewRoot: View {
-+    @State private var wireless=false, folded=false, settings=false, mapping=false
++    @State private var wireless=false
++    @State private var folded=false
++    @State private var settings=false
++    @State private var mapping=false
 +    @State private var mode=WirelessControlMode.gamepad
 +    @State private var last=GamepadState.off
-+    @State private var presses=0, maxLeft=0
++    @State private var presses=0
++    @State private var maxLeft=0
++    @State private var pointerMoves=0
++    @State private var keyPresses=0
 +    @ObservedObject private var preferences=GamepadPreferences.shared
 +    private func receive(_ state: GamepadState) {
 +        if state.buttons&1 != 0 && last.buttons&1 == 0 { presses += 1 }
@@ -7670,13 +7831,18 @@ index 0000000..031002b
 +                    Text("A presses: \(presses)").accessibilityIdentifier("a-count")
 +                    Text("Left maximum: \(maxLeft)").accessibilityIdentifier("left-max")
 +                    Text("Buttons: \(last.buttons)").accessibilityIdentifier("buttons")
++                    Text("Moves: \(pointerMoves)").accessibilityIdentifier("moves")
++                    Text("Keys: \(keyPresses)").accessibilityIdentifier("keys")
 +                }.font(.caption.monospacedDigit()).frame(height:22)
 +                ZStack(alignment:.bottom) {
 +                    LinearGradient(colors:[.indigo.opacity(0.45),.gray.opacity(0.2),.black],startPoint:.topLeading,endPoint:.bottomTrailing)
 +                    if wireless {
 +                        WirelessControlsPanel(status:"Connected · preview fixture",tuning:preferences.value,mode:$mode,
 +                            disconnect:{last = .off},configure:{settings=true},sendPad:receive) { selected in
-+                                ZStack { Color.clear;Text(selected == .keyboard ? "Keyboard preview" : "Touchpad preview").foregroundStyle(.secondary) }
++                                WirelessInputSurface(keyboard:selected == .keyboard,send:{ control in
++                                    if control.type == "move" { pointerMoves += 1 }
++                                    if control.type == "key" && control.down == true { keyPresses += 1 }
++                                })
 +                            }
 +                    } else {
 +                        VStack { Text("Mac display · overlay preview").foregroundStyle(.secondary).padding();Spacer();GamepadSurface(tuning:preferences.value,send:receive).frame(height:320*preferences.value.normalized.scale) }
@@ -7693,11 +7859,12 @@ index 0000000..031002b
 +}
 diff --git a/tests/gamepad-preview/GamepadPreviewUITests.swift b/tests/gamepad-preview/GamepadPreviewUITests.swift
 new file mode 100644
-index 0000000..2d9a8f2
+index 0000000..703ef25
 --- /dev/null
 +++ b/tests/gamepad-preview/GamepadPreviewUITests.swift
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,59 @@
 +import XCTest
++import CoreGraphics
 +
 +final class GamepadPreviewUITests: XCTestCase {
 +    func testControlsAndLayouts() {
@@ -7734,6 +7901,20 @@ index 0000000..2d9a8f2
 +        app.buttons["switch-layout"].tap()
 +        XCTAssertTrue(surface.waitForExistence(timeout:5))
 +        capture("\(PreviewFixture.profile)-wireless-gamepad")
++        app.buttons["Touchpad"].tap()
++        let input=app.otherElements["wireless-input-surface"].firstMatch
++        XCTAssertTrue(input.waitForExistence(timeout:5))
++        let center=input.coordinate(withNormalizedOffset:CGVector(dx:0.5,dy:0.5))
++        center.press(forDuration:0.1,thenDragTo:center.withOffset(CGVector(dx:80,dy:20)))
++        XCTAssertGreaterThan(Int(app.staticTexts["moves"].label.split(separator:" ").last ?? "0") ?? 0,0)
++        capture("\(PreviewFixture.profile)-wireless-touchpad")
++        app.buttons["Keyboard"].tap()
++        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout:5))
++        app.typeText("abc")
++        XCTAssertGreaterThanOrEqual(Int(app.staticTexts["keys"].label.split(separator:" ").last ?? "0") ?? 0,3)
++        capture("\(PreviewFixture.profile)-wireless-keyboard")
++        app.buttons["Gamepad"].tap()
++        XCTAssertTrue(surface.waitForExistence(timeout:5))
 +        if PreviewFixture.profile == "duo-unfolded" {
 +            app.buttons["fold"].tap();capture("duo-folded-transition")
 +            app.buttons["fold"].tap();capture("duo-unfolded-restored")
@@ -7767,10 +7948,10 @@ index 0000000..dfa98b5
 +preview-artifacts. Run in GitHub Actions; no local Mac is required by the user.
 diff --git a/tests/gamepad-preview/project.yml b/tests/gamepad-preview/project.yml
 new file mode 100644
-index 0000000..f34530a
+index 0000000..7c510e6
 --- /dev/null
 +++ b/tests/gamepad-preview/project.yml
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,69 @@
 +name: HengeGamepadPreview
 +options:
 +  deploymentTarget:
@@ -7795,6 +7976,8 @@ index 0000000..f34530a
 +    - ../../ios/Henge/Controls/GamepadSurface.swift
 +    - ../../ios/Henge/Controls/GamepadSettingsPanel.swift
 +    - ../../ios/Henge/Controls/WirelessControlsPanel.swift
++    - ../../ios/Henge/Controls/WirelessInputSurface.swift
++    - ../../ios/Henge/Link/LinkProtocol.swift
 +    settings:
 +      base:
 +        PRODUCT_BUNDLE_IDENTIFIER: com.henge.gamepadpreview
@@ -9011,6 +9194,30 @@ index 2b1be58..cf28a94 100644
      hv_machine_free(&m);
      puts("native WFI integration: guest timer resumes code, activity callback runs at entry/resume, CPU parks on exit");
  }
+diff --git a/tests/test_jit_allocation.py b/tests/test_jit_allocation.py
+index 060441b..09d8836 100644
+--- a/tests/test_jit_allocation.py
++++ b/tests/test_jit_allocation.py
+@@ -43,7 +43,18 @@ int main(void){
+  assert(m.stats.jit_tail_allocations==1&&hot==m.jit.base+256&&cold==m.jit.base+272);
+  assert(chunk_take(&m,32,32,&hot,&cold)==-1&&m.jit.used==288);
+  m.jit_gen++;m.jit.used=0;assert(!chunk_take(&m,8,8,&hot,&cold)&&hot==m.jit.base);
+- free(shared.base);puts("JIT allocation: 12 concurrent allocators, no overlaps, bounds, overflow, failed reserve preserves space, tail recovery and generation reset passed");
++ // A limited comparison cache must work even with final-tail recovery off.
++ // Odd limits leave their final word unused to preserve 8-byte placement.
++ m.jit_gen++;m.jit.used=0;m.jit.limit=65;m.jit_tail_enabled=0;
++ assert(!chunk_take(&m,20,12,&hot,&cold)&&m.jit.used==64);
++ assert(hot==m.jit.base&&cold==m.jit.base+52);
++ assert(!chunk_take(&m,16,16,&hot,&cold)&&m.jit.used==64);
++ assert(chunk_take(&m,1,1,&hot,&cold)==-1&&m.jit.used==64);
++ m.jit_gen++;m.jit.used=0;m.jit.limit=0;
++ assert(!chunk_take(&m,8,8,&hot,&cold)&&m.jit.used==256);
++ m.jit_gen++;m.jit.used=0;m.jit.limit=500;
++ assert(!chunk_take(&m,8,8,&hot,&cold)&&m.jit.used==256);
++ free(shared.base);puts("JIT allocation: 12 concurrent allocators, no overlaps, bounds, overflow, failed reserve preserves space, tail recovery, effective/odd cache limits and generation reset passed");
+ }
+ '''
+ b=r/'build';b.mkdir(exist_ok=True);p=b/'test_jit_allocation.c';p.write_text(s)
 diff --git a/tests/test_link.swift b/tests/test_link.swift
 index 1ac8d90..0ef4da9 100644
 --- a/tests/test_link.swift
@@ -10928,10 +11135,10 @@ index c88ebe4..00251c5 100755
 +python3 tests/test_link_control_services.py
 diff --git a/tools/preview_gamepad.py b/tools/preview_gamepad.py
 new file mode 100644
-index 0000000..953de38
+index 0000000..d4a529c
 --- /dev/null
 +++ b/tools/preview_gamepad.py
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,68 @@
 +"""Actual iOS Simulator UI tests; viewport fixtures are not chip emulation."""
 +from pathlib import Path
 +import argparse,json,os,re,subprocess
@@ -10942,7 +11149,7 @@ index 0000000..953de38
 +root=Path(__file__).resolve().parents[1]
 +folder=root/'tests/gamepad-preview';artifacts=root/'preview-artifacts';artifacts.mkdir(exist_ok=True)
 +viewport=(951,669) if args.profile=='duo-unfolded' else (1376,1032)
-+(folder/'Fixture.swift').write_text('import Foundation\nenum PreviewFixture { static let profile='+json.dumps(args.profile)+'; static let viewport=CGSize(width:'+str(viewport[0])+',height:'+str(viewport[1])+') }\n')
++(folder/'Fixture.swift').write_text('import Foundation\nimport CoreGraphics\nenum PreviewFixture { static let profile='+json.dumps(args.profile)+'; static let viewport=CGSize(width:'+str(viewport[0])+',height:'+str(viewport[1])+') }\n')
 +def output(*cmd):return subprocess.check_output(cmd,text=True)
 +metadata=json.loads(output('xcrun','simctl','list','--json'))
 +runtimes=[r for r in metadata['runtimes'] if r.get('isAvailable') and r.get('name','').startswith('iOS ')]
@@ -10976,17 +11183,25 @@ index 0000000..953de38
 +try:
 + subprocess.run(['xcrun','simctl','boot',udid],check=True)
 + subprocess.run(['xcrun','simctl','bootstatus',udid,'-b'],check=True,timeout=180)
++ for label,command in [('io-help',['xcrun','simctl','io',udid]),('ui-help',['xcrun','simctl','ui',udid]),('displays',['xcrun','simctl','io',udid,'enumerate'])]:
++  probe=subprocess.run(command,capture_output=True,text=True)
++  (artifacts/(label+'.txt')).write_text(probe.stdout+probe.stderr)
 + subprocess.run(['xcodegen','generate'],cwd=folder,check=True)
 + command=['xcodebuild','-project',str(folder/'HengeGamepadPreview.xcodeproj'),'-scheme','GamepadPreview',
 +          '-destination','id='+udid,'-derivedDataPath',str(root/'build/gamepad-preview'),
-+          '-resultBundlePath',str(artifacts/'GamepadPreview.xcresult'),'CODE_SIGNING_ALLOWED=NO','test']
-+ result=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
-+ (artifacts/'xcodebuild.log').write_text(result.stdout)
-+ print('\n'.join(result.stdout.splitlines()[-25:]))
-+ if result.returncode:subprocess.run(['xcrun','simctl','io',udid,'screenshot',str(artifacts/'failure-state.png')],check=False)
++          '-resultBundlePath',str(artifacts/'GamepadPreview.xcresult'),'-parallel-testing-enabled','NO',
++          '-test-timeouts-enabled','YES','-default-test-execution-time-allowance','120',
++          '-maximum-test-execution-time-allowance','180','CODE_SIGNING_ALLOWED=NO','test']
++ timed_out=False
++ with (artifacts/'xcodebuild.log').open('w') as log:
++  try: result=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,text=True,timeout=900);status=result.returncode
++  except subprocess.TimeoutExpired:timed_out=True;status=124
++ print('\n'.join((artifacts/'xcodebuild.log').read_text().splitlines()[-35:]))
++ if timed_out:print('xcodebuild exceeded the 15-minute preview limit; retained log and failure state')
++ if status:subprocess.run(['xcrun','simctl','io',udid,'screenshot','--display=1',str(artifacts/'failure-state.png')],check=False)
 + # Kept XCTest screenshot attachments remain available even after a UI failure.
 + subprocess.run(['xcrun','xcresulttool','export','attachments','--path',str(artifacts/'GamepadPreview.xcresult'),'--output-path',str(artifacts/'screenshots')],check=False)
-+ if result.returncode:raise SystemExit(result.returncode)
++ if status:raise SystemExit(status)
 + if not list((artifacts/'screenshots').rglob('*.png')):raise SystemExit('XCTest passed but screenshot export is missing; preview verification incomplete')
 + report['ui_tests']='passed';(artifacts/'environment.json').write_text(json.dumps(report,indent=2)+'\n')
 +finally:
