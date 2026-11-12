@@ -3322,10 +3322,10 @@ index cf4acc4..42818a6 100644
  
 diff --git a/docs/controller-posture/PROGRESS.md b/docs/controller-posture/PROGRESS.md
 new file mode 100644
-index 0000000..fe8d153
+index 0000000..8c18253
 --- /dev/null
 +++ b/docs/controller-posture/PROGRESS.md
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,41 @@
 +# Controller posture integration
 +
 +Implemented in source (cloud validation pending):
@@ -3364,6 +3364,9 @@ index 0000000..fe8d153
 +
 +- Bounded diagnostic capture now activates the existing presented-time histogram, including p95/p99, without a new sampler/timer. Capture epochs fence late presented callbacks; explicit HV_FRAME_STATS remains respected. Histograms include idle/cursor intervals and are not game FPS.
 +- Audio CPU-only background continuation resets the fallback stream clock while keeping the guest's playing state. Touch helper watchdog runs only while a USB touchscreen device is active, rather than waking when disabled.
++
++Cloud4a5966 exposed Darwin feature visibility in disk_resize.c: POSIX-only declarations hid O_NOFOLLOW/flock; use Darwin feature set on Apple, POSIX elsewhere. Disk GPT regression and audio lifecycle pass locally. Stats lifecycle failure was missing test_vm_lifecycle binary after that compile error, not a waived assertion.
++Hardware codec fixture now models the production serial GPU worker's requestFrame callback. It verifies paced retry, three-credit blocked-consumer ceiling and final deferred snapshot after ACK (37 actual decoded frames), instead of expecting unpaced burst captures. Full macOS run required before release.
 diff --git a/docs/controller-posture/m4-log-ACBA.json b/docs/controller-posture/m4-log-ACBA.json
 new file mode 100644
 index 0000000..c209542
@@ -5704,11 +5707,15 @@ index ecb059f..f36fffc 100644
          close(d->fd);
 diff --git a/host/disk_resize.c b/host/disk_resize.c
 new file mode 100644
-index 0000000..64c747e
+index 0000000..8821424
 --- /dev/null
 +++ b/host/disk_resize.c
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,94 @@
++#ifdef __APPLE__
++#define _DARWIN_C_SOURCE 1
++#else
 +#define _POSIX_C_SOURCE 200809L
++#endif
 +#include "disk_resize.h"
 +#include <errno.h>
 +#include <fcntl.h>
@@ -15065,10 +15072,26 @@ index 060441b..09d8836 100644
  '''
  b=r/'build';b.mkdir(exist_ok=True);p=b/'test_jit_allocation.c';p.write_text(s)
 diff --git a/tests/test_link.swift b/tests/test_link.swift
-index 1ac8d90..fbcde73 100644
+index 1ac8d90..1876135 100644
 --- a/tests/test_link.swift
 +++ b/tests/test_link.swift
-@@ -22,8 +22,47 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -10,6 +10,15 @@ func require(_ value: @autoclosure () -> Bool, _ text: String) {
+ func mustReject(_ operation: () throws -> Void) {
+     do { try operation(); fatalError("Invalid peer data accepted") } catch {}
+ }
++/// Models the production serial guest GPU worker: a paced retry samples the
++/// current surface again, rather than retaining an old guest texture snapshot.
++final class FixtureFrameSource {
++    private let queue = DispatchQueue(label: "henge.test.guest-gpu")
++    private var latest: (() -> Void)?
++    func submit(_ frame: @escaping () -> Void) { queue.sync { latest = frame; frame() } }
++    func refresh() { queue.async { [self] in latest?() } }
++    func stop() { queue.sync { latest = nil } }
++}
+ @main struct LinkChecks {
+     static func main() {
+         setbuf(stdout, nil)
+@@ -22,8 +31,47 @@ func mustReject(_ operation: () throws -> Void) {
          dispatchMain()
      }
      static func checks() throws {
@@ -15116,19 +15139,101 @@ index 1ac8d90..fbcde73 100644
          try LinkControl(type: "release").validate()
          try LinkControl(type: "videoAck", sequence: 1).validate()
          mustReject { try LinkControl(type: "videoAck", sequence: 0).validate() }
-@@ -191,6 +230,12 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -160,8 +208,9 @@ func mustReject(_ operation: () throws -> Void) {
+             return try decoder.decode(data)
+         }, report: { print("worker-fixture: \($0)") })
+         let generation = worker.start(mode: mode, output: { _ in })
+-        let ack = DispatchSemaphore(value: 0)
++        let ack = DispatchSemaphore(value: 0), encoded = DispatchSemaphore(value: 0)
+         func waitFrame() {
++            require(encoded.wait(timeout: .now() + 15) == .success, "Hardware encode timed out")
+             require(done.wait(timeout: .now() + 15) == .success, "Hardware decode timed out")
+             require(ack.wait(timeout: .now() + 15) == .success, "Decoder ACK timed out")
+         }
+@@ -181,7 +230,10 @@ func mustReject(_ operation: () throws -> Void) {
+         require(listening.wait(timeout: .now() + 10) == .success, "Video TLS listener")
+         receiver.connect(host: "127.0.0.1", key: key, wired: false, port: port)
+         require(secure.wait(timeout: .now() + 5) == .success, "Video TLS handshake")
+-        let encoder = try LinkEncoder(mode: mode, library: library, send: { data, finish in sender.sendVideo(data, completion: finish) }, report: { print("fixture: \($0)") })
++        let source = FixtureFrameSource()
++        let encoder = try LinkEncoder(mode: mode, library: library, requestFrame: { source.refresh() }, send: { data, finish in
++            sender.sendVideo(data, completion: finish); encoded.signal()
++        }, report: { print("fixture: \($0)") })
+         sender.onVideoAcknowledged = { [weak encoder] sequence in
+             encoder?.acknowledge(sequence); ack.signal()
+         }
+@@ -191,7 +243,13 @@ func mustReject(_ operation: () throws -> Void) {
          var pixels = [UInt8](repeating: 0, count: mode.width * mode.height * 4)
          for i in stride(from: 0, to: pixels.count, by: 4) { pixels[i+2] = 255; pixels[i+3] = 255 }
          texture.replace(region: MTLRegionMake2D(0, 0, mode.width, mode.height), mipmapLevel: 0, withBytes: &pixels, bytesPerRow: mode.width * 4)
+-        encoder.capture(texture: texture, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero)
 +        encoder.setVisible(false)
-+        encoder.capture(texture: texture, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero)
++        source.submit { encoder.capture(texture: texture, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero) }
 +        let hiddenFence = queue.makeCommandBuffer()!; hiddenFence.commit(); hiddenFence.waitUntilCompleted()
 +        require(done.wait(timeout: .now() + 0.2) == .timedOut, "Hidden viewer received an encoded frame")
 +        encoder.trimMemory()
 +        encoder.setVisible(true)
-         encoder.capture(texture: texture, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero)
++        source.submit { encoder.capture(texture: texture, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero) }
          waitFrame()
          expected = 1
+         let cd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 32, height: 32, mipmapped: false)
+@@ -200,7 +258,7 @@ func mustReject(_ operation: () throws -> Void) {
+         var glyph = [UInt8](repeating: 0, count: 32*32*4)
+         for i in stride(from: 0, to: glyph.count, by: 4) { glyph[i+1] = 255; glyph[i+3] = 255 }
+         cursor.replace(region: MTLRegionMake2D(0, 0, 32, 32), mipmapLevel: 0, withBytes: &glyph, bytesPerRow: 32*4)
+-        encoder.capture(texture: texture, queue: queue, halfMode: 0, cursorTexture: cursor, rect: SIMD4(16, 16, 32, 32))
++        source.submit { encoder.capture(texture: texture, queue: queue, halfMode: 0, cursorTexture: cursor, rect: SIMD4(16, 16, 32, 32)) }
+         waitFrame()
+         expected = 2
+         let hd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: mode.width, height: mode.height, mipmapped: false)
+@@ -209,25 +267,36 @@ func mustReject(_ operation: () throws -> Void) {
+         var gray = [Float16](repeating: 0.5, count: mode.width*mode.height*4)
+         for i in stride(from: 3, to: gray.count, by: 4) { gray[i] = 1 }
+         half.replace(region: MTLRegionMake2D(0, 0, mode.width, mode.height), mipmapLevel: 0, withBytes: &gray, bytesPerRow: mode.width*8)
+-        encoder.capture(texture: half, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero)
++        source.submit { encoder.capture(texture: half, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero) }
+         waitFrame()
+         // Exercise real pool/texture/codec reuse beyond the three in-flight slots.
+         for _ in 0..<30 {
+-            encoder.capture(texture: half, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero)
++            source.submit { encoder.capture(texture: half, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero) }
+             waitFrame()
+         }
+-        // Three snapshots while consumption is blocked must fill the entire
+-        // end-to-end window; the fourth must be rejected BEFORE compression.
++        // Fill all three end-to-end credits while the real decoder is blocked.
++        // Encoding completion, not arbitrary delays, drives each new surface.
+         stateLock.lock(); holdNext = true; stateLock.unlock()
+-        encoder.capture(texture: half, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero)
++        source.submit { encoder.capture(texture: half, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero) }
+         require(blocked.wait(timeout: .now() + 15) == .success, "Slow production worker did not block")
+-        for _ in 0..<3 { encoder.capture(texture: half, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero) }
+-        let fence = queue.makeCommandBuffer()!; fence.commit(); fence.waitUntilCompleted()
++        require(encoded.wait(timeout: .now() + 15) == .success, "First held encode missing")
++        for _ in 0..<2 {
++            source.submit { encoder.capture(texture: half, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero) }
++            require(encoded.wait(timeout: .now() + 15) == .success, "Paced retry failed to fill credit window")
++        }
++        source.submit { encoder.capture(texture: half, queue: queue, halfMode: 0, cursorTexture: nil, rect: .zero) }
++        require(encoded.wait(timeout: .now() + 0.2) == .timedOut, "Fourth frame compressed before decoder credit")
+         decodeGate.signal()
+-        for _ in 0..<3 { waitFrame() }
+-        require(done.wait(timeout: .now() + 0.2) == .timedOut, "Fourth reference frame bypassed window")
+-        print("PASS repeated native GPU/encoder/TLS/production worker: 36 frames including coalesced burst and blocked consumer")
+-        worker.stop(); encoder.stop(); sender.stop(); receiver.stop()
++        // Retirement requests a fresh final snapshot. It must not vanish when
++        // the guest becomes idle immediately after the congested update.
++        for _ in 0..<3 {
++            require(done.wait(timeout: .now() + 15) == .success, "Held decode missing")
++            require(ack.wait(timeout: .now() + 15) == .success, "Held ACK missing")
++        }
++        waitFrame()
++        require(done.wait(timeout: .now() + 0.2) == .timedOut, "Idle refresh became a continuous stream")
++        print("PASS repeated native GPU/encoder/TLS/production worker: 37 frames including cadence retry, blocked consumer and final deferred snapshot")
++        source.stop(); worker.stop(); encoder.stop(); sender.stop(); receiver.stop()
+         sender.queue.sync {}; receiver.queue.sync {}
+         print("PASS hardware: same-queue Metal snapshot → hardware encode → real TLS stream → hardware decode; native dimensions \(mode.width)x\(mode.height), red, cursor and half-float gray")
+     }
 diff --git a/tests/test_link_control_services.py b/tests/test_link_control_services.py
 new file mode 100644
 index 0000000..4459a02
