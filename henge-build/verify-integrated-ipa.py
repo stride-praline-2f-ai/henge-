@@ -76,6 +76,7 @@ with tempfile.TemporaryDirectory(prefix='henge-ipa-check-') as directory:
         assert [x.upper() for x in platforms] in (['2'], ['IOS']) or ('cmd LC_VERSION_MIN_IPHONEOS' in commands and not platforms), binary.name
         architectures[str(binary.relative_to(app))] = arch
     subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
+    guest_helpers=json.loads(subprocess.check_output(['python3','Henge/tools/verify_native_touch_package.py',str(app/'henge-touch-agent.tar.gz')],text=True))
     signed = subprocess.run(['codesign', '-d', '--entitlements', ':-', str(app)], check=True, capture_output=True)
     entitlements = plistlib.loads(signed.stdout)
     requested = plistlib.loads(Path('Henge/ios/Henge/Henge.entitlements').read_bytes())
@@ -84,6 +85,7 @@ with tempfile.TemporaryDirectory(prefix='henge-ipa-check-') as directory:
     assert plist['HengeCustomSourceCommit'] == os.environ['GITHUB_SHA'], 'Wrong final implementation commit'
 result=Path("Henge-output/Henge-build-verification.json")
 data=json.loads(result.read_text())
+data['guest_usb_companions']=guest_helpers
 data['packaging_validation'] = dict(architectures=architectures, ios_device_platform=True,
     nested_signature_verified=True, entitlement_values_verified=True,
     distribution_signing='ad hoc; installation tool must sign with its own supported profile')

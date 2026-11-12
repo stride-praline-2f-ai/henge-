@@ -1,8 +1,17 @@
 diff --git a/Makefile b/Makefile
-index 81b0736..3ac1c2e 100644
+index 81b0736..d5315ca 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -48,7 +48,7 @@ IDR_SRC = $(wildcard third_party/idevicerestore/src/*.c)
+@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
+ METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
+ 
+ TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
+-        $(B)/test_mmu $(B)/test_inline_sysreg $(B)/test_exc $(B)/test_devices $(B)/test_fastmem $(B)/test_memory_bounds $(B)/test_idle_ticker $(B)/test_idle_integration $(B)/test_tail_recheck $(B)/test_audio_lifecycle $(B)/test_shutdown
++        $(B)/test_mmu $(B)/test_inline_sysreg $(B)/test_exc $(B)/test_devices $(B)/test_fastmem $(B)/test_memory_bounds $(B)/test_idle_ticker $(B)/test_idle_integration $(B)/test_tail_recheck $(B)/test_audio_lifecycle $(B)/test_shutdown $(B)/test_usb_touchscreen
+ 
+ all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
+ 
+@@ -48,19 +48,21 @@ IDR_SRC = $(wildcard third_party/idevicerestore/src/*.c)
  RESTORE_OBJ = $(patsubst third_party/%.c,$(RB)/%.o,$(IRECV_SRC) $(MUXD_SRC) $(IDR_SRC))
  
  # The helper that runs inside macOS on a virtual Mac (share.c serves it to the guest).
@@ -11,7 +20,26 @@ index 81b0736..3ac1c2e 100644
  	@mkdir -p $(B)
  	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit $< -o $@
  	codesign -f -s - $@
-@@ -87,7 +87,7 @@ $(B)/%.o: core/%.c core/*.h host/*.h | $(B)
+ 
+-# Guest-side CoreHID companion for native touch.
+-$(B)/henge-touch-agent: tools/henge-touch-agent.swift tools/native-touch/*.swift tools/native-touch.entitlements
++# Guest-side USB-only native-touch companion; no restricted entitlement.
++$(B)/henge-touch-agent: tools/henge-touch-agent.swift tools/native-touch/*.swift
+ 	@mkdir -p $(B)
+ 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx swiftc -parse-as-library -target arm64-apple-macos15.0 -O tools/henge-touch-agent.swift tools/native-touch/*.swift -o $@
+-	codesign -f -s - --entitlements tools/native-touch.entitlements $@
++	codesign -f -s - $@
+ 
+-$(B)/henge-touch-agent.gz: $(B)/henge-touch-agent
+-	gzip -9 -n -c $< > $@
++# Verify and deterministically package both signed guest companions.
++.PHONY: native-touch-package-force
++$(B)/henge-touch-agent.tar.gz: $(B)/henge-touch-agent $(B)/henge-agent tools/package_native_touch.py native-touch-package-force
++	python3 tools/package_native_touch.py --binary $< --sharing-binary $(B)/henge-agent --output $@
+ 
+ $(B)/native_touch.o: host/native_touch.c host/native_touch.h | $(B)
+ 	$(CC) $(CFLAGS) -c $< -o $@
+@@ -87,7 +89,7 @@ $(B)/%.o: core/%.c core/*.h host/*.h | $(B)
  $(B)/%.o: host/%.c host/*.h core/*.h devices/*.h | $(B)
  	$(CC) $(CFLAGS) -c $< -o $@
  $(B)/%.o: host/%.S | $(B)
@@ -20,7 +48,7 @@ index 81b0736..3ac1c2e 100644
  $(B)/%.o: devices/%.c devices/*.h core/*.h host/*.h | $(B)
  	$(CC) $(CFLAGS) -c $< -o $@
  
-@@ -107,8 +107,11 @@ $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
+@@ -107,8 +109,11 @@ $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
  $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
  	$(CC) $(CFLAGS) $^ -o $@
  
@@ -34,7 +62,7 @@ index 81b0736..3ac1c2e 100644
  
  test-vm-lifecycle: $(B)/test_vm_lifecycle
  	$(B)/test_vm_lifecycle
-@@ -259,6 +262,18 @@ test-native-touch: $(B)/test_native_touch $(B)/test_native_touch_session
+@@ -259,6 +264,25 @@ test-native-touch: $(B)/test_native_touch $(B)/test_native_touch_session
  	./$(B)/test_native_touch_session
  .PHONY: test-native-touch
  
@@ -50,9 +78,29 @@ index 81b0736..3ac1c2e 100644
 +	./$(B)/test_runner_control_asan
 +.PHONY: test-runner
 +
++$(B)/test_guest_connection: tests/test_guest_connection.swift tools/native-touch/GuestConnection.swift | $(B)
++	xcrun --sdk macosx swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors -parse-as-library $^ -o $@
++
++test-guest-connection: $(B)/test_guest_connection
++	python3 tests/test_guest_connection.py $<
++.PHONY: test-guest-connection
++
  # Session-owned display routing, independent of JIT, Metal and a connected monitor.
  $(B)/test_display_targets: ios/Henge/DisplayTargetSelection.swift tests/test_display_targets.swift | $(B)
  	xcrun --sdk macosx swiftc $^ -o $@
+@@ -318,3 +342,12 @@ $(B)/test_timer_dispatch: tests/test_timer_dispatch.c $(ENGINE)
+ 
+ $(B)/test_fastmem_bench: tests/test_fastmem_bench.c $(ENGINE)
+ 	$(CC) $(CFLAGS) tests/test_fastmem_bench.c $(ENGINE) -o $@
++
++# Guest USB touchscreen research: protocol checks need no macOS image.
++$(B)/test_usb_touchscreen: tests/test_usb_touchscreen.c $(ENGINE) $(DEV)
++	$(CC) $(CFLAGS) -O1 -fsanitize=address,undefined $^ $(METAL_LIBS) -o $@
++
++test-usb-touchscreen: $(B)/test_usb_touchscreen
++	@mkdir -p $(B)/usb-touch-research
++	./$(B)/test_usb_touchscreen
++.PHONY: test-usb-touchscreen
 diff --git a/core/dispatch.c b/core/dispatch.c
 index 12bd4a9..171acf7 100644
 --- a/core/dispatch.c
@@ -988,6 +1036,18 @@ index 30699bd..6ea7d06 100644
 +    return entry.firstFunction; // nil failures retry; bypass entries are not retained
  }
  @end
+diff --git a/devices/pvg.h b/devices/pvg.h
+index 3afe521..981c205 100644
+--- a/devices/pvg.h
++++ b/devices/pvg.h
+@@ -19,5 +19,7 @@ void hv_pvg_window_run(void);
+ 
+ /* Called from the CPU thread: delivers interrupts the framework raised. */
+ void hv_pvg_poll(void);
++/* Mac test driver: current cursor from the framework-backed display. */
++int hv_pvg_mac_pointer(int *x, int *y);
+ 
+ #endif
 diff --git a/devices/pvg_link.h b/devices/pvg_link.h
 index 4deff97..d0ff98b 100644
 --- a/devices/pvg_link.h
@@ -1217,6 +1277,24 @@ index 0f68eae..12d46e9 100644
 +int hv_pvg_metal_set_display_state(HvPvgMetal *m, const void *in, size_t len);
  
  #endif
+diff --git a/devices/pvg_mac.m b/devices/pvg_mac.m
+index 87728e2..bc7aa34 100644
+--- a/devices/pvg_mac.m
++++ b/devices/pvg_mac.m
+@@ -706,3 +706,13 @@ void hv_pvg_window_run(void) {
+         [app run];
+     }
+ }
++
++int hv_pvg_mac_pointer(int *x, int *y) {
++    if (!pgdisp) return -1;
++    __block PGDisplayCoord_t position;
++    if (NSThread.isMainThread) position = pgdisp.cursorPosition;
++    else dispatch_sync(dispatch_get_main_queue(), ^{ position = pgdisp.cursorPosition; });
++    if (position.x == 0xffff || position.y == 0xffff) return -1;
++    *x = position.x; *y = position.y;
++    return 0;
++}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
 index 9073d22..03be0e7 100644
 --- a/devices/pvg_metal.m
@@ -2444,7 +2522,7 @@ index 0000000..c550603
 +}
 +#endif
 diff --git a/devices/xhci.c b/devices/xhci.c
-index c355628..1d576e3 100644
+index c355628..5e34d41 100644
 --- a/devices/xhci.c
 +++ b/devices/xhci.c
 @@ -6,6 +6,12 @@
@@ -2460,7 +2538,49 @@ index c355628..1d576e3 100644
  
  /* Register layout in BAR 0. */
  #define CAPLENGTH 0x40
-@@ -133,9 +139,30 @@ struct HvXhciDev {
+@@ -126,6 +132,41 @@ static const uint8_t tp_config_desc[34] = {
+ 
+ static const char *const tp_strings[] = {NULL, "Apple Inc.", "Magic Trackpad 2", "HengeVM"};
+ 
++/* Port 3: standard HID Digitizers/Touch Screen, five parallel Finger collections.
++   Confidence (TouchValid) remains set in lift reports so macOS classifies them
++   as fingers. No Apple vendor identity or guest userspace virtual HID is used. */
++#define TS_FINGER \
++    0x05, 0x0d, 0x09, 0x22, 0xa1, 0x02, \
++    0x09, 0x42, 0x09, 0x47, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 2, 0x81, 2, \
++    0x75, 6, 0x95, 1, 0x81, 3, \
++    0x09, 0x51, 0x25, 0x7f, 0x75, 8, 0x95, 1, 0x81, 2, \
++    0x05, 1, 0x09, 0x30, 0x09, 0x31, 0x16, 0, 0, 0x26, 0xff, 0x7f, \
++    0x75, 16, 0x95, 2, 0x81, 2, 0xc0
++static const uint8_t ts_report_desc[] = {
++    0x05, 0x0d, 0x09, 4, 0xa1, 1, 0x85, 1,
++    TS_FINGER, TS_FINGER, TS_FINGER, TS_FINGER, TS_FINGER,
++    0x05, 0x0d, 0x09, 0x54, 0x15, 0, 0x25, HV_TS_FINGERS,
++    0x75, 8, 0x95, 1, 0x81, 2,
++    0x85, 2, 0x09, 0x55, 0x75, 8, 0x95, 1, 0xb1, 2,
++    /* Read during HID event-driver initialization; its reply waits for UUID binding. */
++    0x85, 3, 0x09, 0xa1, 0x16, 0, 0, 0x26, 0xe8, 3,
++    0x75, 16, 0x95, 1, 0xb1, 2, 0xc0,
++};
++#undef TS_FINGER
++static const uint8_t ts_device_desc[18] = {
++    18, 1, 0, 2, 0, 0, 0, 64,
++    0x09, 0x12, 0x07, 0xd0, /* experimental 0x1209:0xd007 */
++    0, 1, 1, 2, 3, 1,
++};
++static const uint8_t ts_config_desc[34] = {
++    9, 2, 34, 0, 1, 1, 0, 0x80, 50,
++    9, 4, 0, 0, 1, 3, 0, 0, 0, /* HID, no boot mouse/keyboard protocol */
++    9, 0x21, 0x11, 1, 0, 1, 0x22,
++    sizeof ts_report_desc & 0xff, sizeof ts_report_desc >> 8,
++    7, 5, 0x81, 3, HV_TS_REPORT_LEN, 0, 4,
++};
++static const char *const ts_strings[] = {NULL, "Henge", "Henge touchscreen", "HengeTouch1"};
++
+ struct HvXhciDev {
+     const char *const *strings;
+     const uint8_t *device_desc;
+@@ -133,9 +174,31 @@ struct HvXhciDev {
      const uint8_t *report_desc;
      unsigned report_desc_len;
  };
@@ -2488,10 +2608,11 @@ index c355628..1d576e3 100644
      {kbd_strings, kbd_device_desc, kbd_config_desc, kbd_report_desc, sizeof kbd_report_desc},
      {tp_strings, tp_device_desc, tp_config_desc, tp_report_desc, sizeof tp_report_desc},
 +    {gp_strings, gp_device_desc, gp_config_desc, hv_gamepad_descriptor, sizeof hv_gamepad_descriptor},
++    {ts_strings, ts_device_desc, ts_config_desc, ts_report_desc, sizeof ts_report_desc},
  };
  
  static int xlog(void) {
-@@ -320,8 +347,13 @@ static void tp_select(HvXhci *x, int reg) {
+@@ -320,8 +383,13 @@ static void tp_select(HvXhci *x, int reg) {
     requests), or -1 to stall. */
  static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, int max) {
      const struct HvXhciDev *d = &devs[x->slots[slot].dev];
@@ -2505,7 +2626,16 @@ index c355628..1d576e3 100644
      if (xlog()) fprintf(stderr, "xhci: request %02x %02x value %04x len %u\n", type, req, value, setup[6] | setup[7] << 8);
      /* Every request the trackpad gets goes to the log, unconditionally: the guest's
         driver handshake is exactly what we are trying to watch. Capped so a polling
-@@ -337,7 +369,7 @@ static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, in
+@@ -331,13 +399,16 @@ static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, in
+         fprintf(stderr, "hengevm: xhci: tp request %02x %02x value %04x index %04x len %u\n",
+                 type, req, value, setup[4] | setup[5] << 8, setup[6] | setup[7] << 8);
+     }
++    if (x->slots[slot].dev == 3 && x->ts_reqs++ < 32)
++        fprintf(stderr, "hengevm: xhci: touchscreen request %02x %02x value %04x len %u\n",
++                type, req, value, setup[6] | setup[7] << 8);
+     const uint8_t *src = NULL;
+     int len = 0;
+     uint8_t tmp[HV_TP_REPORT_LEN + 8];
      if (type == 0x80 && req == 6) { /* GET_DESCRIPTOR (device) */
          uint8_t dt = value >> 8, idx = value & 0xff;
          if (dt == 1) src = d->device_desc, len = 18;
@@ -2514,7 +2644,7 @@ index c355628..1d576e3 100644
          else if (dt == 3) {
              if (idx == 0) {
                  tmp[0] = 4, tmp[1] = 3, tmp[2] = 0x09, tmp[3] = 0x04; /* English (US) */
-@@ -373,7 +405,20 @@ static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, in
+@@ -373,7 +444,37 @@ static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, in
          src = tmp, len = 1;
      } else if (type == 0xa1 && req == 1) { /* GET_REPORT: wValue is (type << 8) | report ID */
          if (x->slots[slot].dev == 0) src = x->state, len = 8;
@@ -2532,11 +2662,28 @@ index c355628..1d576e3 100644
 +                pthread_mutex_lock(&x->mu);memcpy(tmp,x->gp_state,HV_GAMEPAD_BYTES);pthread_mutex_unlock(&x->mu);
 +                src=tmp;len=HV_GAMEPAD_BYTES;
 +            }
++        } else if (x->slots[slot].dev == 3) {
++            if (value == 0x0302) {
++                tmp[0] = 2; tmp[1] = HV_TS_FINGERS;
++                src = tmp; len = 2;
++            } else if (value == 0x0303) {
++                pthread_mutex_lock(&x->mu);
++                int mapped = x->ts_mapped;
++                pthread_mutex_unlock(&x->mu);
++                if (!mapped) return -2; /* leave the setup TRB pending, not stalled */
++                tmp[0] = 3; tmp[1] = 60; tmp[2] = 0;
++                src = tmp; len = 3;
++            } else if (value == 0x0101) {
++                pthread_mutex_lock(&x->mu);
++                memcpy(tmp, x->ts_state, HV_TS_REPORT_LEN);
++                pthread_mutex_unlock(&x->mu);
++                src = tmp; len = HV_TS_REPORT_LEN;
++            } else return -1;
 +        } else {
              int rtype = value >> 8, rid = value & 0xff;
              if (rtype == 3) { /* feature: the sensor-configuration registers */
                  if (rid == 0x01) { /* the header for the register just selected */
-@@ -429,7 +474,7 @@ static void run_ep0(HvXhci *x, int slot) {
+@@ -429,7 +530,7 @@ static void run_ep0(HvXhci *x, int slot) {
      HvXhciRing *r = &x->slots[slot].ep[1];
      uint32_t trb[4];
      uint64_t at;
@@ -2545,7 +2692,18 @@ index c355628..1d576e3 100644
      int reply_len = 0, stalled = 0;
      while (ring_peek(x, r, trb, &at)) {
          int type = (trb[3] >> 10) & 0x3f;
-@@ -488,7 +533,7 @@ static void run_ep0(HvXhci *x, int slot) {
+@@ -438,6 +539,10 @@ static void run_ep0(HvXhci *x, int slot) {
+             memcpy(setup, trb, 8);
+             uint16_t wlen = (uint16_t)(setup[6] | setup[7] << 8);
+             reply_len = control(x, slot, setup, reply, wlen < sizeof reply ? wlen : (int)sizeof reply);
++            if (reply_len == -2) {
++                x->ts_ep0_waiting |= 1u << slot;
++                return;
++            }
+             stalled = reply_len < 0;
+             ring_advance(r);
+             if (stalled) {
+@@ -488,7 +593,7 @@ static void run_ep0(HvXhci *x, int slot) {
  static void run_ep_in(HvXhci *x, int slot) {
      struct HvXhciSlot *s = &x->slots[slot];
      int dci = -1;
@@ -2554,10 +2712,11 @@ index c355628..1d576e3 100644
      if (s->dev < 0 || dci < 0) return;
      HvXhciRing *r = &s->ep[dci];
      uint32_t trb[4];
-@@ -507,6 +552,18 @@ static void run_ep_in(HvXhci *x, int slot) {
+@@ -507,7 +612,19 @@ static void run_ep_in(HvXhci *x, int slot) {
              x->delivered++;
              transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
          }
+-    } else {
 +    } else if (s->dev == 2) {
 +        while (x->gp_online && x->gp_head != x->gp_tail && ring_peek(x,r,trb,&at)) {
 +            int type=(trb[3]>>10)&0x3f;ring_advance(r);
@@ -2570,10 +2729,30 @@ index c355628..1d576e3 100644
 +            wr(x,buf,report,n);x->gp_delivered++;
 +            transfer_event(x,at,n<want?CC_SHORT_PACKET:CC_SUCCESS,want-n,slot,dci);
 +        }
-     } else {
++    } else if (s->dev == 1) {
          while (x->tp_rhead != x->tp_rtail && ring_peek(x, r, trb, &at)) {
              int type = (trb[3] >> 10) & 0x3f;
-@@ -539,6 +596,24 @@ static void run_ep_in(HvXhci *x, int slot) {
+             ring_advance(r);
+@@ -536,9 +653,43 @@ static void run_ep_in(HvXhci *x, int slot) {
+             transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
+         }
+     }
++    if (s->dev == 3) {
++        while (x->ts_rhead != x->ts_rtail && ring_peek(x, r, trb, &at)) {
++            ring_advance(r);
++            if (((trb[3] >> 10) & 0x3f) != TRB_NORMAL) continue;
++            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
++            uint32_t want = trb[2] & 0x1ffff;
++            uint32_t n = want < HV_TS_REPORT_LEN ? want : HV_TS_REPORT_LEN;
++            const uint8_t *report = x->ts_reports[x->ts_rhead++ % HV_TS_REPORTS];
++            wr(x, buf, report, n);
++            if (n == HV_TS_REPORT_LEN) memcpy(x->ts_device_state, report, n);
++            x->ts_delivered++;
++            if (x->ts_delivered <= 8)
++                fprintf(stderr, "hengevm: xhci: touchscreen: %u bytes delivered (%llu)\n", n, (unsigned long long)x->ts_delivered);
++            transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
++        }
++    }
      pthread_mutex_unlock(&x->mu);
  }
  
@@ -2598,25 +2777,29 @@ index c355628..1d576e3 100644
  /* ---- commands ---- */
  
  static void init_ring_from_ctx(HvXhci *x, int slot, int dci) {
-@@ -558,6 +633,7 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
+@@ -557,7 +708,8 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
+     rd(x, input + 64, ep0, 32);
      int port = slot_ctx[6]; /* root hub port number, dword 1 bits 23:16 */
      int dev = port - 1;
-     if (dev < 0 || dev >= HV_XHCI_DEVICES) return CC_TRB_ERROR;
+-    if (dev < 0 || dev >= HV_XHCI_DEVICES) return CC_TRB_ERROR;
++    if (dev < 0 || dev >= HV_XHCI_DEVICES || (dev==3 && !x->ts_enabled)) return CC_TRB_ERROR;
 +    if (dev==2 && !x->gp_online) return CC_CONTEXT_STATE;
      x->slots[slot].dev = dev;
      uint32_t dw3 = (uint32_t)(bsr ? 1 : 2) << 27 | (uint32_t)(bsr ? 0 : slot); /* default or addressed; address = slot */
      memcpy(slot_ctx + 12, &dw3, 4);
-@@ -704,7 +780,8 @@ static void run_commands(HvXhci *x) {
+@@ -704,8 +856,9 @@ static void run_commands(HvXhci *x) {
     Magic Trackpad 2 is. */
  static void port_connect(HvXhci *x) {
      for (int p = 0; p < HV_XHCI_PORTS; p++) {
 -        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
-+        if (p==2 && !x->gp_online) { x->portsc[p]=PORT_PP; continue; }
-+        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p==1 ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
-         port_event(x, p);
+-        port_event(x, p);
++        if ((p==2 && !x->gp_online) || (p==3 && !x->ts_connected)) { x->portsc[p]=PORT_PP;continue; }
++        x->portsc[p]=PORT_PP|PORT_CCS|PORT_CSC|(uint32_t)((p==1 || p==3)?SPEED_HIGH:SPEED_FULL)<<PORT_SPEED_SHIFT|7u<<PORT_PLS_SHIFT;
++        port_event(x,p);
      }
  }
-@@ -737,6 +814,7 @@ static void port_write(HvXhci *x, int p, uint32_t v) {
+ 
+@@ -737,6 +890,7 @@ static void port_write(HvXhci *x, int p, uint32_t v) {
  /* ---- registers ---- */
  
  static void reset(HvXhci *x) {
@@ -2624,7 +2807,7 @@ index c355628..1d576e3 100644
      x->usbcmd = 0;
      x->usbsts = 1; /* halted */
      x->dnctrl = x->config = 0;
-@@ -750,6 +828,7 @@ static void reset(HvXhci *x) {
+@@ -750,6 +904,7 @@ static void reset(HvXhci *x) {
      memset(x->reports, 0, sizeof x->reports);
      x->rhead = x->rtail = 0;
      memset(x->state, 0, sizeof x->state);
@@ -2632,21 +2815,52 @@ index c355628..1d576e3 100644
      memset(x->tp_fingers, 0, sizeof x->tp_fingers);
      x->tp_button = 0;
      x->tp_ts = 0;
-@@ -760,8 +839,12 @@ static void reset(HvXhci *x) {
+@@ -760,8 +915,21 @@ static void reset(HvXhci *x) {
      x->tp_db = 0;
      x->tp_multi_logs = 0;
      x->tp_f1_len = 0;
+-    for (int p = 0; p < HV_XHCI_PORTS; p++)
+-        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
 +    x->gp_online=x->gp_desired;
 +    x->gp_head=x->gp_tail=0;
 +    if (x->gp_desired) memcpy(x->gp_reports[x->gp_tail++],x->gp_state,HV_GAMEPAD_BYTES);
-     for (int p = 0; p < HV_XHCI_PORTS; p++)
--        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
-+        x->portsc[p] = p==2 && !x->gp_online ? PORT_PP : PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p==1 ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
++    x->ts_rhead = x->ts_rtail = x->ts_reqs = 0;
++    x->ts_delivered = 0;
++    x->ts_deadline_ns = 0;
++    x->ts_release_phase = 0;
++    x->ts_release_at_ns = x->ts_release_limit_ns = 0;
++    x->ts_ep0_waiting = 0;
++    x->ts_mapped = x->ts_unmanaged;
++    memset(x->ts_state, 0, sizeof x->ts_state); x->ts_state[0] = 1;
++    memset(x->ts_device_state, 0, sizeof x->ts_device_state); x->ts_device_state[0] = 1;
++    for(int p=0;p<HV_XHCI_PORTS;p++)
++        x->portsc[p]=(p==2 && !x->gp_online) || (p==3 && !x->ts_connected) ? PORT_PP : PORT_PP|PORT_CCS|PORT_CSC|(uint32_t)((p==1 || p==3)?SPEED_HIGH:SPEED_FULL)<<PORT_SPEED_SHIFT|7u<<PORT_PLS_SHIFT;
 +    pthread_mutex_unlock(&x->mu);
      update_irq(x);
  }
  
-@@ -926,6 +1009,7 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
+@@ -774,9 +942,9 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
+         if (n++ < 60) fprintf(stderr, "xhci: read +%llx (%u)\n", (unsigned long long)off, size);
+     }
+     if (off < CAPLENGTH) {
+-        static const uint32_t cap[8] = {
++        const uint32_t cap[8] = {
+             CAPLENGTH | 0x0100u << 16,                           /* CAPLENGTH, HCIVERSION 1.0 */
+-            HV_XHCI_SLOTS | (uint32_t)HV_XHCI_INTRS << 8 | (uint32_t)HV_XHCI_PORTS << 24, /* slots, interrupters, ports */
++            HV_XHCI_SLOTS | (uint32_t)HV_XHCI_INTRS << 8 | (uint32_t)(x->ts_enabled ? 4 : 3) << 24, /* slots, interrupters, ports */
+             1u << 4,                                             /* ERST max 2 segments */
+             0,
+             1u | (uint32_t)(XECP / 4) << 16,                     /* 64-bit addressing, extended caps */
+@@ -789,7 +957,7 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
+         if (size == 8 && i + 1 < 8) v |= (uint64_t)cap[i + 1] << 32;
+         v >>= 8 * (off & 3);
+     } else if (off >= XECP && off < XECP + 16) { /* Supported Protocol: USB 2.0 on every port */
+-        static const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | ((1u << HV_XHCI_PORTS) - 1u) << 8, 0};
++        const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | (uint32_t)(x->ts_enabled ? 4 : 3) << 8, 0};
+         uint32_t i = (uint32_t)(off - XECP) / 4;
+         v = ext[i];
+         if (size == 8 && i + 1 < 4) v |= (uint64_t)ext[i + 1] << 32;
+@@ -926,34 +1094,105 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
              if (state != 1) set_ep_state(x, slot, dci, 1);
              x->slots[slot].ep_running[dci] = 1;
              if (dci == 1) run_ep0(x, slot);
@@ -2654,15 +2868,18 @@ index c355628..1d576e3 100644
              else run_ep_in(x, slot);
          }
      }
-@@ -933,27 +1017,24 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
+ }
  
- /* ---- the keyboard's reports ---- */
+-/* ---- the keyboard's reports ---- */
++static uint64_t touchscreen_now(void) {
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
++}
  
 -void hv_xhci_key(HvXhci *x, uint8_t usage, int down) {
 -    if (!x || !usage) return;
-+void hv_xhci_key_source(HvXhci *x,uint8_t usage,int down,unsigned source) {
-+    if (!x || usage<4 || usage>231 || source>3) return;
-     pthread_mutex_lock(&x->mu);
+-    pthread_mutex_lock(&x->mu);
 -    uint8_t *s = x->state;
 -    if (usage >= 0xe0 && usage <= 0xe7) { /* modifiers live in byte 0 */
 -        uint8_t bit = (uint8_t)(1u << (usage - 0xe0));
@@ -2676,11 +2893,79 @@ index c355628..1d576e3 100644
 -        } else if (!down && i < 8) { /* let go: close the gap */
 -            memmove(s + i, s + i + 1, (size_t)(7 - i));
 -            s[7] = 0;
--        }
--    }
++int hv_xhci_touchscreen_report(HvXhci *x, const uint8_t report[HV_TS_REPORT_LEN]) {
++    if (!x || !x->ts_enabled || !report || report[0] != 1 || report[31] > HV_TS_FINGERS) return 0;
++    unsigned count = report[31];
++    for (unsigned i = 0; i < HV_TS_FINGERS; i++) {
++        const uint8_t *finger = report + 1 + 6 * i;
++        if (i >= count) {
++            for (int j = 0; j < 6; j++) if (finger[j]) return 0;
++            continue;
+         }
++        if ((finger[0] != 2 && finger[0] != 3) || !finger[1] || finger[1] > 127 ||
++            finger[3] > 127 || finger[5] > 127) return 0;
++        for (unsigned j = 0; j < i; j++) if (report[2 + 6 * j] == finger[1]) return 0;
+     }
 -    if (x->rtail - x->rhead < HV_XHCI_REPORTS) memcpy(x->reports[x->rtail++ % HV_XHCI_REPORTS], s, 8);
--    pthread_mutex_unlock(&x->mu);
--    hv_machine_wake(x->m);
++    pthread_mutex_lock(&x->mu);
++    if (!x->ts_connected || x->ts_release_phase || (x->ts_connection_pending && !x->ts_wanted)) {
++        pthread_mutex_unlock(&x->mu);
++        return 0;
++    }
++    int accepted = x->ts_rtail - x->ts_rhead < HV_TS_REPORTS;
++    if (accepted) {
++        memcpy(x->ts_state, report, HV_TS_REPORT_LEN);
++        memcpy(x->ts_reports[x->ts_rtail++ % HV_TS_REPORTS], report, HV_TS_REPORT_LEN);
++    }
++    else {
++        x->ts_rhead = x->ts_rtail = 0;
++        x->ts_wanted = 0; x->ts_connection_pending = 1;
++    }
++    x->ts_deadline_ns = touchscreen_now() + 700000000ull;
++    pthread_mutex_unlock(&x->mu);
++    hv_machine_wake(x->m);
++    return accepted;
++}
++
++int hv_xhci_touchscreen_connect(HvXhci *x, int connected) {
++    if (!x || !x->ts_enabled || (connected != 0 && connected != 1)) return 0;
++    pthread_mutex_lock(&x->mu);
++    x->ts_wanted = connected;
++    x->ts_connection_pending = 1;
+     pthread_mutex_unlock(&x->mu);
+     hv_machine_wake(x->m);
++    return 1;
++}
++
++int hv_xhci_touchscreen_connected(HvXhci *x) {
++    if (!x) return 0;
++    pthread_mutex_lock(&x->mu);
++    int connected = x->ts_connected;
++    pthread_mutex_unlock(&x->mu); return connected;
++}
++
++void hv_xhci_touchscreen_keepalive(HvXhci *x) {
++    if (!x) return;
++    pthread_mutex_lock(&x->mu);
++    x->ts_deadline_ns = touchscreen_now() + 700000000ull;
++    pthread_mutex_unlock(&x->mu);
++}
++
++int hv_xhci_touchscreen_mapped(HvXhci *x) {
++    if (!x) return 0;
++    pthread_mutex_lock(&x->mu);
++    int accepted = x->ts_connected && x->ts_wanted && !x->ts_release_phase;
++    if (accepted) x->ts_mapped = 1;
++    pthread_mutex_unlock(&x->mu);
++    if (accepted) hv_machine_wake(x->m);
++    return accepted;
++}
++
++/* ---- the keyboard's reports ---- */
++
++void hv_xhci_key_source(HvXhci *x,uint8_t usage,int down,unsigned source) {
++    if (!x || usage<4 || usage>231 || source>3) return;
++    pthread_mutex_lock(&x->mu);
 +    uint8_t before=x->key_owners[usage],bit=(uint8_t)(1u<<source);
 +    uint8_t after=down ? before|bit : before&~bit;
 +    x->key_owners[usage]=after;
@@ -2699,27 +2984,108 @@ index c355628..1d576e3 100644
  }
  
  /* Linux input key codes to HID keyboard usages (the same table macOS's virtio
-@@ -1114,6 +1195,17 @@ void hv_xhci_touch_button(HvXhci *x, int down) {
+@@ -1114,6 +1353,91 @@ void hv_xhci_touch_button(HvXhci *x, int down) {
  
  void hv_xhci_poll(HvXhci *x) {
      if (!x) return;
 +    pthread_mutex_lock(&x->mu);
-+    int changed=x->gp_online!=x->gp_desired;
-+    if (changed) {
++    int gamepad_changed=x->gp_online!=x->gp_desired;
++    if (gamepad_changed) {
 +        x->gp_online=x->gp_desired;
 +        x->portsc[2]=(x->portsc[2]&PORT_PP)|PORT_CSC|(x->gp_online ? PORT_CCS|SPEED_FULL<<PORT_SPEED_SHIFT|7u<<PORT_PLS_SHIFT:0);
 +    }
 +    pthread_mutex_unlock(&x->mu);
-+    if (changed) {
++    if (gamepad_changed) {
 +        fprintf(stderr,"hengevm: virtual-gamepad %s profile=%s\n",x->gp_online?"connected":"disconnected",x->gp_profile==1?"PS4-compatible":"generic HID");
 +        port_event(x,2);
++    }
++    int changed = 0;
++    pthread_mutex_lock(&x->mu);
++    uint64_t now = touchscreen_now();
++    if (x->ts_connected && !x->ts_release_phase && x->ts_deadline_ns && now >= x->ts_deadline_ns) {
++        for (unsigned i = 0; i < HV_TS_FINGERS; i++) {
++            if (!(x->ts_state[1 + 6*i] & 1) && !(x->ts_device_state[1 + 6*i] & 1)) continue;
++            x->ts_wanted = 0; x->ts_connection_pending = 1;
++            break;
++        }
++    }
++    if (x->ts_connection_pending && !x->ts_release_phase) {
++        if (x->ts_connected && !x->ts_wanted && x->ts_device_state[31]) {
++            /* macOS does not reliably send an app a cancellation on USB
++               removal. Deliver explicit lifts, then a neutral frame first. */
++            x->ts_rhead = x->ts_rtail = 0;
++            memcpy(x->ts_state, x->ts_device_state, sizeof x->ts_state);
++            for (unsigned i = 0; i < x->ts_state[31]; i++) x->ts_state[1 + 6*i] = 2;
++            memcpy(x->ts_reports[x->ts_rtail++ % HV_TS_REPORTS], x->ts_state, HV_TS_REPORT_LEN);
++            x->ts_release_phase = 1;
++            x->ts_release_at_ns = now + 60000000ull;
++            x->ts_release_limit_ns = now + 500000000ull;
++        } else {
++            x->ts_connection_pending = 0;
++            if (x->ts_connected != x->ts_wanted) {
++                x->ts_connected = x->ts_wanted;
++                x->ts_mapped = x->ts_unmanaged;
++                x->ts_ep0_waiting = 0;
++                x->ts_rhead = x->ts_rtail = 0;
++                x->ts_deadline_ns = 0;
++                memset(x->ts_state, 0, sizeof x->ts_state); x->ts_state[0] = 1;
++                memset(x->ts_device_state, 0, sizeof x->ts_device_state); x->ts_device_state[0] = 1;
++                changed = 1;
++            }
++        }
++    }
++    if (x->ts_release_phase &&
++        ((now >= x->ts_release_at_ns && x->ts_rhead == x->ts_rtail) || now >= x->ts_release_limit_ns)) {
++        if (x->ts_release_phase == 1 && now < x->ts_release_limit_ns) {
++            memset(x->ts_state, 0, sizeof x->ts_state); x->ts_state[0] = 1;
++            memcpy(x->ts_reports[x->ts_rtail++ % HV_TS_REPORTS], x->ts_state, HV_TS_REPORT_LEN);
++            x->ts_release_phase = 2;
++            x->ts_release_at_ns = now + 60000000ull;
++        } else {
++            x->ts_release_phase = 0;
++            x->ts_connected = 0;
++            x->ts_mapped = 0;
++            x->ts_ep0_waiting = 0;
++            x->ts_connection_pending = x->ts_wanted;
++            x->ts_rhead = x->ts_rtail = 0;
++            x->ts_deadline_ns = 0;
++            memset(x->ts_state, 0, sizeof x->ts_state); x->ts_state[0] = 1;
++            memset(x->ts_device_state, 0, sizeof x->ts_device_state); x->ts_device_state[0] = 1;
++            changed = 1;
++        }
++    }
++    int mapped = x->ts_mapped;
++    pthread_mutex_unlock(&x->mu);
++    if (changed) {
++        x->portsc[3] = PORT_PP | PORT_CSC;
++        if (x->ts_connected)
++            x->portsc[3] |= PORT_CCS | SPEED_HIGH << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
++        else for (int slot = 1; slot <= HV_XHCI_SLOTS; slot++) {
++            if (x->slots[slot].dev != 3) continue;
++            memset(x->slots[slot].ep_running, 0, sizeof x->slots[slot].ep_running);
++        }
++        port_event(x, 3);
++    }
++    if (mapped && x->ts_ep0_waiting) {
++        for (int slot = 1; slot <= HV_XHCI_SLOTS; slot++) {
++            if (!(x->ts_ep0_waiting & (1u << slot))) continue;
++            x->ts_ep0_waiting &= ~(1u << slot);
++            if (x->slots[slot].dev == 3 && x->slots[slot].ep_running[1]) run_ep0(x, slot);
++        }
 +    }
      for (int slot = 1; slot <= HV_XHCI_SLOTS; slot++)
          if (x->slots[slot].dev >= 0) run_ep_in(x, slot);
  }
-@@ -1122,6 +1214,9 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
+@@ -1121,7 +1445,16 @@ void hv_xhci_poll(HvXhci *x) {
+ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
      HvXhci *x = calloc(1, sizeof *x);
      x->m = m;
++    const char *touchscreen = getenv("HV_USB_TOUCHSCREEN");
++    x->ts_enabled = !touchscreen || strcmp(touchscreen, "0");
++    /* The ordinary helper installs its UUID observer before attaching touch.
++       Research runs can still request immediate attachment explicitly. */
++    x->ts_unmanaged = touchscreen && !strcmp(touchscreen, "1") && !getenv("HV_USB_TOUCHSCREEN_DELAYED");
++    x->ts_connected = x->ts_wanted = x->ts_unmanaged;
      pthread_mutex_init(&x->mu, NULL);
 +    const char *profile=getenv("HV_GAMEPAD_PROFILE");x->gp_profile=profile&&!strcmp(profile,"ds4")?1:0;
 +    fprintf(stderr,"hengevm: virtual-gamepad profile=%s; USB is emulated, not physical passthrough\n",x->gp_profile?"PS4-compatible (experimental)":"generic HID");
@@ -2727,7 +3093,7 @@ index c355628..1d576e3 100644
      /* QEMU's xHCI IDs. Class 0x0c0330 with revision 0: macOS's IOPCIClassMatch compares all 32 bits. */
      hv_pci_init(&x->pci, 0x1b36, 0x000d, 0x0c033000, 0x1af4, 0x1100);
      x->pci.opaque = x;
-@@ -1137,3 +1232,49 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
+@@ -1137,3 +1470,51 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
      reset(x);
      return x;
  }
@@ -2747,6 +3113,8 @@ index c355628..1d576e3 100644
 +    tp_queue(x, 0);
 +    hv_gamepad_neutral(x->gp_state);
 +    x->gp_desired=0; /* virtual control surface is released across VM pause/stop */
++    x->ts_rhead=x->ts_rtail=0;x->ts_wanted=0;x->ts_connection_pending=1;
++    x->ts_deadline_ns=0;x->ts_ep0_waiting=0;x->ts_mapped=0;
 +    x->gp_head=x->gp_tail;
 +    memcpy(x->gp_reports[x->gp_tail++%64],x->gp_state,HV_GAMEPAD_BYTES);
 +    memset(x->tp_fingers, 0, sizeof x->tp_fingers);
@@ -2778,10 +3146,10 @@ index c355628..1d576e3 100644
 +    if (changed) hv_machine_wake(x->m);
 +}
 diff --git a/devices/xhci.h b/devices/xhci.h
-index cf4acc4..86e074e 100644
+index cf4acc4..42818a6 100644
 --- a/devices/xhci.h
 +++ b/devices/xhci.h
-@@ -4,17 +4,19 @@
+@@ -4,17 +4,17 @@
  #include <pthread.h>
  
  #include "pcie.h"
@@ -2789,32 +3157,43 @@ index cf4acc4..86e074e 100644
  
  /* An xHCI USB host controller (xHCI 1.0, one interrupter, 32-byte contexts,
 -   INTx) with two USB HID devices: a boot keyboard on port 1 and a Magic
-+   INTx) with two default USB HID devices: a boot keyboard on port 1 and a Magic
-    Trackpad 2 on port 2: what Virtualization.framework gives a macOS guest as
+-   Trackpad 2 on port 2: what Virtualization.framework gives a macOS guest as
 -   its "Virtual USB Keyboard", plus Apple's multitouch pad, so the guest's
-+   its "Virtual USB Keyboard", plus Apple's multitouch pad. Port 3 is an
-+   opt-in Generic Desktop HID gamepad. The guest's
++   INTx) with a boot keyboard on port 1, Magic Trackpad 2 on port 2,
++   optional gamepad on port 3 and deferred USB touchscreen on port 4. The guest's
     own gesture engine sees a real trackpad. Changes come from the host UI on
     any thread (hv_xhci_key, hv_xhci_touch); the CPU thread delivers them
     (hv_xhci_poll). */
  #define HV_XHCI_SLOTS 8
 -#define HV_XHCI_PORTS 2
 -#define HV_XHCI_DEVICES 2
-+#define HV_XHCI_PORTS 3
-+#define HV_XHCI_DEVICES 3
++#define HV_XHCI_PORTS 4
++#define HV_XHCI_DEVICES 4
  #define HV_XHCI_INTRS 4
  #define HV_XHCI_EPS 32 /* device context index 1..31 */
  #define HV_XHCI_REPORTS 256
-@@ -52,7 +54,7 @@ typedef struct HvXhci {
+@@ -23,6 +23,11 @@
+    hv_xhci_touch takes coordinates in these ranges. */
+ #define HV_TP_SENSOR_X 8134
+ #define HV_TP_SENSOR_Y 5206
++/* USB touchscreen on port 4. The sharing helper binds its display identity
++   before attachment; HV_USB_TOUCHSCREEN=0 disables this optional device. */
++#define HV_TS_FINGERS 5
++#define HV_TS_REPORT_LEN 32
++#define HV_TS_REPORTS 64
+ #define HV_TP_FINGERS 10
+ #define HV_TP_REPORTS 64
+ #define HV_TP_REPORT_LEN (12 + 9 * HV_TP_FINGERS) /* report ID 2: 12-byte prefix, N x 9-byte fingers */
+@@ -52,7 +57,7 @@ typedef struct HvXhci {
      /* device slots: -1 until the device on the slot's port is addressed */
      int slot_used[HV_XHCI_SLOTS + 1];
      struct HvXhciSlot {
 -        int dev;         /* 0 keyboard, 1 trackpad, -1 none */
-+        int dev;         /* 0 keyboard, 1 trackpad, 2 optional gamepad, -1 none */
++        int dev; /* 0 keyboard, 1 trackpad, 2 gamepad, 3 touchscreen, -1 none */
          int configured;
          HvXhciRing ep[HV_XHCI_EPS];
          int ep_running[HV_XHCI_EPS];
-@@ -63,6 +65,7 @@ typedef struct HvXhci {
+@@ -63,6 +68,7 @@ typedef struct HvXhci {
      uint32_t rhead, rtail;
      uint8_t state[8];      /* modifiers, reserved, six keys: the current report */
      uint64_t delivered;
@@ -2822,7 +3201,7 @@ index cf4acc4..86e074e 100644
      /* Magic Trackpad 2: the fingers on the pad and their reports (Apple
         multitouch format, report ID 2: 12-byte prefix plus 9 bytes a finger). */
      struct HvTpFinger {
-@@ -83,11 +86,24 @@ typedef struct HvXhci {
+@@ -83,11 +89,36 @@ typedef struct HvXhci {
      uint32_t tp_multi_logs; /* multi-finger deliveries logged, capped */
      uint8_t tp_f1[8];   /* feature report 1: the header for the selected sensor register */
      int tp_f1_len;
@@ -2833,6 +3212,18 @@ index cf4acc4..86e074e 100644
 +    uint8_t gp_profile, gp_requests; /* former zero padding: profile and bounded setup log */
 +    uint32_t gp_head, gp_tail;
 +    uint64_t gp_delivered, gp_coalesced, gp_overflow;
++    int ts_enabled;
++    int ts_connected, ts_wanted, ts_connection_pending;
++    int ts_mapped, ts_unmanaged;
++    uint32_t ts_ep0_waiting;
++    uint64_t ts_deadline_ns;
++    uint64_t ts_release_at_ns, ts_release_limit_ns;
++    int ts_release_phase;
++    uint8_t ts_reports[HV_TS_REPORTS][HV_TS_REPORT_LEN];
++    uint8_t ts_state[HV_TS_REPORT_LEN];
++    uint8_t ts_device_state[HV_TS_REPORT_LEN];
++    uint32_t ts_rhead, ts_rtail, ts_reqs;
++    uint64_t ts_delivered;
  } HvXhci;
  
  HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus);
@@ -2847,12 +3238,30 @@ index cf4acc4..86e074e 100644
  /* The same, by Linux input key code (what the host UI produces). */
  void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down);
  /* Any thread: a Magic Trackpad 2 touch. phase: 0 down, 1 move, 2 up. id: a
+@@ -102,6 +133,17 @@ void hv_xhci_touch(HvXhci *x, int id, int phase, int px, int py, uint32_t ts_ms)
+ void hv_xhci_touch_frame(HvXhci *x, uint32_t ts_ms);
+ /* Any thread: the pad's full press (a click), down or up. */
+ void hv_xhci_touch_button(HvXhci *x, int down);
++/* Queue one complete touchscreen report. Returns 0 if absent, malformed,
++   stopping or overflowed. Overflow releases input and disconnects the device. */
++int hv_xhci_touchscreen_report(HvXhci *x, const uint8_t report[HV_TS_REPORT_LEN]);
++/* Any thread: change the optional touchscreen's presence. The CPU thread
++   publishes the port change and releases queued state. */
++int hv_xhci_touchscreen_connect(HvXhci *x, int connected);
++int hv_xhci_touchscreen_connected(HvXhci *x);
++/* Healthy guest/helper and sender heartbeats keep stationary contacts held. */
++void hv_xhci_touchscreen_keepalive(HvXhci *x);
++/* Complete HID initialization after the helper has written the display UUID. */
++int hv_xhci_touchscreen_mapped(HvXhci *x);
+ /* CPU thread: hand waiting reports to the guest. */
+ void hv_xhci_poll(HvXhci *x);
+ 
 diff --git a/docs/controller-posture/PROGRESS.md b/docs/controller-posture/PROGRESS.md
 new file mode 100644
-index 0000000..df7511e
+index 0000000..70970bd
 --- /dev/null
 +++ b/docs/controller-posture/PROGRESS.md
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,29 @@
 +# Controller posture integration
 +
 +Implemented in source (cloud validation pending):
@@ -2873,6 +3282,15 @@ index 0000000..df7511e
 +- Audio interruption/route/reset/foreground recovery with generation fencing and bounded retries. Native pause now preserves guest sound-running state; transient start failure can restore its backend. Linux production-backend ASan/UBSan tests pass. Full SDK/VM/real TLS/Metal tests pending.
 +
 +Cloud checkpoint b0cd93e: pure controller tests passed. Full integration identified missing standalone-fixture hardware symbol and a sanitizer-script Swift source list; both repaired. First Simulator test could not resolve UIKeyInput touchpad as an Other element; now queries the exact identifier across accessibility types. No test skipped. New source must pass both real production UI and full native/app compile before release.
++
++## Entitlement-free touchscreen integration
++- Upstream PR32 USB commit385a4f6 integrated selectively; gamepad port3 preserved, touchscreen port4. Both guest input devices can connect together.
++- Removed CoreHID virtual-device implementation and restricted guest entitlements. Native touch remains experimental for macOS27.2+; unavailable guests fall back to trackpad.
++- Bounded helper stdio/HTTP transport, epoch checks, watchdog, deferred UUID mapping, guest contact lifts and queue isolation retained. Runner companion paths retained.
++- Snapshot fingerprint includes expanded xHCI; restore discards old queued motion and requires fresh touch-helper mapping. Pause fences helper epoch before serialization.
++- Two signed guest app bundles inside deterministic tar.gz, empty entitlements, architecture/signature/archive-path validation in CI and IPA inspector. Guest helper update required.
++- Optional video encoding now has explicit60/120Hz capture budgets and one deferred latest-frame refresh after cadence/credit backpressure. Decoder ACK sequence IDs survive encoder replacement; remote display presents at the selected supported cadence with one latest image.
++- Source4f55 passed all native/sanitizer/SDK/Release app compilation (run43281138121). M4 UI actions reached the final keyboard/gamepad return but exceeded the old180s test allowance; the expanded full-feature suite now has480s. Duo canvas boot timed out externally before app launch; retain run43281138212 evidence and retry exact next source. No ignored failures and no IPA.
 diff --git a/docs/desktop-heat-20261111.md b/docs/desktop-heat-20261111.md
 new file mode 100644
 index 0000000..17638b3
@@ -3311,6 +3729,177 @@ index 0000000..091a0de
 +including the new groups_shared native-vs-JIT program in all four memory modes,
 +ASan/UBSan, the shared-copy graph checks, real Metal checks and complete iOS app
 +compile. No IPA was packaged. Device warm-up and thermal benefit remain unmeasured.
+diff --git a/docs/native-touch.md b/docs/native-touch.md
+index c9a6b51..dde73d3 100644
+--- a/docs/native-touch.md
++++ b/docs/native-touch.md
+@@ -1,70 +1,113 @@
+ # Native touch
+ 
+-Native touch sends direct contact input to a macOS 27.2 or later guest.
+-Trackpad mode is the default and the fallback when native touch is unavailable.
++Native touch sends up to five direct finger contacts to a macOS 27.2 or later
++guest through Henge's emulated USB touchscreen. It works with guest SIP enabled.
++The default USB path needs no virtual-HID entitlement, Apple Developer account
++or guest provisioning profile.
++
++Trackpad mode remains the default and the fallback when the guest helper is
++unavailable.
+ 
+ ## Setup
+ 
+-1. In the guest, focus Terminal. Open Henge's Details panel and choose
+-   **Touch input → Type the Helper Update Command**, then press Return in Terminal.
+-2. Allow Accessibility for `henge-touch-agent` in the guest's System Settings.
+-   The helper also requires authorization to create its virtual HID device.
+-3. Enable **Native touch (experimental)** in Details, then close the panel.
++1. Install a Henge build containing USB native-touch support.
++2. Focus Terminal in the guest. In Henge's Details panel, choose
++   **Touch input → Type the Helper Update Command**, then press Return.
++3. Allow **Local Network** for **Henge Sharing Agent** when macOS asks. This is
++   the ordinary permission for the shared folder, clipboard and touch connection.
++4. Enable **Native touch (experimental)** in Details, then close the panel.
+ 
+-The setting is saved. Details shows connection and permission errors.
+-Transport timeouts retry automatically after the guest helper connects.
++The setting is saved. The USB path needs neither Accessibility nor Input
++Monitoring permission. Details reports connection failures and falls back to
++trackpad mode. Transport timeouts retry after the helper reconnects.
+ 
+ ## Behaviour
+ 
+-The virtual touchscreen binds to the guest's main display and supports up to
+-five contacts. Coordinates follow the displayed image, including zoom.
+-Contact transitions are queued, and movement with the same contacts is coalesced.
+-Idle requests wait up to 250 ms; new input wakes them immediately.
++Contacts are normalized to the displayed guest image, including zoom. The
++helper preserves changes in contact membership and coalesces ordinary movement.
++It keeps finger identities stable through motion and lift, including the brief
++lift-report interval that macOS needs before a contact slot is reused.
++
++Opening a Henge panel, backgrounding the app or changing image geometry releases
++the contacts. Sender and helper heartbeats protect stationary touches. If either
++stops for 0.7 seconds, the host releases input and restores trackpad mode. The
++USB device also has an independent watchdog, so a stalled helper cannot leave a
++contact held just because the UI stopped polling status.
++
++USB shutdown delivers lifts and an empty frame before removal. A guest driver
++that stops servicing its interrupt ring cannot hold device teardown indefinitely.
++
++External-display sessions use the phone's trackpad controls. A four-finger tap
++reveals hidden Henge controls.
++
++## Display association
++
++Recognizing a standard touchscreen descriptor is insufficient: macOS also needs
++to associate the device with a display. The helper obtains the main display's
++UUID using `CGDisplayCreateUUIDFromDisplayID` and registers an IOKit publication
++observer before asking Henge to attach the USB device.
++
++The observer writes a `displayUUID` string on Henge's USB HID device as it is
++published. Its child event service inherits that property. This happens before
++the desktop caches the service identity: the USB controller holds the standard
++Digitizer Report Rate feature reply until the helper verifies the current device's
++UUID and acknowledges the mapping. The helper then checks the event-service
++association and the display's multitouch capability before advertising readiness.
++
++`displayUUID` routing is undocumented and can change with macOS updates. This
++is why the setting remains experimental. Henge does not change SIP, boot policy
++or the private external-touch feature flag.
++
++## Guest helpers and transport
+ 
+-Opening a Henge panel, backgrounding the app, or changing image geometry releases
+-the contacts. Missing heartbeats also release input and restore trackpad mode.
+-An external display uses the phone's trackpad controls.
+-When controls are hidden, a three-finger tap reveals them.
++The installer delivers two normally signed, unentitled bundles:
+ 
+-## Development
++- **Henge Sharing Agent.app** owns the existing private connection to Henge at
++  `10.0.2.4`, clipboard synchronization and the shared folder mount. Its bundle
++  declares the Local Network purpose so macOS can present a recognizable prompt.
++- **Henge Touch Agent.app** observes USB publication and encodes contact reports.
++  It uses bounded stdin/stdout requests through the sharing helper and has no
++  network connection or listening socket of its own.
+ 
+-Build with Xcode 27.3 or newer. The iOS build bundles the guest touch helper.
+-Run the focused checks from the repository root:
++Both bundles travel in `henge-touch-agent.tar.gz`, preserving their Mac signatures
++through IPA signing and installation. The installer verifies signatures before
++replacing helpers and keeps a previously installed sharing bundle as a fallback
++if an update fails.
++
++The host validates command epochs, contact IDs and coordinates. USB reports carry
++an epoch plus a fixed 32-byte HID packet; stale reports cannot reactivate input
++after a mode or geometry change. Only the three native-touch HTTP endpoints can
++be requested through the companion's pipe connection.
++
++## Development and verification
++
++Build with Xcode 27.3 or newer:
+ 
+ ```sh
++make test-native-touch test-guest-connection test-usb-touchscreen
+ tools/check_native_touch.sh
+ ```
+ 
+-These cover the transport, contact transitions, timeouts, reconnection, and Swift
+-compilation. Hardware testing on an iPhone Duo covered direct touch on macOS 27.2
+-and direct touch with the newer touch UI on macOS 27.3.
+-
+-## Custom iPad build integration
+-
+-Pinned PR #32 commit: `fd30cda9ffb6f93cefdd6ae67480c90d61f10334`.
+-The native-touch negotiation task does not run when its toggle is off. The
+-existing Guest sharing switch also gates helper access; enable sharing and fully
+-reopen Henge before setup. Sharing disabled means no native-touch host endpoint.
+-The guest companion, once installed, still uses long-poll requests/watchdogs;
+-this feature is optional and should not be described as a general speed boost.
+-
+-The integration test now keeps helper heartbeats running until its simulated
+-sender completes. Its original fixed three-poll loop could starve the watchdog
+-while joining a slow sender. A deliberately delayed sender reproduces the old
+-test failure; the corrected loop passes without changing production timeouts.
+-
+-## Confirmed signing limitation (8 November 2026)
+-
+-A stock macOS 27.2 guest rejected the bundled helper at process launch with AMFI
+-error -424: "The file is adhoc signed but contains restricted entitlements."
+-The Accessibility grant succeeded, but cannot authorize this signature. The
+-virtual-HID entitlement requires Apple-authorized Mac signing/provisioning for
+-normal enforcement. iLoader's iOS signature does not authorize a Mac executable.
+-Reinstalling the guest does not fix this. Keep native touch off and use trackpad
+-input while this requirement is unmet. The source remains integrated; no guest
+-security policy changes or signing checks are bypassed by this build.
+-
+-CI now probes whether the helper reaches main without activating HID or opening
+-network connections. Its result is recorded separately from compilation and
+-transport tests, and does not certify guest HID authorization. This prevents a
+-passing compile from being mistaken for successful guest launch.
++The focused checks cover epoch validation, contact membership, idle polling,
++HTTP transport, pipe concurrency/cancellation/EOF, USB control and interrupt
++transfers, hot-plug, overflow, watchdog release and Swift compilation.
++
++Live validation used a macOS **27.2, build 26B123** guest with SIP and authenticated
++root enabled, empty boot arguments and the external-touch flag disabled. The
++ordinary helpers carried no restricted entitlement or provisioning profile.
++Through the same host input API used by iOS, USB input activated an AppKit button
++and delivered five direct contacts, motion, partial lifts, replacement fingers
++and a final all-up sequence. The receiver recorded direct contacts rather than
++mouse synthesis. The same suite passed after a full shutdown and cold start,
++without reinstalling or restarting either helper. Sender expiry and killing the
++touch companion both delivered a terminal zero-active-contact event.
++
++## Fork integration and remaining validation
++
++This fork uses USB only. The restricted CoreHID virtual-device provider and its entitlement file have been removed. Unsupported guests retain trackpad input. USB touchscreen occupies port 4; the existing gamepad stays on port 3.
++
++The upstream author reported working direct contacts and watchdog recovery on a macOS 27.2 guest. Those results above are upstream evidence, not physical tests performed on this fork. The `displayUUID` association remains an experimental macOS implementation detail and can fail safely to trackpad mode.
++
++Pause invalidates helper epochs. Restore discards queued touch motion, emits lifts from the last delivered state, and detaches until a fresh helper maps the current display. The changed xHCI state size changes the native snapshot fingerprint; older incompatible saves are rejected and retained for recovery rather than silently loaded.
++
++Guest setup uses the updated sharing-helper install command. The archive contains two ordinary ad-hoc signed macOS app bundles, with empty entitlements and no provisioning profile. Native build validation verifies both signatures and architecture. App installation on iOS still requires the user's normal sideload signing method.
 diff --git a/docs/optimization-integration.md b/docs/optimization-integration.md
 new file mode 100644
 index 0000000..7c5b2e2
@@ -5059,6 +5648,211 @@ index cc902ed..15b606f 100644
      ldr x0, [x28, #CPU_SP]
      mov sp, x0
      ldr x0, [x28, #CPU_NZCV]
+diff --git a/host/main.c b/host/main.c
+index eeabe42..5dc6952 100644
+--- a/host/main.c
++++ b/host/main.c
+@@ -8,6 +8,7 @@
+ #include <pthread.h>
+ #include <signal.h>
+ #include <stdio.h>
++#include <ctype.h>
+ #include <unistd.h>
+ #include <sys/stat.h>
+ #include <stdlib.h>
+@@ -22,6 +23,7 @@
+ #include "pvg.h"
+ #include "pvg_lite.h"
+ #include "vm.h"
++#include "native_touch.h"
+ #include "install.h"
+ #include "snapshot.h"
+ #include <dispatch/dispatch.h>
+@@ -260,9 +262,16 @@ static void prof_dump(const char *path) {
+    it is, in small steps as a hand makes: macOS accelerates big ones past the target. */
+ static void pointer_to(int x, int y) {
+     const uint8_t *page = hv_pvg_lite_display_page(board.pvg);
+-    for (int i = 0; page && i < 1500; i++) {
+-        uint32_t at = *(const volatile uint32_t *)(page + 0xe00);
+-        int dx = x - (int)(at & 0xffff), dy = y - (int)(at >> 16);
++    for (int i = 0; i < 1500; i++) {
++        int px, py;
++        if (hv_pvg_mac_pointer(&px, &py) == 0) {
++            /* The native backend owns the current cursor, including after a
++               WindowServer restart; its lightweight page can retain old data. */
++        } else if (page) {
++            uint32_t at = *(const volatile uint32_t *)(page + 0xe00);
++            px = (int)(at & 0xffff); py = (int)(at >> 16);
++        } else return;
++        int dx = x - px, dy = y - py;
+         if (abs(dx) < 3 && abs(dy) < 3) break;
+         int sx = dx > 16 ? 16 : dx < -16 ? -16 : dx, sy = dy > 16 ? 16 : dy < -16 ? -16 : dy;
+         hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, sx);
+@@ -557,7 +566,54 @@ static void *input_thread(void *unused) {
+         at = ftell(f);
+         line[strcspn(line, "\n")] = 0;
+         int x, y;
+-        if (sscanf(line, "click %d %d", &x, &y) == 2) pointer_to(x, y), click_here();
++        int contact_id, contact_flags, tx, ty;
++        if (sscanf(line, "native-touch-enable %d", &x) == 1) {
++            fprintf(stderr, "hengevm: native-touch epoch=%u\n", hv_native_touch_enable(x));
++        }
++        else if (!strncmp(line, "native-touch-frame ", 19)) {
++            const char *text = line + 19;
++            unsigned count = 0; int used = 0;
++            uint8_t ids[5]; double px[5], py[5];
++            int valid = sscanf(text, "%u %n", &count, &used) == 1 && count <= 5;
++            text += used;
++            for (unsigned i = 0; valid && i < count; i++) {
++                unsigned id;
++                if (sscanf(text, "%u %lf %lf %n", &id, &px[i], &py[i], &used) != 3 || id < 1 || id > 127) valid = 0;
++                else { ids[i] = (uint8_t)id; text += used; }
++            }
++            if (*text) valid = 0;
++            int accepted = valid && hv_native_touch_submit(hv_native_touch_epoch(), ids, px, py, count);
++            fprintf(stderr, "hengevm: native-touch-frame accepted=%d status=%d\n", accepted, hv_native_touch_status());
++        }
++        else if (sscanf(line, "usb-touch-connect %d", &x) == 1) {
++            fprintf(stderr, "hengevm: usb-touch-connect accepted=%d\n", hv_xhci_touchscreen_connect(board.usb, x));
++        }
++        else if (!strncmp(line, "usb-touch-report ", 17)) {
++            const char *hex = line + 17;
++            const char *digits = "0123456789abcdef";
++            uint8_t report[HV_TS_REPORT_LEN];
++            int valid = strlen(hex) == 2 * HV_TS_REPORT_LEN;
++            for (size_t i = 0; valid && i < sizeof report; i++) {
++                int hi = tolower((unsigned char)hex[2*i]), lo = tolower((unsigned char)hex[2*i+1]);
++                const char *h = strchr(digits, hi), *l = strchr(digits, lo);
++                if (!h || !l) valid = 0;
++                else report[i] = (uint8_t)((h - digits) * 16 + l - digits);
++            }
++            fprintf(stderr, "hengevm: usb-touch-report accepted=%d\n", valid && hv_xhci_touchscreen_report(board.usb, report));
++        }
++        else if (sscanf(line, "usb-touch %d %d %d %d", &contact_id, &contact_flags, &tx, &ty) == 4) {
++            uint8_t report[HV_TS_REPORT_LEN] = {1};
++            int valid = contact_id >= 0 && contact_id <= 127 && (contact_flags == 2 || contact_flags == 3) &&
++                        tx >= 0 && tx <= 32767 && ty >= 0 && ty <= 32767;
++            if (valid && contact_id) {
++                report[1] = (uint8_t)contact_flags; report[2] = (uint8_t)contact_id;
++                report[3] = tx & 255; report[4] = tx >> 8; report[5] = ty & 255; report[6] = ty >> 8;
++                report[31] = 1;
++            }
++            fprintf(stderr, "hengevm: usb-touch accepted=%d\n",
++                    valid && hv_xhci_touchscreen_report(board.usb, report));
++        }
++        else if (sscanf(line, "click %d %d", &x, &y) == 2) pointer_to(x, y), click_here();
+         else if (sscanf(line, "move %d %d", &x, &y) == 2) pointer_to(x, y);
+         else if (sscanf(line, "scroll %d %d", &x, &y) == 2) {
+             if (y) hv_vm_mouse_wheel(y);
+@@ -712,6 +768,7 @@ static void *input_thread(void *unused) {
+             usleep(60000);
+             key_event(125, 0);
+         }
++        else if (sscanf(line, "wait-ms %d", &x) == 1 && x >= 0 && x <= 10000) usleep((unsigned)x * 1000u);
+         else if (sscanf(line, "wait %d", &x) == 1) sleep((unsigned)x);
+         else if (!strncmp(line, "type ", 5)) type_text(line + 5);
+         else if (!strncmp(line, "prof ", 5)) prof_dump(line + 5);
+diff --git a/host/native_touch.c b/host/native_touch.c
+index 504e669..3eec420 100644
+--- a/host/native_touch.c
++++ b/host/native_touch.c
+@@ -15,8 +15,10 @@ static size_t queued;
+ static uint32_t epoch = 1;
+ static int enabled, status;
+ static double last_sender, last_helper, started;
++static HvNativeTouchUSB usb;
+ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
+ static void reset_locked(void) {
++    if (usb.connect) usb.connect(usb.context, 0);
+     if (++epoch == 0) epoch = 1;
+     queued = 0; memset(&current, 0, sizeof current);
+     started = last_sender = now(); last_helper = 0;
+@@ -71,7 +73,10 @@ void hv_native_touch_report(uint32_t generation, int value) {
+     pthread_mutex_lock(&mutex); expire_locked();
+     if (enabled && generation == epoch && value >= HV_TOUCH_READY && value <= HV_TOUCH_DEVICE) {
+         last_helper = now(); if (status == HV_TOUCH_WAITING) last_sender = last_helper; status = value;
+-        if (value != HV_TOUCH_READY) { enabled = 0; queued = 0; memset(&current, 0, sizeof current); }
++        if (value != HV_TOUCH_READY) {
++            enabled = 0; queued = 0; memset(&current, 0, sizeof current);
++            if (usb.connect) usb.connect(usb.context, 0);
++        } else if (usb.keepalive) usb.keepalive(usb.context);
+     }
+     pthread_mutex_unlock(&mutex);
+ }
+@@ -85,9 +90,48 @@ size_t hv_native_touch_next(char *json, size_t capacity) {
+         pthread_cond_timedwait(&changed, &mutex, &until); expire_locked();
+     }
+     if (queued) { current = queue[0]; memmove(queue, queue+1, (--queued)*sizeof(Frame)); }
+-    size_t n = (size_t)snprintf(json, capacity, "{\"version\":1,\"epoch\":%u,\"enabled\":%s,\"contacts\":[", epoch, enabled ? "true" : "false");
++    size_t n = (size_t)snprintf(json, capacity, "{\"version\":1,\"epoch\":%u,\"enabled\":%s,\"usb\":%s,\"contacts\":[", epoch, enabled ? "true" : "false", usb.connect ? "true" : "false");
+     for (size_t i = 0; i < current.count; i++) n += (size_t)snprintf(json+n, capacity-n,
+         "%s{\"id\":%u,\"x\":%.9f,\"y\":%.9f}", i ? "," : "", current.ids[i], current.x[i], current.y[i]);
+     n += (size_t)snprintf(json+n, capacity-n, "]}");
+     pthread_mutex_unlock(&mutex); return n;
+ }
++
++void hv_native_touch_set_usb(const HvNativeTouchUSB *transport) {
++    pthread_mutex_lock(&mutex);
++    enabled = 0; reset_locked();
++    usb = transport ? *transport : (HvNativeTouchUSB){0};
++    pthread_mutex_unlock(&mutex);
++}
++
++size_t hv_native_touch_usb_state(char *json, size_t capacity) {
++    pthread_mutex_lock(&mutex); expire_locked();
++    int connected = usb.connected && usb.connected(usb.context);
++    int n = snprintf(json, capacity, "{\"version\":1,\"epoch\":%u,\"available\":%s,\"connected\":%s}",
++                     epoch, usb.connect ? "true" : "false", connected ? "true" : "false");
++    pthread_mutex_unlock(&mutex);
++    return n >= 0 && (size_t)n < capacity ? (size_t)n : 0;
++}
++
++int hv_native_touch_usb_connect(uint32_t generation, int connected) {
++    if (connected != 0 && connected != 1) return 0;
++    pthread_mutex_lock(&mutex); expire_locked();
++    int accepted = enabled && generation == epoch && usb.connect && usb.connect(usb.context, connected);
++    pthread_mutex_unlock(&mutex); return accepted;
++}
++
++int hv_native_touch_usb_report(uint32_t generation, const uint8_t report[32]) {
++    if (!report) return 0;
++    pthread_mutex_lock(&mutex); expire_locked();
++    /* The startup dispatch is neutral. Contacts cannot precede readiness. */
++    int accepted = enabled && generation == epoch && usb.report &&
++                   (status == HV_TOUCH_READY || (status == HV_TOUCH_WAITING && report[31] == 0)) &&
++                   usb.report(usb.context, report);
++    pthread_mutex_unlock(&mutex); return accepted;
++}
++
++int hv_native_touch_usb_mapped(uint32_t generation) {
++    pthread_mutex_lock(&mutex); expire_locked();
++    int accepted = enabled && generation == epoch && usb.mapped && usb.mapped(usb.context);
++    pthread_mutex_unlock(&mutex); return accepted;
++}
+diff --git a/host/native_touch.h b/host/native_touch.h
+index 4072159..760f33f 100644
+--- a/host/native_touch.h
++++ b/host/native_touch.h
+@@ -13,4 +13,19 @@ int hv_native_touch_submit(uint32_t epoch, const uint8_t *ids, const double *x,
+ /* Guest helper transport. next waits at most 250 ms; new input wakes it immediately. */
+ size_t hv_native_touch_next(char *json, size_t capacity);
+ void hv_native_touch_report(uint32_t epoch, int status);
++/* The emulator supplies this transport; the guest only associates the USB
++   device with its display and encodes reports. No virtual-HID grant is needed. */
++typedef struct HvNativeTouchUSB {
++    void *context;
++    int (*connect)(void *context, int connected);
++    int (*connected)(void *context);
++    int (*report)(void *context, const uint8_t report[32]);
++    void (*keepalive)(void *context);
++    int (*mapped)(void *context);
++} HvNativeTouchUSB;
++void hv_native_touch_set_usb(const HvNativeTouchUSB *transport);
++size_t hv_native_touch_usb_state(char *json, size_t capacity);
++int hv_native_touch_usb_connect(uint32_t epoch, int connected);
++int hv_native_touch_usb_mapped(uint32_t epoch);
++int hv_native_touch_usb_report(uint32_t epoch, const uint8_t report[32]);
+ #endif
 diff --git a/host/prof_ios.c b/host/prof_ios.c
 index b7ff92a..9a9648c 100644
 --- a/host/prof_ios.c
@@ -5263,7 +6057,7 @@ index 083d66e..d51f8b2 100644
  
  typedef struct {
 diff --git a/host/share.c b/host/share.c
-index 9c7244a..d1ea7d8 100644
+index 9c7244a..bd9c52f 100644
 --- a/host/share.c
 +++ b/host/share.c
 @@ -39,6 +39,39 @@
@@ -5322,7 +6116,45 @@ index 9c7244a..d1ea7d8 100644
  
  void hv_share_set_clipboard(const char *text) {
      pthread_mutex_lock(&clip_mu);
-@@ -662,12 +704,53 @@ static int clipboard_put(Conn *c, Request *r) {
+@@ -590,13 +632,26 @@ static const char install_script[] =
+     "launchctl bootout \"gui/$(id -u)/com.henge.agent\" 2>/dev/null\n"
+     "curl -fsS http://" HV_SHARE_ADDR "/.henge/agent | gunzip > \"$D/henge-agent\" || { echo 'Could not reach Henge.'; exit 1; }\n"
+     "chmod 755 \"$D/henge-agent\"\n"
+-    "if curl -fsS http://" HV_SHARE_ADDR "/.henge/touch-agent | gunzip > \"$D/henge-touch-agent.new\"; then mv \"$D/henge-touch-agent.new\" \"$D/henge-touch-agent\"; chmod 755 \"$D/henge-touch-agent\"; else rm -f \"$D/henge-touch-agent.new\"; fi\n"
++    "A=\"$D/henge-agent\"\n"
++    "if [ -x \"$D/Henge Sharing Agent.app/Contents/MacOS/henge-agent\" ] && codesign --verify --strict \"$D/Henge Sharing Agent.app\"; then A=\"$D/Henge Sharing Agent.app/Contents/MacOS/henge-agent\"; fi\n"
++    "T=$(mktemp -d \"$D/touch-update.XXXXXX\") || exit 1\n"
++    "if curl -fsS http://" HV_SHARE_ADDR "/.henge/touch-agent -o \"$T/helper.tar.gz\" && tar -xzf \"$T/helper.tar.gz\" -C \"$T\" && codesign --verify --strict \"$T/Henge Touch Agent.app\" && { [ ! -d \"$T/Henge Sharing Agent.app\" ] || codesign --verify --strict \"$T/Henge Sharing Agent.app\"; }; then\n"
++    "  rm -rf \"$D/Henge Touch Agent.app\"\n"
++    "  mv \"$T/Henge Touch Agent.app\" \"$D/Henge Touch Agent.app\"\n"
++    "  rm -f \"$D/henge-touch-agent\"\n"
++    "  if [ -d \"$T/Henge Sharing Agent.app\" ] && codesign --verify --strict \"$T/Henge Sharing Agent.app\"; then\n"
++    "    rm -rf \"$D/Henge Sharing Agent.app\"\n"
++    "    mv \"$T/Henge Sharing Agent.app\" \"$D/Henge Sharing Agent.app\"\n"
++    "    A=\"$D/Henge Sharing Agent.app/Contents/MacOS/henge-agent\"\n"
++    "  fi\n"
++    "else echo \"Touch helper update failed; keeping the previous helper.\"; fi\n"
++    "rm -rf \"$T\"\n"
+     "cat > \"$P\" <<EOF\n"
+     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+     "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+     "<plist version=\"1.0\"><dict>\n"
+     "<key>Label</key><string>com.henge.agent</string>\n"
+-    "<key>ProgramArguments</key><array><string>$D/henge-agent</string></array>\n"
++    "<key>ProgramArguments</key><array><string>$A</string></array>\n"
+     "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n"
+     "<key>LimitLoadToSessionType</key><string>Aqua</string>\n"
+     "<key>ProcessType</key><string>Background</string>\n"
+@@ -612,7 +667,7 @@ static int serve_agent(Conn *c, Request *r, int touch) {
+     if (touch) {
+         char *slash = strrchr(path, '/');
+         if (!slash || (size_t)(slash-path)+32 >= sizeof path) return respond_empty(c, r, 404, "Not Found");
+-        strcpy(slash+1, "henge-touch-agent.gz");
++        strcpy(slash+1, "henge-touch-agent.tar.gz");
+     }
+     int fd = path[0] ? open(path, O_RDONLY) : -1;
+     struct stat st;
+@@ -662,18 +717,86 @@ static int clipboard_put(Conn *c, Request *r) {
      free(guest_clip);
      guest_clip = text;
      agent_seen = time(NULL);
@@ -5376,6 +6208,39 @@ index 9c7244a..d1ea7d8 100644
      if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
          if (body_discard(c, r) != 0) return -1;
          return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);
+     }
+     if (!strcmp(what, "agent") && !strcmp(r->method, "GET")) return serve_agent(c, r, 0);
+     if (!strcmp(what, "touch-agent") && !strcmp(r->method, "GET")) return serve_agent(c, r, 1);
++    if (!strcmp(what, "native-touch-usb") && !strcmp(r->method, "GET")) {
++        if (body_discard(c, r) != 0) return -1;
++        char json[160]; size_t n = hv_native_touch_usb_state(json, sizeof json);
++        return respond(c, r, 200, "OK", "Content-Type: application/json\r\n", json, n);
++    }
++    if (!strcmp(what, "native-touch-usb") && !strcmp(r->method, "PUT")) {
++        if (r->chunked || r->length < 0 || r->length > 64) { r->close = 1; return respond_empty(c, r, 400, "Bad Request"); }
++        size_t length; char *body = body_small(c, r, &length);
++        unsigned generation; int action; char extra;
++        if (!body) return -1;
++        int valid = sscanf(body, "%u %d %c", &generation, &action, &extra) == 2 && action >= 0 && action <= 2;
++        free(body);
++        if (!valid) return respond_empty(c, r, 400, "Bad Request");
++        int accepted = action == 2 ? hv_native_touch_usb_mapped(generation) : hv_native_touch_usb_connect(generation, action);
++        if (!accepted) return respond_empty(c, r, 409, "Conflict");
++        return respond_empty(c, r, 204, "No Content");
++    }
++    if (!strcmp(what, "native-touch-usb/report") && !strcmp(r->method, "PUT")) {
++        if (r->chunked || r->length != 36) { r->close = 1; return respond_empty(c, r, 400, "Bad Request"); }
++        size_t length; uint8_t *body = (uint8_t *)body_small(c, r, &length);
++        if (!body) return -1;
++        if (length != 36) { free(body); return respond_empty(c, r, 400, "Bad Request"); }
++        uint32_t generation = (uint32_t)body[0] | (uint32_t)body[1] << 8 | (uint32_t)body[2] << 16 | (uint32_t)body[3] << 24;
++        int accepted = hv_native_touch_usb_report(generation, body + 4);
++        free(body);
++        return accepted ? respond_empty(c, r, 204, "No Content") : respond_empty(c, r, 409, "Conflict");
++    }
+     if (!strcmp(what, "native-touch") && !strcmp(r->method, "GET")) {
+         if (body_discard(c, r) != 0) return -1;
+         char json[1024]; size_t n = hv_native_touch_next(json, sizeof json);
 diff --git a/host/share.h b/host/share.h
 index 37b2313..da6d7a1 100644
 --- a/host/share.h
@@ -5402,7 +6267,7 @@ index 37b2313..da6d7a1 100644
 +
  #endif
 diff --git a/host/snapshot.c b/host/snapshot.c
-index 383ae01..83fbe22 100644
+index 383ae01..368ca8d 100644
 --- a/host/snapshot.c
 +++ b/host/snapshot.c
 @@ -27,11 +27,26 @@
@@ -5692,7 +6557,21 @@ index 383ae01..83fbe22 100644
      w_section(w, TAG('P', 'V', 'G', 'D'), db, db ? dn : 0);
      free(db);
  }
-@@ -592,12 +662,23 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
+@@ -577,6 +647,13 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
+             r_section(r, XHCI, (uint8_t *)x + offsetof(HvXhci, usbcmd), offsetof(HvXhci, mu) - offsetof(HvXhci, usbcmd)) ||
+             r_section(r, XHCI, (uint8_t *)x + offsetof(HvXhci, reports), sizeof(HvXhci) - offsetof(HvXhci, reports)))
+             return -1;
++        /* A helper/socket/display mapping cannot be restored. Retain the last
++           delivered contacts only to emit lifts, discard queued old motion,
++           then detach until a fresh helper epoch maps the current display. */
++        pthread_mutex_lock(&x->mu);
++        x->ts_rhead=x->ts_rtail=0;x->ts_mapped=0;x->ts_wanted=0;
++        x->ts_connection_pending=1;x->ts_release_phase=0;x->ts_deadline_ns=0;x->ts_ep0_waiting=0;
++        pthread_mutex_unlock(&x->mu);
+     }
+     void *blob;
+     uint64_t len;
+@@ -592,12 +669,23 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
  /* ---- the file ---- */
  
  int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errlen) {
@@ -5717,7 +6596,7 @@ index 383ae01..83fbe22 100644
      struct timespec t0, t1;
      clock_gettime(CLOCK_MONOTONIC, &t0);
      char tmp[1100];
-@@ -605,7 +686,9 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+@@ -605,7 +693,9 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
      int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
      if (fd < 0) return fail(err, errlen, "Cannot write %s: %s", tmp, strerror(errno));
      fcntl(fd, F_NOCACHE, 1);
@@ -5728,7 +6607,7 @@ index 383ae01..83fbe22 100644
      w.buf = malloc(w.cap);
      if (!w.buf) {
          close(fd);
-@@ -624,6 +707,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+@@ -624,6 +714,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
          unlink(tmp);
          return fail(err, errlen, "Cannot read the disk's details.");
      }
@@ -5736,7 +6615,7 @@ index 383ae01..83fbe22 100644
      w_raw(&w, &h, sizeof h);
      for (int i = 0; i < ncpus; i++) {
          CpuState s;
-@@ -641,10 +725,12 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+@@ -641,10 +732,12 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
      free(w.buf);
      int bad = w.err;
      if (!bad && fsync(fd) != 0) bad = errno;
@@ -5749,7 +6628,7 @@ index 383ae01..83fbe22 100644
          return fail(err, errlen, "Cannot write the saved Mac: %s", strerror(bad));
      }
      clock_gettime(CLOCK_MONOTONIC, &t1);
-@@ -659,11 +745,11 @@ static int read_header(int fd, SnapHeader *h, const char *ident, uint64_t *bytes
+@@ -659,11 +752,11 @@ static int read_header(int fd, SnapHeader *h, const char *ident, uint64_t *bytes
      struct stat st;
      Trailer t;
      if (fstat(fd, &st) != 0 || (uint64_t)st.st_size < sizeof *h + sizeof t) return -1;
@@ -5765,7 +6644,7 @@ index 383ae01..83fbe22 100644
      if (pread(fd, &t, sizeof t, st.st_size - (off_t)sizeof t) != (ssize_t)sizeof t || t.tag != TAG('E', 'N', 'D', ' ') ||
          t.total != (uint64_t)st.st_size)
          return -1;
-@@ -675,12 +761,26 @@ int hv_snapshot_check(const char *path, const char *ident, uint64_t *bytes, int6
+@@ -675,12 +768,26 @@ int hv_snapshot_check(const char *path, const char *ident, uint64_t *bytes, int6
      int fd = open(path, O_RDONLY);
      if (fd < 0) return -1;
      SnapHeader h;
@@ -5793,7 +6672,7 @@ index 383ae01..83fbe22 100644
  int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t errlen) {
      HvMachine *m = hv_vm_machine();
      HvVmapple *b = hv_vm_board();
-@@ -692,10 +792,11 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
+@@ -692,10 +799,11 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
      if (fd < 0) return fail(err, errlen, "No saved Mac: %s", strerror(errno));
      fcntl(fd, F_NOCACHE, 1);
      SnapHeader h;
@@ -5807,7 +6686,7 @@ index 383ae01..83fbe22 100644
      }
      char disk_now[256];
      h.disk[sizeof h.disk - 1] = 0;
-@@ -728,7 +829,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
+@@ -728,7 +836,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
      if (!bad) bad = r_raw(&r, &t, sizeof t) || t.tag != TAG('E', 'N', 'D', ' ');
      free(r.buf);
      close(fd);
@@ -5846,7 +6725,7 @@ index 67fc764..2ca437b 100644
  
  #endif
 diff --git a/host/vm.c b/host/vm.c
-index db95c05..511e90d 100644
+index db95c05..3b85d3d 100644
 --- a/host/vm.c
 +++ b/host/vm.c
 @@ -4,6 +4,7 @@
@@ -5857,7 +6736,15 @@ index db95c05..511e90d 100644
  #include <CoreFoundation/CoreFoundation.h>
  #include <dispatch/dispatch.h>
  #include <os/lock.h>
-@@ -62,6 +63,13 @@ static uint64_t paused_counter; /* the guest's virtual counter when its CPUs sto
+@@ -26,6 +27,7 @@
+ #include "sysreg.h"
+ #include "net_slirp.h"
+ #include "sysreg.h"
++#include "native_touch.h"
+ 
+ static HvMachine m;
+ static HvCpu cpus[HV_MAX_CPUS]; /* the board takes them as an array */
+@@ -62,6 +64,13 @@ static uint64_t paused_counter; /* the guest's virtual counter when its CPUs sto
  static int64_t paused_wall_ns;  /* and the wall clock then */
  static _Atomic int nudge_after_start; /* resumed: tell the guest someone is here as soon as it runs */
  
@@ -5871,7 +6758,39 @@ index db95c05..511e90d 100644
  HvMachine *hv_vm_machine(void) { return &m; }
  HvVmapple *hv_vm_board(void) { return &board; }
  HvCpu *hv_vm_cpu(int index) { return index >= 0 && index < ncpus ? &cpus[index] : NULL; }
-@@ -343,8 +351,34 @@ static int idle_ticker_enabled = 1;
+@@ -136,6 +145,12 @@ static void board_poll(void) {
+     if (net_on) hv_net_poll();
+ }
+ 
++static int touch_usb_connect(void *context, int connected) { return hv_xhci_touchscreen_connect(context, connected); }
++static int touch_usb_connected(void *context) { return hv_xhci_touchscreen_connected(context); }
++static int touch_usb_report(void *context, const uint8_t report[32]) { return hv_xhci_touchscreen_report(context, report); }
++static void touch_usb_keepalive(void *context) { hv_xhci_touchscreen_keepalive(context); }
++static int touch_usb_mapped(void *context) { return hv_xhci_touchscreen_mapped(context); }
++
+ static int fail(char *err, size_t n, const char *msg) {
+     if (err && n) snprintf(err, n, "%s", msg);
+     return -1;
+@@ -291,6 +306,10 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
+     if (hv_vmapple_create(&board, &m, cpus, (c->ram_mb ? c->ram_mb : 2048) << 20, &disk, &aux, &cfg, mac) != 0)
+         return fail(err, errlen, "Cannot build the machine (not enough memory for the guest's RAM?).");
+     if (hv_vmapple_load_rom(&board, c->rom) != 0) return fail(err, errlen, "Cannot read the ROM (AVPBooter.vmapple2.bin).");
++    if (board.usb && board.usb->ts_enabled) {
++        HvNativeTouchUSB transport = {board.usb, touch_usb_connect, touch_usb_connected, touch_usb_report, touch_usb_keepalive, touch_usb_mapped};
++        hv_native_touch_set_usb(&transport);
++    }
+     hv_vmapple_reset_cpu(&board);
+     if (board.net && !c->no_net) {
+         if (hv_net_attach(&m, board.net) != 0) fprintf(stderr, "hengevm: user-mode network unavailable\n");
+@@ -323,6 +342,7 @@ void hv_vm_destroy(void) {
+     atomic_store_explicit(&display_pvg, NULL, memory_order_release);
+     os_unfair_lock_unlock(&display_lock);
+     stop_pointer();
++    hv_native_touch_set_usb(NULL);
+     hv_net_detach();
+     net_on = 0;
+     hv_audio_detach(board.snd);
+@@ -343,8 +363,34 @@ static int idle_ticker_enabled = 1;
  static int deadline_kicks;
  
  void hv_vm_log_ticker(void) {
@@ -5906,7 +6825,7 @@ index db95c05..511e90d 100644
      fprintf(stderr,"flush-wait: enabled=%d waits=%llu timeouts=%llu errors=%llu (cumulative; notifications on peer park and pending requests)\n",m.quiesce_enabled,(unsigned long long)atomic_load(&m.quiesce.waits),(unsigned long long)atomic_load(&m.quiesce.timeouts),(unsigned long long)atomic_load(&m.quiesce.errors));
      fprintf(stderr, "idle-ticker: active_ticks=%llu sleep_waits=%llu resumes=%llu waiting=%u marked_cpu_flags=%llu (cumulative; timer/device wakeups remain active)\n",
              (unsigned long long)atomic_load_explicit(&kicker.ticks, memory_order_relaxed),
-@@ -386,7 +420,8 @@ static pthread_key_t signal_stack_key;
+@@ -386,7 +432,8 @@ static pthread_key_t signal_stack_key;
  static pthread_once_t signal_stack_once = PTHREAD_ONCE_INIT;
  static int signal_stack_key_ready;
  static void release_signal_stack(void *p) {
@@ -5916,7 +6835,7 @@ index db95c05..511e90d 100644
      if (sigaltstack(&disabled, NULL) == 0) free(p);
  }
  static void make_signal_stack_key(void) {
-@@ -398,7 +433,12 @@ void hv_vm_prepare_cpu_thread(void) {
+@@ -398,7 +445,12 @@ void hv_vm_prepare_cpu_thread(void) {
      static __thread int done;
      if (done) return;
      done = 1;
@@ -5930,7 +6849,7 @@ index db95c05..511e90d 100644
      if (ss.ss_sp) {
          if (sigaltstack(&ss, NULL) != 0) free(ss.ss_sp);
          else {
-@@ -461,9 +501,17 @@ int hv_vm_disk_identity(char *out, size_t n) {
+@@ -461,9 +513,17 @@ int hv_vm_disk_identity(char *out, size_t n) {
      return 0;
  }
  
@@ -5951,9 +6870,11 @@ index db95c05..511e90d 100644
  }
  
  int hv_vm_run_cpu0(void) {
-@@ -473,7 +521,8 @@ int hv_vm_run_cpu0(void) {
+@@ -472,8 +532,10 @@ int hv_vm_run_cpu0(void) {
+     if (hv_prof_session) hv_prof_session(0);
      if (hv_prof_unregister) hv_prof_unregister();
      hv_idle_ticker_advance(&kicker);
++    hv_native_touch_enable(0); /* fence helper epochs before pause/snapshot */
      hv_dev_lock(&m);
 -    hv_audio_detach(board.snd);
 +    if(atomic_load(&cpus[0].halted)==HV_HALT_SAVE)hv_audio_pause(board.snd);
@@ -5961,7 +6882,7 @@ index db95c05..511e90d 100644
      hv_dev_unlock(&m);
      return result;
  }
-@@ -512,19 +561,45 @@ int hv_vm_finish_pause(void) {
+@@ -512,19 +574,45 @@ int hv_vm_finish_pause(void) {
      hv_virtio_blk_stop(board.root_blk);
      hv_virtio_blk_stop(board.aux_blk);
      /* hv_vm_run_cpu0 already detached board.snd under the device lock. */
@@ -6010,7 +6931,7 @@ index db95c05..511e90d 100644
  /* Where the guest's counter goes on from after a pause or a restore: as much later as the wall clock moved meanwhile, so
     its clock is right at once (macOS then also checks it with the network) -- the counter on a host (an iPhone asleep)
     stops for longer than the wall clock does. A jump of 10 minutes was seen to do no harm beyond what a Mac left alone
-@@ -588,7 +663,7 @@ int hv_vm_continue(void) {
+@@ -588,7 +676,7 @@ int hv_vm_continue(void) {
      }
      hv_virtio_blk_start(board.root_blk);
      hv_virtio_blk_start(board.aux_blk);
@@ -6019,7 +6940,7 @@ index db95c05..511e90d 100644
          hv_audio_attach(board.snd);
          hv_virtio_snd_resume(board.snd);
      }
-@@ -627,6 +702,7 @@ static void *cpu0_thread(void *unused) {
+@@ -627,6 +715,7 @@ static void *cpu0_thread(void *unused) {
  }
  
  int hv_vm_start(int cpu0, void (*on_exit)(int reason)) {
@@ -6027,7 +6948,7 @@ index db95c05..511e90d 100644
      exit_cb = on_exit;
      pthread_mutex_lock(&pause_mu);
      run_ended = 0;
-@@ -685,6 +761,7 @@ void hv_vm_stop(void) {
+@@ -685,6 +774,7 @@ void hv_vm_stop(void) {
  static os_unfair_lock rctrl_lock = OS_UNFAIR_LOCK_INIT;
  static int rctrl_user, rctrl_click;
  static int left_user, left_click, left_sent; /* only the pointer queue touches these */
@@ -6035,7 +6956,7 @@ index db95c05..511e90d 100644
  
  static dispatch_queue_t pointer_queue(void) {
      static dispatch_queue_t q;
-@@ -702,9 +779,14 @@ static void stop_pointer(void) {
+@@ -702,9 +792,14 @@ static void stop_pointer(void) {
              hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);
              hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
          }
@@ -6051,7 +6972,7 @@ index db95c05..511e90d 100644
          rctrl_user = rctrl_click = 0;
          os_unfair_lock_unlock(&rctrl_lock);
      });
-@@ -752,7 +834,13 @@ static void left_update(void) {
+@@ -752,7 +847,13 @@ static void left_update(void) {
  static void button_now(void *ctx) {
      if (atomic_load(&input_stopping)) return;
      intptr_t v = (intptr_t)ctx;
@@ -6066,7 +6987,7 @@ index db95c05..511e90d 100644
      if (button == 0) {
          left_user = down;
          left_update();
-@@ -777,6 +865,16 @@ void hv_vm_mouse_button(int button, int down) {
+@@ -777,6 +878,16 @@ void hv_vm_mouse_button(int button, int down) {
      if (button < 0 || button > 2) return;
      dispatch_async_f(pointer_queue(), (void *)(intptr_t)(button << 1 | !!down), button_now);
  }
@@ -6083,7 +7004,7 @@ index db95c05..511e90d 100644
  
  /* The guest takes a wheel event as 8 bits: -200 arrives as +56, the wrong way. So big moves go in pieces. */
  static void wheel(uint16_t axis, int amount) {
-@@ -802,6 +900,9 @@ void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
+@@ -802,6 +913,9 @@ void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
  void hv_vm_touch_frame(uint32_t ts_ms) { hv_xhci_touch_frame(board.usb, ts_ms); }
  
  void hv_vm_touch_button(int down) { hv_xhci_touch_button(board.usb, down); }
@@ -7094,10 +8015,10 @@ index 0000000..da9cdbc
 +}
 diff --git a/ios/Henge/Controls/GyroSteeringMath.swift b/ios/Henge/Controls/GyroSteeringMath.swift
 new file mode 100644
-index 0000000..a932755
+index 0000000..6b743f6
 --- /dev/null
 +++ b/ios/Henge/Controls/GyroSteeringMath.swift
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,26 @@
 +import Foundation
 +
 +/// Rotation about the calibrated screen's normal, with a small center deadband.
@@ -7124,7 +8045,6 @@ index 0000000..a932755
 +        var result=pad;result.lx=steering;return result
 +    }
 +}
-+
 diff --git a/ios/Henge/Controls/PadInput.swift b/ios/Henge/Controls/PadInput.swift
 new file mode 100644
 index 0000000..7cc0e18
@@ -8091,10 +9011,10 @@ index 8b4bf3b..b1e8aac 100644
      }
  }
 diff --git a/ios/Henge/Link/LinkFlowControl.swift b/ios/Henge/Link/LinkFlowControl.swift
-index 7e9ba85..e82c7f8 100644
+index 7e9ba85..529567b 100644
 --- a/ios/Henge/Link/LinkFlowControl.swift
 +++ b/ios/Henge/Link/LinkFlowControl.swift
-@@ -44,3 +44,15 @@ final class LinkFrameCredits: @unchecked Sendable {
+@@ -44,3 +44,24 @@ final class LinkFrameCredits: @unchecked Sendable {
          let count = frames.count; frames.removeAll(); return count
      }
  }
@@ -8109,6 +9029,15 @@ index 7e9ba85..e82c7f8 100644
 +        precondition(value<UInt64.max,"Link sequence exhausted")
 +        value += 1;return value
 +    }
++}
++
++/// Snapshot cadence is separate from transport credits. A denied final change
++/// requests one fresh worker snapshot when its budget/credit becomes available.
++struct LinkCaptureBudget {
++    private var deadline=0.0
++    func delay(now:Double)->Double { max(0,deadline-now) }
++    mutating func accepted(now:Double,hz:Int) { deadline=now+1/Double(min(120,max(24,hz))) }
++    mutating func reset() { deadline=0 }
 +}
 diff --git a/ios/Henge/Link/LinkProtocol.swift b/ios/Henge/Link/LinkProtocol.swift
 index 94231b2..23db487 100644
@@ -8161,7 +9090,7 @@ index 0000000..37e561d
 +    }
 +}
 diff --git a/ios/Henge/Link/LinkService.swift b/ios/Henge/Link/LinkService.swift
-index 07cd331..3a2c203 100644
+index 07cd331..5165619 100644
 --- a/ios/Henge/Link/LinkService.swift
 +++ b/ios/Henge/Link/LinkService.swift
 @@ -7,6 +7,8 @@ import CoreVideo
@@ -8224,7 +9153,7 @@ index 07cd331..3a2c203 100644
 +                        status = "Reconnect using the saved second monitor’s size and refresh rate. A new monitor requires restarting the Mac."; return
 +                    }
 +                }
-+                let created = try LinkEncoder(mode: proposed, library:shaderLibrary, send: { [weak transport] data, done in
++                let created = try LinkEncoder(mode: proposed, library:shaderLibrary, requestFrame:{henge_vm_link_connected(1)}, send: { [weak transport] data, done in
                      guard let transport else { done(false); return }; transport.sendVideo(data, completion: done)
                  }, report: { [weak self] message in
                      HengeLog.log("link", message)
@@ -8288,7 +9217,7 @@ index 07cd331..3a2c203 100644
 +        }
 +        let stream=LinkMode(width:Int(display.width),height:Int(display.height),widthMM:Int(display.width_mm),heightMM:Int(display.height_mm),hz:min(requestedHz,Int(display.hz)))
 +        do {
-+            let created=try LinkEncoder(mode:stream,mirrorsPrimary:true,library:shaderLibrary,send:{ [weak transport] data,done in
++            let created=try LinkEncoder(mode:stream,mirrorsPrimary:true,library:shaderLibrary,requestFrame:{henge_vm_mirror_refresh()},send:{ [weak transport] data,done in
 +                guard let transport else { done(false);return };transport.sendVideo(data,completion:done)
 +            },report:{ HengeLog.log("link-mirror",$0) })
 +            encoder=created;mirrorActive=true
@@ -8630,7 +9559,7 @@ index ab4d4d8..eafac24 100644
      }
  }
 diff --git a/ios/Henge/Link/LinkVideo.swift b/ios/Henge/Link/LinkVideo.swift
-index f49ac55..ab0499b 100644
+index f49ac55..881cb5f 100644
 --- a/ios/Henge/Link/LinkVideo.swift
 +++ b/ios/Henge/Link/LinkVideo.swift
 @@ -8,6 +8,7 @@ import VideoToolbox
@@ -8641,11 +9570,14 @@ index f49ac55..ab0499b 100644
      private let device: MTLDevice
      private let plain: MTLRenderPipelineState, linear: MTLRenderPipelineState, cursor: MTLRenderPipelineState
      private let sampler: MTLSamplerState
-@@ -21,16 +22,18 @@ final class LinkEncoder {
+@@ -21,16 +22,21 @@ final class LinkEncoder {
      private var cache: CVMetalTextureCache
      private let lock = NSLock()
      private var stopped = false, captured: UInt64 = 0, congested: UInt64 = 0
 +    private var visible = true, visibilityEpoch: UInt64 = 0
++    private var budget=LinkCaptureBudget()
++    private var refreshQueued=false,deferredFrame=false
++    private let requestFrame:()->Void
      private var sequence: UInt64 = 0
      private let send: (Data, @escaping (Bool) -> Void) -> Void
      private let report: (String) -> Void
@@ -8656,14 +9588,14 @@ index f49ac55..ab0499b 100644
 +        init(_ owner: LinkEncoder, epoch: UInt64) { self.owner = owner; self.epoch = epoch }
      }
 -    init(mode: LinkMode, library: MTLLibrary? = nil, send: @escaping (Data, @escaping (Bool) -> Void) -> Void, report: @escaping (String) -> Void) throws {
-+    init(mode: LinkMode, mirrorsPrimary:Bool = false, library: MTLLibrary? = nil, send: @escaping (Data, @escaping (Bool) -> Void) -> Void, report: @escaping (String) -> Void) throws {
++    init(mode: LinkMode, mirrorsPrimary:Bool = false, library: MTLLibrary? = nil, requestFrame:@escaping ()->Void = {}, send: @escaping (Data, @escaping (Bool) -> Void) -> Void, report: @escaping (String) -> Void) throws {
          guard #available(iOS 17.4, *) else { throw LinkError.invalid("Henge Link hardware encoding requires iOS/iPadOS 17.4 or later") }
 -        try mode.validate(); guard mode.codedWidth * mode.codedHeight <= 33_554_432 else { throw LinkError.invalid("Codec canvas exceeds the supported size") }; self.mode = mode; self.send = send; self.report = report
-+        try mode.validate(); guard mode.codedWidth * mode.codedHeight <= 33_554_432 else { throw LinkError.invalid("Codec canvas exceeds the supported size") }; self.mode = mode;self.mirrorsPrimary=mirrorsPrimary; self.send = send; self.report = report
++        try mode.validate(); guard mode.codedWidth * mode.codedHeight <= 33_554_432 else { throw LinkError.invalid("Codec canvas exceeds the supported size") }; self.mode = mode;self.mirrorsPrimary=mirrorsPrimary;self.requestFrame=requestFrame; self.send = send; self.report = report
          guard let device = MTLCreateSystemDefaultDevice(), let lib = library ?? device.makeDefaultLibrary() else { throw LinkError.invalid("Native Metal shaders unavailable") }
          self.device = device
          func pipeline(_ fragment: String, blend: Bool = false) throws -> MTLRenderPipelineState {
-@@ -65,7 +68,7 @@ final class LinkEncoder {
+@@ -65,7 +71,7 @@ final class LinkEncoder {
                  outputCallback: { _, source, status, _, sample in
                      guard let source else { return }
                      let ticket = Unmanaged<Ticket>.fromOpaque(source).takeRetainedValue()
@@ -8672,7 +9604,7 @@ index f49ac55..ab0499b 100644
                  }, refcon: nil, compressionSessionOut: &candidate)
              guard status == noErr, let candidate else { continue }
              func set(_ key: CFString, _ value: CFTypeRef) -> Bool {
-@@ -89,8 +92,8 @@ final class LinkEncoder {
+@@ -89,12 +95,26 @@ final class LinkEncoder {
      /// Called synchronously by the serial guest GPU worker. Commit on its queue
      /// before returning so later guest writes cannot overtake this snapshot.
      func capture(texture: MTLTexture, queue: MTLCommandQueue, halfMode: UInt32, cursorTexture: MTLTexture?, rect: SIMD4<Float>) {
@@ -8680,10 +9612,29 @@ index f49ac55..ab0499b 100644
 -        guard texture.width == mode.width, texture.height == mode.height else { return }
 +        lock.lock(); let active = !stopped && visible; let epoch = visibilityEpoch; lock.unlock(); guard active else { return }
 +        guard mirrorsPrimary || (texture.width == mode.width && texture.height == mode.height) else { return }
++        let now=ProcessInfo.processInfo.systemUptime
++        lock.lock();let delay=budget.delay(now:now)
++        let arrange=delay>0 && !refreshQueued
++        if arrange { refreshQueued=true }
++        lock.unlock()
++        if delay>0 {
++            if arrange { work.asyncAfter(deadline:.now()+delay) { [self] in
++                lock.lock();let refresh = !stopped && visible && epoch==visibilityEpoch
++                if epoch==visibilityEpoch { refreshQueued=false };lock.unlock()
++                if refresh { requestFrame() }
++            } }
++            return
++        }
          guard slots.wait(timeout: .now()) == .success else {
-             lock.lock(); congested &+= 1; let n = congested; lock.unlock()
+-            lock.lock(); congested &+= 1; let n = congested; lock.unlock()
++            lock.lock();deferredFrame=true; congested &+= 1; let n = congested; lock.unlock()
              if n == 1 || n % 120 == 0 { report("remote capture backpressure=\(n); primary display/guest completions unchanged") }; return
-@@ -121,24 +124,26 @@ final class LinkEncoder {
+         }
++        lock.lock();budget.accepted(now:now,hz:mode.hz);lock.unlock()
+         var pixel: CVPixelBuffer?
+         let aux = [kCVPixelBufferPoolAllocationThresholdKey as String: 3] as CFDictionary
+         guard CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool, aux, &pixel) == noErr, let pixel else { slots.signal(); return }
+@@ -121,24 +141,26 @@ final class LinkEncoder {
              e.setRenderPipelineState(cursor); e.setVertexBytes(&r, length: 16, index: 0)
              e.setFragmentTexture(cursorTexture, index: 0); e.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
          }
@@ -8715,7 +9666,7 @@ index f49ac55..ab0499b 100644
          guard status == noErr, let sample, CMSampleBufferDataIsReady(sample), let format = CMSampleBufferGetFormatDescription(sample), let block = CMSampleBufferGetDataBuffer(sample) else { slots.signal(); report("Hardware encoder produced no frame: \(status)"); return }
          let hevc = CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC
          var sets = [Data]()
-@@ -155,7 +160,8 @@ final class LinkEncoder {
+@@ -155,7 +177,8 @@ final class LinkEncoder {
          let copied = bytes.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!) }
          guard copied == noErr else { slots.signal(); return }
          // VT output is serialized by the encoder when reordering is disabled.
@@ -8725,13 +9676,13 @@ index f49ac55..ab0499b 100644
          guard active else { slots.signal(); return }
          do {
              let dimensions = CMVideoFormatDescriptionGetDimensions(format)
-@@ -172,6 +178,17 @@ final class LinkEncoder {
+@@ -172,8 +195,21 @@ final class LinkEncoder {
      func acknowledge(_ sequence: UInt64) {
          if let receipt = credits.consumed(sequence) { retire(receipt) }
      }
 +    func setVisible(_ value: Bool) {
 +        lock.lock()
-+        if visible != value { visible = value; visibilityEpoch &+= 1 }
++        if visible != value { visible = value; visibilityEpoch &+= 1;refreshQueued=false;deferredFrame=false;budget.reset() }
 +        lock.unlock()
 +    }
 +    func trimMemory() {
@@ -8742,7 +9693,11 @@ index f49ac55..ab0499b 100644
 +    }
      private func retire(_ receipt: LinkFrameCredits.Receipt) {
          slots.signal()
++        lock.lock();let refresh=deferredFrame && !stopped && visible;deferredFrame=false;lock.unlock()
++        if refresh { requestFrame() }
          guard receipt.consumed else { return }
+         lock.lock(); acknowledged &+= 1; let count = acknowledged
+         worstRoundTripMS = max(worstRoundTripMS, receipt.seconds * 1000)
 diff --git a/ios/Henge/Link/LinkViews.swift b/ios/Henge/Link/LinkViews.swift
 index 1bc238f..6db51ad 100644
 --- a/ios/Henge/Link/LinkViews.swift
@@ -9886,6 +10841,28 @@ index 25e7bad..246a6f8 100644
  
      init(defaults: UserDefaults = .standard,
           now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+diff --git a/ios/Henge/NativeTouchSurface.swift b/ios/Henge/NativeTouchSurface.swift
+index b89dc8a..cb525dd 100644
+--- a/ios/Henge/NativeTouchSurface.swift
++++ b/ios/Henge/NativeTouchSurface.swift
+@@ -29,7 +29,7 @@ struct NativeTouchSurface: UIViewRepresentable {
+             super.init(frame: frame)
+             isMultipleTouchEnabled = true
+             backgroundColor = .clear
+-            controlsTap.numberOfTouchesRequired = 3
++            controlsTap.numberOfTouchesRequired = 4
+             controlsTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+             controlsTap.cancelsTouchesInView = true
+             controlsTap.isEnabled = false
+@@ -59,7 +59,7 @@ struct NativeTouchSurface: UIViewRepresentable {
+ 
+         @objc private func revealControls() {
+             cancel()
+-            NotificationCenter.default.post(name: Trackpad.threeFingerTap, object: nil)
++            NotificationCenter.default.post(name: Trackpad.revealTap, object: nil)
+         }
+ 
+         override func didMoveToWindow() {
 diff --git a/ios/Henge/ResumeCoordinator.swift b/ios/Henge/ResumeCoordinator.swift
 new file mode 100644
 index 0000000..8bc7214
@@ -10681,7 +11658,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..727d4fc 100644
+index f84465e..ecb66c2 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,18 @@ struct SessionView: View {
@@ -11049,6 +12026,26 @@ index f84465e..727d4fc 100644
                  Section("Display") {
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
+@@ -618,15 +823,15 @@ struct SessionView: View {
+                         Text("Enable Guest sharing in Henge Settings and reopen Henge to use native touch.")
+                             .font(.footnote).foregroundStyle(.secondary)
+                     }
+-                    Text("Requires macOS 27.2 or later and an Apple-authorized virtual-HID guest helper. The bundled ad-hoc helper may be blocked by macOS signing checks. Accessibility permission alone does not resolve that block.")
++                    Text("Requires macOS 27.2 or later and the updated Henge sharing helper. Allow Local Network for Henge Sharing Agent if macOS asks. If unavailable, the screen continues to work as a trackpad.")
+                         .font(.footnote).foregroundStyle(.secondary)
+                     switch nativeTouch.status {
+                     case 2: Text("Native touch is ready.")
+                     case 3: Text("This guest needs macOS 27.2 or later. Using trackpad.")
+                     case 4: Text("Allow Accessibility for henge-touch-agent in the Mac. Using trackpad.")
+-                    case 5: Text("The Mac could not create its touchscreen. Check the helper’s virtual HID authorization. Using trackpad.")
+-                    case 6: Text("Touch helper unavailable. Check its Mac signing and permissions. Trackpad is active.")
+-                    case 1: Text("Waiting for the guest touch helper. Close Details to connect; check the helper’s Mac signing if this persists.")
++                    case 5: Text("The Mac could not connect its touchscreen. Update the helper and try again. Using trackpad.")
++                    case 6: Text("The touch helper did not respond. Retrying automatically while you use the trackpad.")
++                    case 1: Text("Waiting for the updated guest sharing helper. Close Details to connect.")
+                     default: Text("Trackpad is active. Native touch connects after you close Details.")
+                     }
+                     Button("Type the Helper Update Command") {
 @@ -680,6 +885,8 @@ struct SessionView: View {
      }
  
@@ -11519,6 +12516,28 @@ index eb316cc..0d1a62e 100644
      }
  
      /// Text from this device, pasted at the Mac's cursor. Without the helper it is typed, as far as the keyboard can.
+diff --git a/ios/project.yml b/ios/project.yml
+index a3be374..a022ef6 100644
+--- a/ios/project.yml
++++ b/ios/project.yml
+@@ -111,7 +111,7 @@ targets:
+         script: |
+           set -e
+           cd "$SRCROOT/.."
+-          make ios-lib build/henge-agent.gz build/henge-touch-agent.gz build/tl-samples.dmg
++          make ios-lib build/henge-agent.gz build/tl-samples.dmg build/henge-touch-agent.tar.gz
+           ./tools/build_ios_restore.sh
+         basedOnDependencyAnalysis: false
+     postBuildScripts:
+@@ -119,7 +119,7 @@ targets:
+         # What runs inside macOS for the clipboard and shared folder (tools/henge-agent.m).
+         script: |
+           set -e
+-          cp "$SRCROOT/../build/henge-agent.gz" "$SRCROOT/../build/henge-touch-agent.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/"
++          cp "$SRCROOT/../build/henge-agent.gz" "$SRCROOT/../build/henge-touch-agent.tar.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/"
+           rm -f "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"
+           cp -X "$SRCROOT/../build/tl-samples.dmg" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"
+         basedOnDependencyAnalysis: false
 diff --git a/ios/scripts/build_app.sh b/ios/scripts/build_app.sh
 new file mode 100644
 index 0000000..d9d7efa
@@ -11807,7 +12826,7 @@ index 0000000..8a6b492
 +}
 diff --git a/tests/gamepad-preview/GamepadPreviewUITests.swift b/tests/gamepad-preview/GamepadPreviewUITests.swift
 new file mode 100644
-index 0000000..83e7b87
+index 0000000..7b36ae3
 --- /dev/null
 +++ b/tests/gamepad-preview/GamepadPreviewUITests.swift
 @@ -0,0 +1,109 @@
@@ -11857,7 +12876,7 @@ index 0000000..83e7b87
 +        let motion=NSPredicate { _,_ in (Int(maximum.value as? String ?? "") ?? -1)>20000 }
 +        XCTAssertEqual(XCTWaiter.wait(for:[XCTNSPredicateExpectation(predicate:motion,object:nil)],timeout:5),.completed,"Stick movement did not reach the production callback")
 +        XCTAssertEqual(app.staticTexts["buttons"].label,"Buttons: 0")
-+        let gamepadPad=app.descendants(matching:.any).matching(identifier:"gamepad-touchpad").firstMatch
++        let gamepadPad=app.textViews["gamepad-touchpad"].firstMatch
 +        XCTAssertTrue(gamepadPad.waitForExistence(timeout:5))
 +        let padCenter=gamepadPad.coordinate(withNormalizedOffset:CGVector(dx:0.5,dy:0.5))
 +        padCenter.press(forDuration:0.1,thenDragTo:padCenter.withOffset(CGVector(dx:40,dy:8)))
@@ -11877,7 +12896,7 @@ index 0000000..83e7b87
 +        XCTAssertTrue(surface.waitForExistence(timeout:5))
 +        capture("\(PreviewFixture.profile)-wireless-gamepad")
 +        app.buttons["Touchpad"].tap()
-+        let input=app.descendants(matching:.any).matching(identifier:"wireless-input-surface").firstMatch
++        let input=app.textViews["wireless-input-surface"].firstMatch
 +        XCTAssertTrue(input.waitForExistence(timeout:5))
 +        let center=input.coordinate(withNormalizedOffset:CGVector(dx:0.5,dy:0.5))
 +        center.press(forDuration:0.1,thenDragTo:center.withOffset(CGVector(dx:80,dy:20)))
@@ -11893,7 +12912,7 @@ index 0000000..83e7b87
 +        if PreviewFixture.profile == "duo-unfolded" {
 +            app.buttons["Controller layout"].tap()
 +            app.buttons["Tabletop"].tap()
-+            let tabletop=app.descendants(matching:.any).matching(identifier:"tabletop-touchpad").firstMatch
++            let tabletop=app.textViews["tabletop-touchpad"].firstMatch
 +            XCTAssertTrue(tabletop.waitForExistence(timeout:5))
 +            XCTAssertLessThan(tabletop.frame.maxY,surface.frame.minY,"The hinge gap must separate the touchpad and controller")
 +            tap(.a)
@@ -12278,7 +13297,7 @@ index 0000000..b04923c
 +printf '\nExpanded diagnostic pass: %d failed checks\n' "$failures"
 +test "$failures" -eq 0
 diff --git a/tests/test_audio_lifecycle.c b/tests/test_audio_lifecycle.c
-index dc4e6a8..8581661 100644
+index dc4e6a8..1eee7c7 100644
 --- a/tests/test_audio_lifecycle.c
 +++ b/tests/test_audio_lifecycle.c
 @@ -6,10 +6,11 @@
@@ -12315,6 +13334,7 @@ index dc4e6a8..8581661 100644
      assert(stops==2 && uninits==2 && disposals==2);
      hv_audio_detach(&d);
      assert(stops==3 && uninits==3 && disposals==3 && !unit && !unit_running);
+-    puts("audio lifecycle: render, no duplicate start, stop/uninitialize/dispose, late-start rejection, idempotence and reattach passed");
 +    hv_audio_attach(&d);d.channels=2;d.format=HV_VSND_FMT_S16;d.rate_hz=48000;d.running=1;
 +    assert(d.backend.start(d.backend.opaque,2,HV_VSND_FMT_S16,48000)==0);
 +    hv_audio_pause(&d);assert(d.running && !unit && detached);
@@ -12326,7 +13346,7 @@ index dc4e6a8..8581661 100644
 +    fail_start=0;assert(hv_audio_recover(&d)==0 && d.backend.start && unit_running && d.running);
 +    hv_audio_detach(&d);unsigned count=created;
 +    assert(hv_audio_recover(&d)==-1 && created==count);
-     puts("audio lifecycle: render, no duplicate start, stop/uninitialize/dispose, late-start rejection, idempotence and reattach passed");
++    puts("audio lifecycle: render, no duplicate start, stop/uninitialize/dispose, late-start rejection, idempotence, pause stream preservation, interruption, failed-start recovery and reattach passed");
  }
 diff --git a/tests/test_bench.c b/tests/test_bench.c
 index b3af248..b8e6466 100644
@@ -13288,6 +14308,115 @@ index 0000000..032d060
 +subprocess.run(['cc', '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
 +                '-fsanitize=address,undefined', str(path), '-o', str(build / 'test_group_copy_sharing')], check=True)
 +subprocess.run([str(build / 'test_group_copy_sharing')], check=True, timeout=15)
+diff --git a/tests/test_guest_connection.py b/tests/test_guest_connection.py
+new file mode 100644
+index 0000000..13b4342
+--- /dev/null
++++ b/tests/test_guest_connection.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++"""Exercise the real pipe client against a deliberately asynchronous parent."""
++import base64
++import json
++import os
++import select
++import subprocess
++import sys
++import time
++
++
++def exercise(mode):
++    process = subprocess.Popen([sys.argv[1], mode], stdin=subprocess.PIPE,
++                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
++    buffered = b''
++
++    def read():
++        nonlocal buffered
++        deadline = time.monotonic() + 5
++        while b'\n' not in buffered:
++            remaining = deadline - time.monotonic()
++            assert remaining > 0 and select.select([process.stdout], [], [], remaining)[0], mode
++            chunk = os.read(process.stdout.fileno(), 4096)
++            assert chunk, f'{mode}: unexpected EOF'
++            buffered += chunk
++            assert len(buffered) <= 8192
++        line, buffered = buffered.split(b'\n', 1)
++        message = json.loads(line)
++        assert message['version'] == 1
++        return message
++
++    def reply(identifier, status, body):
++        response = dict(version=1, id=identifier, status=status,
++                        body=base64.b64encode(body).decode())
++        process.stdin.write(json.dumps(response).encode() + b'\n')
++        process.stdin.flush()
++
++    try:
++        first = read()
++        if mode == 'multiplex':
++            second = read()
++            messages = {item['method']: item for item in [first, second]}
++            assert base64.b64decode(messages['PUT']['body']) == bytes(range(36))
++            # An orphan reply must not consume a live continuation. Reverse the
++            # real replies to detect accidental FIFO response matching.
++            reply(first['id'] + 1000, 200, b'orphan')
++            reply(messages['PUT']['id'], 204, b'report')
++            reply(messages['GET']['id'], 200, b'metadata')
++        elif mode == 'eof':
++            process.stdin.close()
++        assert process.wait(timeout=6) == 0, process.stderr.read().decode(errors='replace')
++    finally:
++        if process.poll() is None:
++            process.kill()
++            process.wait()
++
++
++for name in ['multiplex', 'cancel', 'timeout', 'eof']:
++    exercise(name)
++print('Guest pipe transport: out-of-order replies, orphan replies, binary bodies, cancellation, timeout and EOF passed')
+diff --git a/tests/test_guest_connection.swift b/tests/test_guest_connection.swift
+new file mode 100644
+index 0000000..b072380
+--- /dev/null
++++ b/tests/test_guest_connection.swift
+@@ -0,0 +1,37 @@
++import Foundation
++
++@main
++enum GuestConnectionCheck {
++    static func main() async throws {
++        let connection = GuestConnection()
++        await connection.start()
++        let url = URL(string: "http://10.0.2.4/.henge/native-touch-usb")!
++        switch CommandLine.arguments[1] {
++        case "multiplex":
++            var report = URLRequest(url: url.appendingPathComponent("report"))
++            report.httpMethod = "PUT"
++            report.httpBody = Data((0..<36).map(UInt8.init))
++            async let first = connection.data(from: url)
++            async let second = connection.data(for: report)
++            let (a, b) = try await (first, second)
++            precondition(a.0 == Data("metadata".utf8))
++            precondition(b.0 == Data("report".utf8))
++            precondition((a.1 as? HTTPURLResponse)?.statusCode == 200)
++            precondition((b.1 as? HTTPURLResponse)?.statusCode == 204)
++        case "cancel":
++            let operation = Task { try await connection.data(from: url) }
++            try await Task.sleep(for: .milliseconds(200))
++            operation.cancel()
++            do { _ = try await operation.value; preconditionFailure("cancelled request completed") }
++            catch is CancellationError { }
++        case "timeout":
++            do { _ = try await connection.data(from: url); preconditionFailure("request did not time out") }
++            catch let error as URLError { precondition(error.code == .timedOut) }
++        case "eof":
++            do { _ = try await connection.data(from: url); preconditionFailure("closed connection completed") }
++            catch let error as URLError { precondition(error.code == .networkConnectionLost) }
++        default: preconditionFailure("unknown test")
++        }
++        await connection.close()
++    }
++}
 diff --git a/tests/test_idle_integration.c b/tests/test_idle_integration.c
 index 2b1be58..cf28a94 100644
 --- a/tests/test_idle_integration.c
@@ -13372,13 +14501,20 @@ index 060441b..09d8836 100644
  '''
  b=r/'build';b.mkdir(exist_ok=True);p=b/'test_jit_allocation.c';p.write_text(s)
 diff --git a/tests/test_link.swift b/tests/test_link.swift
-index 1ac8d90..262d964 100644
+index 1ac8d90..fbcde73 100644
 --- a/tests/test_link.swift
 +++ b/tests/test_link.swift
-@@ -22,8 +22,40 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -22,8 +22,47 @@ func mustReject(_ operation: () throws -> Void) {
          dispatchMain()
      }
      static func checks() throws {
++        var pacing=LinkCaptureBudget()
++        pacing.accepted(now:10,hz:60)
++        require(abs(pacing.delay(now:10)-1/60.0)<0.000001,"60Hz snapshot budget")
++        pacing.accepted(now:20,hz:120)
++        require(abs(pacing.delay(now:20)-1/120.0)<0.000001,"120Hz snapshot budget")
++        require(pacing.delay(now:21)==0,"No backlogged deadline after an idle period")
++        pacing.reset();require(pacing.delay(now:0)==0,"Visibility transition resets cadence")
 +        let firstIdentity=LinkFrameSequence.next(),secondIdentity=LinkFrameSequence.next()
 +        require(secondIdentity>firstIdentity,"Encoder replacement must not reuse outstanding ACK identities")
 +        var retry=LinkReconnectPolicy()
@@ -13416,7 +14552,7 @@ index 1ac8d90..262d964 100644
          try LinkControl(type: "release").validate()
          try LinkControl(type: "videoAck", sequence: 1).validate()
          mustReject { try LinkControl(type: "videoAck", sequence: 0).validate() }
-@@ -191,6 +223,12 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -191,6 +230,12 @@ func mustReject(_ operation: () throws -> Void) {
          var pixels = [UInt8](repeating: 0, count: mode.width * mode.height * 4)
          for i in stride(from: 0, to: pixels.count, by: 4) { pixels[i+2] = 255; pixels[i+3] = 255 }
          texture.replace(region: MTLRegionMake2D(0, 0, mode.width, mode.height), mipmapLevel: 0, withBytes: &pixels, bytesPerRow: mode.width * 4)
@@ -13719,6 +14855,138 @@ index 3f46cf5..d231f2a 100644
      /* 4 KB granule, 39-bit TTBR0 (levels 1-3): pages, 2 MB and 1 GB blocks. */
      pt_next = 2 * 65536;
      uint64_t r4 = alloc_table();
+diff --git a/tests/test_native_touch.c b/tests/test_native_touch.c
+index 1766e60..2ba0d15 100644
+--- a/tests/test_native_touch.c
++++ b/tests/test_native_touch.c
+@@ -40,20 +40,34 @@ static void *delayed_contact(void *generation) {
+     submit(*(uint32_t *)generation, 1, 0.6);
+     return NULL;
+ }
+-static void http(const char *path, const char *body, char *result, size_t size, const char *socket_path) {
++static void http_bytes(const char *path, const void *body, size_t length, char *result, size_t size, const char *socket_path) {
+     int fd = socket(AF_UNIX, SOCK_STREAM, 0); assert(fd >= 0);
+     struct sockaddr_un address = {.sun_family = AF_UNIX};
+     snprintf(address.sun_path, sizeof address.sun_path, "%s", socket_path);
+     assert(connect(fd, (struct sockaddr *)&address, sizeof address) == 0);
+     char request[1024];
+     int n = snprintf(request, sizeof request,
+-        "%s %s HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n%s",
+-        body ? "PUT" : "GET", path, body ? strlen(body) : 0, body ? body : "");
++        "%s %s HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n",
++        body ? "PUT" : "GET", path, length);
+     assert(write(fd, request, (size_t)n) == n);
++    if (length) assert(write(fd, body, length) == (ssize_t)length);
+     size_t at = 0; ssize_t read_count;
+     while ((read_count = read(fd, result+at, size-at-1)) > 0) { at += (size_t)read_count; assert(at < size-1); }
+     result[at] = 0; close(fd);
+ }
++static void http(const char *path, const char *body, char *result, size_t size, const char *socket_path) {
++    http_bytes(path, body, body ? strlen(body) : 0, result, size, socket_path);
++}
++typedef struct { int connected, reports, heartbeats; uint8_t last[32]; } USB;
++static int usb_connect(void *context, int connected) { ((USB *)context)->connected = connected; return 1; }
++static int usb_connected(void *context) { return ((USB *)context)->connected; }
++static int usb_report(void *context, const uint8_t report[32]) {
++    USB *usb = context;
++    if (!usb->connected) return 0;
++    memcpy(usb->last, report, 32); usb->reports++; return 1;
++}
++static void usb_heartbeat(void *context) { ((USB *)context)->heartbeats++; }
++static int usb_mapped(void *context) { return ((USB *)context)->connected; }
+ int main(void) {
+     assert(hv_native_touch_status() == HV_TOUCH_OFF);
+     uint32_t e = hv_native_touch_enable(1);
+@@ -121,8 +135,18 @@ int main(void) {
+     // Exercise the real guest HTTP endpoints and their status validation.
+     char directory[] = "/tmp/henge-touch-test-XXXXXX"; assert(mkdtemp(directory));
+     char socket_path[108]; snprintf(socket_path, sizeof socket_path, "%s/s", directory);
+-    assert(hv_share_start(directory, socket_path, NULL) == 0);
++    char agent_path[256], touch_path[256];
++    snprintf(agent_path, sizeof agent_path, "%s/henge-agent.gz", directory);
++    snprintf(touch_path, sizeof touch_path, "%s/henge-touch-agent.tar.gz", directory);
++    FILE *archive = fopen(touch_path, "wb"); assert(archive);
++    fputs("touch archive fixture", archive); assert(fclose(archive) == 0);
++    assert(hv_share_start(directory, socket_path, agent_path) == 0);
+     char response[4096], body[64];
++    http("/.henge/touch-agent", NULL, response, sizeof response, socket_path);
++    assert(strstr(response, "200 OK") && strstr(response, "touch archive fixture"));
++    http("/.henge/install", NULL, response, sizeof response, socket_path);
++    assert(strstr(response, "tar -xzf") && strstr(response, "codesign --verify --strict"));
++    assert(strstr(response, "Henge Touch Agent.app"));
+     e = hv_native_touch_enable(1);
+     http("/.henge/native-touch", NULL, response, sizeof response, socket_path);
+     assert(strstr(response, "200 OK") && strstr(response, "\"version\":1"));
+@@ -137,6 +161,43 @@ int main(void) {
+     hv_native_touch_enable(0);
+     http("/.henge/native-touch", NULL, response, sizeof response, socket_path);
+     assert(strstr(response, "\"enabled\":false") && strstr(response, "\"contacts\":[]"));
+-    unlink(socket_path); rmdir(directory);
++    USB usb = {0};
++    HvNativeTouchUSB transport = {&usb, usb_connect, usb_connected, usb_report, usb_heartbeat, usb_mapped};
++    hv_native_touch_set_usb(&transport);
++    e = hv_native_touch_enable(1);
++    http("/.henge/native-touch", NULL, response, sizeof response, socket_path);
++    assert(strstr(response, "\"usb\":true"));
++    http("/.henge/native-touch-usb", NULL, response, sizeof response, socket_path);
++    assert(strstr(response, "\"available\":true") && strstr(response, "\"connected\":false"));
++    assert(!hv_native_touch_usb_connect(e - 1, 1));
++    assert(!hv_native_touch_usb_mapped(e - 1));
++    assert(!hv_native_touch_usb_connect(e, 2));
++    snprintf(body, sizeof body, "%u 1", e);
++    http("/.henge/native-touch-usb", body, response, sizeof response, socket_path);
++    assert(strstr(response, "204 No Content") && usb.connected);
++    snprintf(body, sizeof body, "%u 2", e);
++    http("/.henge/native-touch-usb", body, response, sizeof response, socket_path);
++    assert(strstr(response, "204 No Content"));
++    uint8_t report[32] = {1, 3, 1}; report[31] = 1;
++    assert(!hv_native_touch_usb_report(e, report));
++    uint8_t neutral[32] = {1};
++    assert(hv_native_touch_usb_report(e, neutral));
++    hv_native_touch_report(e, HV_TOUCH_READY);
++    assert(usb.heartbeats == 1);
++    uint8_t packet[36] = {e & 255, (e >> 8) & 255, (e >> 16) & 255, (e >> 24) & 255};
++    memcpy(packet + 4, report, 32);
++    http_bytes("/.henge/native-touch-usb/report", packet, sizeof packet, response, sizeof response, socket_path);
++    assert(strstr(response, "204 No Content") && usb.last[31] == 1);
++    int reports = usb.reports;
++    packet[0] ^= 0x80;
++    http_bytes("/.henge/native-touch-usb/report", packet, sizeof packet, response, sizeof response, socket_path);
++    assert(strstr(response, "409 Conflict") && usb.reports == reports);
++    http_bytes("/.henge/native-touch-usb/report", packet, 35, response, sizeof response, socket_path);
++    assert(strstr(response, "400 Bad Request"));
++    usleep(800000);
++    assert(hv_native_touch_status() == HV_TOUCH_TIMEOUT && !usb.connected);
++    assert(!hv_native_touch_usb_report(e, report));
++    hv_native_touch_set_usb(NULL);
++    unlink(touch_path); unlink(socket_path); rmdir(directory);
+     puts("native touch: idle polling, immediate wake, transitions, validation, generations, fallback, timeout and HTTP passed");
+ }
+diff --git a/tests/test_native_touch_packaging.py b/tests/test_native_touch_packaging.py
+new file mode 100644
+index 0000000..2c357bc
+--- /dev/null
++++ b/tests/test_native_touch_packaging.py
+@@ -0,0 +1,19 @@
++"""Validate the archive path/ownership boundary used by the real packager."""
++import importlib.util
++from pathlib import Path
++import tarfile
++import unittest
++spec=importlib.util.spec_from_file_location('packaging',Path(__file__).resolve().parents[1]/'tools/package_native_touch.py')
++packaging=importlib.util.module_from_spec(spec);spec.loader.exec_module(packaging)
++class PackagingChecks(unittest.TestCase):
++    def test_regular_signed_bundle_paths(self):
++        for root in packaging.ROOTS:
++            for suffix in ['/Contents/Info.plist','/Contents/MacOS/henge-touch-agent','/Contents/_CodeSignature/CodeResources']:
++                packaging.validate_members([tarfile.TarInfo(root+suffix)])
++    def test_reject_escape_other_bundle_and_links(self):
++        for name in ['/tmp/escape','../escape','Henge Touch Agent.app/../../escape','Other.app/Contents/MacOS/other']:
++            with self.subTest(name=name),self.assertRaises(ValueError):packaging.validate_members([tarfile.TarInfo(name)])
++        for kind in [tarfile.SYMTYPE,tarfile.LNKTYPE,tarfile.CHRTYPE,tarfile.FIFOTYPE]:
++            member=tarfile.TarInfo('Henge Touch Agent.app/Contents/link');member.type=kind
++            with self.assertRaises(ValueError):packaging.validate_members([member])
++if __name__=='__main__':unittest.main()
 diff --git a/tests/test_native_touch_session.swift b/tests/test_native_touch_session.swift
 index 5249aa5..acbc9c9 100644
 --- a/tests/test_native_touch_session.swift
@@ -14729,6 +15997,194 @@ index 01aead4..b1daca1 100644
 +''')
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
+diff --git a/tests/test_usb_touchscreen.c b/tests/test_usb_touchscreen.c
+new file mode 100644
+index 0000000..2cee166
+--- /dev/null
++++ b/tests/test_usb_touchscreen.c
+@@ -0,0 +1,182 @@
++/* Exercise the guest-facing USB path, without a ROM or a guest installation. */
++#include "machine.h"
++#include "xhci.h"
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define BASE 0x100000ull
++#define RING (BASE + 0x3000)
++#define DATA (BASE + 0x5000)
++static HvMachine machine;
++static HvPcie bus;
++static uint8_t memory[65536];
++
++static void write_trb(uint64_t at, uint64_t pointer, uint32_t length, uint32_t flags) {
++    uint32_t trb[] = {(uint32_t)pointer, (uint32_t)(pointer >> 32), length, flags | 1};
++    assert(hv_phys_write(&machine, at, trb, sizeof trb) == 0);
++}
++static void prepare_slot(HvXhci *x, int dev) {
++    x->slots[3].dev = dev;
++    x->dcbaap = BASE + 0x1000;
++    uint64_t context = BASE + 0x2000;
++    assert(hv_phys_write(&machine, x->dcbaap + 3 * 8, &context, 8) == 0);
++    memset(memory + 0x3000, 0, 0x1000);
++    memset(memory + 0x5000, 0xcc, 512);
++}
++static void control(HvXhci *x, uint8_t type, uint8_t request, uint16_t value, uint16_t length) {
++    prepare_slot(x, 3);
++    x->slots[3].ep[1] = (HvXhciRing){RING, 1};
++    uint8_t setup[] = {type, request, value & 255, value >> 8, 0, 0, length & 255, length >> 8};
++    uint64_t packed;
++    memcpy(&packed, setup, 8);
++    write_trb(RING, packed, 8, 2u << 10 | 1u << 6);
++    write_trb(RING + 16, DATA, length, 3u << 10 | 1u << 16);
++    write_trb(RING + 32, 0, 0, 4u << 10);
++    x->pci.bar_write(&x->pci, 0, 0x2000 + 3 * 4, 1, 4);
++}
++static void receive(HvXhci *x, const uint8_t expected[HV_TS_REPORT_LEN]) {
++    prepare_slot(x, 3);
++    memset(x->slots[3].ep_running, 0, sizeof x->slots[3].ep_running);
++    x->slots[3].ep[3] = (HvXhciRing){RING, 1};
++    write_trb(RING, DATA, HV_TS_REPORT_LEN, 1u << 10);
++    x->pci.bar_write(&x->pci, 0, 0x2000 + 3 * 4, 3, 4);
++    assert(memcmp(memory + 0x5000, expected, HV_TS_REPORT_LEN) == 0);
++}
++static void finish_release(HvXhci *x, const uint8_t lifted[HV_TS_REPORT_LEN], const uint8_t up[HV_TS_REPORT_LEN]) {
++    assert(hv_xhci_touchscreen_connected(x) && x->ts_release_phase == 1);
++    assert(!hv_xhci_touchscreen_report(x, lifted));
++    receive(x, lifted);
++    x->ts_release_at_ns = 1; hv_xhci_poll(x);
++    receive(x, up);
++    x->ts_release_at_ns = 1; hv_xhci_poll(x);
++    assert(!hv_xhci_touchscreen_connected(x));
++    assert(x->ts_rhead == x->ts_rtail && !x->ts_state[31]);
++}
++int main(void) {
++    assert(hv_machine_init(&machine, 1 << 20) == 0);
++    assert(hv_machine_add_ram(&machine, BASE, sizeof memory, memory, 0) == 0);
++    bus.m = &machine;
++    setenv("HV_USB_TOUCHSCREEN", "0", 1);
++    HvXhci *off = hv_xhci_create(&machine, &bus);
++    assert(off && !off->ts_enabled);
++    assert((off->pci.bar_read(&off->pci, 0, 4, 4) >> 24) == 3);
++    assert(((off->pci.bar_read(&off->pci, 0, 0x808, 4) >> 8) & 255) == 2);
++    uint8_t up[HV_TS_REPORT_LEN] = {1};
++    assert(!hv_xhci_touchscreen_report(off, up));
++    assert(!hv_xhci_touchscreen_connect(off, 1));
++    setenv("HV_USB_TOUCHSCREEN", "1", 1);
++    HvXhci *x = hv_xhci_create(&machine, &bus);
++    assert(x && x->ts_enabled);
++    assert((x->pci.bar_read(&x->pci, 0, 4, 4) >> 24) == 4);
++    assert(((x->pci.bar_read(&x->pci, 0, 0x808, 4) >> 8) & 255) == 4);
++    assert(x->pci.bar_read(&x->pci, 0, 0x470, 4) & 1);
++
++    control(x, 0x80, 6, 0x0100, 18);
++    assert(memory[0x5000] == 18 && memory[0x5001] == 1);
++    assert(memory[0x5008] == 9 && memory[0x5009] == 0x12);
++    control(x, 0x80, 6, 0x0200, 34);
++    uint16_t descriptor_size = memory[0x5000 + 25] | memory[0x5000 + 26] << 8;
++    assert(descriptor_size > 256 && descriptor_size < 512);
++    assert(memory[0x5000 + 15] == 0 && memory[0x5000 + 16] == 0);
++    control(x, 0x81, 6, 0x2200, descriptor_size);
++    assert(memory[0x5000] == 5 && memory[0x5001] == 13 && memory[0x5003] == 4);
++    assert(memory[0x5000 + descriptor_size - 1] == 0xc0);
++    control(x, 0xa1, 1, 0x0302, 2);
++    assert(memory[0x5000] == 2 && memory[0x5001] == HV_TS_FINGERS);
++    control(x, 0xa1, 1, 0x0101, HV_TS_REPORT_LEN);
++    assert(memcmp(memory + 0x5000, up, sizeof up) == 0);
++
++    uint8_t down[HV_TS_REPORT_LEN] = {1, 3, 42, 0xff, 0x7f, 0, 0};
++    down[31] = 1;
++    uint8_t lifted[HV_TS_REPORT_LEN]; memcpy(lifted, down, sizeof down); lifted[1] = 2;
++    assert(hv_xhci_touchscreen_report(x, down));
++    assert(hv_xhci_touchscreen_report(x, lifted));
++    assert(hv_xhci_touchscreen_report(x, up));
++    receive(x, down); receive(x, lifted); receive(x, up);
++    assert(x->ts_delivered == 3);
++    uint8_t five[HV_TS_REPORT_LEN] = {1}; five[31] = HV_TS_FINGERS;
++    for (int i = 0; i < HV_TS_FINGERS; i++) {
++        five[1 + 6*i] = 3; five[2 + 6*i] = (uint8_t)(i+1);
++        five[3 + 6*i] = (uint8_t)(10*i); five[5 + 6*i] = (uint8_t)(20*i);
++    }
++    assert(hv_xhci_touchscreen_report(x, five)); receive(x, five);
++    control(x, 0xa1, 1, 0x0101, HV_TS_REPORT_LEN);
++    assert(memcmp(memory + 0x5000, five, sizeof five) == 0);
++    assert(hv_xhci_touchscreen_report(x, up)); receive(x, up);
++    uint8_t invalid[HV_TS_REPORT_LEN]; memcpy(invalid, down, sizeof down); invalid[4] = 0x80;
++    assert(!hv_xhci_touchscreen_report(x, invalid));
++    memcpy(invalid, down, sizeof down); invalid[31] = 6;
++    assert(!hv_xhci_touchscreen_report(x, invalid));
++    memcpy(invalid, down, sizeof down); invalid[31] = 2; memcpy(invalid + 7, invalid + 1, 6);
++    assert(!hv_xhci_touchscreen_report(x, invalid));
++    for (int i = 0; i < HV_TS_REPORTS; i++) assert(hv_xhci_touchscreen_report(x, down));
++    assert(!hv_xhci_touchscreen_report(x, down));
++    hv_xhci_poll(x);
++    assert(!hv_xhci_touchscreen_connected(x));
++    assert(x->ts_rhead == x->ts_rtail);
++    assert(hv_xhci_touchscreen_connect(x, 1)); hv_xhci_poll(x);
++    assert(hv_xhci_touchscreen_report(x, down)); receive(x, down);
++    for (int i = 0; i < HV_TS_REPORTS; i++) assert(hv_xhci_touchscreen_report(x, down));
++    assert(!hv_xhci_touchscreen_report(x, down)); hv_xhci_poll(x);
++    finish_release(x, lifted, up);
++    x->pci.bar_write(&x->pci, 0, 0x40, 2, 4);
++    assert(x->ts_rhead == x->ts_rtail && x->ts_state[31] == 0);
++    assert(!hv_xhci_touchscreen_connect(x, 2));
++    assert(hv_xhci_touchscreen_connect(x, 1)); hv_xhci_poll(x);
++    assert(hv_xhci_touchscreen_report(x, down));
++    assert(hv_xhci_touchscreen_connect(x, 0));
++    hv_xhci_poll(x);
++    assert(!(x->pci.bar_read(&x->pci, 0, 0x470, 4) & 1));
++    assert(x->ts_state[31] == 0 && x->ts_rhead == x->ts_rtail);
++    assert(!hv_xhci_touchscreen_report(x, down));
++    x->pci.bar_write(&x->pci, 0, 0x40, 2, 4);
++    assert(!(x->pci.bar_read(&x->pci, 0, 0x470, 4) & 1));
++    assert(hv_xhci_touchscreen_connect(x, 1));
++    hv_xhci_poll(x);
++    assert(x->pci.bar_read(&x->pci, 0, 0x470, 4) & 1);
++    assert(hv_xhci_touchscreen_report(x, up)); receive(x, up);
++    /* An identical request must not manufacture a second port change. */
++    x->pci.bar_write(&x->pci, 0, 0x470, (1u << 9) | (1u << 17), 4);
++    assert(hv_xhci_touchscreen_connect(x, 1)); hv_xhci_poll(x);
++    assert(!(x->pci.bar_read(&x->pci, 0, 0x470, 4) & (1u << 17)));
++    setenv("HV_USB_TOUCHSCREEN_DELAYED", "1", 1);
++    HvXhci *delayed = hv_xhci_create(&machine, &bus);
++    unsetenv("HV_USB_TOUCHSCREEN_DELAYED");
++    assert(delayed && delayed->ts_enabled && !delayed->ts_connected);
++    assert((delayed->pci.bar_read(&delayed->pci, 0, 4, 4) >> 24) == 4);
++    assert(!hv_xhci_touchscreen_report(delayed, up));
++    assert(hv_xhci_touchscreen_connect(delayed, 1)); hv_xhci_poll(delayed);
++    assert(delayed->pci.bar_read(&delayed->pci, 0, 0x470, 4) & 1);
++    control(delayed, 0xa1, 1, 0x0303, 3);
++    assert(delayed->slots[3].ep[1].dequeue == RING && memory[0x5000] == 0xcc);
++    assert(delayed->ts_ep0_waiting && !delayed->ts_mapped);
++    assert(hv_xhci_touchscreen_mapped(delayed)); hv_xhci_poll(delayed);
++    assert(!delayed->ts_ep0_waiting && memory[0x5000] == 3 && memory[0x5001] == 60 && memory[0x5002] == 0);
++    /* A lost helper must cancel a held contact even if the UI stops polling. */
++    assert(hv_xhci_touchscreen_report(delayed, down));
++    receive(delayed, down);
++    delayed->ts_deadline_ns = 1;
++    hv_xhci_poll(delayed);
++    finish_release(delayed, lifted, up);
++    assert(hv_xhci_touchscreen_connect(delayed, 1)); hv_xhci_poll(delayed);
++    assert(hv_xhci_touchscreen_report(delayed, down)); receive(delayed, down);
++    assert(hv_xhci_touchscreen_connect(delayed, 0)); hv_xhci_poll(delayed);
++    /* A guest that stops servicing its IN ring cannot hold teardown forever. */
++    delayed->ts_release_limit_ns = 1; hv_xhci_poll(delayed);
++    assert(!hv_xhci_touchscreen_connected(delayed));
++    unsetenv("HV_USB_TOUCHSCREEN");
++    HvXhci *normal = hv_xhci_create(&machine, &bus);
++    assert(normal && normal->ts_enabled && !normal->ts_connected);
++    assert((normal->pci.bar_read(&normal->pci, 0, 4, 4) >> 24) == 4);
++    int16_t axes[4]={1200,-5000,0,0};
++    hv_xhci_gamepad(normal,1,1,8,axes,0,0);hv_xhci_poll(normal);
++    assert(normal->gp_online && (normal->portsc[2]&1) && !(normal->portsc[3]&1));
++    assert(hv_xhci_touchscreen_connect(normal,1));hv_xhci_poll(normal);
++    assert((normal->portsc[2]&1) && (normal->portsc[3]&1));
++    assert(hv_xhci_touchscreen_report(normal,up));
++    assert(normal->gp_state[0]==1 && normal->ts_state[0]==1 && normal->gp_tail-normal->gp_head==1);
++    puts("USB touchscreen: descriptors, transfers, lifts, validation, overflow, reset, hot-plug and watchdog passed");
++    return 0;
++}
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
 index a13a70d..3b6939d 100644
 --- a/tests/test_vm_lifecycle.c
@@ -15328,22 +16784,68 @@ index 509bce1..08f0a4d 100755
  # Typecheck the actual app, not a rewritten Settings/Session fixture. There is
  # no linking, .app output, packaging, signing, new entitlement or simulator job.
  python3 - "$SDK" <<'PY'
+diff --git a/tools/check_native_touch.sh b/tools/check_native_touch.sh
+index eac7481..b176603 100755
+--- a/tools/check_native_touch.sh
++++ b/tools/check_native_touch.sh
+@@ -1,10 +1,14 @@
+ #!/bin/bash
+-# Select Xcode 27.3+ with DEVELOPER_DIR. This does not need the external iOS build dependencies.
++# Select the latest installed Xcode with DEVELOPER_DIR. This does not need the external iOS build dependencies.
+ set -euo pipefail
+ cd "$(dirname "$0")/.."
+-make test-native-touch build/henge-agent.gz build/henge-touch-agent.gz build/share.o build/native_touch.o
++python3 tests/test_native_touch_packaging.py
++make test-native-touch test-guest-connection test-usb-touchscreen build/henge-agent.gz build/henge-touch-agent.tar.gz build/share.o build/native_touch.o
++python3 tools/verify_native_touch_package.py build/henge-touch-agent.tar.gz
+ xcrun --sdk macosx swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
+     -parse-as-library -typecheck tools/henge-touch-agent.swift tools/native-touch/*.swift
++xcrun --sdk macosx swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
++    -parse-as-library tools/native-touch-probe.swift tools/native-touch/*.swift -o build/native-touch-probe
+ sdk="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+ sources=()
+ while IFS= read -r -d '' source; do sources+=("$source"); done < <(find ios/Henge -name '*.swift' -print0)
 diff --git a/tools/henge-agent.m b/tools/henge-agent.m
-index 62cdaee..61301ea 100644
+index 62cdaee..2cfeed0 100644
 --- a/tools/henge-agent.m
 +++ b/tools/henge-agent.m
-@@ -24,7 +24,9 @@ static int send_all(int fd, const void *p, size_t n) {
+@@ -7,6 +7,9 @@
+ #include <sys/stat.h>
+ #include <sys/time.h>
+ #include <unistd.h>
++#include <signal.h>
++#include <stdatomic.h>
++#include <errno.h>
+ 
+ #define HOST "10.0.2.4"
+ 
+@@ -22,18 +25,24 @@ static int send_all(int fd, const void *p, size_t n) {
+ 
+ // One request on its own connection. A plain socket: the server is ours, and URLSession refuses plain HTTP.
  static NSData *request(NSString *method, NSString *path, NSData *body, int *status, unsigned long *seq) {
++    static _Atomic int lastConnectionError;
      int fd = socket(AF_INET, SOCK_STREAM, 0);
      if (fd < 0) return nil;
 -    struct timeval timeout = {.tv_sec = 40};
-+    // A disabled runner channel sleeps on a host condition, rather than adding
-+    // another frequent poll to the existing clipboard companion.
-+    struct timeval timeout = {.tv_sec = [method isEqual:@"GET"] && [path hasPrefix:@"/.henge/runner?"] ? 150 : 40};
++    struct timeval timeout = {.tv_sec = [path hasPrefix:@"/.henge/native-touch"] ? 1 : ([method isEqual:@"GET"] && [path hasPrefix:@"/.henge/runner?"] ? 150 : 40)};
      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
++    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
      int on = 1;
      setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
-@@ -59,6 +61,8 @@ static NSData *request(NSString *method, NSString *path, NSData *body, int *stat
+     struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(80)};
+     inet_pton(AF_INET, HOST, &addr.sin_addr);
+     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
++        int error = errno;
++        if (atomic_exchange(&lastConnectionError, error) != error)
++            NSLog(@"Henge sharing connection failed: %d (%s)", error, strerror(error));
+         close(fd);
+         return nil;
+     }
++    atomic_store(&lastConnectionError, 0);
+     NSString *head = [NSString stringWithFormat:@"%@ %@ HTTP/1.1\r\nHost: " HOST "\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n", method, path,
+                                                 (unsigned long)body.length];
+     const char *text = head.UTF8String;
+@@ -59,6 +68,8 @@ static NSData *request(NSString *method, NSString *path, NSData *body, int *stat
      return [all subdataWithRange:NSMakeRange(start, all.length - start)];
  }
  
@@ -15352,7 +16854,92 @@ index 62cdaee..61301ea 100644
  static NSInteger lastChange;
  
  // The device's clipboard, as it changes. The server holds each request until there is something new.
-@@ -132,6 +136,8 @@ int main(void) {
+@@ -118,24 +129,91 @@ static void keepMounted(void) {
+     [task launchAndReturnError:NULL];
+ }
+ 
++// The companion shares this helper's existing private connection. Keep its
++// protocol bounded and forward only touch endpoints; it never needs its own
++// network access, listening socket, or restricted HID entitlement.
++static void launchTouchCompanion(NSString *companion) {
++    NSTask *touch = [NSTask new];
++    NSPipe *commands = [NSPipe pipe], *replies = [NSPipe pipe];
++    touch.executableURL = [NSURL fileURLWithPath:companion];
++    touch.arguments = @[[NSString stringWithFormat:@"%d", getpid()], @"--stdio"];
++    touch.standardInput = replies;
++    touch.standardOutput = commands;
++    if (![touch launchAndReturnError:NULL]) return;
++    [commands.fileHandleForWriting closeAndReturnError:NULL];
++    [replies.fileHandleForReading closeAndReturnError:NULL];
++    NSLock *outputLock = [NSLock new];
++    NSFileHandle *input = commands.fileHandleForReading, *output = replies.fileHandleForWriting;
++    [NSThread detachNewThreadWithBlock:^{
++        NSMutableData *buffer = [NSMutableData data];
++        NSData *newline = [NSData dataWithBytes:"\n" length:1];
++        for (;;) { @autoreleasepool {
++            NSData *chunk = input.availableData;
++            if (!chunk.length) break;
++            [buffer appendData:chunk];
++            if (buffer.length > 16384) { [touch terminate]; break; }
++            for (;;) {
++                NSRange end = [buffer rangeOfData:newline options:0 range:NSMakeRange(0, buffer.length)];
++                if (end.location == NSNotFound) break;
++                NSData *line = [buffer subdataWithRange:NSMakeRange(0, end.location)];
++                [buffer replaceBytesInRange:NSMakeRange(0, NSMaxRange(end)) withBytes:NULL length:0];
++                id decoded = [NSJSONSerialization JSONObjectWithData:line options:0 error:NULL];
++                if (![decoded isKindOfClass:NSDictionary.class]) continue;
++                NSDictionary *message = decoded;
++                NSNumber *identifier = message[@"id"];
++                NSString *method = message[@"method"], *path = message[@"path"];
++                NSString *encodedBody = message[@"body"];
++                if (![identifier isKindOfClass:NSNumber.class]) continue;
++                BOOL valid = [message[@"version"] isEqual:@1] &&
++                    ([method isEqual:@"GET"] || [method isEqual:@"PUT"]) &&
++                    ([path isEqual:@"/.henge/native-touch"] || [path isEqual:@"/.henge/native-touch-usb"] ||
++                     [path isEqual:@"/.henge/native-touch-usb/report"]) &&
++                    (!encodedBody || ([encodedBody isKindOfClass:NSString.class] && encodedBody.length <= 128));
++                NSData *body = valid && encodedBody ? [[NSData alloc] initWithBase64EncodedString:encodedBody options:0] : nil;
++                valid = valid && (!encodedBody || body) && body.length <= 64;
++                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool {
++                    int status = valid ? 0 : 400;
++                    NSData *data = valid ? request(method, path, body, &status, NULL) : nil;
++                    NSDictionary *response = @{@"version":@1, @"id":identifier, @"status":@(status),
++                        @"body":[(data ?: [NSData data]) base64EncodedStringWithOptions:0]};
++                    NSMutableData *encoded = [[NSJSONSerialization dataWithJSONObject:response options:0 error:NULL] mutableCopy];
++                    [encoded appendData:newline];
++                    [outputLock lock];
++                    @try { [output writeData:encoded]; } @catch (NSException *exception) { (void)exception; }
++                    [outputLock unlock];
++                }});
++            }
++        }}
++        [outputLock lock];
++        [output closeAndReturnError:NULL];
++        [outputLock unlock];
++    }];
++}
++
+ int main(void) {
+     @autoreleasepool {
+-        // The optional Swift companion owns CoreHID, so old guests keep the original helper.
+-        NSString *companion = [NSBundle.mainBundle.executablePath.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"henge-touch-agent"];
++        signal(SIGPIPE, SIG_IGN);
++        NSApplication *application = NSApplication.sharedApplication;
++        [application setActivationPolicy:NSApplicationActivationPolicyAccessory];
++        [application finishLaunching];
++        // The optional companion binds USB touch to the display and encodes
++        // contact lifecycles. Old guests keep the original sharing helper.
++        NSBundle *bundle = NSBundle.mainBundle;
++        NSString *directory = [bundle.bundleURL.pathExtension isEqual:@"app"] ? bundle.bundleURL.URLByDeletingLastPathComponent.path : bundle.executablePath.stringByDeletingLastPathComponent;
++        NSString *companion = [directory stringByAppendingPathComponent:@"Henge Touch Agent.app/Contents/MacOS/henge-touch-agent"];
+         if (@available(macOS 15.0, *)) {
+             if ([NSFileManager.defaultManager isExecutableFileAtPath:companion]) {
+-                NSTask *touch = [NSTask new];
+-                touch.executableURL = [NSURL fileURLWithPath:companion];
+-                touch.arguments = @[[NSString stringWithFormat:@"%d", getpid()]];
+-                [touch launchAndReturnError:NULL];
++                launchTouchCompanion(companion);
+             }
          }
          lastChange = NSPasteboard.generalPasteboard.changeCount;
          dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ followDevice(); });
@@ -15361,6 +16948,11 @@ index 62cdaee..61301ea 100644
          keepMounted();
          [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) { (void)timer; checkClipboard(); }];
          [NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(NSTimer *timer) { (void)timer; keepMounted(); }];
+-        [NSRunLoop.mainRunLoop run];
++        [application run];
+     }
+     return 0;
+ }
 diff --git a/tools/henge-runner-agent.h b/tools/henge-runner-agent.h
 new file mode 100644
 index 0000000..1df55f8
@@ -15558,6 +17150,135 @@ index 0000000..1df55f8
 +    } }
 +}
 +@end
+diff --git a/tools/henge-touch-agent.swift b/tools/henge-touch-agent.swift
+index a06b082..ebbe001 100644
+--- a/tools/henge-touch-agent.swift
++++ b/tools/henge-touch-agent.swift
+@@ -2,10 +2,15 @@ import AppKit
+ import Foundation
+ import Darwin
+ 
++private func diagnostic(_ message: String) {
++    NSLog("Henge touch: %@", message)
++}
++
+ private struct Command: Decodable {
+     let version: Int
+     let epoch: UInt32
+     let enabled: Bool
++    let usb: Bool?
+     let contacts: [NativeTouchContact]
+ 
+     var isValid: Bool {
+@@ -17,17 +22,27 @@ private struct Command: Decodable {
+ /// Runs only inside the guest. No listening socket and no changes to OS security policy.
+ @main
+ private enum TouchAgent {
+-    @MainActor static func main() async {
++    @MainActor static func main() {
+         if CommandLine.arguments.contains("--check-launch") {
+-            print("henge-touch-agent: launch probe reached main; HID authorization not tested")
+-            return
++            print("henge-touch-agent: launch probe reached main; USB connection not tested");return
++        }
++        // USB publication callbacks need the main CFRunLoop as well as the
++        // main actor used by contact handling.
++        let application = NSApplication.shared
++        application.setActivationPolicy(.accessory)
++        Task { @MainActor in
++            await run()
++            application.terminate(nil)
+         }
++        application.run()
++    }
++
++    @MainActor private static func run() async {
+         let parent = CommandLine.arguments.dropFirst().first.flatMap(Int32.init) ?? getppid()
+-        let configuration = URLSessionConfiguration.ephemeral
+-        configuration.timeoutIntervalForRequest = 0.5
+-        configuration.timeoutIntervalForResource = 1
+-        configuration.connectionProxyDictionary = [:]
+-        let session = URLSession(configuration: configuration)
++        diagnostic("started (parent \(parent))")
++        guard CommandLine.arguments.contains("--stdio") else { diagnostic("update the Henge sharing helper"); return }
++        let connection = GuestConnection()
++        await connection.start()
+         let url = URL(string: "http://10.0.2.4/.henge/native-touch")!
+         let state = AgentState()
+         // A hung network operation must not leave fingers held in the guest.
+@@ -44,10 +59,13 @@ private enum TouchAgent {
+             do {
+                 var request = URLRequest(url: url)
+                 request.cachePolicy = .reloadIgnoringLocalCacheData
+-                let (data, response) = try await session.data(for: request)
++                let (data, response) = try await connection.data(for: request)
+                 guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+                 let command = try JSONDecoder().decode(Command.self, from: data)
+                 guard command.isValid else { throw URLError(.cannotParseResponse) }
++                if command.epoch != state.generation {
++                    diagnostic("command epoch \(command.epoch), enabled \(command.enabled), USB \(command.usb == true)")
++                }
+                 state.lastCommand = ProcessInfo.processInfo.systemUptime
+                 if command.epoch != state.generation || !command.enabled {
+                     await state.device?.stop(); state.device = nil
+@@ -56,19 +74,23 @@ private enum TouchAgent {
+                 guard command.enabled else { continue }
+                 if state.device == nil && state.failure == 0 {
+                     if #available(macOS 27.2, *) {
+-                        if !AXIsProcessTrusted() { state.failure = 4 }
++                        if command.usb != true { state.failure = 5 }
+                         else {
+-                            let next = SystemNativeTouchDevice()
+-                            next.onFailure = { _ in state.failure = 5 }
++                            diagnostic("configuring USB touch")
++                            let transport=USBTouchTransport(connection:connection,epoch:command.epoch)
++                            let next = SystemNativeTouchDevice(usb: transport)
++                            next.onFailure = { reason in diagnostic("report failed: \(reason)"); state.failure = 5 }
+                             do {
+                                 state.display = CGMainDisplayID(); state.bounds = CGDisplayBounds(state.display)
+                                 try await next.start(displayID: state.display)
+                                 state.device = next
+-                            } catch { await next.stop(); state.failure = 5 }
++                                diagnostic("touchscreen ready")
++                            } catch { diagnostic("setup failed: \(error)"); await next.stop(); state.failure = 5 }
+                         }
+                     } else { state.failure = 3 }
+                 }
+-                if state.device != nil && (CGMainDisplayID() != state.display || CGDisplayBounds(state.display) != state.bounds || !AXIsProcessTrusted()) {
++                if state.device != nil && (CGMainDisplayID() != state.display || CGDisplayBounds(state.display) != state.bounds ||
++                    command.usb != true) {
+                     state.failure = 5
+                 }
+                 if state.failure != 0 { await state.device?.stop(); state.device = nil }
+@@ -79,16 +101,20 @@ private enum TouchAgent {
+                 var report = URLRequest(url: url)
+                 report.httpMethod = "PUT"
+                 report.httpBody = Data("\(state.generation) \(state.failure == 0 ? 2 : state.failure)".utf8)
+-                let (_, acknowledgment) = try await session.data(for: report)
++                let (_, acknowledgment) = try await connection.data(for: report)
+                 guard (acknowledgment as? HTTPURLResponse)?.statusCode == 204 else { throw URLError(.badServerResponse) }
++                state.lastError = nil
+             } catch {
++                let failure = error as NSError
++                let message = "\(failure.domain) \(failure.code): \(failure.localizedDescription)"
++                if state.lastError != message { diagnostic(message); state.lastError = message }
+                 await state.device?.stop(); state.device = nil; state.generation = 0; state.neutralRequired = true
+                 try? await Task.sleep(for: .milliseconds(250))
+             }
+         }
+         watchdog.cancel()
+         await state.device?.stop()
+-        session.invalidateAndCancel()
++        await connection.close()
+     }
+ }
+ 
+@@ -101,4 +127,5 @@ private final class AgentState {
+     var failure = 0
+     var neutralRequired = true
+     var lastCommand = ProcessInfo.processInfo.systemUptime
++    var lastError: String?
+ }
 diff --git a/tools/link/check.sh b/tools/link/check.sh
 index c88ebe4..e8b6228 100755
 --- a/tools/link/check.sh
@@ -15581,9 +17302,533 @@ index c88ebe4..e8b6228 100755
  build/link/test_link build/link/screen.metallib
 +
 +python3 tests/test_link_control_services.py
+diff --git a/tools/native-touch-probe.swift b/tools/native-touch-probe.swift
+new file mode 100644
+index 0000000..b29df45
+--- /dev/null
++++ b/tools/native-touch-probe.swift
+@@ -0,0 +1,15 @@
++import Foundation
++import IOKit
++
++/// Read-only USB publication diagnostic; never creates a HID device or injects input.
++@main enum NativeTouchUSBProbe {
++    static func main() {
++        let matching=IOServiceMatching("IOHIDDevice")! as NSMutableDictionary
++        matching["IOPropertyMatch"]=["VendorID":0x1209,"ProductID":0xD007]
++        let service=IOServiceGetMatchingService(kIOMainPortDefault,matching)
++        guard service != 0 else { print("USB touchscreen not attached; enable native touch with the updated sharing helper.");return }
++        defer { IOObjectRelease(service) }
++        let uuid=IORegistryEntrySearchCFProperty(service,kIOServicePlane,"displayUUID" as CFString,nil,0)
++        print("Henge USB touchscreen present; display association=\(uuid as? String ?? "not mapped yet"). No virtual HID entitlement is used.")
++    }
++}
+diff --git a/tools/native-touch.entitlements b/tools/native-touch.entitlements
+deleted file mode 100644
+index 27d2ab2..0000000
+--- a/tools/native-touch.entitlements
++++ /dev/null
+@@ -1,5 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+-<plist version="1.0"><dict>
+-<key>com.apple.developer.hid.virtual.device</key><true/>
+-</dict></plist>
+diff --git a/tools/native-touch/GuestConnection.swift b/tools/native-touch/GuestConnection.swift
+new file mode 100644
+index 0000000..653c83b
+--- /dev/null
++++ b/tools/native-touch/GuestConnection.swift
+@@ -0,0 +1,99 @@
++import Foundation
++
++/// Multiplexes requests through the sharing helper's standard-I/O pipes.
++/// The touch app has no network connection or listener of its own.
++actor GuestConnection {
++    private struct Request: Encodable {
++        let version = 1
++        let id: UInt64
++        let method: String
++        let path: String
++        let body: Data?
++    }
++    private struct Reply: Decodable {
++        let version: Int
++        let id: UInt64
++        let status: Int
++        let body: Data
++    }
++    private struct Pending {
++        let url: URL
++        let continuation: CheckedContinuation<(Data, URLResponse), Error>
++        let timeout: Task<Void, Never>
++    }
++    private var pending: [UInt64: Pending] = [:]
++    private var nextID: UInt64 = 0
++    private var reader: Task<Void, Never>?
++    private var closed = false
++
++    func start() {
++        guard reader == nil else { return }
++        reader = Task.detached { [weak self] in
++            do {
++                for try await line in FileHandle.standardInput.bytes.lines {
++                    guard line.utf8.count <= 8192 else { throw URLError(.cannotParseResponse) }
++                    let reply = try JSONDecoder().decode(Reply.self, from: Data(line.utf8))
++                    guard reply.version == 1, reply.body.count <= 2048 else { throw URLError(.cannotParseResponse) }
++                    await self?.receive(reply)
++                }
++            } catch { }
++            await self?.close()
++        }
++    }
++
++    func data(from url: URL) async throws -> (Data, URLResponse) {
++        try await data(for: URLRequest(url: url))
++    }
++
++    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
++        try Task.checkCancellation()
++        guard !closed, pending.count < 8, let url = request.url,
++              url.scheme == "http", url.host == "10.0.2.4", url.port == nil || url.port == 80,
++              url.query == nil else { throw URLError(.cannotConnectToHost) }
++        nextID &+= 1
++        let identifier = nextID
++        let message = Request(id: identifier, method: request.httpMethod ?? "GET", path: url.path, body: request.httpBody)
++        var encoded = try JSONEncoder().encode(message)
++        encoded.append(10)
++        return try await withTaskCancellationHandler {
++            try await withCheckedThrowingContinuation { continuation in
++                guard !Task.isCancelled else { continuation.resume(throwing: CancellationError()); return }
++                let timeout = Task.detached { [weak self] in
++                    do {
++                        try await Task.sleep(for: .seconds(2))
++                        await self?.fail(identifier, error: URLError(.timedOut))
++                    } catch { }
++                }
++                pending[identifier] = Pending(url: url, continuation: continuation, timeout: timeout)
++                do { try FileHandle.standardOutput.write(contentsOf: encoded) }
++                catch { fail(identifier, error: error) }
++            }
++        } onCancel: {
++            Task { await self.fail(identifier, error: CancellationError()) }
++        }
++    }
++
++    private func receive(_ reply: Reply) {
++        guard let item = pending.removeValue(forKey: reply.id) else { return }
++        item.timeout.cancel()
++        guard reply.status != 0,
++              let response = HTTPURLResponse(url: item.url, statusCode: reply.status, httpVersion: "HTTP/1.1", headerFields: nil) else {
++            item.continuation.resume(throwing: URLError(.cannotConnectToHost))
++            return
++        }
++        item.continuation.resume(returning: (reply.body, response))
++    }
++
++    private func fail(_ identifier: UInt64, error: Error) {
++        guard let item = pending.removeValue(forKey: identifier) else { return }
++        item.timeout.cancel()
++        item.continuation.resume(throwing: error)
++    }
++
++    func close() {
++        guard !closed else { return }
++        closed = true
++        reader?.cancel()
++        for identifier in Array(pending.keys) { fail(identifier, error: URLError(.networkConnectionLost)) }
++    }
++}
+diff --git a/tools/native-touch/NativeTouchDescriptor.swift b/tools/native-touch/NativeTouchDescriptor.swift
+index 81c453a..a7ff541 100644
+--- a/tools/native-touch/NativeTouchDescriptor.swift
++++ b/tools/native-touch/NativeTouchDescriptor.swift
+@@ -7,7 +7,8 @@ enum NativeTouchDescriptor {
+         let finger: [UInt8] = [
+             0x05, 0x0D, 0x09, 0x22, 0xA1, 0x02,
+             0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02,
+-            0x75, 0x07, 0x95, 0x01, 0x81, 0x03,
++            0x09, 0x47, 0x81, 0x02,
++            0x75, 0x06, 0x95, 0x01, 0x81, 0x03,
+             0x09, 0x51, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
+             0x05, 0x01, 0x09, 0x30, 0x09, 0x31,
+             0x16, 0x00, 0x00, 0x26, 0xFF, 0x7F,
+diff --git a/tools/native-touch/SystemNativeTouchDevice.swift b/tools/native-touch/SystemNativeTouchDevice.swift
+index 7f9c3b6..7cf7dce 100644
+--- a/tools/native-touch/SystemNativeTouchDevice.swift
++++ b/tools/native-touch/SystemNativeTouchDevice.swift
+@@ -1,21 +1,7 @@
+ import AppKit
+-import CoreHID
+ import IOKit.hid
+ 
+ 
+-@available(macOS 15, *)
+-actor NativeTouchDeviceDelegate: HIDVirtualDeviceDelegate {
+-    enum ReportError: Error { case unsupported }
+-    func hidVirtualDevice(_ device: HIDVirtualDevice, receivedSetReportRequestOfType type: HIDReportType,
+-                          id: HIDReportID?, data: Data) async throws { throw ReportError.unsupported }
+-    func hidVirtualDevice(_ device: HIDVirtualDevice, receivedGetReportRequestOfType type: HIDReportType,
+-                          id: HIDReportID?, maxSize: Int) async throws -> Data {
+-        guard type == .feature, id?.rawValue == 2, maxSize >= 1 else { throw ReportError.unsupported }
+-        let maximum = UInt8(NativeTouchFrame.maximumContacts)
+-        return maxSize == 1 ? Data([maximum]) : Data([2, maximum])
+-    }
+-}
+-
+ @MainActor
+ @available(macOS 15, *)
+ final class SystemNativeTouchDevice: NativeTouchDevice {
+@@ -26,8 +12,8 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
+         var published = false
+         var liftedAt: TimeInterval?
+     }
+-    private var device: HIDVirtualDevice?
+-    private let delegate = NativeTouchDeviceDelegate()
++    private let usb: USBTouchTransport
++    private var started = false
+     private var task: Task<Void, Never>?
+     private var slots: [Slot?] = Array(repeating: nil, count: NativeTouchFrame.maximumContacts)
+     private var pending: [[NativeTouchContact]] = []
+@@ -35,24 +21,17 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
+     private var lastSentReport: Data?
+     private var lastDownIDs = Set<UInt8>()
+     private var transitionDeadline: TimeInterval = 0
+-    private let allowed: ([NativeTouchContact]) -> Bool = { $0.allSatisfy(\.isValid) && AXIsProcessTrusted() }
++    private func allowed(_ contacts: [NativeTouchContact]) -> Bool {
++        contacts.allSatisfy(\.isValid)
++    }
+     var onFailure: ((String) -> Void)?
+ 
++    init(usb: USBTouchTransport) { self.usb = usb }
++
+     func start(displayID: CGDirectDisplayID) async throws {
+-        guard let uuid = CGDisplayCreateUUIDFromDisplayID(displayID)?.takeRetainedValue() else { throw CocoaError(.featureUnsupported) }
+-        let displayUUID = CFUUIDCreateString(nil, uuid) as String
+-        guard IOHIDCheckAccess(kIOHIDRequestTypePostEvent).rawValue == 0 else { throw CocoaError(.userCancelled) }
+-        guard let device = HIDVirtualDevice(properties: .init(descriptor: NativeTouchDescriptor.descriptor(),
+-            vendorID: 0x1209, productID: 0xD006, transport: .virtual,
+-            product: "Henge touchscreen", manufacturer: "Henge",
+-            uniqueID: UUID().uuidString,
+-            extraProperties: [kIOHIDDisplayIntegratedKey: NSNumber(value: true), "displayUUID": displayUUID as NSString])) else {
+-            throw CocoaError(.featureUnsupported)
+-        }
+-        self.device = device
+-        await device.activate(delegate: delegate)
+-        // Validate report dispatch before advertising readiness to the host.
+-        try await device.dispatchInputReport(data: report(), timestamp: .now)
++        try await usb.start(displayID:displayID)
++        started=true
++        try await dispatch(report())
+     }
+ 
+     func enqueue(_ contacts: [NativeTouchContact]) {
+@@ -94,18 +73,22 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
+         let remaining = transitionDeadline-ProcessInfo.processInfo.systemUptime
+         if remaining > 0 { try? await Task.sleep(for: .seconds(remaining)) }
+         releaseAll()
+-        if let device {
++        if started {
+             let lifted = report()
+-            if lifted != lastSentReport { try? await device.dispatchInputReport(data: lifted, timestamp: .now) }
++            if lifted != lastSentReport { try? await dispatch(lifted) }
+             try? await Task.sleep(for: .milliseconds(70))
+             slots = Array(repeating: nil, count: NativeTouchFrame.maximumContacts)
+-            try? await device.dispatchInputReport(data: report(), timestamp: .now)
++            try? await dispatch(report())
+         }
+-        device = nil; hadReport = false
++        await usb.stop()
++        started = false
++        hadReport = false
+     }
+ 
++    private func dispatch(_ report:Data) async throws { try await usb.send(report) }
++
+     private func tick() async throws {
+-        guard let device else { return }
++        guard started else { return }
+         let now = ProcessInfo.processInfo.systemUptime
+         // AppKit needs time to consume each contact transition's change mask.
+         guard now >= transitionDeadline else { return }
+@@ -142,7 +125,7 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
+             let downIDs = Set(slots.compactMap { $0 }.filter(\.down).map { $0.finger.id })
+             for index in slots.indices where slots[index]?.down == true { slots[index]?.published = true }
+             for index in slots.indices where slots[index]?.down == false && slots[index]?.liftedAt == nil { slots[index]?.liftedAt = now }
+-            try await device.dispatchInputReport(data: data, timestamp: .now)
++            try await dispatch(data)
+             if downIDs != lastDownIDs { transitionDeadline = ProcessInfo.processInfo.systemUptime + 0.06 }
+             lastDownIDs = downIDs; lastSentReport = data
+             hadReport = occupied
+@@ -158,7 +141,7 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
+                 let slot = occupied[index]
+                 let x = UInt16((min(1,max(0,slot.finger.x))*32767).rounded())
+                 let y = UInt16((min(1,max(0,slot.finger.y))*32767).rounded())
+-                bytes += [slot.down ? 1 : 0, slot.hidID, UInt8(x&255), UInt8(x>>8), UInt8(y&255), UInt8(y>>8)]
++                bytes += [slot.down ? 3 : 2, slot.hidID, UInt8(x&255), UInt8(x>>8), UInt8(y&255), UInt8(y>>8)]
+             } else { bytes += Array(repeating: 0, count: 6) }
+         }
+         bytes.append(UInt8(occupied.count))
+diff --git a/tools/native-touch/USBTouchTransport.swift b/tools/native-touch/USBTouchTransport.swift
+new file mode 100644
+index 0000000..e8debbb
+--- /dev/null
++++ b/tools/native-touch/USBTouchTransport.swift
+@@ -0,0 +1,188 @@
++import AppKit
++import Foundation
++import IOKit
++
++/// Adds the display identity before the touchscreen's event service is matched.
++/// This observes ordinary USB hardware; it never creates a virtual HID device.
++@MainActor
++private final class USBDisplayMapper {
++    private var port: IONotificationPortRef?
++    private var iterator: io_iterator_t = 0
++    private var displayUUID = ""
++    private(set) var lastError: kern_return_t = KERN_SUCCESS
++    private var mappedRegistryID: UInt64 = 0
++
++    static func matching(_ serviceClass: String) -> CFDictionary {
++        let matching = IOServiceMatching(serviceClass)! as NSMutableDictionary
++        matching["IOPropertyMatch"] = ["VendorID": 0x1209, "ProductID": 0xD007]
++        return matching as CFDictionary
++    }
++
++    func start(displayUUID: String) throws {
++        self.displayUUID = displayUUID
++        guard let port = IONotificationPortCreate(kIOMainPortDefault),
++              let source = IONotificationPortGetRunLoopSource(port)?.takeUnretainedValue() else {
++            throw CocoaError(.featureUnsupported)
++        }
++        self.port = port
++        CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
++        let result = IOServiceAddMatchingNotification(port, kIOPublishNotification,
++            Self.matching("IOHIDDevice"), { context, iterator in
++                guard let context else { return }
++                MainActor.assumeIsolated {
++                    Unmanaged<USBDisplayMapper>.fromOpaque(context).takeUnretainedValue().bind(iterator)
++                }
++            }, Unmanaged.passUnretained(self).toOpaque(), &iterator)
++        guard result == KERN_SUCCESS else {
++            stop()
++            throw NSError(domain: NSOSStatusErrorDomain, code: Int(result))
++        }
++        bind(iterator)
++    }
++
++    private func bind(_ iterator: io_iterator_t) {
++        while true {
++            let device = IOIteratorNext(iterator)
++            guard device != 0 else { return }
++            lastError = IORegistryEntrySetCFProperty(device, "displayUUID" as CFString, displayUUID as CFString)
++            if lastError == KERN_SUCCESS { IORegistryEntryGetRegistryEntryID(device, &mappedRegistryID) }
++            IOObjectRelease(device)
++        }
++    }
++
++    var devicePresent: Bool {
++        let device = IOServiceGetMatchingService(kIOMainPortDefault, Self.matching("IOHIDDevice"))
++        guard device != 0 else { return false }
++        IOObjectRelease(device)
++        return true
++    }
++
++    var mapped: Bool {
++        guard mappedRegistryID != 0 else { return false }
++        let device = IOServiceGetMatchingService(kIOMainPortDefault, Self.matching("IOHIDDevice"))
++        guard device != 0 else { return false }
++        defer { IOObjectRelease(device) }
++        var identifier: UInt64 = 0
++        IORegistryEntryGetRegistryEntryID(device, &identifier)
++        let value = IORegistryEntrySearchCFProperty(device, kIOServicePlane, "displayUUID" as CFString, nil, 0)
++        return identifier == mappedRegistryID && value as? String == displayUUID
++    }
++
++    func prepareAttachment() { mappedRegistryID = 0; lastError = KERN_SUCCESS }
++
++    func isAssociated() -> Bool {
++        let service = IOServiceGetMatchingService(kIOMainPortDefault, Self.matching("IOHIDEventService"))
++        guard service != 0 else { return false }
++        defer { IOObjectRelease(service) }
++        let value = IORegistryEntrySearchCFProperty(service, kIOServicePlane, "displayUUID" as CFString, nil,
++            IOOptionBits(kIORegistryIterateRecursively | kIORegistryIterateParents))
++        return value as? String == displayUUID && lastError == KERN_SUCCESS
++    }
++
++    func stop() {
++        if let port { IONotificationPortDestroy(port) }
++        port = nil
++        if iterator != 0 { IOObjectRelease(iterator); iterator = 0 }
++        mappedRegistryID = 0
++    }
++}
++
++@MainActor
++final class USBTouchTransport {
++    private struct State: Decodable {
++        let version: Int
++        let epoch: UInt32
++        let available: Bool
++        let connected: Bool
++    }
++    private let connection: GuestConnection
++    private let epoch: UInt32
++    private let mapper = USBDisplayMapper()
++    private let base = URL(string: "http://10.0.2.4/.henge/native-touch-usb")!
++    private(set) var active = false
++
++    init(connection: GuestConnection, epoch: UInt32) { self.connection = connection; self.epoch = epoch }
++
++    private func setConnected(_ connected: Bool) async throws {
++        try await control(connected ? 1 : 0)
++    }
++
++    private func control(_ action: Int) async throws {
++        var request = URLRequest(url: base)
++        request.httpMethod = "PUT"
++        request.httpBody = Data("\(epoch) \(action)".utf8)
++        let (_, response) = try await connection.data(for: request)
++        guard (response as? HTTPURLResponse)?.statusCode == 204 else { throw URLError(.badServerResponse) }
++    }
++
++    private func state() async throws -> State {
++        let (data, response) = try await connection.data(from: base)
++        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
++        let state = try JSONDecoder().decode(State.self, from: data)
++        guard state.version == 1, state.epoch == epoch, state.available else { throw URLError(.badServerResponse) }
++        return state
++    }
++
++    func start(displayID: CGDirectDisplayID) async throws {
++        guard #available(macOS 27.2, *),
++              let uuid = CGDisplayCreateUUIDFromDisplayID(displayID)?.takeRetainedValue() else {
++            throw CocoaError(.featureUnsupported)
++        }
++        let displayUUID = CFUUIDCreateString(nil, uuid) as String
++        try mapper.start(displayUUID: displayUUID)
++        do {
++            // A prior session can leave a service with a cached display identity.
++            // Wait for its actual removal before attaching the replacement.
++            try await setConnected(false)
++            let deadline = ProcessInfo.processInfo.systemUptime + 4
++            while try await state().connected || mapper.devicePresent {
++                guard ProcessInfo.processInfo.systemUptime < deadline else { throw URLError(.timedOut) }
++                try await Task.sleep(for: .milliseconds(25))
++            }
++            mapper.prepareAttachment()
++            try await setConnected(true)
++            while !mapper.mapped {
++                guard ProcessInfo.processInfo.systemUptime < deadline else { throw URLError(.timedOut) }
++                try await Task.sleep(for: .milliseconds(10))
++            }
++            // The Report Rate feature query holds event-driver initialization
++            // until this acknowledgement, closing the publication/cache race.
++            try await control(2)
++            while !mapper.isAssociated() {
++                guard ProcessInfo.processInfo.systemUptime < deadline else { throw URLError(.timedOut) }
++                try Task.checkCancellation()
++                try await Task.sleep(for: .milliseconds(25))
++            }
++            // The desktop also has to discover the newly associated service.
++            while !NSScreen.screens.contains(where: {
++                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == displayID &&
++                    $0.touchCapabilities.contains(.multiTouch)
++            }) {
++                guard ProcessInfo.processInfo.systemUptime < deadline else { throw URLError(.timedOut) }
++                try await Task.sleep(for: .milliseconds(25))
++            }
++            active = true
++        } catch {
++            await stop()
++            throw error
++        }
++    }
++
++    func send(_ report: Data) async throws {
++        guard active, report.count == 32 else { throw CocoaError(.featureUnsupported) }
++        var generation = epoch.littleEndian
++        var body = withUnsafeBytes(of: &generation) { Data($0) }
++        body.append(report)
++        var request = URLRequest(url: base.appendingPathComponent("report"))
++        request.httpMethod = "PUT"
++        request.httpBody = body
++        let (_, response) = try await connection.data(for: request)
++        guard (response as? HTTPURLResponse)?.statusCode == 204 else { throw URLError(.badServerResponse) }
++    }
++
++    func stop() async {
++        active = false
++        try? await setConnected(false)
++        mapper.stop()
++    }
++}
+diff --git a/tools/package_native_touch.py b/tools/package_native_touch.py
+new file mode 100644
+index 0000000..68d2542
+--- /dev/null
++++ b/tools/package_native_touch.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++"""Package the USB-only guest companions with no restricted entitlement claims."""
++import argparse
++import gzip
++import os
++from pathlib import Path, PurePosixPath
++import plistlib
++import shutil
++import subprocess
++import tarfile
++import tempfile
++
++ROOTS={'Henge Touch Agent.app','Henge Sharing Agent.app'}
++def validate_members(members):
++    for member in members:
++        p=PurePosixPath(member.name)
++        if p.is_absolute() or '..' in p.parts or not p.parts or p.parts[0] not in ROOTS or not (member.isfile() or member.isdir()):
++            raise ValueError('Unsafe guest-helper archive member: '+member.name)
++
++def run(*args):
++    return subprocess.run(args,check=True,capture_output=True).stdout
++
++def package(args):
++    args.output.parent.mkdir(parents=True,exist_ok=True)
++    with tempfile.TemporaryDirectory(prefix='henge-usb-touch-',dir=args.output.parent) as directory:
++        root=Path(directory)
++        empty=root/'entitlements.plist';empty.write_bytes(plistlib.dumps({}))
++        apps=[]
++        for name,binary,bundle,minimum in [
++            ('Henge Touch Agent',args.binary,'dev.henge.touch-agent','15.0'),
++            ('Henge Sharing Agent',args.sharing_binary,'dev.henge.sharing-agent','12.0')]:
++            app=root/(name+'.app');contents=app/'Contents';executable=contents/'MacOS'/binary.name
++            executable.parent.mkdir(parents=True);shutil.copy2(binary,executable);executable.chmod(0o755)
++            info=dict(CFBundleIdentifier=bundle,CFBundleExecutable=binary.name,CFBundleName=name,CFBundlePackageType='APPL',CFBundleVersion='1',CFBundleShortVersionString='1.0',LSMinimumSystemVersion=minimum,LSUIElement=True)
++            if name=='Henge Sharing Agent':info['NSLocalNetworkUsageDescription']='Connect to Henge for the shared folder, clipboard, touch input and approved GitHub runner.'
++            (contents/'Info.plist').write_bytes(plistlib.dumps(info))
++            run('codesign','--force','--sign','-','--identifier',bundle,'--entitlements',str(empty),str(app))
++            run('codesign','--verify','--strict',str(app))
++            claims=plistlib.loads(run('codesign','-d','--entitlements','-','--xml',str(app)))
++            if claims:raise ValueError('USB companions must have empty entitlements')
++            apps.append(app)
++        archive=root/'helpers.tar.gz'
++        def stable(member):
++            member.uid=member.gid=member.mtime=0;member.uname=member.gname='';return member
++        with archive.open('wb') as file,gzip.GzipFile(fileobj=file,mode='wb',filename='',mtime=0) as compressed,tarfile.open(fileobj=compressed,mode='w') as tar:
++            for app in apps:tar.add(app,arcname=app.name,filter=stable)
++        with tarfile.open(archive,'r:gz') as tar:validate_members(tar.getmembers())
++        os.replace(archive,args.output)
++    print(str(args.output)+': USB touch; two signed companions; no virtual HID entitlement')
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--binary',type=Path,required=True);p.add_argument('--sharing-binary',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
++    args=p.parse_args()
++    try:package(args)
++    except (ValueError,subprocess.CalledProcessError) as error:p.exit(1,'USB helper packaging failed: '+str(error)+'\n')
++if __name__=='__main__':main()
 diff --git a/tools/preview_gamepad.py b/tools/preview_gamepad.py
 new file mode 100644
-index 0000000..e7a8234
+index 0000000..649729a
 --- /dev/null
 +++ b/tools/preview_gamepad.py
 @@ -0,0 +1,131 @@
@@ -15685,18 +17930,18 @@ index 0000000..e7a8234
 +  (artifacts/'unfolded-error.txt').write_text(str(error))
 +try:
 + subprocess.run(['xcrun','simctl','boot',udid],check=True,timeout=240)
-+ subprocess.run(['xcrun','simctl','bootstatus',udid,'-b'],check=True,timeout=240)
++ subprocess.run(['xcrun','simctl','bootstatus',udid,'-b'],check=True,timeout=480)
 + subprocess.run(['xcodegen','generate'],cwd=folder,check=True)
 + command=['xcodebuild','-project',str(folder/'HengeGamepadPreview.xcodeproj'),'-scheme','GamepadPreview',
 +          '-destination','id='+udid,'-derivedDataPath',str(root/'build/gamepad-preview'),
 +          '-resultBundlePath',str(artifacts/'GamepadPreview.xcresult'),'-parallel-testing-enabled','NO',
-+          '-test-timeouts-enabled','YES','-default-test-execution-time-allowance','180',
-+          '-maximum-test-execution-time-allowance','240','CODE_SIGNING_ALLOWED=NO','test']
++          '-test-timeouts-enabled','YES','-default-test-execution-time-allowance','480',
++          '-maximum-test-execution-time-allowance','600','CODE_SIGNING_ALLOWED=NO','test']
 + timed_out=False;fold_thread=None
 + if native_duo:
 +  fold_thread=threading.Thread(target=unfold_after_ui_launch,daemon=True);fold_thread.start()
 + with (artifacts/'xcodebuild.log').open('w') as log:
-+  try: result=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,text=True,timeout=900,env={**os.environ,'NSUnbufferedIO':'YES'});status=result.returncode
++  try: result=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,text=True,timeout=1500,env={**os.environ,'NSUnbufferedIO':'YES'});status=result.returncode
 +  except subprocess.TimeoutExpired:timed_out=True;status=124
 + stop_fold.set()
 + if fold_thread:fold_thread.join(timeout=75)
@@ -15706,7 +17951,7 @@ index 0000000..e7a8234
 +  report['native_duo_unfolded_window_verified']=True
 +  if fold_errors:report['optional_display_request_warning']=fold_errors
 + print('\n'.join((artifacts/'xcodebuild.log').read_text().splitlines()[-35:]))
-+ if timed_out:print('xcodebuild exceeded the 15-minute preview limit; retained log and failure state')
++ if timed_out:print('xcodebuild exceeded the 25-minute preview limit; retained log and failure state')
 + if status:diagnostic('failure-screenshot',['xcrun','simctl','io',udid,'screenshot','--display=1',str(artifacts/'failure-state.png')])
 + diagnostic('active-display-screenshot',['xcrun','simctl','io',udid,'screenshot','--display='+('3' if native_duo else '1'),str(artifacts/'active-display.png')])
 + # Kept XCTest screenshot attachments remain available even after a UI failure.
@@ -15718,3 +17963,44 @@ index 0000000..e7a8234
 + stop_fold.set()
 + diagnostic('cleanup-shutdown',['xcrun','simctl','shutdown',udid])
 + diagnostic('cleanup-delete',['xcrun','simctl','delete',udid])
+diff --git a/tools/verify_native_touch_package.py b/tools/verify_native_touch_package.py
+new file mode 100644
+index 0000000..b2ec559
+--- /dev/null
++++ b/tools/verify_native_touch_package.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python3
++"""Verify the actual guest bundle archive with native Apple signing tools."""
++import argparse
++import hashlib
++import json
++from pathlib import Path
++import plistlib
++import subprocess
++import tarfile
++import tempfile
++from package_native_touch import validate_members
++
++def verify(archive):
++    result={}
++    with tempfile.TemporaryDirectory(prefix='henge-verify-touch-') as directory:
++        root=Path(directory)
++        with tarfile.open(archive,'r:gz') as tar:
++            validate_members(tar.getmembers());tar.extractall(root,filter='data')
++        for name,executable in [('Henge Touch Agent.app','henge-touch-agent'),('Henge Sharing Agent.app','henge-agent')]:
++            app=root/name
++            info=plistlib.loads((app/'Contents/Info.plist').read_bytes())
++            assert info['CFBundleExecutable']==executable and info['LSUIElement'] is True
++            binary=app/'Contents/MacOS'/executable
++            assert binary.read_bytes()[:4]==bytes.fromhex('cffaedfe')
++            assert subprocess.check_output(['lipo','-archs',str(binary)],text=True).strip()=='arm64'
++            subprocess.run(['codesign','--verify','--strict',str(app)],check=True)
++            claims=plistlib.loads(subprocess.check_output(['codesign','-d','--entitlements','-','--xml',str(app)]))
++            assert claims=={}, 'Unexpected guest entitlement claims'
++            assert not (app/'Contents/embedded.provisionprofile').exists()
++            if executable=='henge-agent':assert info.get('NSLocalNetworkUsageDescription')
++            result[executable]=dict(sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),arm64=True,signature_verified=True,entitlements={})
++    return result
++if __name__=='__main__':
++    p=argparse.ArgumentParser(description=__doc__);p.add_argument('archive',type=Path);a=p.parse_args()
++    print(json.dumps(verify(a.archive),indent=2))
