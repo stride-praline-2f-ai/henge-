@@ -4318,11 +4318,12 @@ index 0000000..edd955a
 +}
 diff --git a/ios/Henge/Controls/GamepadLayout.swift b/ios/Henge/Controls/GamepadLayout.swift
 new file mode 100644
-index 0000000..385abea
+index 0000000..31d573f
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadLayout.swift
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,52 @@
 +import Foundation
++import CoreGraphics
 +
 +enum PadControl: Int, CaseIterable {
 +    case move, look, a, b, x, y, lb, rb, lt, rt, menu, view, leftClick, rightClick, dpad, guide
@@ -4685,11 +4686,12 @@ index 0000000..22c945c
 +}
 diff --git a/ios/Henge/Controls/PadInput.swift b/ios/Henge/Controls/PadInput.swift
 new file mode 100644
-index 0000000..8e3fb0e
+index 0000000..7cc0e18
 --- /dev/null
 +++ b/ios/Henge/Controls/PadInput.swift
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,40 @@
 +import Foundation
++import CoreGraphics
 +
 +/// Transport-independent finger ownership and full-state production input model.
 +/// Drawing and UIKit events use this same model; tests need no synthetic UITouch.
@@ -8684,11 +8686,12 @@ index 0000000..080debb
 +}
 diff --git a/tests/test_gamepad_tuning.swift b/tests/test_gamepad_tuning.swift
 new file mode 100644
-index 0000000..d247bc3
+index 0000000..1867403
 --- /dev/null
 +++ b/tests/test_gamepad_tuning.swift
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,68 @@
 +import Foundation
++import CoreGraphics
 +
 +@main struct GamepadTuningChecks {
 +    static func main() throws {
@@ -10925,10 +10928,10 @@ index c88ebe4..00251c5 100755
 +python3 tests/test_link_control_services.py
 diff --git a/tools/preview_gamepad.py b/tools/preview_gamepad.py
 new file mode 100644
-index 0000000..b76a932
+index 0000000..953de38
 --- /dev/null
 +++ b/tools/preview_gamepad.py
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,60 @@
 +"""Actual iOS Simulator UI tests; viewport fixtures are not chip emulation."""
 +from pathlib import Path
 +import argparse,json,os,re,subprocess
@@ -10944,18 +10947,31 @@ index 0000000..b76a932
 +metadata=json.loads(output('xcrun','simctl','list','--json'))
 +runtimes=[r for r in metadata['runtimes'] if r.get('isAvailable') and r.get('name','').startswith('iOS ')]
 +if not runtimes:raise SystemExit('No installed iOS Simulator runtime; no device test is claimed')
-+runtime=max(runtimes,key=lambda r:tuple(map(int,r['version'].split('.'))))
-+types=metadata['devicetypes'];duo=[d for d in types if 'duo' in d['name'].lower()]
-+canvases=[d for d in types if 'iPad Pro' in d['name'] and ('13-inch' in d['name'] or '12.9-inch' in d['name'])]
-+if not canvases:raise SystemExit('No large iPad Simulator device type for full viewport rendering')
-+m4=[d for d in canvases if 'M4' in d['name']]
-+device=(duo[-1] if args.profile=='duo-unfolded' and duo else (m4[-1] if m4 else canvases[-1]))
-+udid=output('xcrun','simctl','create','Henge-'+args.profile,device['identifier'],runtime['identifier']).strip()
++# Device types can be installed by an SDK but unsupported by a particular runtime.
++# Try the newest runtime first, preferring the requested model, then a large canvas.
++# Record failed combinations instead of claiming the requested device booted.
++types=metadata['devicetypes']
++attempts=[];udid=None
++for runtime in sorted(runtimes,key=lambda r:tuple(map(int,r['version'].split('.'))),reverse=True):
++ supported=runtime.get('supportedDeviceTypes')
++ allowed={d['identifier'] if isinstance(d,dict) else d for d in supported} if supported else None
++ candidates=[d for d in types if (allowed is None or d['identifier'] in allowed) and
++             ('duo' in d['name'].lower() if args.profile=='duo-unfolded' else False)]
++ canvases=[d for d in types if (allowed is None or d['identifier'] in allowed) and 'iPad Pro' in d['name'] and
++           ('13-inch' in d['name'] or '12.9-inch' in d['name'])]
++ candidates+=sorted(canvases,key=lambda d:('M4' in d['name'],d['name']),reverse=True)
++ for device in candidates:
++  created=subprocess.run(['xcrun','simctl','create','Henge-'+args.profile,device['identifier'],runtime['identifier']],capture_output=True,text=True)
++  attempts.append(dict(device=device['name'],runtime=runtime['name'],status=created.returncode,error=created.stderr.strip()))
++  (artifacts/'simulator-selection.json').write_text(json.dumps(attempts,indent=2)+'\n')
++  if created.returncode==0:udid=created.stdout.strip();break
++ if udid:break
++if not udid:raise SystemExit('No compatible installed iOS runtime and large Simulator canvas; see simulator-selection.json')
 +report=dict(source=os.environ.get('GITHUB_SHA'),profile=args.profile,requested_viewport=viewport,
 +            simulator_device=device['name'],runtime=runtime['name'],xcode=output('xcodebuild','-version').strip(),
 +            host_model=output('sysctl','-n','hw.model').strip(),host_cores=output('sysctl','-n','hw.logicalcpu').strip(),
 +            scope='Production controller UI/input checks only. A20/M4 CPU, GPU, core placement and thermals are not emulated.',
-+            duo_unfolded_primary=args.profile=='duo-unfolded',fallback_canvas=not bool(duo) if args.profile=='duo-unfolded' else not bool(m4))
++            duo_unfolded_primary=args.profile=='duo-unfolded',fallback_canvas=('duo' not in device['name'].lower()) if args.profile=='duo-unfolded' else ('M4' not in device['name']))
 +(artifacts/'environment.json').write_text(json.dumps(report,indent=2)+'\n')
 +try:
 + subprocess.run(['xcrun','simctl','boot',udid],check=True)
