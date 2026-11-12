@@ -1,35 +1,54 @@
-# Advanced controls — integrated source
+# Controls and new release features
 
-Validated source `5701f45fcd7db0cdd19557b5a0f81924bead210c`; https://github.com/stride-praline-2f-ai/henge-/actions/runs/43176532298; https://github.com/stride-praline-2f-ai/henge-/actions/runs/43176532244.
+Validated source `f1f492f5ae935791859baa615aa01fe5c21e67bd`: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43296777053; https://github.com/stride-praline-2f-ai/henge-/actions/runs/43296777073.
 
-One multitouch UIKit surface/input model serves the local overlay and controls-only
-Link. The Hide Gamepad bar is removed; use the three-finger menu for visibility
-and settings. Two circular sticks, radial dead zone, response curves, sensitivity,
-inversion, D-pad, analog triggers, L3/R3 and View/Menu/Home are integrated. Size,
-opacity and mapped mouse-look speed persist. Clear overlay areas pass through.
-Ordinary relayout retains held fingers; actual geometry/tuning changes release
-them. Hiding, pause and disconnect release owned inputs. No idle polling timer.
+Three-finger controls → virtual gamepad. Shared pointer touchpad supports movement
+and scroll sensitivity. Wireless keyboard already includes its own touchpad.
+Choose controller layout Automatic, Standard, Portrait or Tabletop. Duo uses
+public active division geometry when available; manual Tabletop works without a
+hardware fold signal. iPad Automatic is not treated as a folding phone.
 
-Wireless keyboard, touchpad and pad use the existing authenticated TLS transport
-without a video codec or extra display. Short keyboard windows use a compact
-scrollable sidebar; narrow layouts retain the segmented selector. Whole sticks
-have one source owner. The additive protocol2 mouseSpeed field preserves old-peer
-default900; update both devices for new tuning. Keyboard mapping remains explicit.
+Wireless controls → Video optionally mirrors the existing main display, without
+adding a guest monitor. Landscape overlays controls; portrait separates video
+above controls. Fit preserves the whole image; Fill crops explicitly. Controls-only
+remains the default and starts no codec. Update both devices. The approved key and
+host listener survive transient socket loss; bounded foreground retries stop on
+explicit disconnect. Background releases inputs and does not promise continuous
+video or VM execution.
 
-Generic USB HID stays default. The optional PS4-compatible profile is experimental
-and applies on a cold Mac boot. It implements a 507-byte report descriptor, 64-byte
-USB input, calibrated/address/firmware feature replies and bounded output reports.
-It is not Xbox/XInput, physical USB passthrough, Bluetooth or real rumble/light-bar
-output. A/B/X/Y positions map to Cross/Circle/Square/Triangle. Generic retains
-16-bit axes, PS4 uses its real 8-bit report format. Guest Roblox recognition is
-unverified. Snapshot size/later offsets are guarded; profile uses formerly zero
-alignment bytes, and a saved session keeps its USB identity.
+Steering is opt-in in controller settings: enable, calibrate at neutral, choose
+angle/invert. Tilt overrides only LX; throttle/brake, other stick and buttons
+remain. Existing keyboard mapping converts steering to A/D. Sensor stops on
+inactivity/settings/disconnect. Guest native HID recognition is not guaranteed;
+Generic is default, PS4 compatibility remains explicitly experimental.
 
-Native packet/xHCI and Swift ownership/tuning/geometry tests pass. Actual controller
-touch, settings, pointer and software keyboard UI tests pass on M4 and at unfolded
-951x669 on a labelled M4 canvas. Native Duo cloud SpringBoard/XCTest launch failed
-in run43158389557/job130983663525; artifact13917861161 retains evidence. Earlier
-public inner-display power requests timed out. Native folding is not validated.
-Manual preview workflow native_duo=true preserves the strict native-window test.
-Both IPA workflows retain henge-custom-ipa/cancel-in-progress; preview runs cancel
-only older previews on the same branch. No IPA is produced by the preview workflow.
+Touchscreen uses emulated USB port4, independently of gamepad port3. Update the
+guest companion to this version and enable touchscreen on a compatible macOS27.2+
+guest. No restricted CoreHID entitlement is required. Mapping failure or an older
+guest falls back to pointer input; physical display UUID association still needs
+hardware validation. This does not provide physical USB/iTunes passthrough.
+
+Audio now rebuilds failed/interrupted output and preserves logical playback across
+pause. Route/media-reset/foreground events trigger bounded recovery. The existing
+manual Recover Sound action remains available.
+
+Fully shut down the Mac and resolve/discard a saved session before disk expansion.
+Storage → Expand Disk offers128/256/512GiB and custom up to2048GiB, grow only.
+The original remains as disk.img.before-expansion. GPT tables are validated and
+repaired for the new capacity atomically; no APFS/recovery contents are moved.
+After a cold boot enlarge APFS using the displayed macOS command or Disk Utility.
+A following recovery partition may require manual layout work; extra raw capacity
+is not automatically usable filesystem capacity. Export/remove the prior backup
+before another expansion; retain enough space for copy-on-write growth.
+
+Use60Hz for a controlled smoothness baseline;120Hz remains available. The primary
+presenter uses one display-link cadence while dirty and pauses when unchanged.
+Wireless encoding uses negotiated60/120Hz limits and a bounded three-frame window.
+Capture Diagnostics temporarily enables existing frame-time percentiles; idle and
+cursor intervals are included, so host presentation rate is not game FPS.
+
+Instant Resume: return quickly for in-memory continuation. For persistent saving,
+use Save Mac & Leave and keep Henge visible until complete. Old native-layout
+snapshots are clearly rejected with disks retained. iOS may deny background time
+or terminate the process. CPU-only runner remains opt-in; GPU jobs can require
+foreground. No entitlement bypass or unlimited background execution is claimed.

@@ -1,39 +1,31 @@
-# Exact integrated validation
+# Exact source validation
 
-Source `5701f45fcd7db0cdd19557b5a0f81924bead210c`, patch `a690fc757ab4d5638742a9aa442b92bac0a6ae605e552c5f05fe4d00b102a641`.
-Native/Release application: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43176532298. Controller previews: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43176532244.
+Source `f1f492f5ae935791859baa615aa01fe5c21e67bd`; patch `d1494f2e07873e3fb117d9a7b219f579ae9383dbbdda5520153e7436568b60e2`.
+Native/SDK/Release: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43296777053. Production UI: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43296777073.
 
-Passed: pinned source reconstruction; native JIT/MMU/ASID/page-crossing/permission
-differentials including interleaved memory groups; shared-copy emitter graph;
-concurrent JIT allocation/tail/limit checks; VM lifecycle/snapshot/teardown;
-ASan/UBSan/concurrency; actual Metal resource/LRU/function/store-action checks;
-input, network/audio lifecycle and real Link host/client TLS; production Swift
-SDK checks and complete iPhoneOS Release application compilation.
+Passed: pinned reconstruction; native JIT/MMU/ASID/permission/page-boundary
+regressions; grouped-memory differential tests; code publication/invalidation;
+VM lifecycle/snapshot/teardown; sanitizers and concurrency; real Metal resource,
+store-action and pipeline reuse; native audio interruption/pause/failure recovery;
+xHCI gamepad and USB touchscreen coexistence; real hardware video encode/decode
+and TLS flow, paced refresh and credit backpressure; controls-only host/client
+services, owned input release and reconnect; production display-link callback
+fixture; GPT cloning/CRC/payload/backup preservation; Swift6 guest helper and
+safe two-bundle archive validation; complete iOS SDK and Release app compilation.
 
-Controller checks exercise actual xHCI EP0 setup/data/status, 507-byte descriptor,
-Generic/PS4 packets, IN/OUT/features, neutral release and disconnection. Swift
-checks cover bounded tuning, geometry, ownership, multi-touch and wire compatibility.
-Production UIKit/SwiftUI UI tests exercise a real stick drag/button release, sensitivity,
-wireless pad, pointer pan, software keyboard and compact layout controls.
-M4 uses the installed M4 16GB simulator; Duo uses a separately labelled 951x669
-viewport on that working simulator, including narrow/wide layout transitions.
-Xcode 27.2 is recorded; host VirtualMac2,1 is not A20/M4 performance emulation.
+UI checks use production controller surfaces, pointer gestures, software keyboard,
+sensitivity, portrait/tabletop/video controls. M4 is the installed M4 Simulator.
+Duo uses an explicitly labelled exact 951x669 unfolded viewport on an M4 canvas.
+Native Duo runtime failed before UI launch in run43158389557/job130983663525;
+artifact13917861161 retains that evidence. This is not native folding validation.
 
-Failures retained: native Duo run43158389557/job130983663525/artifact13917861161
-failed before UI launch with SpringBoard/test-runner failure; earlier supported
-inner-display power RPCs timed out. This is not a native Duo pass.
-M4 attempt1 in run43160398386 timed out in XCTest's AX snapshot query at the
-wireless touchpad (artifact13918028386); retained spindump shows the app main
-thread idle. Only that job was retried on a fresh runner, with assertions and
-source unchanged. The final preview receipt records the successful attempt.
+Cloud is not M4/A20 performance emulation. Physical checks remain: sustained
+60/120Hz frame times, equivalent-work cooling/power, gyro ergonomics, Roblox HID
+recognition, real-network recovery, host audio routing, actual guest USB display
+association, APFS enlargement on user disks, and real background grants/expiry.
+No measured whole-VM FPS, temperature or efficiency-core residency claim.
 
-Measured host fixtures: 100 identical Metal library requests reuse one first
-function; a three-overlap grouped fallback fixture emits 7 rather than 15 words.
-These are not whole-emulator speed, game FPS, watts or temperature measurements.
-JIT/RAM defaults were not enlarged and display clarity was not reduced.
-
-Physical validation pending: native Duo fold/foreground/peripheral behaviour,
-Roblox PS4 recognition and sustained FPS, M4/Duo cold-start and thermal/power
-comparison, cross-device real-network ergonomics, and actual iOS continued CPU
-processing grants/expiry. Runner mode remains experimental; iOS may suspend or
-terminate Henge. GPU-dependent guest jobs may need foreground.
+M4 logsACBA used 14GiB guest RAM with experimental grouped/superblocks enabled.
+Host presentation samples were14.12..29.60/s (median24.98), not game FPS. The
+production double-cadence bug is fixed; use the existing M4 Automatic4CPU/8GiB
+baseline for comparison. Saved VM settings are not silently overwritten.

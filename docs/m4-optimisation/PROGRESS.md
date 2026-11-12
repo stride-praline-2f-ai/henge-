@@ -1,20 +1,17 @@
-# Integrated 0.3.4 source gate
+# Henge 0.3.5 (106) integrated source gate
 
-Source `5701f45fcd7db0cdd19557b5a0f81924bead210c`, cumulative patch `a690fc757ab4d5638742a9aa442b92bac0a6ae605e552c5f05fe4d00b102a641`.
-Native/full iOS Release compile: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43176532298. Controls UI: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43176532244.
+Source `f1f492f5ae935791859baa615aa01fe5c21e67bd`, patch `d1494f2e07873e3fb117d9a7b219f579ae9383dbbdda5520153e7436568b60e2`.
+Native and complete iOS Release compilation: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43296777053.
+Production controller UI: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43296777073.
 
-All feasible source workstreams are integrated. Retained safe alternatives and
-physical-device limits are recorded in henge-build/optimization-state.json.
-The final metadata-only child requests one IPA; archive inspection remains a
-separate gate. No interim IPA was packaged during these changes.
+Shared M4/Duo source now includes demand-driven primary display cadence without
+the commit-clock double gate, bounded existing frame-time capture, optional main
+screen wireless video, portrait/tabletop controls, pointer pad and sensitivity,
+opt-in gyro steering, automatic approved-pair reconnect, audio interruption
+recovery, entitlement-free USB guest touchscreen and offline GPT disk expansion.
+Existing Retina, ProMotion choices, MMU/JIT work, Instant Resume and CPU-only
+runner integration remain. Experimental controls stay explicit.
 
-New follow-up: exact-binary LRU/function reuse, bounded repeated-warning cache
-retention, shared grouped-memory fallback suffixes, aligned effective JIT limit,
-advanced local/wireless controls with sensitivity/dead-zone/response tuning and
-optional experimental PS4 USB compatibility. Existing Low Power policy, Retina,
-ProMotion choice, idle waits, two-port Link and CPU-only runner paths retained.
-
-Duo UI passes at the exact unfolded 951x669 viewport on a labelled M4 canvas.
-The native Duo cloud runtime failed SpringBoard/XCTest startup; native fold
-transitions remain unverified. No P/E placement, watts, thermal improvement,
-Roblox driver-recognition or game FPS result is claimed from Simulator.
+All required exact-source cloud checks passed. A metadata-only child requests
+one final IPA; archive production, nested signatures and delivery are separate
+gates. Physical limitations remain below; no interim IPA was packaged.
