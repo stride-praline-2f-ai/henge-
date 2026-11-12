@@ -988,8 +988,20 @@ index 30699bd..6ea7d06 100644
 +    return entry.firstFunction; // nil failures retry; bypass entries are not retained
  }
  @end
+diff --git a/devices/pvg_link.h b/devices/pvg_link.h
+index 4deff97..d0ff98b 100644
+--- a/devices/pvg_link.h
++++ b/devices/pvg_link.h
+@@ -10,5 +10,7 @@ int hv_pvg_lite_set_link_mode(uint32_t width, uint32_t height, uint32_t width_mm
+ typedef void (^HvPvgLinkFrameHandler)(void *texture, void *queue, uint32_t half_mode,
+     void *cursor_texture, float cursor_x, float cursor_y, float cursor_w, float cursor_h);
+ void hv_pvg_link_set_frame_handler(HvPvgLinkFrameHandler handler);
++/* Optional mirror of port zero; never changes guest topology or local output. */
++void hv_pvg_link_set_primary_frame_handler(HvPvgLinkFrameHandler handler);
+ #endif
+ #endif
 diff --git a/devices/pvg_lite.c b/devices/pvg_lite.c
-index 9f6ebcb..d8bc235 100644
+index 9f6ebcb..7fbb822 100644
 --- a/devices/pvg_lite.c
 +++ b/devices/pvg_lite.c
 @@ -90,6 +90,8 @@ struct HvPvgLite {
@@ -1012,7 +1024,13 @@ index 9f6ebcb..d8bc235 100644
  uint8_t *hv_pvg_lite_display_page_for_port(HvPvgLite *p,uint32_t port){
      if(!p||port>=p->display_count)return NULL;
      uint64_t pa=__atomic_load_n(&p->displays[port].page,__ATOMIC_ACQUIRE);return pa ? hv_phys_ptr(p->m,pa,0x4000) : NULL;
-@@ -202,6 +208,37 @@ void hv_pvg_lite_apply_link_connected(HvPvgLite *p,int connected){
+@@ -199,9 +205,43 @@ void hv_pvg_lite_apply_link_connected(HvPvgLite *p,int connected){
+     if(d){hv_pvg_display_publish(&p->displays[1],d);__atomic_fetch_or(&p->display_pending,2,__ATOMIC_ACQ_REL);hv_gicv3_pend(p->gic,p->gfx_irq);}
+     fprintf(stderr,"henge-link: port=1 connected=%d mode-change=%u\n",!!connected,p->displays[1].sequence);
+ }
++void hv_pvg_lite_mirror_refresh(HvPvgLite *p){
++    if(p&&p->metal)hv_pvg_metal_mirror_refresh(p->metal);
++}
  void hv_pvg_lite_link_connected(HvPvgLite *p,int connected){
      if(p&&p->metal)hv_pvg_metal_link_connected(p->metal,connected);
  }
@@ -1050,7 +1068,7 @@ index 9f6ebcb..d8bc235 100644
  
  static int task_read(HvPvgLite *p, uint32_t task, uint64_t off, void *to, uint32_t n);
  static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args) {
-@@ -591,6 +628,10 @@ static void ensure_metal(HvPvgLite *p) {
+@@ -591,6 +631,10 @@ static void ensure_metal(HvPvgLite *p) {
  }
  
  static void do_channel(HvPvgLite *p, uint32_t ch) {
@@ -1061,7 +1079,7 @@ index 9f6ebcb..d8bc235 100644
      uint64_t root = (uint64_t)reg(p, 0x101c) << 14, buf = (uint64_t)reg(p, 0x1030) << 14;
      if (!root || !buf || !ch) return;
      uint32_t *rec = hv_phys_ptr(p->m, root + 0x400 + 0x14 * (ch - 1), 0x14);
-@@ -729,6 +770,14 @@ static void vblank(HvPvgLite *p) {
+@@ -729,6 +773,14 @@ static void vblank(HvPvgLite *p) {
  
  void hv_pvg_lite_poll(HvPvgLite *p) {
      if (!p) return;
@@ -1076,7 +1094,7 @@ index 9f6ebcb..d8bc235 100644
      vblank(p);
      uint32_t chans = p->chan_pending;
      if (chans) {
-@@ -744,7 +793,7 @@ static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
+@@ -744,7 +796,7 @@ static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
      uint64_t v = 0;
      switch (off) {
      case 0x100c:
@@ -1085,7 +1103,7 @@ index 9f6ebcb..d8bc235 100644
          v = p->root_rp;
          break;
      case 0x1018:
-@@ -764,6 +813,10 @@ static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+@@ -764,6 +816,10 @@ static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
      HvPvgLite *p = opaque;
      (void)size;
      if (off >= 0x1000 && off < 0x2000) p->regs[(off - 0x1000) / 4] = (uint32_t)v;
@@ -1096,7 +1114,7 @@ index 9f6ebcb..d8bc235 100644
      /* Doorbells are answered here, on the CPU that rang: no waiting for CPU 0 to come by. */
      if (off == 0x1008) {
          do_root(p);
-@@ -791,7 +844,7 @@ static void iosfc_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+@@ -791,7 +847,7 @@ static void iosfc_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
      HvPvgLite *p = opaque;
      (void)size;
      if (off >= 0x1000 && off < 0x1040) p->io_regs[(off - 0x1000) / 8] = v;
@@ -1105,7 +1123,7 @@ index 9f6ebcb..d8bc235 100644
  }
  
  HvPvgLite *hv_pvg_lite_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t iosfc_pa, int gfx_irq, int iosfc_irq) {
-@@ -878,9 +931,10 @@ int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
+@@ -878,9 +934,10 @@ int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
  }
  
  /* CPUs stopped: the GPU's queued work done, and what only it holds copied into guest memory. */
@@ -1118,7 +1136,7 @@ index 9f6ebcb..d8bc235 100644
  }
  
  size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
-@@ -889,11 +943,11 @@ size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
+@@ -889,11 +946,11 @@ size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
  }
  
  /* After hv_pvg_lite_set_state: the screen and the pointer as they were, before the guest draws again. */
@@ -1134,7 +1152,7 @@ index 9f6ebcb..d8bc235 100644
  
  /* Debugging (the Mac runner's devstate): each channel's ring and stamps, to tell work never taken from work never
 diff --git a/devices/pvg_lite.h b/devices/pvg_lite.h
-index 0f68eae..f027569 100644
+index 0f68eae..12d46e9 100644
 --- a/devices/pvg_lite.h
 +++ b/devices/pvg_lite.h
 @@ -38,8 +38,23 @@ int hv_pvg_lite_old_driver(HvPvgLite *p);
@@ -1162,16 +1180,19 @@ index 0f68eae..f027569 100644
  uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m);
  void hv_pvg_metal_log_metrics(HvPvgMetal *m);
  void hv_pvg_lite_log_metrics(HvPvgLite *p);
-@@ -55,6 +70,8 @@ void hv_pvg_lite_link_connected(HvPvgLite *p, int connected);
+@@ -54,7 +69,11 @@ uint8_t *hv_pvg_lite_display_page_for_port(HvPvgLite *p, uint32_t port);
+ void hv_pvg_lite_link_connected(HvPvgLite *p, int connected);
  void hv_pvg_lite_apply_link_connected(HvPvgLite *p, int connected);
  void hv_pvg_metal_link_connected(HvPvgMetal *m, int connected);
++void hv_pvg_metal_mirror_refresh(HvPvgMetal *m);
++void hv_pvg_lite_mirror_refresh(HvPvgLite *p);
  void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m);
 +void hv_pvg_lite_trim_memory(HvPvgLite *p);
 +void hv_pvg_metal_trim_memory(HvPvgMetal *m);
  void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *command, uint32_t length);
  void hv_pvg_lite_complete(HvPvgLite *p, uint32_t channel, uint32_t stamp);
  
-@@ -67,18 +84,20 @@ void hv_pvg_lite_set_mode(uint32_t width, uint32_t height);
+@@ -67,18 +86,20 @@ void hv_pvg_lite_set_mode(uint32_t width, uint32_t height);
  int hv_pvg_lite_set_link_mode(uint32_t width, uint32_t height, uint32_t width_mm, uint32_t height_mm, uint32_t hz);
  /* The display's one mode. A scaled resolution chosen in macOS draws smaller surfaces for the same mode. */
  void hv_pvg_lite_mode(uint32_t *width, uint32_t *height);
@@ -1197,7 +1218,7 @@ index 0f68eae..f027569 100644
  
  #endif
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..c68e46c 100644
+index 9073d22..03be0e7 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -1241,7 +1262,30 @@ index 9073d22..c68e46c 100644
  
  #if !TARGET_OS_IPHONE
  #import <CoreGraphics/CoreGraphics.h>
-@@ -149,9 +162,16 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -120,7 +133,13 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
+ 
+ /* The registration lock never crosses encoding, callbacks or network operations. */
+ static os_unfair_lock link_handler_lock = OS_UNFAIR_LOCK_INIT;
+-static HvPvgLinkFrameHandler link_handler;
++static HvPvgLinkFrameHandler link_handler, primary_handler;
++void hv_pvg_link_set_primary_frame_handler(HvPvgLinkFrameHandler handler) {
++    os_unfair_lock_lock(&link_handler_lock);primary_handler=[handler copy];os_unfair_lock_unlock(&link_handler_lock);
++}
++static HvPvgLinkFrameHandler primary_frame_handler(void) {
++    os_unfair_lock_lock(&link_handler_lock);HvPvgLinkFrameHandler handler=primary_handler;os_unfair_lock_unlock(&link_handler_lock);return handler;
++}
+ void hv_pvg_link_set_frame_handler(HvPvgLinkFrameHandler handler) {
+     os_unfair_lock_lock(&link_handler_lock);
+     link_handler = [handler copy];
+@@ -135,6 +154,7 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+ @interface HvReplay : NSObject {
+ @public
+     HvPvgLite *lite;
++    _Atomic int mirror_queued;
+     id<MTLDevice> device;
+     id<MTLCommandQueue> queue;
+     dispatch_queue_t worker;
+@@ -149,9 +169,16 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      uint64_t execs, draws, heap_bytes, synced, remaps;
      _Atomic uint64_t failed;
      HvMetalLibraryCache *library_cache; /* serial GPU worker only; exact binary keys */
@@ -1258,7 +1302,7 @@ index 9073d22..c68e46c 100644
      uint64_t command_epoch, current_epoch, object_hits, object_reads, page_checks, page_hits;
      struct HvGpuEpochKey object_keys[HV_GPU_EPOCH_SLOTS];
      HvObject *object_values[HV_GPU_EPOCH_SLOTS];
-@@ -167,7 +187,6 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -167,7 +194,6 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      _Atomic uint64_t gpu_completed, gpu_duration_ns, gpu_max_ns, gpu_timing_missing;
      HvFramePacing frame_pacing;
      BOOL pacing_pending;
@@ -1266,7 +1310,7 @@ index 9073d22..c68e46c 100644
      int pacing_fps;
      BOOL pacing_policy_logged;
  
-@@ -193,6 +212,15 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -193,6 +219,15 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      uint64_t frames, frames_shot;
      /* Showing frames with the GPU: a layer the app gave us. No copies, no conversion on a CPU. */
      CAMetalLayer *layer; /* screen_lock protects the target and its generation */
@@ -1282,7 +1326,7 @@ index 9073d22..c68e46c 100644
      uint64_t layer_generation;
      __weak CAMetalLayer *prepared_layer; /* presenter only: each target needs its own setup */
      id<MTLRenderPipelineState> screen_pipe, linear_pipe, cursor_pipe;
-@@ -216,6 +244,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -216,6 +251,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      BOOL drawable_retry_pending;
      double drawable_retry_cooldown; /* fresh work coalesces one wake at its expiry */
      uint64_t screen_requests; /* fresh frames/cursor changes, not automatic retries */
@@ -1292,7 +1336,7 @@ index 9073d22..c68e46c 100644
      double drawable_retry_deadline; /* at most two seconds of retrying an unavailable target */
      uint32_t screen_w, screen_h;
      id<MTLBuffer> test_readback; /* HV_PVG_GPU_TEST: the drawable's pixels for screenshots */
-@@ -227,12 +258,30 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -227,13 +265,33 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
  - (void)complain:(NSString *)what;
  - (HvObject *)object:(uint32_t)ref task:(uint32_t)task;
  - (void)drawCursor;
@@ -1301,6 +1345,8 @@ index 9073d22..c68e46c 100644
  - (void)kickPresenter:(BOOL)fresh;
  - (void)present:(uint64_t)mapping;
  - (void)screenChanged;
++- (void)sendPrimaryMirror;
++- (void)schedulePrimaryMirror;
  - (void)sendLinkMapping:(uint64_t)mapping;
 +- (void)refreshCacheBudget;
 +- (BOOL)prepareScreenForLayer:(CAMetalLayer *)target;
@@ -1308,12 +1354,12 @@ index 9073d22..c68e46c 100644
 +- (void)requestDisplayPulse;
 +- (void)displayPulse:(CAMetalDisplayLink *)link update:(CAMetalDisplayLinkUpdate *)update;
 +#endif
-+@end
-+
+ @end
+ 
 +#if TARGET_OS_IPHONE
 +@interface HvDisplayPulse : NSObject <CAMetalDisplayLinkDelegate>
 +@property(nonatomic, weak) HvReplay *owner;
- @end
++@end
 +@implementation HvDisplayPulse
 +- (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update {
 +    link.paused = YES; // one damage-driven pulse, never an idle refresh loop
@@ -1321,10 +1367,11 @@ index 9073d22..c68e46c 100644
 +}
 +@end
 +#endif
- 
++
  /* What Metal asks while it reads a serialized pipeline. */
  @interface HvContext : NSObject {
-@@ -457,6 +506,20 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+ @public
+@@ -457,6 +515,20 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
  @end
  
  @implementation HvReplay
@@ -1345,7 +1392,7 @@ index 9073d22..c68e46c 100644
  
  - (void)complain:(NSString *)what {
      if ([complaints containsObject:what]) return;
-@@ -488,8 +551,11 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+@@ -488,8 +560,11 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
      NSMutableData *lib = [NSMutableData dataWithLength:h.len];
      if (hv_pvg_lite_task_read(lite, task, h.off, lib.mutableBytes, h.len)) return nil;
      __block NSError *err = nil;
@@ -1358,7 +1405,7 @@ index 9073d22..c68e46c 100644
          dispatch_data_t data = dispatch_data_create(lib.bytes, lib.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
          id<MTLLibrary> result = [self->device newLibraryWithData:data error:&err];
          double seconds = now_seconds() - begin;
-@@ -497,7 +563,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+@@ -497,7 +572,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
          if (seconds > self->library_load_worst) self->library_load_worst = seconds;
          return result;
      }];
@@ -1367,7 +1414,7 @@ index 9073d22..c68e46c 100644
          [self complain:[NSString stringWithFormat:@"library: %@", err.localizedDescription]];
          return nil;
      }
-@@ -509,11 +575,11 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+@@ -509,11 +584,11 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
          if (tf && keep) {
              NSString *dir = [[[NSString stringWithUTF8String:tf] stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"shaders"];
              [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -1381,7 +1428,7 @@ index 9073d22..c68e46c 100644
  }
  
  - (id)makeSerialized:(uint64_t)at length:(uint32_t)size task:(uint32_t)task {
-@@ -838,15 +904,10 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
+@@ -838,15 +913,10 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
      return made;
  }
  
@@ -1400,7 +1447,7 @@ index 9073d22..c68e46c 100644
  }
  
  static uint64_t guest_hash(HvObject *s) { return hash_bytes(s->mapped + s->first, s->alloc); }
-@@ -863,7 +924,7 @@ static void sync_iosurface(HvObject *s) {
+@@ -863,7 +933,7 @@ static void sync_iosurface(HvObject *s) {
      if (!s->iosurface) return;
      const uint8_t *from = s->mapped + s->first;
      BOOL by_plane = s->plane_count && IOSurfaceGetPlaneCount(s->iosurface) >= s->plane_count;
@@ -1409,7 +1456,7 @@ index 9073d22..c68e46c 100644
      uint32_t changed = 0;
      uint64_t *have = s->shared_hashes ? (uint64_t *)s->shared_hashes.mutableBytes : s->plane_hash;
      if (by_plane) {
-@@ -876,9 +937,9 @@ static void sync_iosurface(HvObject *s) {
+@@ -876,9 +946,9 @@ static void sync_iosurface(HvObject *s) {
      } else {
          uint64_t hash = guest_hash(s);
          if (hash == s->content_hash) return;
@@ -1421,7 +1468,7 @@ index 9073d22..c68e46c 100644
      /* HV_PVG_HOST_DUMP=prefix (debugging): the host surface as it is just before the guest's pixels go over it,
         for the first few multi-plane surfaces, with its layout in a .txt beside it: did the GPU draw something here
         that this copy throws away? */
-@@ -907,7 +968,6 @@ static void sync_iosurface(HvObject *s) {
+@@ -907,7 +977,6 @@ static void sync_iosurface(HvObject *s) {
             requested. Copy each changed video plane through its actual host layout. */
          for (uint32_t i = 0; i < s->plane_count && i < 4; i++) {
              if (!(changed & 1u << i)) continue;
@@ -1429,7 +1476,7 @@ index 9073d22..c68e46c 100644
              uint8_t *dst = IOSurfaceGetBaseAddressOfPlane(s->iosurface, i);
              size_t dst_row = IOSurfaceGetBytesPerRowOfPlane(s->iosurface, i);
              size_t rows = MIN((size_t)s->plane_h[i], IOSurfaceGetHeightOfPlane(s->iosurface, i));
-@@ -916,10 +976,13 @@ static void sync_iosurface(HvObject *s) {
+@@ -916,10 +985,13 @@ static void sync_iosurface(HvObject *s) {
              size_t bytes = MIN((size_t)src_row, dst_row);
              for (size_t y = 0; y < rows; y++)
                  memcpy(dst + y * dst_row, from + src_off + y * src_row, bytes);
@@ -1444,7 +1491,7 @@ index 9073d22..c68e46c 100644
      }
      IOSurfaceUnlock(s->iosurface, 0, NULL);
      const char *dump = getenv("HV_PVG_SURFACE_DUMP");
-@@ -988,18 +1051,18 @@ static void sync_surface_once(HvReplay *r, HvObject *s, uint64_t epoch) {
+@@ -988,18 +1060,18 @@ static void sync_surface_once(HvReplay *r, HvObject *s, uint64_t epoch) {
      }
      surface->surface_w = (uint32_t)sw, surface->surface_h = (uint32_t)sh;
      uint64_t n = surface->length >> 14;
@@ -1467,7 +1514,7 @@ index 9073d22..c68e46c 100644
          vm_prot_t cur, max;
          vm_remap(mach_task_self(), &to, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
      }
-@@ -1233,30 +1296,38 @@ static BOOL has_guest_pages(HvObject *o) {
+@@ -1233,30 +1305,38 @@ static BOOL has_guest_pages(HvObject *o) {
  }
  
  /* Between guest memory and the GPU's own copy, in the layout the guest was told. */
@@ -1515,7 +1562,7 @@ index 9073d22..c68e46c 100644
              if (down)
                  [*blit copyFromTexture:tex sourceSlice:s sourceLevel:m sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, d)
                                toBuffer:copy destinationOffset:from destinationBytesPerRow:row destinationBytesPerImage:image];
-@@ -1264,6 +1335,7 @@ static BOOL has_guest_pages(HvObject *o) {
+@@ -1264,6 +1344,7 @@ static BOOL has_guest_pages(HvObject *o) {
                  [*blit copyFromBuffer:copy sourceOffset:from sourceBytesPerRow:row sourceBytesPerImage:image
                             sourceSize:MTLSizeMake(w, h, d) toTexture:tex destinationSlice:s destinationLevel:m destinationOrigin:MTLOriginMake(0, 0, 0)];
          }
@@ -1523,7 +1570,7 @@ index 9073d22..c68e46c 100644
  }
  
  /* The guest asks to see what the GPU made: {task, count, refs}. */
-@@ -1278,8 +1350,7 @@ static BOOL has_guest_pages(HvObject *o) {
+@@ -1278,8 +1359,7 @@ static BOOL has_guest_pages(HvObject *o) {
          HvObject *o = objs[@(a[2 + i])];
          if (!o || !o->guest_backed || !o->host_valid) continue;
          if (!cb) cb = [queue commandBuffer];
@@ -1533,7 +1580,7 @@ index 9073d22..c68e46c 100644
      }
      [blit endEncoding];
      if (cb) {
-@@ -1459,6 +1530,12 @@ typedef struct {
+@@ -1459,6 +1539,12 @@ typedef struct {
      if (!pipeline_set && draw) return;
      if (tracing && draw) fprintf(stderr, "trace:  draw tag %u\n", tag);
      switch (tag) {
@@ -1546,7 +1593,7 @@ index 9073d22..c68e46c 100644
      case 24: { /* {fence, stages} */
          id f = [self get:U32(0) task:task];
          if (f) [e updateFence:f afterStages:(MTLRenderStages)(U32(4) & 0xffff)];
-@@ -2108,7 +2185,7 @@ typedef struct {
+@@ -2108,7 +2194,7 @@ typedef struct {
              self->failed++;
              fprintf(stderr, "hengevm: pvg-metal: command buffer: %s\n", done.error.localizedDescription.UTF8String);
          }
@@ -1555,7 +1602,7 @@ index 9073d22..c68e46c 100644
          double elapsed = done.GPUEndTime - done.GPUStartTime;
          atomic_fetch_add_explicit(&self->gpu_completed, 1, memory_order_relaxed);
          if (done.GPUStartTime > 0 && elapsed >= 0) {
-@@ -2169,8 +2246,7 @@ typedef struct {
+@@ -2169,8 +2255,7 @@ typedef struct {
          }
          if (res[i * 2 + 1] & 1) o->guest_stale = NO, o->host_valid = NO; /* the guest wrote it */
          if (o->guest_backed && !o->host_valid) {
@@ -1565,7 +1612,7 @@ index 9073d22..c68e46c 100644
          }
          if (res[i * 2 + 1] & 4) sync_after = YES;
      }
-@@ -2254,8 +2330,7 @@ typedef struct {
+@@ -2254,8 +2339,7 @@ typedef struct {
              if (!(res[i * 2 + 1] & 4)) continue;
              HvObject *o = [self object:res[i * 2] task:task];
              if (!o || !o->guest_backed) continue;
@@ -1575,7 +1622,7 @@ index 9073d22..c68e46c 100644
          }
          [back endEncoding];
      }
-@@ -2263,7 +2338,7 @@ typedef struct {
+@@ -2263,7 +2347,7 @@ typedef struct {
      [self commit:cb channel:ch stamp:stamp complete:YES];
      double t2 = now_seconds();
      encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
@@ -1584,7 +1631,7 @@ index 9073d22..c68e46c 100644
          static double t0;
          if (!t0) t0 = now_seconds();
          fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, commit/wait CPU time %.2f s\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time);
-@@ -2287,6 +2362,19 @@ typedef struct {
+@@ -2287,6 +2371,19 @@ typedef struct {
                  library_load_seconds * 1000, library_load_worst * 1000);
          fprintf(stderr, "hengevm: gpu-pipelines: builds=%llu total_ms=%.2f worst_ms=%.2f (cumulative host pipeline creation, including failures)\n",
                  (unsigned long long)pipeline_builds, pipeline_seconds * 1000, pipeline_worst_seconds * 1000);
@@ -1604,7 +1651,7 @@ index 9073d22..c68e46c 100644
      }
      return YES;
  }
-@@ -2319,14 +2407,27 @@ static const uint8_t *half_to_byte(void) {
+@@ -2319,14 +2416,27 @@ static const uint8_t *half_to_byte(void) {
      memcpy(&hx, (const uint8_t *)a + 0x24, 2), memcpy(&hy, (const uint8_t *)a + 0x26, 2);
      if (!w || !h || w > 512 || h > 512 || stride < (uint64_t)w * 4 || stride > 8192) return;
      uint8_t *bits = malloc((size_t)stride * h);
@@ -1632,7 +1679,7 @@ index 9073d22..c68e46c 100644
      [glyph replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
      if (a[0] == 1) {
          link_cursor=glyph;link_cw=w;link_ch=h;link_hx=hx;link_hy=hy;
-@@ -2336,21 +2437,22 @@ static const uint8_t *half_to_byte(void) {
+@@ -2336,21 +2446,22 @@ static const uint8_t *half_to_byte(void) {
      os_unfair_lock_lock(&screen_lock);
      cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
      cursor_tex = glyph;
@@ -1658,7 +1705,7 @@ index 9073d22..c68e46c 100644
          [self screenChanged];
          return;
      }
-@@ -2439,26 +2541,98 @@ static const uint8_t *half_to_byte(void) {
+@@ -2439,26 +2550,98 @@ static const uint8_t *half_to_byte(void) {
     refresh, so that happens on a thread of its own and never holds up the guest's GPU work:
     this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
  - (void)updatePacingPolicy {
@@ -1767,7 +1814,7 @@ index 9073d22..c68e46c 100644
      if (presenter_running || !layer || !screen_tex || drawable_retry_pending || pacing_pending) return;
      [self updatePacingPolicy];
      double now = now_seconds();
-@@ -2507,6 +2681,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2507,6 +2690,7 @@ static const uint8_t *half_to_byte(void) {
     submit another guest write. All link cursor state belongs to this worker. */
  - (void)sendLinkMapping:(uint64_t)mapping {
      link_mapping=mapping;
@@ -1775,7 +1822,43 @@ index 9073d22..c68e46c 100644
      HvPvgLinkFrameHandler handler=link_frame_handler();
      HvObject *surface=surfaces[@(mapping)];
      if(!handler || !surface)return;
-@@ -2552,7 +2727,15 @@ static const uint8_t *half_to_byte(void) {
+@@ -2526,6 +2710,29 @@ static const uint8_t *half_to_byte(void) {
+             (float)(at&0xffff)-link_hx*scale,(float)(at>>16)-link_hy*scale,link_cw*scale,link_ch*scale);
+ }
+ 
++/* Worker-owned optional capture. The consumer commits on the guest queue before
++   another guest write; borrowed textures are retained through GPU completion. */
++- (void)sendPrimaryMirror {
++    if (atomic_load(&stopping) || hv_pvg_lite_cpu_background(lite)) return;
++    HvPvgLinkFrameHandler handler=primary_frame_handler();if(!handler)return;
++    os_unfair_lock_lock(&screen_lock);
++    id<MTLTexture> tex=screen_tex,ctex=cursor_tex;
++    BOOL shown=cursor_shown;
++    uint32_t cw=cursor_w,ch=cursor_h,hx=cursor_hot_x,hy=cursor_hot_y;
++    os_unfair_lock_unlock(&screen_lock);
++    if(!tex)return;
++    const uint8_t *page=hv_pvg_lite_display_page(lite);
++    uint32_t at=page ? __atomic_load_n((const uint32_t *)(page+0xe00),__ATOMIC_ACQUIRE) : UINT32_MAX;
++    BOOL visible=page && at!=UINT32_MAX && ctex && (shown || page[0xe04]);
++    float scale=cursor_scale();
++    handler((__bridge void *)tex,(__bridge void *)queue,(uint32_t)hv_half_mode_get(),visible ? (__bridge void *)ctex : NULL,
++            (float)(at&0xffff)-hx*scale,(float)(at>>16)-hy*scale,cw*scale,ch*scale);
++}
++- (void)schedulePrimaryMirror {
++    if(!primary_frame_handler() || atomic_exchange(&mirror_queued,1))return;
++    dispatch_async(worker,^{atomic_store(&self->mirror_queued,0);[self sendPrimaryMirror];});
++}
++
+ - (void)showOnLayer:(uint64_t)mapping {
+     HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]); /* not met yet: a resumed machine's screen */
+     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
+@@ -2547,28 +2754,49 @@ static const uint8_t *half_to_byte(void) {
+     screen_dirty = YES;
+     [self kickPresenter:YES];
+     os_unfair_lock_unlock(&screen_lock);
++    [self sendPrimaryMirror];
+ }
+ 
  /* The pointer moved or changed: the screen again, with no need to go through the GPU queue's worker. */
  - (void)screenChanged {
      os_unfair_lock_lock(&screen_lock);
@@ -1792,7 +1875,10 @@ index 9073d22..c68e46c 100644
          screen_dirty = YES;
          [self kickPresenter:YES];
      }
-@@ -2562,13 +2745,24 @@ static const uint8_t *half_to_byte(void) {
+     os_unfair_lock_unlock(&screen_lock);
++    [self schedulePrimaryMirror];
+ }
+ 
  - (void)presentLoop {
      for (;;) @autoreleasepool {
          os_unfair_lock_lock(&screen_lock);
@@ -1819,7 +1905,7 @@ index 9073d22..c68e46c 100644
              presenter_running = NO;
              [self kickPresenter:NO];
              os_unfair_lock_unlock(&screen_lock);
-@@ -2597,7 +2791,12 @@ static const uint8_t *half_to_byte(void) {
+@@ -2597,7 +2825,12 @@ static const uint8_t *half_to_byte(void) {
              target.drawableSize = want;
              [CATransaction commit];
          }
@@ -1833,7 +1919,7 @@ index 9073d22..c68e46c 100644
          if (!drawable) {
              os_unfair_lock_lock(&screen_lock);
              screen_dirty = YES;
-@@ -2636,6 +2835,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2636,6 +2869,7 @@ static const uint8_t *half_to_byte(void) {
          cw0 = cursor_w, ch0 = cursor_h, hx = cursor_hot_x, hy = cursor_hot_y;
          BOOL same_target = layer_generation == generation && layer == target;
          BOOL same_size = screen_w == W && screen_h == H;
@@ -1841,7 +1927,7 @@ index 9073d22..c68e46c 100644
          if (same_target && same_size) {
              screen_dirty = NO;
              drawable_retry_deadline = 0;
-@@ -2717,7 +2917,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2717,7 +2951,7 @@ static const uint8_t *half_to_byte(void) {
          // Serialize the final check and commit with set_layer: a switch that has
          // returned must not be followed by a commit to its old target.
          os_unfair_lock_lock(&screen_lock);
@@ -1850,7 +1936,7 @@ index 9073d22..c68e46c 100644
              if (frame_metrics_enabled) {
                  [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
                      os_unfair_lock_lock(&self->frame_metrics_lock);
-@@ -2738,10 +2938,10 @@ static const uint8_t *half_to_byte(void) {
+@@ -2738,10 +2972,10 @@ static const uint8_t *half_to_byte(void) {
  
  /* What the display should show: at most a few times a second by CPU, for tests and the boot's first frames. */
  - (void)present:(uint64_t)mapping {
@@ -1863,7 +1949,7 @@ index 9073d22..c68e46c 100644
          late = NO;
          [self showOnLayer:mapping];
          return;
-@@ -2834,13 +3034,19 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2834,13 +3068,19 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->completions = dispatch_group_create();
          r->device = dev;
          r->queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
@@ -1884,7 +1970,7 @@ index 9073d22..c68e46c 100644
          r->resource_tally = getenv("HV_PVG_TALLY") != NULL;
          r->batch_cache = getenv("HV_GPU_BATCH_CACHE") && !strcmp(getenv("HV_GPU_BATCH_CACHE"), "1");
          r->tasks = [NSMutableDictionary new];
-@@ -2848,6 +3054,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2848,6 +3088,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->surfaces = [NSMutableDictionary new];
          r->planar = [NSMutableDictionary new];
          r->complaints = [NSMutableSet new];
@@ -1909,7 +1995,7 @@ index 9073d22..c68e46c 100644
          r->shot = getenv("HV_PVG_SHOT");
          cp_start(r);
  #if !TARGET_OS_IPHONE
-@@ -2864,6 +3088,31 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2864,6 +3122,31 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
              r->shot_timer = timer;
          }
  #endif
@@ -1941,7 +2027,7 @@ index 9073d22..c68e46c 100644
          fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
          return (HvPvgMetal *)CFBridgingRetain(r);
      }
-@@ -2874,20 +3123,35 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
+@@ -2874,20 +3157,35 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
      @autoreleasepool {
          HvReplay *r = CFBridgingRelease(m);
          atomic_store(&r->stopping, 1);
@@ -1980,7 +2066,7 @@ index 9073d22..c68e46c 100644
          dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
          /* GPU completions may have enqueued a final readback on the worker. */
          dispatch_sync(r->worker, ^{
-@@ -2998,24 +3262,67 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
+@@ -2998,24 +3296,67 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
      }
      r->pacing_pending = NO; r->frame_pacing.next = 0; /* reattaching the same layer also wakes a stopped presenter */
      r->layer = l;
@@ -2049,7 +2135,17 @@ index 9073d22..c68e46c 100644
          [r screenChanged];
          return;
      }
-@@ -3117,25 +3424,45 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+@@ -3104,6 +3445,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
+         (unsigned long long)m.overflow,(unsigned long long)m.invalid);
+ }
+ 
++void hv_pvg_metal_mirror_refresh(HvPvgMetal *m){
++    if(!m)return;HvReplay *r=(__bridge HvReplay *)m;[r schedulePrimaryMirror];
++}
+ void hv_pvg_metal_link_connected(HvPvgMetal *m,int connected){
+     if(!m)return;HvReplay *r=(__bridge HvReplay *)m;
+     dispatch_async(r->worker,^{
+@@ -3117,25 +3461,45 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
      if(atomic_exchange(&r->link_cursor_queued,1))return;
      dispatch_async(r->worker,^{atomic_store(&r->link_cursor_queued,0);if (!atomic_load(&r->stopping)) [r sendLinkMapping:r->link_mapping];});
  }
@@ -2099,7 +2195,7 @@ index 9073d22..c68e46c 100644
              for (NSNumber *task in r->tasks) {
                  NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
                  for (NSNumber *ref in objs) {
-@@ -3143,79 +3470,117 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -3143,79 +3507,117 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
                      if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
                      if (o->parent && o->parent->heap_whole) continue;
                      if (!cb) cb = [r->queue commandBuffer];
@@ -2124,8 +2220,13 @@ index 9073d22..c68e46c 100644
          dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
      }
 +    return failed ? -1 : 0;
-+}
-+
+ }
+ 
+-typedef struct DisplayState {
+-    uint64_t on_screen;
+-    uint32_t cursor_w, cursor_h, cursor_stride, cursor_shown;
+-    int32_t hot_x, hot_y;
+-} DisplayState;
 +/* Entry is foreground-only, with CPUs stopped and local presentation paused.
 +   Fence both guest and Link submissions before the CPU-only gate is published. */
 +int hv_pvg_metal_background_fence(HvPvgMetal *m) {
@@ -2142,13 +2243,8 @@ index 9073d22..c68e46c 100644
 +    dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
 +    dispatch_sync(r->worker, ^{});
 +    return failed ? -1 : 0;
- }
- 
--typedef struct DisplayState {
--    uint64_t on_screen;
--    uint32_t cursor_w, cursor_h, cursor_stride, cursor_shown;
--    int32_t hot_x, hot_y;
--} DisplayState;
++}
++
 +#include "display_snapshot.h"
  
  size_t hv_pvg_metal_display_state(HvPvgMetal *m, void *out, size_t cap) {
@@ -2753,10 +2849,10 @@ index cf4acc4..86e074e 100644
  /* Any thread: a Magic Trackpad 2 touch. phase: 0 down, 1 move, 2 up. id: a
 diff --git a/docs/controller-posture/PROGRESS.md b/docs/controller-posture/PROGRESS.md
 new file mode 100644
-index 0000000..bbd6ce1
+index 0000000..df7511e
 --- /dev/null
 +++ b/docs/controller-posture/PROGRESS.md
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,20 @@
 +# Controller posture integration
 +
 +Implemented in source (cloud validation pending):
@@ -2768,6 +2864,15 @@ index 0000000..bbd6ce1
 +- Tests: geometry overlap/bounds, posture selection, fractional motion/normalisation/persistence, source ownership and real production Simulator UI interactions.
 +
 +Next: compile against actual Xcode SDK, run native + production controller UI tests and inspect screenshots. No IPA requested for this development checkpoint. The USB touchscreen replacement remains a separate integration requirement; current controller touchpad is pointer input and requires no CoreHID entitlement.
++
++## Added scope
++- Optional main-display video mirror, no extra guest monitor. Existing hardware encoder/decoder/TLS path; bounded three-frame credits, unique frame IDs across replacements, one replaceable display image and demand-driven 60/120Hz display pulse.
++- Duo portrait video/controller deck and full-window landscape overlay; Fit/Fill, Video off, Reconnect and refresh controls.
++- Opt-in CoreMotion steering, calibration and angle/inversion; LX only, LY/buttons preserved, existing owned A/D mapping. One foreground motion owner and no idle sensor updates.
++- Listener/key retained on peer socket loss; client has cancellable bounded exponential reconnect and immediate foreground retry. Explicit disconnect stops retries. Background does not keep the VM/controller alive.
++- Audio interruption/route/reset/foreground recovery with generation fencing and bounded retries. Native pause now preserves guest sound-running state; transient start failure can restore its backend. Linux production-backend ASan/UBSan tests pass. Full SDK/VM/real TLS/Metal tests pending.
++
++Cloud checkpoint b0cd93e: pure controller tests passed. Full integration identified missing standalone-fixture hardware symbol and a sanitizer-script Swift source list; both repaired. First Simulator test could not resolve UIKeyInput touchpad as an Other element; now queries the exact identifier across accessibility types. No test skipped. New source must pass both real production UI and full native/app compile before release.
 diff --git a/docs/desktop-heat-20261111.md b/docs/desktop-heat-20261111.md
 new file mode 100644
 index 0000000..17638b3
@@ -4816,6 +4921,80 @@ index 0000000..c2a9184
 +  ],
 +  "notes": "Inventory of all PRs; not a claim every diff was runtime-tested. Current focus: shared controller UI and entitlement-free USB touchscreen. No blanket upstream merge."
 +}
+diff --git a/host/audio_mac.c b/host/audio_mac.c
+index 4e016ae..7f9063a 100644
+--- a/host/audio_mac.c
++++ b/host/audio_mac.c
+@@ -20,7 +20,7 @@
+ 
+ static AudioComponentInstance unit;
+ static int unit_running;
+-static int detached;
++static int detached, interrupted;
+ static unsigned cur_channels, cur_format, cur_rate;
+ 
+ static OSStatus render(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus,
+@@ -33,7 +33,7 @@ static OSStatus render(void *ref, AudioUnitRenderActionFlags *flags, const Audio
+ }
+ 
+ static int start(void *opaque, unsigned channels, unsigned format, unsigned rate_hz) {
+-    if (detached) return -1;
++    if (detached || interrupted) return -1;
+     HvVirtioSnd *d = opaque;
+     if (unit && (channels != cur_channels || format != cur_format || rate_hz != cur_rate)) {
+         AudioOutputUnitStop(unit);
+@@ -79,11 +79,11 @@ static void stop(void *opaque) {
+ }
+ 
+ void hv_audio_attach(HvVirtioSnd *d) {
+-    detached = 0;
++    detached = 0;interrupted=0;
+     d->backend = (HvVirtioSndBackend){start, stop, d};
+ }
+ 
+-void hv_audio_detach(HvVirtioSnd *d) {
++static void dispose_output(void) {
+     detached = 1;
+     stop(NULL); /* AudioOutputUnitStop waits for an in-flight render callback. */
+     if (unit) {
+@@ -93,5 +93,22 @@ void hv_audio_detach(HvVirtioSnd *d) {
+         fprintf(stderr, "hengevm: sound: output stopped and AudioUnit disposed after guest exit\n");
+     }
+     cur_channels = cur_format = cur_rate = 0;
+-    if (d) d->running = 0;
++}
++void hv_audio_pause(HvVirtioSnd *d) {
++    (void)d;dispose_output(); /* Preserve guest running/prepared state for snapshots. */
++}
++void hv_audio_detach(HvVirtioSnd *d) {
++    dispose_output();if(d)d->running=0;
++}
++void hv_audio_interrupt(HvVirtioSnd *d) {
++    interrupted=1;stop(NULL);
++    if(d){d->backend.start=NULL;hv_virtio_snd_resume(d);}
++}
++int hv_audio_recover(HvVirtioSnd *d) {
++    if(!d || detached)return -1;
++    /* Restore even a backend.start cleared after a transient AudioUnit failure.
++       Recreate the unit after route/media-service changes, retaining PCM state. */
++    dispose_output();hv_audio_attach(d);
++    hv_virtio_snd_resume(d);
++    return !d->running || d->backend.start ? 0 : -1;
+ }
+diff --git a/host/audio_mac.h b/host/audio_mac.h
+index 4919f5d..5a6c506 100644
+--- a/host/audio_mac.h
++++ b/host/audio_mac.h
+@@ -8,5 +8,9 @@ void hv_audio_attach(HvVirtioSnd *d);
+ /* Caller holds the device lock. Stop callbacks and release the AudioUnit;
+    a late guest request cannot restart it before another attach. */
+ void hv_audio_detach(HvVirtioSnd *d);
++/* Device lock required. Pause preserves the guest stream, unlike destruction. */
++void hv_audio_pause(HvVirtioSnd *d);
++void hv_audio_interrupt(HvVirtioSnd *d);
++int hv_audio_recover(HvVirtioSnd *d);
+ 
+ #endif
 diff --git a/host/enter.S b/host/enter.S
 index cc902ed..15b606f 100644
 --- a/host/enter.S
@@ -5667,7 +5846,7 @@ index 67fc764..2ca437b 100644
  
  #endif
 diff --git a/host/vm.c b/host/vm.c
-index db95c05..6b9880e 100644
+index db95c05..511e90d 100644
 --- a/host/vm.c
 +++ b/host/vm.c
 @@ -4,6 +4,7 @@
@@ -5678,7 +5857,21 @@ index db95c05..6b9880e 100644
  #include <CoreFoundation/CoreFoundation.h>
  #include <dispatch/dispatch.h>
  #include <os/lock.h>
-@@ -343,8 +344,34 @@ static int idle_ticker_enabled = 1;
+@@ -62,6 +63,13 @@ static uint64_t paused_counter; /* the guest's virtual counter when its CPUs sto
+ static int64_t paused_wall_ns;  /* and the wall clock then */
+ static _Atomic int nudge_after_start; /* resumed: tell the guest someone is here as soon as it runs */
+ 
++int hv_vm_audio_event(int recover) {
++    if(!sound_on || !board.snd || hv_vm_paused() || hv_vm_cpu_background())return -1;
++    hv_dev_lock(&m);
++    int result=0;
++    if(recover)result=hv_audio_recover(board.snd);else hv_audio_interrupt(board.snd);
++    hv_dev_unlock(&m);return result;
++}
+ HvMachine *hv_vm_machine(void) { return &m; }
+ HvVmapple *hv_vm_board(void) { return &board; }
+ HvCpu *hv_vm_cpu(int index) { return index >= 0 && index < ncpus ? &cpus[index] : NULL; }
+@@ -343,8 +351,34 @@ static int idle_ticker_enabled = 1;
  static int deadline_kicks;
  
  void hv_vm_log_ticker(void) {
@@ -5713,7 +5906,7 @@ index db95c05..6b9880e 100644
      fprintf(stderr,"flush-wait: enabled=%d waits=%llu timeouts=%llu errors=%llu (cumulative; notifications on peer park and pending requests)\n",m.quiesce_enabled,(unsigned long long)atomic_load(&m.quiesce.waits),(unsigned long long)atomic_load(&m.quiesce.timeouts),(unsigned long long)atomic_load(&m.quiesce.errors));
      fprintf(stderr, "idle-ticker: active_ticks=%llu sleep_waits=%llu resumes=%llu waiting=%u marked_cpu_flags=%llu (cumulative; timer/device wakeups remain active)\n",
              (unsigned long long)atomic_load_explicit(&kicker.ticks, memory_order_relaxed),
-@@ -386,7 +413,8 @@ static pthread_key_t signal_stack_key;
+@@ -386,7 +420,8 @@ static pthread_key_t signal_stack_key;
  static pthread_once_t signal_stack_once = PTHREAD_ONCE_INIT;
  static int signal_stack_key_ready;
  static void release_signal_stack(void *p) {
@@ -5723,7 +5916,7 @@ index db95c05..6b9880e 100644
      if (sigaltstack(&disabled, NULL) == 0) free(p);
  }
  static void make_signal_stack_key(void) {
-@@ -398,7 +426,12 @@ void hv_vm_prepare_cpu_thread(void) {
+@@ -398,7 +433,12 @@ void hv_vm_prepare_cpu_thread(void) {
      static __thread int done;
      if (done) return;
      done = 1;
@@ -5737,7 +5930,7 @@ index db95c05..6b9880e 100644
      if (ss.ss_sp) {
          if (sigaltstack(&ss, NULL) != 0) free(ss.ss_sp);
          else {
-@@ -461,9 +494,17 @@ int hv_vm_disk_identity(char *out, size_t n) {
+@@ -461,9 +501,17 @@ int hv_vm_disk_identity(char *out, size_t n) {
      return 0;
  }
  
@@ -5758,7 +5951,17 @@ index db95c05..6b9880e 100644
  }
  
  int hv_vm_run_cpu0(void) {
-@@ -512,19 +553,45 @@ int hv_vm_finish_pause(void) {
+@@ -473,7 +521,8 @@ int hv_vm_run_cpu0(void) {
+     if (hv_prof_unregister) hv_prof_unregister();
+     hv_idle_ticker_advance(&kicker);
+     hv_dev_lock(&m);
+-    hv_audio_detach(board.snd);
++    if(atomic_load(&cpus[0].halted)==HV_HALT_SAVE)hv_audio_pause(board.snd);
++    else hv_audio_detach(board.snd);
+     hv_dev_unlock(&m);
+     return result;
+ }
+@@ -512,19 +561,45 @@ int hv_vm_finish_pause(void) {
      hv_virtio_blk_stop(board.root_blk);
      hv_virtio_blk_stop(board.aux_blk);
      /* hv_vm_run_cpu0 already detached board.snd under the device lock. */
@@ -5807,7 +6010,7 @@ index db95c05..6b9880e 100644
  /* Where the guest's counter goes on from after a pause or a restore: as much later as the wall clock moved meanwhile, so
     its clock is right at once (macOS then also checks it with the network) -- the counter on a host (an iPhone asleep)
     stops for longer than the wall clock does. A jump of 10 minutes was seen to do no harm beyond what a Mac left alone
-@@ -588,7 +655,7 @@ int hv_vm_continue(void) {
+@@ -588,7 +663,7 @@ int hv_vm_continue(void) {
      }
      hv_virtio_blk_start(board.root_blk);
      hv_virtio_blk_start(board.aux_blk);
@@ -5816,7 +6019,7 @@ index db95c05..6b9880e 100644
          hv_audio_attach(board.snd);
          hv_virtio_snd_resume(board.snd);
      }
-@@ -627,6 +694,7 @@ static void *cpu0_thread(void *unused) {
+@@ -627,6 +702,7 @@ static void *cpu0_thread(void *unused) {
  }
  
  int hv_vm_start(int cpu0, void (*on_exit)(int reason)) {
@@ -5824,7 +6027,7 @@ index db95c05..6b9880e 100644
      exit_cb = on_exit;
      pthread_mutex_lock(&pause_mu);
      run_ended = 0;
-@@ -685,6 +753,7 @@ void hv_vm_stop(void) {
+@@ -685,6 +761,7 @@ void hv_vm_stop(void) {
  static os_unfair_lock rctrl_lock = OS_UNFAIR_LOCK_INIT;
  static int rctrl_user, rctrl_click;
  static int left_user, left_click, left_sent; /* only the pointer queue touches these */
@@ -5832,7 +6035,7 @@ index db95c05..6b9880e 100644
  
  static dispatch_queue_t pointer_queue(void) {
      static dispatch_queue_t q;
-@@ -702,9 +771,14 @@ static void stop_pointer(void) {
+@@ -702,9 +779,14 @@ static void stop_pointer(void) {
              hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);
              hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
          }
@@ -5848,7 +6051,7 @@ index db95c05..6b9880e 100644
          rctrl_user = rctrl_click = 0;
          os_unfair_lock_unlock(&rctrl_lock);
      });
-@@ -752,7 +826,13 @@ static void left_update(void) {
+@@ -752,7 +834,13 @@ static void left_update(void) {
  static void button_now(void *ctx) {
      if (atomic_load(&input_stopping)) return;
      intptr_t v = (intptr_t)ctx;
@@ -5863,7 +6066,7 @@ index db95c05..6b9880e 100644
      if (button == 0) {
          left_user = down;
          left_update();
-@@ -777,6 +857,16 @@ void hv_vm_mouse_button(int button, int down) {
+@@ -777,6 +865,16 @@ void hv_vm_mouse_button(int button, int down) {
      if (button < 0 || button > 2) return;
      dispatch_async_f(pointer_queue(), (void *)(intptr_t)(button << 1 | !!down), button_now);
  }
@@ -5880,7 +6083,7 @@ index db95c05..6b9880e 100644
  
  /* The guest takes a wheel event as 8 bits: -200 arrives as +56, the wrong way. So big moves go in pieces. */
  static void wheel(uint16_t axis, int amount) {
-@@ -802,6 +892,9 @@ void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
+@@ -802,6 +900,9 @@ void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
  void hv_vm_touch_frame(uint32_t ts_ms) { hv_xhci_touch_frame(board.usb, ts_ms); }
  
  void hv_vm_touch_button(int down) { hv_xhci_touch_button(board.usb, down); }
@@ -5891,10 +6094,18 @@ index db95c05..6b9880e 100644
  int hv_vm_pointer(int *x, int *y) {
      HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
 diff --git a/host/vm.h b/host/vm.h
-index 47e26eb..da802d1 100644
+index 47e26eb..79341ce 100644
 --- a/host/vm.h
 +++ b/host/vm.h
-@@ -77,13 +77,18 @@ int hv_vm_finish_pause(void);
+@@ -31,6 +31,7 @@ int hv_vm_create(const HvVmConfig *cfg, char *err, size_t errlen);
+    JIT memory stays owned by the app and can be attached to the next machine. */
+ void hv_vm_destroy(void);
+ HvMachine *hv_vm_machine(void);
++int hv_vm_audio_event(int recover);
+ HvVmapple *hv_vm_board(void);
+ HvCpu *hv_vm_cpu(int index);
+ extern void (*hv_prof_register)(void); /* debugging: each thread that will run guest code calls this */
+@@ -77,13 +78,18 @@ int hv_vm_finish_pause(void);
  int hv_vm_paused(void);
  int hv_vm_continue(void);
  int hv_vm_pause_clean(void); /* paused with no disk request in flight: it can be saved */
@@ -5914,7 +6125,7 @@ index 47e26eb..da802d1 100644
  /* The disk and auxiliary storage files as they are now (inode, size, last change): a saved machine resumes only onto these. */
  int hv_vm_disk_identity(char *out, size_t n);
  const char *hv_vm_reason_name(int reason);
-@@ -101,6 +106,10 @@ void hv_vm_mouse_hwheel(int dx);
+@@ -101,6 +107,10 @@ void hv_vm_mouse_hwheel(int dx);
  void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms);
  void hv_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
  void hv_vm_touch_button(int down); /* the pad's full press (a click) */
@@ -5925,6 +6136,102 @@ index 47e26eb..da802d1 100644
  /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
  int hv_vm_pointer(int *x, int *y);
  /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */
+diff --git a/ios/Henge/AudioSessionRecovery.swift b/ios/Henge/AudioSessionRecovery.swift
+new file mode 100644
+index 0000000..ed16b54
+--- /dev/null
++++ b/ios/Henge/AudioSessionRecovery.swift
+@@ -0,0 +1,90 @@
++import UIKit
++import AVFAudio
++
++/// Event-driven recovery for the existing virtio-snd/RemoteIO backend. A retry
++/// belongs to one VM generation; route changes never force the speaker output.
++@MainActor final class AudioSessionRecovery {
++    static let shared=AudioSessionRecovery()
++    private var observers:[NSObjectProtocol]=[]
++    private let work=DispatchQueue(label:"henge.audio.recovery",qos:.utility)
++    private var pending:DispatchWorkItem?
++    private var revision=UUID()
++    private var interrupted=false
++    private var route=""
++    func start() {
++        guard observers.isEmpty else { return }
++        configureCategory()
++        let center=NotificationCenter.default
++        func observe(_ name:Notification.Name,_ action:@escaping @MainActor (Notification)->Void) {
++            observers.append(center.addObserver(forName:name,object:nil,queue:.main) { notification in
++                MainActor.assumeIsolated { action(notification) }
++            })
++        }
++        observe(AVAudioSession.interruptionNotification) { [weak self] notification in
++            guard let self,let value=notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
++                  let type=AVAudioSession.InterruptionType(rawValue:value) else { return }
++            self.interrupted=type == .began
++            if self.interrupted {
++                self.cancel();let generation=henge_vm_generation()
++                self.work.async { _=henge_vm_audio_event(generation,0) }
++                HengeLog.log("audio","Output interrupted; guest audio clock retained")
++            } else {
++                let options=AVAudioSession.InterruptionOptions(rawValue:notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
++                if options.contains(.shouldResume) { self.recover(reason:"interruption ended") }
++            }
++        }
++        observe(AVAudioSession.routeChangeNotification) { [weak self] _ in
++            guard let self else { return }
++            let signature=self.routeSignature
++            guard signature != self.route else { return }
++            self.route=signature;self.recover(reason:"output route changed")
++        }
++        observe(AVAudioSession.mediaServicesWereLostNotification) { [weak self] _ in
++            self?.interrupted=true;self?.cancel();HengeLog.log("audio","Audio services unavailable; waiting for reset")
++        }
++        observe(AVAudioSession.mediaServicesWereResetNotification) { [weak self] _ in
++            self?.interrupted=false;self?.configureCategory();self?.recover(reason:"audio services reset")
++        }
++        observe(UIApplication.didBecomeActiveNotification) { [weak self] _ in self?.recover(reason:"foreground") }
++        route=routeSignature
++    }
++    private var routeSignature:String {
++        let session=AVAudioSession.sharedInstance()
++        return session.currentRoute.outputs.map { $0.uid }.joined(separator:"|")+"/\(session.sampleRate)/\(session.outputNumberOfChannels)"
++    }
++    private func configureCategory() {
++        let session=AVAudioSession.sharedInstance()
++        guard session.category != .playback || !session.categoryOptions.contains(.mixWithOthers) else { return }
++        do { try session.setCategory(.playback,options:[.mixWithOthers]) }
++        catch { HengeLog.log("audio","Cannot configure output: \(error.localizedDescription)") }
++    }
++    private func cancel() { revision=UUID();pending?.cancel();pending=nil }
++    func recover(reason:String="manual") {
++        guard !interrupted,henge_vm_state()==1,henge_vm_cpu_background()==0 else { return }
++        cancel();let current=revision,generation=henge_vm_generation()
++        attempt(reason:reason,generation:generation,revision:current,index:0)
++    }
++    private func attempt(reason:String,generation:UInt64,revision current:UUID,index:Int) {
++        guard revision==current,!interrupted,henge_vm_state()==1,henge_vm_generation()==generation else { return }
++        configureCategory()
++        do { try AVAudioSession.sharedInstance().setActive(true) }
++        catch { retry(reason:reason,generation:generation,revision:current,index:index);return }
++        route=routeSignature
++        work.async { [weak self] in
++            let result=henge_vm_audio_event(generation,1)
++            Task { @MainActor in
++                guard let self,self.revision==current else { return }
++                if result==0 { HengeLog.log("audio","Output recovered after \(reason); existing guest stream preserved") }
++                else { self.retry(reason:reason,generation:generation,revision:current,index:index) }
++            }
++        }
++    }
++    private func retry(reason:String,generation:UInt64,revision current:UUID,index:Int) {
++        let delays=[0.25,1.0,3.0]
++        guard index<delays.count else { HengeLog.log("audio","Output recovery paused; use Recover sound from the three-finger menu");return }
++        let task=DispatchWorkItem { [weak self] in
++            MainActor.assumeIsolated { self?.attempt(reason:reason,generation:generation,revision:current,index:index+1) }
++        }
++        pending=task;DispatchQueue.main.asyncAfter(deadline:.now()+delays[index],execute:task)
++    }
++}
 diff --git a/ios/Henge/Autopilot.swift b/ios/Henge/Autopilot.swift
 index 6a0a9cc..e01a852 100644
 --- a/ios/Henge/Autopilot.swift
@@ -6117,25 +6424,35 @@ index 0000000..4ce55b3
 +}
 diff --git a/ios/Henge/Controls/GamepadControllerSurface.swift b/ios/Henge/Controls/GamepadControllerSurface.swift
 new file mode 100644
-index 0000000..a7e9022
+index 0000000..ce1e25a
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadControllerSurface.swift
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,56 @@
 +import SwiftUI
 +
 +/// The controller and pointing pad share existing input paths. No extra ticker.
 +struct GamepadControllerSurface: View {
 +    let tuning:GamepadTuning
++    var acceptsInput=true
 +    var portrait=false
 +    var showsTouchpad=true
 +    var capturesKeyboard=false
 +    let send:(GamepadState)->Void
 +    let sendPointer:(LinkControl)->Void
++    @ObservedObject private var gyro=GyroSteeringService.shared
++    @Environment(\.scenePhase) private var phase
++    @State private var owner=UUID()
++    @State private var latest=GamepadState()
++    private func publish(_ state:GamepadState) {
++        latest=state
++        guard phase == .active && acceptsInput else { send(.off);return }
++        send(GyroSteeringMath.merge(state,steering:gyro.axis,enabled:gyro.steering && gyro.owns(owner)))
++    }
 +    var body:some View {
 +        GeometryReader { geometry in
 +            let pad=PadLayout(bounds:CGRect(origin:.zero,size:geometry.size),size:tuning.normalized.scale,portrait:portrait).touchpadRect
 +            ZStack(alignment:.topLeading) {
-+                GamepadSurface(tuning:tuning,portrait:portrait,send:send)
++                GamepadSurface(tuning:tuning,portrait:portrait,send:publish)
 +                if showsTouchpad {
 +                    WirelessInputSurface(keyboard:false,send:sendPointer,capturesKeyboard:capturesKeyboard,identifier:"gamepad-touchpad")
 +                        .background(.black.opacity(tuning.normalized.opacity),in:RoundedRectangle(cornerRadius:12))
@@ -6149,6 +6466,22 @@ index 0000000..a7e9022
 +                }
 +            }
 +        }
++        .overlay(alignment:.top) {
++            if gyro.enabled {
++                Button { gyro.calibrate() } label: {
++                    Label("Recenter",systemImage:"steeringwheel").font(.caption).padding(.horizontal,10).frame(height:28).background(.ultraThinMaterial,in:Capsule())
++                }.accessibilityLabel("Recenter gyro steering")
++            }
++        }
++        .onAppear { gyro.acquire(owner);gyro.setForeground(phase == .active && acceptsInput,owner:owner) }
++        .onDisappear { gyro.release(owner);send(.off) }
++        .onChange(of:phase) { _,value in gyro.setForeground(value == .active && acceptsInput,owner:owner) }
++        .onChange(of:acceptsInput) { _,value in
++            gyro.setForeground(phase == .active && value,owner:owner)
++            if !value { latest = .off;send(.off);sendPointer(LinkControl(type:"release")) }
++        }
++        .onChange(of:gyro.axis) { _,_ in if gyro.owns(owner) { publish(latest) } }
++        .onChange(of:gyro.enabled) { _,_ in if gyro.owns(owner) { publish(latest) } }
 +    }
 +}
 diff --git a/ios/Henge/Controls/GamepadHub.swift b/ios/Henge/Controls/GamepadHub.swift
@@ -6244,7 +6577,7 @@ index 0000000..437d2f5
 +}
 diff --git a/ios/Henge/Controls/GamepadLayout.swift b/ios/Henge/Controls/GamepadLayout.swift
 new file mode 100644
-index 0000000..9d6cc64
+index 0000000..d12c37e
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadLayout.swift
 @@ -0,0 +1,84 @@
@@ -6277,7 +6610,7 @@ index 0000000..9d6cc64
 +        scale = max(0.01,min(CGFloat(size),min(bounds.width/(portrait ? 390 : 560),bounds.height/(portrait ? 700 : 320))))
 +    }
 +    var touchpadRect: CGRect {
-+        if portrait { return mapped(CGRect(x:24,y:24,width:342,height:240)) }
++        if portrait { return mapped(CGRect(x:24,y:40,width:342,height:224)) }
 +        let width=min(260*scale,max(1,bounds.width-416*scale))
 +        return CGRect(x:bounds.midX-width/2,y:bounds.maxY-178*scale,width:width,height:60*scale)
 +    }
@@ -6334,10 +6667,10 @@ index 0000000..9d6cc64
 +
 diff --git a/ios/Henge/Controls/GamepadSettingsPanel.swift b/ios/Henge/Controls/GamepadSettingsPanel.swift
 new file mode 100644
-index 0000000..9261c5e
+index 0000000..5f4ecb5
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadSettingsPanel.swift
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,72 @@
 +import SwiftUI
 +
 +struct GamepadSettingsPanel: View {
@@ -6346,6 +6679,7 @@ index 0000000..9261c5e
 +    @AppStorage("henge.gamepad.profile") private var profile = "generic"
 +    @ObservedObject private var preferences = GamepadPreferences.shared
 +    @ObservedObject private var touchpad = TouchpadPreferences.shared
++    @ObservedObject private var gyro=GyroSteeringService.shared
 +    @Environment(\.dismiss) private var dismiss
 +    var body: some View {
 +        NavigationStack {
@@ -6373,6 +6707,14 @@ index 0000000..9261c5e
 +                        adjustment("Mouse look speed",value:$preferences.value.mouseLookSpeed,range:300...2400)
 +                    }
 +                }
++                Section("Racing · gyro steering") {
++                    Toggle("Tilt to steer",isOn:$gyro.enabled).disabled(!gyro.available)
++                    adjustment("Full steering angle",value:$gyro.fullLockDegrees,range:15...70)
++                    Toggle("Invert steering",isOn:$gyro.inverted)
++                    Text(gyro.available ? "Tilt controls horizontal steering. The joystick still controls acceleration/braking and all buttons remain available. Keyboard mapping translates steering to A/D. Recenter while holding the device comfortably." : "This device does not report a motion sensor. Joystick controls remain available.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                    Text(gyro.status).font(.caption).foregroundStyle(.secondary)
++                }
 +                Section("Touchpad") {
 +                    adjustment("Touchpad movement speed",value:$touchpad.value.pointerSpeed,range:0.25...3)
 +                    adjustment("Touchpad scrolling speed",value:$touchpad.value.scrollSpeed,range:0.25...3)
@@ -6388,6 +6730,8 @@ index 0000000..9261c5e
 +                Button("Reset gamepad tuning") { preferences.value = GamepadTuning() }
 +            }
 +            .navigationTitle("Gamepad settings")
++            .onAppear { gyro.setConfigurationVisible(true) }
++            .onDisappear { gyro.setConfigurationVisible(false) }
 +            .toolbar { ToolbarItem(placement:.confirmationAction) { Button("Done") { dismiss() } } }
 +        }
 +    }
@@ -6687,6 +7031,100 @@ index 0000000..13b637d
 +    @ObservedObject private var hub=GamepadHub.shared
 +    var body: some View { GamepadSettingsPanel(mapping:mapping ?? $hub.keyboardMapping,allowsNativeProfile:mapping == nil) }
 +}
+diff --git a/ios/Henge/Controls/GyroSteering.swift b/ios/Henge/Controls/GyroSteering.swift
+new file mode 100644
+index 0000000..da9cdbc
+--- /dev/null
++++ b/ios/Henge/Controls/GyroSteering.swift
+@@ -0,0 +1,55 @@
++import Foundation
++import Combine
++import CoreMotion
++
++/// One opt-in motion owner. No sensor, timer or network work when disabled,
++/// backgrounded, disconnected or outside the gamepad view.
++@MainActor final class GyroSteeringService: ObservableObject {
++    static let shared=GyroSteeringService()
++    @Published var enabled=false { didSet { if oldValue != enabled { reconcile() } } }
++    @Published private(set) var axis:Int16=0
++    @Published private(set) var status="Gyro off"
++    @Published var fullLockDegrees:Double=UserDefaults.standard.object(forKey:"henge.gyro.lock") as? Double ?? 35 {
++        didSet { UserDefaults.standard.set(fullLockDegrees.isFinite ? min(70,max(15,fullLockDegrees)) : 35,forKey:"henge.gyro.lock");calibrate() }
++    }
++    @Published var inverted=UserDefaults.standard.bool(forKey:"henge.gyro.inverted") {
++        didSet { UserDefaults.standard.set(inverted,forKey:"henge.gyro.inverted");calibrate() }
++    }
++    private let motion=CMMotionManager()
++    private var reference:CMAttitude?
++    private var math=GyroSteeringMath()
++    private var owner:UUID?
++    private var foreground=true
++    private var configuring=false
++    private var generation=UUID()
++    var available:Bool { motion.isDeviceMotionAvailable }
++    var steering:Bool { enabled && available && owner != nil && foreground && !configuring }
++    func acquire(_ id:UUID) { owner=id;foreground=true;reconcile() }
++    func release(_ id:UUID) { guard owner==id else { return };owner=nil;reconcile() }
++    func setForeground(_ active:Bool,owner id:UUID) { guard owner==id else { return };foreground=active;reconcile() }
++    func owns(_ id:UUID)->Bool { owner==id }
++    func setConfigurationVisible(_ visible:Bool) { configuring=visible;reconcile() }
++    func calibrate() { reference=nil;math.reset();axis=0 }
++    private func reconcile() {
++        motion.stopDeviceMotionUpdates();generation=UUID();calibrate()
++        guard steering else { status=available ? "Gyro off" : "Motion sensor unavailable";return }
++        status="Hold comfortably · calibrating…"
++        motion.deviceMotionUpdateInterval=1/60
++        let stamp=generation
++        motion.startDeviceMotionUpdates(to:.main) { [weak self] sample,error in
++            MainActor.assumeIsolated {
++                guard let self,self.generation==stamp,self.steering else { return }
++                guard error==nil,let sample else { self.enabled=false;self.status="Motion unavailable; joystick steering restored";return }
++                guard let reference=self.reference else {
++                    self.reference=sample.attitude.copy() as? CMAttitude;self.status="Tilt to steer";return
++                }
++                guard let relative=sample.attitude.copy() as? CMAttitude else { return }
++                relative.multiply(byInverseOf:reference)
++                let q=relative.quaternion
++                let angle=atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z))
++                let next=self.math.update(angle:angle,time:sample.timestamp,fullLockDegrees:self.fullLockDegrees,inverted:self.inverted)
++                if next==0 || abs(Int(next)-Int(self.axis))>=32 { self.axis=next }
++            }
++        }
++    }
++}
+diff --git a/ios/Henge/Controls/GyroSteeringMath.swift b/ios/Henge/Controls/GyroSteeringMath.swift
+new file mode 100644
+index 0000000..a932755
+--- /dev/null
++++ b/ios/Henge/Controls/GyroSteeringMath.swift
+@@ -0,0 +1,27 @@
++import Foundation
++
++/// Rotation about the calibrated screen's normal, with a small center deadband.
++/// Horizontal steering replaces LX only; throttle/brake (LY) and all buttons stay.
++struct GyroSteeringMath {
++    private var filtered=0.0
++    private var last:Double?
++    mutating func reset() { filtered=0;last=nil }
++    mutating func update(angle:Double,time:Double,fullLockDegrees:Double,inverted:Bool)->Int16 {
++        guard angle.isFinite,time.isFinite,fullLockDegrees.isFinite else { reset();return 0 }
++        let full=min(70,max(15,fullLockDegrees))*Double.pi/180
++        let bounded=min(1,max(-1,atan2(sin(angle),cos(angle))/full))
++        let dead=0.04
++        let target=abs(bounded)<=dead ? 0 : (bounded<0 ? -1.0 : 1.0)*(abs(bounded)-dead)/(1-dead)
++        let dt=last.map { min(0.1,max(0,time-$0)) } ?? 1/60.0
++        last=time
++        filtered += (target-filtered)*(1-exp(-dt/0.04))
++        if target==0 && abs(filtered)<0.005 { filtered=0 }
++        let result=Int16((min(1,max(-1,filtered))*(inverted ? -32767 : 32767)).rounded())
++        return result
++    }
++    static func merge(_ pad:GamepadState,steering:Int16,enabled:Bool)->GamepadState {
++        guard enabled,pad.connected else { return pad }
++        var result=pad;result.lx=steering;return result
++    }
++}
++
 diff --git a/ios/Henge/Controls/PadInput.swift b/ios/Henge/Controls/PadInput.swift
 new file mode 100644
 index 0000000..7cc0e18
@@ -6780,10 +7218,10 @@ index 0000000..f4bf2f7
 +}
 diff --git a/ios/Henge/Controls/WirelessControlsPanel.swift b/ios/Henge/Controls/WirelessControlsPanel.swift
 new file mode 100644
-index 0000000..92c7307
+index 0000000..69257d2
 --- /dev/null
 +++ b/ios/Henge/Controls/WirelessControlsPanel.swift
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,151 @@
 +import SwiftUI
 +
 +enum WirelessControlMode: Int, CaseIterable, Identifiable {
@@ -6799,6 +7237,9 @@ index 0000000..92c7307
 +    let status: String
 +    let tuning: GamepadTuning
 +    var isDuo=false
++    var acceptsInput=true
++    var supportsVideo=false
++    var enableVideo:()->Void = {}
 +    @Binding var mode: WirelessControlMode
 +    let disconnect: () -> Void
 +    let configure: () -> Void
@@ -6847,7 +7288,7 @@ index 0000000..92c7307
 +                pointingPad(identifier:"tabletop-touchpad")
 +            }.padding(14).frame(height:layout.upper.height)
 +            Color.clear.frame(height:layout.fold.height).allowsHitTesting(false)
-+            GamepadControllerSurface(tuning:tuning,showsTouchpad:false,send:sendPad,sendPointer:sendPointer)
++            GamepadControllerSurface(tuning:tuning,acceptsInput:acceptsInput,showsTouchpad:false,send:sendPad,sendPointer:sendPointer)
 +                .padding(.horizontal,12).frame(height:layout.lower.height)
 +        }.accessibilityIdentifier("duo-tabletop-controls")
 +    }
@@ -6860,6 +7301,7 @@ index 0000000..92c7307
 +            }
 +            Spacer(minLength:0)
 +            if isDuo && mode == .gamepad { layoutMenu }
++            if supportsVideo { videoButton }
 +            settingsButton
 +            Button(action:disconnect) { Image(systemName:"xmark.circle.fill").font(.title2) }
 +                .accessibilityLabel("Disconnect wireless controls")
@@ -6894,9 +7336,13 @@ index 0000000..92c7307
 +            }
 +            Spacer(minLength:0)
 +            if isDuo && mode == .gamepad { layoutMenu }
++            if supportsVideo { videoButton }
 +            settingsButton
 +            Button("Disconnect",systemImage:"xmark.circle",action:disconnect).font(.caption)
 +        }.padding(.vertical,8)
++    }
++    private var videoButton:some View {
++        Button(action:enableVideo) { Image(systemName:"video").frame(width:44,height:44) }.accessibilityLabel("Show Mac video with controls")
 +    }
 +    private var settingsButton: some View {
 +        Button(action:configure) { Image(systemName:"slider.horizontal.3").font(.title3).frame(width:44,height:44) }
@@ -6912,7 +7358,7 @@ index 0000000..92c7307
 +    }
 +    @ViewBuilder private func content(portrait:Bool) -> some View {
 +        if mode == .gamepad {
-+            GamepadControllerSurface(tuning:tuning,portrait:portrait,capturesKeyboard:true,send:sendPad,sendPointer:sendPointer)
++            GamepadControllerSurface(tuning:tuning,acceptsInput:acceptsInput,portrait:portrait,capturesKeyboard:true,send:sendPad,sendPointer:sendPointer)
 +                .frame(maxWidth:.infinity,maxHeight:.infinity)
 +        } else {
 +            VStack(alignment:.leading,spacing:10) {
@@ -7056,6 +7502,47 @@ index 0000000..a2c62de
 +        view.releaseInput();view.resignFirstResponder();view.send = nil;view.rejectedPaste = nil
 +    }
 +}
+diff --git a/ios/Henge/Controls/WirelessVideoControls.swift b/ios/Henge/Controls/WirelessVideoControls.swift
+new file mode 100644
+index 0000000..0bb94d7
+--- /dev/null
++++ b/ios/Henge/Controls/WirelessVideoControls.swift
+@@ -0,0 +1,35 @@
++import SwiftUI
++
++/// Shared controller composition; video remains the existing native decoder.
++/// Portrait Duo uses the upper panel for video and the lower for controls.
++struct WirelessVideoControls<Video:View,Toolbar:View>:View {
++    let isDuo:Bool
++    let tuning:GamepadTuning
++    var acceptsInput=true
++    let sendPad:(GamepadState)->Void
++    let sendPointer:(LinkControl)->Void
++    let video:Video
++    let toolbar:Toolbar
++    var body:some View {
++        GeometryReader { geometry in
++            let ds=isDuo && geometry.size.height>geometry.size.width
++            let layout=ControllerPostureLayout(size:geometry.size,choice:.tabletop,isDuo:isDuo,division:controllerDivision(geometry,isDuo:isDuo))
++            if ds {
++                VStack(spacing:0) {
++                    video.overlay(alignment:.top) { toolbar.padding(8) }
++                        .frame(height:layout.upper.height)
++                    Color.clear.frame(height:layout.fold.height).allowsHitTesting(false)
++                    GamepadControllerSurface(tuning:tuning,acceptsInput:acceptsInput,send:sendPad,sendPointer:sendPointer)
++                        .frame(height:layout.lower.height)
++                }.background(.black).accessibilityIdentifier("duo-video-deck")
++            } else {
++                ZStack(alignment:.bottom) {
++                    video.ignoresSafeArea()
++                    GamepadControllerSurface(tuning:tuning,acceptsInput:acceptsInput,send:sendPad,sendPointer:sendPointer)
++                        .frame(height:min(360,geometry.size.height*0.72))
++                    VStack { toolbar.padding(8);Spacer() }.allowsHitTesting(true)
++                }.background(.black).accessibilityIdentifier("landscape-video-controller")
++            }
++        }
++    }
++}
 diff --git a/ios/Henge/DisplayRouter.swift b/ios/Henge/DisplayRouter.swift
 index 47b0ced..af8939d 100644
 --- a/ios/Henge/DisplayRouter.swift
@@ -7193,10 +7680,10 @@ index e579188..6d1fcc8 100644
              setenv(k, v, 1)
              HengeLog.log("tuning", "\(k)=\(v)")
 diff --git a/ios/Henge/HengeApp.swift b/ios/Henge/HengeApp.swift
-index 04b1a49..6df9ecf 100644
+index 04b1a49..78177b4 100644
 --- a/ios/Henge/HengeApp.swift
 +++ b/ios/Henge/HengeApp.swift
-@@ -13,6 +13,7 @@ struct HengeApp: App {
+@@ -13,13 +13,14 @@ struct HengeApp: App {
          HengeLog.start()
          HengeLog.log("boot", "address space: \(henge_largest_reservation_gb()) GB can be reserved in one piece")
          EngineTuning.apply()
@@ -7204,6 +7691,14 @@ index 04b1a49..6df9ecf 100644
          BackgroundExecutionStatus.log()
          HengeLog.logFootprint("app-launch")
          JITBootstrap.noteLaunchState()
+         HengeLog.log("app", "increased memory limit: \(Entitlements.increasedMemory ? "yes" : "no"); extended addressing: \(Entitlements.extendedAddressing ? "yes" : "no"); limit \(Entitlements.memoryLimitAtLaunch >> 20) MB")
+         // Without the guard, a brk no debugger answers kills the app instead of failing.
+         JITBootstrap.installTrapGuard()
+-        try? AVAudioSession.sharedInstance().setCategory(.playback, options: [.mixWithOthers])
++        AudioSessionRecovery.shared.start()
+         Machines.shared.collectImports()
+         // The display question: does this iOS have Apple's paravirtualized graphics at all?
+         for path in ["/System/Library/Frameworks/ParavirtualizedGraphics.framework/ParavirtualizedGraphics",
 @@ -40,7 +41,7 @@ struct HengeApp: App {
  }
  
@@ -7595,28 +8090,50 @@ index 8b4bf3b..b1e8aac 100644
 +        coordinator.perform { _=henge_vm_foreground_generation(generation) }
      }
  }
+diff --git a/ios/Henge/Link/LinkFlowControl.swift b/ios/Henge/Link/LinkFlowControl.swift
+index 7e9ba85..e82c7f8 100644
+--- a/ios/Henge/Link/LinkFlowControl.swift
++++ b/ios/Henge/Link/LinkFlowControl.swift
+@@ -44,3 +44,15 @@ final class LinkFrameCredits: @unchecked Sendable {
+         let count = frames.count; frames.removeAll(); return count
+     }
+ }
++
++/// Process-wide frame identities prevent a delayed ACK from an old mirror
++/// encoder releasing credit in a replacement encoder on the same connection.
++final class LinkFrameSequence {
++    private static let lock=NSLock()
++    private static var value:UInt64=0
++    static func next()->UInt64 {
++        lock.lock();defer { lock.unlock() }
++        precondition(value<UInt64.max,"Link sequence exhausted")
++        value += 1;return value
++    }
++}
 diff --git a/ios/Henge/Link/LinkProtocol.swift b/ios/Henge/Link/LinkProtocol.swift
-index 94231b2..b1a53e8 100644
+index 94231b2..23db487 100644
 --- a/ios/Henge/Link/LinkProtocol.swift
 +++ b/ios/Henge/Link/LinkProtocol.swift
-@@ -23,14 +23,25 @@ struct LinkControl: Codable {
+@@ -23,14 +23,26 @@ struct LinkControl: Codable {
      var mode: LinkMode? = nil
      var x: Int? = nil, y: Int? = nil, code: Int? = nil, down: Bool? = nil
      var sequence: UInt64? = nil
 +    var visible: Bool? = nil
 +    var capabilities: [String]? = nil
 +    var gamepad: GamepadState? = nil
-+    var supportsViewerVisibility: Bool { ["ready","readyInput"].contains(type) && capabilities?.contains("viewerVisibility") == true }
++    var supportsViewerVisibility: Bool { ["ready","readyInput","readyMirror"].contains(type) && capabilities?.contains("viewerVisibility") == true }
      func validate() throws {
          guard version == Self.currentVersion else { throw LinkError.invalid("Update Henge on both devices: different Link protocol version") }
 +        if let capabilities, capabilities.count > 8 || capabilities.contains(where: { $0.utf8.count > 64 }) {
 +            throw LinkError.invalid("Invalid capability list")
 +        }
          switch type {
-         case "hello", "ready": guard let mode else { throw LinkError.invalid("Missing display mode") }; try mode.validate()
+-        case "hello", "ready": guard let mode else { throw LinkError.invalid("Missing display mode") }; try mode.validate()
++        case "hello", "ready", "readyMirror": guard let mode else { throw LinkError.invalid("Missing display mode") }; try mode.validate()
 +        case "helloInput", "readyInput": guard mode == nil else { throw LinkError.invalid("Controls-only connections have no video mode") }
 +        case "gamepad": guard let gamepad, gamepad.valid else { throw LinkError.invalid("Invalid gamepad state") }
 +        case "padMode": guard down != nil else { throw LinkError.invalid("Missing gamepad mapping") }
++        case "mirror": guard down != nil,x==nil || [30,60,120].contains(x!) else { throw LinkError.invalid("Invalid mirror refresh request") }
          case "move", "scroll": guard let x, let y, (-4096...4096).contains(x), (-4096...4096).contains(y) else { throw LinkError.invalid("Invalid pointer delta") }
          case "button": guard let code, (0...2).contains(code), down != nil else { throw LinkError.invalid("Invalid button") }
          case "key": guard let code, (4...231).contains(code), down != nil else { throw LinkError.invalid("Invalid HID key") }
@@ -7625,15 +8142,44 @@ index 94231b2..b1a53e8 100644
          case "ping", "pong", "bye", "release": break
          default: throw LinkError.invalid("Unknown control message")
          }
+diff --git a/ios/Henge/Link/LinkReconnectPolicy.swift b/ios/Henge/Link/LinkReconnectPolicy.swift
+new file mode 100644
+index 0000000..37e561d
+--- /dev/null
++++ b/ios/Henge/Link/LinkReconnectPolicy.swift
+@@ -0,0 +1,12 @@
++import Foundation
++
++/// Bounded retries while a controller is visible. No polling or background task.
++struct LinkReconnectPolicy {
++    private(set) var attempts=0
++    mutating func reset() { attempts=0 }
++    mutating func nextDelay()->Double? {
++        guard attempts<12 else { return nil }
++        let delay=min(15,0.35*pow(2,Double(min(6,attempts))))
++        attempts += 1;return delay
++    }
++}
 diff --git a/ios/Henge/Link/LinkService.swift b/ios/Henge/Link/LinkService.swift
-index 07cd331..4ad42a5 100644
+index 07cd331..3a2c203 100644
 --- a/ios/Henge/Link/LinkService.swift
 +++ b/ios/Henge/Link/LinkService.swift
-@@ -14,13 +14,14 @@ final class LinkHostService: ObservableObject {
+@@ -7,6 +7,8 @@ import CoreVideo
+ @MainActor
+ final class LinkHostService: ObservableObject {
+     static let shared = LinkHostService()
++    private let shaderLibrary:MTLLibrary?
++    init(library:MTLLibrary? = nil) { shaderLibrary=library }
+     @Published private(set) var key = ""
+     @Published private(set) var pairingName = ""
+     @Published private(set) var port: UInt16?
+@@ -14,13 +16,16 @@ final class LinkHostService: ObservableObject {
      @Published private(set) var mode: LinkMode?
      @Published private(set) var active = false
      @Published private(set) var connected = false
 +    @Published private(set) var controlOnly = false
++    @Published private(set) var mirrorActive=false
++    var streamsVideo:Bool { active || mirrorActive }
      private var transport: LinkTransport?
      private var encoder: LinkEncoder?
      private var keys = Set<Int>(), buttons = Set<Int>()
@@ -7645,23 +8191,23 @@ index 07cd331..4ad42a5 100644
          stop(); let generation = UUID(); token = generation
          do {
              let pairing = try LinkPairingStore.shared.host(remember: remember)
-@@ -34,7 +35,7 @@ final class LinkHostService: ObservableObject {
+@@ -34,7 +39,7 @@ final class LinkHostService: ObservableObject {
                      HengeLog.log("link", text)
                      if !okay {
                          self.releaseInput()
 -                        if self.active { self.stopKeepingStatus(); self.status = text }
-+                        if self.active || self.controlOnly { self.stopKeepingStatus(); self.status = text }
++                        if self.active || self.controlOnly { self.endPeer(); self.status = text+" · Waiting for reconnect" }
                      }
                  }
              }
-@@ -54,10 +55,24 @@ final class LinkHostService: ObservableObject {
+@@ -54,11 +59,25 @@ final class LinkHostService: ObservableObject {
      }
      private func receive(_ command: LinkControl) {
          guard (try? command.validate()) != nil else { return }
 +        if command.type == "helloInput" {
 +            guard encoder == nil, mode == nil, !active else { return }
 +            controlOnly = true
-+            transport?.sendControl(LinkControl(type:"readyInput",down:GamepadHub.shared.keyboardMapping,capabilities:["inputOnly","gamepad","viewerVisibility"]))
++            transport?.sendControl(LinkControl(type:"readyInput",down:GamepadHub.shared.keyboardMapping,capabilities:["inputOnly","gamepad","viewerVisibility","primaryMirror"]))
 +            transport?.setInputOnly()
 +            status = "Secure wireless keyboard, touchpad and gamepad connected; video is off."
 +            HengeLog.log("link","controls-only peer authenticated; no encoder, decoder or second display")
@@ -7672,15 +8218,17 @@ index 07cd331..4ad42a5 100644
 +            guard !active, !controlOnly, encoder == nil else { status = "This session's display mode is already fixed. Stop the Mac before pairing again."; return }
              do {
                  guard let transport else { return }
+-                let created = try LinkEncoder(mode: proposed, send: { [weak transport] data, done in
 +                if henge_vm_state() == 1 || henge_vm_state() == 4 {
 +                    guard matchesRunningMode(proposed) else {
 +                        status = "Reconnect using the saved second monitor’s size and refresh rate. A new monitor requires restarting the Mac."; return
 +                    }
 +                }
-                 let created = try LinkEncoder(mode: proposed, send: { [weak transport] data, done in
++                let created = try LinkEncoder(mode: proposed, library:shaderLibrary, send: { [weak transport] data, done in
                      guard let transport else { done(false); return }; transport.sendVideo(data, completion: done)
                  }, report: { [weak self] message in
-@@ -68,25 +83,38 @@ final class LinkHostService: ObservableObject {
+                     HengeLog.log("link", message)
+@@ -68,34 +87,96 @@ final class LinkHostService: ObservableObject {
                  })
                  encoder = created; mode = proposed
                  transport.onVideoAcknowledged = { [weak created] sequence in created?.acknowledge(sequence) }
@@ -7695,9 +8243,14 @@ index 07cd331..4ad42a5 100644
              return
          }
 -        guard active, henge_vm_state() == 1 else { return }
++        if command.type == "mirror",let enabled=command.down,controlOnly {
++            if enabled { startMirror(requestedHz:command.x ?? 60) } else { stopMirror();transport?.sendControl(LinkControl(type:"mirror",down:false)) }
++            return
++        }
 +        if command.type == "visibility", let visible = command.visible {
 +            encoder?.setVisible(visible)
 +            if !visible { releaseInput() }
++            else if mirrorActive { henge_vm_mirror_refresh() }
 +            else if active { henge_vm_link_connected(1) } // request the latest frame even when the guest is idle
 +            return
 +        }
@@ -7723,7 +8276,44 @@ index 07cd331..4ad42a5 100644
          case "bye": stop()
          default: break
          }
-@@ -96,6 +124,15 @@ final class LinkHostService: ObservableObject {
+     }
++    private func startMirror(requestedHz:Int) {
++        if mirrorActive,encoder?.mode.hz==requestedHz { henge_vm_mirror_refresh();return }
++        stopMirror()
++        guard encoder==nil,henge_vm_state()==1,henge_vm_cpu_background()==0,let transport else { return }
++        var display=HengeVmDisplayMode()
++        guard henge_vm_display_mode(0,&display)==0 else {
++            status="The main Mac display is not ready yet. Try Video again after startup."
++            transport.sendControl(LinkControl(type:"mirror",code:1,down:false));return
++        }
++        let stream=LinkMode(width:Int(display.width),height:Int(display.height),widthMM:Int(display.width_mm),heightMM:Int(display.height_mm),hz:min(requestedHz,Int(display.hz)))
++        do {
++            let created=try LinkEncoder(mode:stream,mirrorsPrimary:true,library:shaderLibrary,send:{ [weak transport] data,done in
++                guard let transport else { done(false);return };transport.sendVideo(data,completion:done)
++            },report:{ HengeLog.log("link-mirror",$0) })
++            encoder=created;mirrorActive=true
++            transport.onVideoAcknowledged={ [weak created] in created?.acknowledge($0) }
++            transport.sendControl(LinkControl(type:"readyMirror",mode:stream,down:GamepadHub.shared.keyboardMapping,capabilities:["primaryMirror","gamepad","viewerVisibility"]))
++            hv_pvg_link_set_primary_frame_handler(Self.captureHandler(created))
++            henge_vm_mirror_refresh();status="Streaming the main Mac display with wireless controls."
++        } catch { status=error.localizedDescription;stopMirror();transport.sendControl(LinkControl(type:"mirror",code:1,down:false)) }
++    }
++    private func stopMirror() {
++        guard mirrorActive else { return }
++        hv_pvg_link_set_primary_frame_handler(nil);mirrorActive=false
++        encoder?.stop();encoder=nil;transport?.onVideoAcknowledged=nil
++    }
++    private static func captureHandler(_ encoder:LinkEncoder)->HvPvgLinkFrameHandler {
++        { texture,queue,halfMode,cursor,x,y,w,h in
++            guard let texture,let queue else { return }
++            let t=Unmanaged<AnyObject>.fromOpaque(texture).takeUnretainedValue() as! MTLTexture
++            let q=Unmanaged<AnyObject>.fromOpaque(queue).takeUnretainedValue() as! MTLCommandQueue
++            let c=cursor.map { Unmanaged<AnyObject>.fromOpaque($0).takeUnretainedValue() as! MTLTexture }
++            encoder.capture(texture:t,queue:q,halfMode:halfMode,cursorTexture:c,rect:SIMD4(x,y,w,h))
++        }
++    }
+     /// Called immediately before boot. No link means exactly the original port count.
+     func prepareBoot() throws {
          if let mode {
              guard canStart, let encoder else { throw LinkError.invalid("The Duo disconnected. Cancel the display link or pair it again before booting.") }
              guard henge_vm_set_link_display(UInt32(mode.width), UInt32(mode.height), UInt32(mode.widthMM), UInt32(mode.heightMM), UInt32(mode.hz)) == 0 else { throw LinkError.invalid("Cannot configure the guest's second display") }
@@ -7739,7 +8329,7 @@ index 07cd331..4ad42a5 100644
              hv_pvg_link_set_frame_handler { texture, queue, halfMode, cursor, x, y, w, h in
                  guard let texture, let queue else { return }
                  let t = Unmanaged<AnyObject>.fromOpaque(texture).takeUnretainedValue() as! MTLTexture
-@@ -103,30 +140,44 @@ final class LinkHostService: ObservableObject {
+@@ -103,30 +184,52 @@ final class LinkHostService: ObservableObject {
                  let c = cursor.map { Unmanaged<AnyObject>.fromOpaque($0).takeUnretainedValue() as! MTLTexture }
                  encoder.capture(texture: t, queue: q, halfMode: halfMode, cursorTexture: c, rect: SIMD4(x, y, w, h))
              }
@@ -7759,6 +8349,7 @@ index 07cd331..4ad42a5 100644
 +    }
 +    /// Snapshot ports remain disconnected until a matching authenticated peer returns.
 +    func resumeVideoIfNeeded() {
++        if mirrorActive { henge_vm_mirror_refresh();return }
 +        guard active,let mode else { return }
 +        var saved=HengeVmDisplayMode()
 +        let result=henge_vm_display_mode(1,&saved)
@@ -7776,8 +8367,16 @@ index 07cd331..4ad42a5 100644
      }
      func stop() { stopKeepingStatus(); status = "Display link stopped." }
 +    func trimMemory() { encoder?.trimMemory() }
++    private func endPeer() {
++        releaseInput();stopMirror()
++        hv_pvg_link_set_frame_handler(nil)
++        if active { henge_vm_link_connected(0) }
++        active=false;connected=false;controlOnly=false
++        encoder?.stop();encoder=nil;mode=nil;transport?.onVideoAcknowledged=nil
++    }
      private func stopKeepingStatus() {
-         token = UUID(); releaseInput()
+-        token = UUID(); releaseInput()
++        token = UUID(); releaseInput();stopMirror()
          hv_pvg_link_set_frame_handler(nil)
          if active { henge_vm_link_connected(0) }
 -        active = false; connected = false
@@ -7793,97 +8392,203 @@ index 07cd331..4ad42a5 100644
          keys.removeAll(); buttons.removeAll()
      }
  }
-@@ -135,14 +186,19 @@ final class LinkHostService: ObservableObject {
+@@ -135,61 +238,138 @@ final class LinkHostService: ObservableObject {
  final class LinkViewerService: ObservableObject {
      @Published private(set) var status = "Select a local iPad or enter its address manually."
      @Published private(set) var ready = false
++    @Published private(set) var videoHz=60
++    @Published private(set) var videoActive=false
++    @Published private(set) var mirrorSupported=false
 +    @Published var keyboardMapping = false {
 +        didSet { if oldValue != keyboardMapping { send(LinkControl(type:"padMode",down:keyboardMapping)) } }
 +    }
++    private struct Request {
++        let host:String,port:UInt16,key:String,wired:Bool,mode:LinkMode
++        let peer:LinkDiscoveredPeer?
++        let remember:Bool,inputOnly:Bool
++    }
++    private var request:Request?
      private var transport = LinkTransport()
      private let decodeWorker = LinkDecodeWorker(report: { HengeLog.log("link-viewer", $0) })
      private var generation = UUID()
-     private var mode: LinkMode?
+-    private var mode: LinkMode?
+-    // A single replaceable output, owned by the view. No array of decoded frames.
++    private var decodeGeneration=UUID()
 +    private var hostReady: LinkControl?
-+    private var inputOnly = false
-     // A single replaceable output, owned by the view. No array of decoded frames.
++    private var foreground=true
++    private var wantsMirror=false
++    private var mirrorHz=60
++    private var retry=LinkReconnectPolicy()
++    private var retryTask:Task<Void,Never>?
      var onPixel: ((CVPixelBuffer) -> Void)?
 -    func connect(host: String, port: UInt16, key: String, wired: Bool, mode: LinkMode, peer: LinkDiscoveredPeer? = nil, remember: Bool = false) {
 -        disconnect(); let g = UUID(); generation = g; self.mode = mode
+-        let channel = transport
+-        let mailbox = LinkPixelMailbox { [weak self] pixel in
+-            guard let self, self.generation == g else { return }
+-            if self.status.hasPrefix("Connected.") {
+-                self.status = "Receiving the independent second monitor."
+-                HengeLog.log("link-viewer", "first decoded native frame=\(mode.width)x\(mode.height); no guest VM/JIT started by viewer")
+-            }
 +    func connect(host: String, port: UInt16, key: String, wired: Bool, mode: LinkMode, peer: LinkDiscoveredPeer? = nil, remember: Bool = false, inputOnly: Bool = false) {
-+        disconnect(); let g = UUID(); generation = g; self.mode = inputOnly ? nil : mode; self.inputOnly = inputOnly
-         let channel = transport
-         let mailbox = LinkPixelMailbox { [weak self] pixel in
-             guard let self, self.generation == g else { return }
-@@ -152,27 +208,38 @@ final class LinkViewerService: ObservableObject {
-             }
++        disconnect();foreground=true
++        request=Request(host:host.trimmingCharacters(in:.whitespacesAndNewlines),port:port,key:key.trimmingCharacters(in:.whitespacesAndNewlines),wired:wired,mode:mode,peer:peer,remember:remember,inputOnly:inputOnly)
++        attemptConnection()
++    }
++    private func clearConnection() {
++        generation=UUID();ready=false;videoActive=false;mirrorSupported=false;hostReady=nil
++        transport.onPacket=nil;transport.onStatus=nil;transport.onClosed=nil;transport.stop();transport=LinkTransport()
++        decodeWorker.stop();decodeGeneration=UUID()
++    }
++    private func beginDecode(_ mode:LinkMode,generation g:UUID) {
++        let mailbox=LinkPixelMailbox { [weak self] pixel in
++            guard let self,self.generation==g,self.foreground else { return }
              self.onPixel?(pixel)
          }
 -        let decodeGeneration = decodeWorker.start(mode: mode, output: { mailbox.submit($0) })
-+        let decodeGeneration = inputOnly ? UUID() : decodeWorker.start(mode: mode, output: { mailbox.submit($0) })
-         let worker = decodeWorker
-         transport.onStatus = { [weak self] text, connected in
+-        let worker = decodeWorker
+-        transport.onStatus = { [weak self] text, connected in
++        decodeGeneration=decodeWorker.start(mode:mode,output:{mailbox.submit($0)})
++    }
++    private func attemptConnection() {
++        guard foreground,let request else { return }
++        retryTask?.cancel();retryTask=nil;clearConnection()
++        let g=generation,channel=transport
++        if !request.inputOnly { videoHz=request.mode.hz;beginDecode(request.mode,generation:g) }
++        channel.onStatus={ [weak self,weak channel] text,connected in
              Task { @MainActor in
-                 guard let self, self.generation == g else { return }
-                 self.status = text; HengeLog.log("link-viewer", text); if !connected { self.ready = false }
+-                guard let self, self.generation == g else { return }
+-                self.status = text; HengeLog.log("link-viewer", text); if !connected { self.ready = false }
 -                if connected { self.transport.sendControl(LinkControl(type: "hello", mode: mode)) }
++                guard let self,let channel,self.generation==g else { return }
++                self.status=text
 +                if connected {
-+                    self.transport.sendControl(LinkControl(type: inputOnly ? "helloInput" : "hello", mode: inputOnly ? nil : mode))
-+                    DispatchQueue.main.asyncAfter(deadline:.now()+8) { [weak self] in
-+                        guard let self, self.generation==g, !self.ready else { return }
-+                        self.disconnect()
-+                        self.status = inputOnly ? "Host did not accept controls-only mode. Update Henge on both devices." : "Host did not accept the display mode. Update Henge on both devices."
++                    channel.sendControl(LinkControl(type:request.inputOnly ? "helloInput" : "hello",mode:request.inputOnly ? nil : request.mode))
++                    Task { @MainActor [weak self] in
++                        try? await Task.sleep(nanoseconds:8_000_000_000)
++                        guard !Task.isCancelled,let self,self.generation==g,!self.ready else { return }
++                        self.connectionLost("Host did not accept the requested mode. Update Henge on both devices.",generation:g)
 +                    }
 +                }
              }
          }
-         transport.onPacket = { [weak self, weak channel] packet in
-             guard let self else { return }
+-        transport.onPacket = { [weak self, weak channel] packet in
+-            guard let self else { return }
 -            if packet.kind == 1, let command = try? JSONDecoder().decode(LinkControl.self, from: packet.payload), command.type == "ready", command.mode == mode {
-+            if packet.kind == 1, let command = try? JSONDecoder().decode(LinkControl.self, from: packet.payload),
-+               (try? command.validate()) != nil, command.type == (inputOnly ? "readyInput" : "ready"), command.mode == (inputOnly ? nil : mode),
-+               !inputOnly || command.capabilities?.contains("inputOnly") == true {
-                 Task { @MainActor in
+-                Task { @MainActor in
 -                    guard self.generation == g else { return }; self.ready = true
 -                    self.status = "Connected. Start macOS on the iPad; waiting for the second desktop."
-+                    guard self.generation == g else { return }; self.hostReady = command; self.ready = true
-+                    self.status = inputOnly ? "Connected. Wireless controls only; no video or local Mac." : "Connected. Start macOS on the iPad; waiting for the second desktop."
-+                    if inputOnly { self.keyboardMapping = command.down ?? false }
-+                    if inputOnly { self.transport.setInputOnly() }
-                     if remember, let peer {
-                         do { try LinkPairingStore.shared.save("viewer", value: LinkSavedPeer(name: peer.name, key: key.trimmingCharacters(in: .whitespacesAndNewlines), wired: wired)) }
-                         catch { self.status = "Connected. " + error.localizedDescription }
+-                    if remember, let peer {
+-                        do { try LinkPairingStore.shared.save("viewer", value: LinkSavedPeer(name: peer.name, key: key.trimmingCharacters(in: .whitespacesAndNewlines), wired: wired)) }
+-                        catch { self.status = "Connected. " + error.localizedDescription }
++        channel.onClosed={ [weak self] reason in
++            Task { @MainActor in self?.connectionLost(reason,generation:g) }
++        }
++        channel.onPacket={ [weak self,weak channel] packet in
++            // Mutating service state and choosing decode generations is confined
++            // to MainActor. Decode and acknowledgements remain off-main.
++            Task { @MainActor in
++                guard let self,self.generation==g else { return }
++                if packet.kind==1,let command=try? JSONDecoder().decode(LinkControl.self,from:packet.payload),(try? command.validate()) != nil {
++                    if command.type==(request.inputOnly ? "readyInput" : "ready"),command.mode==(request.inputOnly ? nil : request.mode),
++                       !request.inputOnly || command.capabilities?.contains("inputOnly")==true {
++                        self.hostReady=command;self.ready=true;self.retry.reset()
++                        self.mirrorSupported=request.inputOnly && command.capabilities?.contains("primaryMirror")==true
++                        self.status=request.inputOnly ? "Connected. Wireless controls ready." : "Connected. Waiting for the second desktop."
++                        if request.inputOnly { self.keyboardMapping=command.down ?? false;channel?.setInputOnly() }
++                        if request.remember,let peer=request.peer {
++                            do { try LinkPairingStore.shared.save("viewer",value:LinkSavedPeer(name:peer.name,key:request.key,wired:request.wired)) }
++                            catch { self.status="Connected. "+error.localizedDescription }
++                        }
++                        if self.wantsMirror && self.mirrorSupported { channel?.sendControl(LinkControl(type:"mirror",x:self.mirrorHz,down:true)) }
++                    } else if command.type=="readyMirror",request.inputOnly,self.wantsMirror,self.mirrorSupported,let mode=command.mode {
++                        self.beginDecode(mode,generation:g);self.videoHz=mode.hz;self.videoActive=true;self.status="Connected. Main Mac screen and controls."
++                    } else if command.type=="mirror",command.down==false,request.inputOnly {
++                        self.videoActive=false;self.decodeWorker.stop();self.decodeGeneration=UUID()
++                        if command.code==1 { self.status="Host video is not ready. Retry after the Mac display appears." }
                      }
++                } else if packet.kind==2 && (!request.inputOnly || self.videoActive) {
++                    self.decodeWorker.consume(packet.payload,generation:self.decodeGeneration,consumed:{ [weak channel] sequence in
++                        channel?.sendControl(LinkControl(type:"videoAck",sequence:sequence))
++                    },failed:{ [weak self] reason in
++                        Task { @MainActor in self?.connectionLost(reason,generation:g) }
++                    })
                  }
 -            } else if packet.kind == 2 {
-+            } else if packet.kind == 2 && !inputOnly {
-                 worker.consume(packet.payload, generation: decodeGeneration, consumed: { [weak channel] sequence in
-                     // Runs after the decode slot is free, independently of UI work.
-                     channel?.sendControl(LinkControl(type: "videoAck", sequence: sequence))
-@@ -187,9 +254,16 @@ final class LinkViewerService: ObservableObject {
-         if let peer { transport.connect(peer: peer, key: secret, wired: wired) }
-         else { transport.connect(host: host.trimmingCharacters(in: .whitespacesAndNewlines), key: secret, wired: wired, port: port) }
-     }
--    func send(_ control: LinkControl) { guard ready else { return }; transport.sendControl(control) }
+-                worker.consume(packet.payload, generation: decodeGeneration, consumed: { [weak channel] sequence in
+-                    // Runs after the decode slot is free, independently of UI work.
+-                    channel?.sendControl(LinkControl(type: "videoAck", sequence: sequence))
+-                }, failed: { [weak self] error in
+-                    Task { @MainActor in
+-                        guard let self, self.generation == g else { return }; self.status = error; self.ready = false; self.transport.stop()
+-                    }
+-                })
+             }
+         }
+-        let secret = key.trimmingCharacters(in: .whitespacesAndNewlines)
+-        if let peer { transport.connect(peer: peer, key: secret, wired: wired) }
+-        else { transport.connect(host: host.trimmingCharacters(in: .whitespacesAndNewlines), key: secret, wired: wired, port: port) }
++        if let peer=request.peer { channel.connect(peer:peer,key:request.key,wired:request.wired) }
++        else { channel.connect(host:request.host,key:request.key,wired:request.wired,port:request.port) }
++    }
++    private func connectionLost(_ reason:String,generation g:UUID) {
++        guard generation==g,request != nil else { return }
++        clearConnection() // invalidates late status/frame/timeout callbacks
++        guard foreground else { status="Connection paused while Henge is in the background.";return }
++        guard let delay=retry.nextDelay() else { status=reason+" · Automatic retries paused. Tap Reconnect.";return }
++        status="Reconnecting in \(String(format:"%.1f",delay))s · \(reason)"
++        let pending=generation
++        retryTask=Task { @MainActor [weak self] in
++            do { try await Task.sleep(nanoseconds:UInt64(delay*1_000_000_000)) } catch { return }
++            guard let self,self.generation==pending,self.foreground,self.request != nil else { return }
++            self.attemptConnection()
++        }
++    }
++    func reconnect() { retry.reset();attemptConnection() }
++    func setForeground(_ active:Bool) {
++        guard foreground != active else { return }
++        if !active { send(LinkControl(type:"release"));send(LinkControl(type:"visibility",visible:false)) }
++        foreground=active
++        if active { if !ready { retry.reset();attemptConnection() } else { send(LinkControl(type:"visibility",visible:true)) } }
++        else { retryTask?.cancel();retryTask=nil;clearConnection();status="Connection paused; returning reconnects automatically." }
++    }
++    func setMirror(_ enabled:Bool,hz:Int = 60) {
++        wantsMirror=enabled;mirrorHz=[30,60,120].contains(hz) ? hz : 60
++        guard ready,mirrorSupported else { return }
++        if !enabled { videoActive=false;decodeWorker.stop();decodeGeneration=UUID() }
++        send(LinkControl(type:"mirror",x:mirrorHz,down:enabled))
++    }
 +    func send(_ control: LinkControl) {
 +        guard ready else { return }
-+        // Protocol-2 hosts validate known message types strictly. Send the
-+        // optional control only after their ready reply advertises support.
 +        if control.type == "visibility", hostReady?.supportsViewerVisibility != true { return }
 +        if ["gamepad","padMode"].contains(control.type), hostReady?.capabilities?.contains("gamepad") != true { return }
++        if control.type=="mirror",!mirrorSupported { return }
 +        transport.sendControl(control)
-+    }
+     }
+-    func send(_ control: LinkControl) { guard ready else { return }; transport.sendControl(control) }
      func disconnect() {
 -        generation = UUID(); ready = false; transport.onPacket = nil; transport.onStatus = nil; transport.stop(); transport = LinkTransport()
-+        generation = UUID(); ready = false; hostReady = nil; transport.onPacket = nil; transport.onStatus = nil; transport.stop(); transport = LinkTransport()
-         decodeWorker.stop(); mode = nil
+-        decodeWorker.stop(); mode = nil
++        retryTask?.cancel();retryTask=nil;request=nil;wantsMirror=false;retry.reset();clearConnection()
      }
  }
 diff --git a/ios/Henge/Link/LinkTransport.swift b/ios/Henge/Link/LinkTransport.swift
-index ab4d4d8..3a22346 100644
+index ab4d4d8..eafac24 100644
 --- a/ios/Henge/Link/LinkTransport.swift
 +++ b/ios/Henge/Link/LinkTransport.swift
-@@ -35,6 +35,8 @@ final class LinkTransport {
+@@ -8,6 +8,11 @@ final class LinkTransport {
+     let queue = DispatchQueue(label: "henge.link.transport", qos: .userInitiated)
+     private let callbackLock = NSLock()
+     private var packetHandler: ((LinkPacket) -> Void)?
++    private var closedHandler: ((String) -> Void)?
++    var onClosed: ((String) -> Void)? {
++        get { callbackLock.lock();defer { callbackLock.unlock() };return closedHandler }
++        set { callbackLock.lock();closedHandler=newValue;callbackLock.unlock() }
++    }
+     private var statusHandler: ((String, Bool) -> Void)?
+     private var listeningHandler: ((UInt16) -> Void)?
+     private var acknowledgedHandler: ((UInt64) -> Void)?
+@@ -35,6 +40,8 @@ final class LinkTransport {
      private var ready = false
      private var watchdog: DispatchSourceTimer?
      private var lastReceive = ProcessInfo.processInfo.systemUptime
@@ -7892,7 +8597,7 @@ index ab4d4d8..3a22346 100644
      private var controlWindow: TimeInterval = 0
      private var controlCount = 0
      static let port: UInt16 = 49173
-@@ -148,7 +150,7 @@ final class LinkTransport {
+@@ -148,7 +155,7 @@ final class LinkTransport {
                  timer.schedule(deadline: .now() + 2, repeating: 2, leeway: .milliseconds(200))
                  timer.setEventHandler { [weak self] in
                      guard let self, self.generation == g else { return }
@@ -7901,20 +8606,42 @@ index ab4d4d8..3a22346 100644
                      self.sendControl(LinkControl(type: "ping"))
                  }
                  self.watchdog = timer; timer.resume()
-@@ -230,7 +232,7 @@ final class LinkTransport {
-     private func fail(_ text: String) { stopNow(); onStatus?(text, false) }
+@@ -227,12 +234,18 @@ final class LinkTransport {
+         }
+     }
+     func stop() { queue.async { [self] in stopNow() } }
+-    private func fail(_ text: String) { stopNow(); onStatus?(text, false) }
++    private func fail(_ text: String) {
++        // An authenticated host keeps its listener/key for a fresh peer socket.
++        // Explicit stop still closes it; failed listeners must be recreated.
++        var keep=listener != nil
++        if let listener,case .failed = listener.state { keep=false }
++        stopNow(keepingListener:keep);onStatus?(text,false);onClosed?(text)
++    }
      deinit { watchdog?.cancel(); connection?.cancel(); listener?.cancel() }
-     private func stopNow() {
+-    private func stopNow() {
 -        generation &+= 1; ready = false; videosPending = 0; controlsPending = 0
++    private func stopNow(keepingListener:Bool = false) {
 +        generation &+= 1; ready = false; videosPending = 0; controlsPending = 0; receiveTimeout = 12
          watchdog?.cancel(); watchdog = nil
          connection?.stateUpdateHandler = nil; connection?.pathUpdateHandler = nil; connection?.cancel(); connection = nil
-         listener?.cancel(); listener = nil; parser = LinkParser()
+-        listener?.cancel(); listener = nil; parser = LinkParser()
++        if !keepingListener { listener?.cancel(); listener=nil };parser=LinkParser()
+     }
+ }
 diff --git a/ios/Henge/Link/LinkVideo.swift b/ios/Henge/Link/LinkVideo.swift
-index f49ac55..a062560 100644
+index f49ac55..ab0499b 100644
 --- a/ios/Henge/Link/LinkVideo.swift
 +++ b/ios/Henge/Link/LinkVideo.swift
-@@ -21,12 +21,14 @@ final class LinkEncoder {
+@@ -8,6 +8,7 @@ import VideoToolbox
+ /// chroma. The local Retina presenter is never passed through this encoder.
+ final class LinkEncoder {
+     let mode: LinkMode
++    private let mirrorsPrimary:Bool
+     private let device: MTLDevice
+     private let plain: MTLRenderPipelineState, linear: MTLRenderPipelineState, cursor: MTLRenderPipelineState
+     private let sampler: MTLSamplerState
+@@ -21,16 +22,18 @@ final class LinkEncoder {
      private var cache: CVMetalTextureCache
      private let lock = NSLock()
      private var stopped = false, captured: UInt64 = 0, congested: UInt64 = 0
@@ -7928,9 +8655,15 @@ index f49ac55..a062560 100644
 +        let epoch: UInt64
 +        init(_ owner: LinkEncoder, epoch: UInt64) { self.owner = owner; self.epoch = epoch }
      }
-     init(mode: LinkMode, library: MTLLibrary? = nil, send: @escaping (Data, @escaping (Bool) -> Void) -> Void, report: @escaping (String) -> Void) throws {
+-    init(mode: LinkMode, library: MTLLibrary? = nil, send: @escaping (Data, @escaping (Bool) -> Void) -> Void, report: @escaping (String) -> Void) throws {
++    init(mode: LinkMode, mirrorsPrimary:Bool = false, library: MTLLibrary? = nil, send: @escaping (Data, @escaping (Bool) -> Void) -> Void, report: @escaping (String) -> Void) throws {
          guard #available(iOS 17.4, *) else { throw LinkError.invalid("Henge Link hardware encoding requires iOS/iPadOS 17.4 or later") }
-@@ -65,7 +67,7 @@ final class LinkEncoder {
+-        try mode.validate(); guard mode.codedWidth * mode.codedHeight <= 33_554_432 else { throw LinkError.invalid("Codec canvas exceeds the supported size") }; self.mode = mode; self.send = send; self.report = report
++        try mode.validate(); guard mode.codedWidth * mode.codedHeight <= 33_554_432 else { throw LinkError.invalid("Codec canvas exceeds the supported size") }; self.mode = mode;self.mirrorsPrimary=mirrorsPrimary; self.send = send; self.report = report
+         guard let device = MTLCreateSystemDefaultDevice(), let lib = library ?? device.makeDefaultLibrary() else { throw LinkError.invalid("Native Metal shaders unavailable") }
+         self.device = device
+         func pipeline(_ fragment: String, blend: Bool = false) throws -> MTLRenderPipelineState {
+@@ -65,7 +68,7 @@ final class LinkEncoder {
                  outputCallback: { _, source, status, _, sample in
                      guard let source else { return }
                      let ticket = Unmanaged<Ticket>.fromOpaque(source).takeRetainedValue()
@@ -7939,16 +8672,25 @@ index f49ac55..a062560 100644
                  }, refcon: nil, compressionSessionOut: &candidate)
              guard status == noErr, let candidate else { continue }
              func set(_ key: CFString, _ value: CFTypeRef) -> Bool {
-@@ -89,7 +91,7 @@ final class LinkEncoder {
+@@ -89,8 +92,8 @@ final class LinkEncoder {
      /// Called synchronously by the serial guest GPU worker. Commit on its queue
      /// before returning so later guest writes cannot overtake this snapshot.
      func capture(texture: MTLTexture, queue: MTLCommandQueue, halfMode: UInt32, cursorTexture: MTLTexture?, rect: SIMD4<Float>) {
 -        lock.lock(); let active = !stopped; lock.unlock(); guard active else { return }
+-        guard texture.width == mode.width, texture.height == mode.height else { return }
 +        lock.lock(); let active = !stopped && visible; let epoch = visibilityEpoch; lock.unlock(); guard active else { return }
-         guard texture.width == mode.width, texture.height == mode.height else { return }
++        guard mirrorsPrimary || (texture.width == mode.width && texture.height == mode.height) else { return }
          guard slots.wait(timeout: .now()) == .success else {
              lock.lock(); congested &+= 1; let n = congested; lock.unlock()
-@@ -127,9 +129,9 @@ final class LinkEncoder {
+             if n == 1 || n % 120 == 0 { report("remote capture backpressure=\(n); primary display/guest completions unchanged") }; return
+@@ -121,24 +124,26 @@ final class LinkEncoder {
+             e.setRenderPipelineState(cursor); e.setVertexBytes(&r, length: 16, index: 0)
+             e.setFragmentTexture(cursorTexture, index: 0); e.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+         }
+-        e.endEncoding(); command.label = "Henge Link port 1 snapshot"
++        e.endEncoding(); command.label = mirrorsPrimary ? "Henge Link primary mirror snapshot" : "Henge Link port 1 snapshot"
+         let stamp = CMClockGetTime(CMClockGetHostTimeClock())
+         command.addCompletedHandler { [self, pixel, cvTexture, texture, cursorTexture] done in
              _ = cvTexture; _ = texture; _ = cursorTexture // keep aliased resources alive until the GPU completes
              guard done.status == .completed else { slots.signal(); report("Link GPU snapshot failed"); return }
              work.async { [self] in
@@ -7960,9 +8702,11 @@ index f49ac55..a062560 100644
                  let status = VTCompressionSessionEncodeFrame(session, imageBuffer: pixel, presentationTimeStamp: stamp, duration: CMTime(value: 1, timescale: Int32(mode.hz)), frameProperties: nil, sourceFrameRefcon: ticket.toOpaque(), infoFlagsOut: nil)
                  if status != noErr { ticket.release(); slots.signal(); report("Hardware encode failed: \(status)") }
              }
-@@ -138,7 +140,9 @@ final class LinkEncoder {
+         }
+         command.commit()
          lock.lock(); captured &+= 1; let n = captured; lock.unlock()
-         if n == 1 { report("first independent port-1 Metal frame captured") }
+-        if n == 1 { report("first independent port-1 Metal frame captured") }
++        if n == 1 { report(mirrorsPrimary ? "first primary mirror Metal frame captured" : "first independent port-1 Metal frame captured") }
      }
 -    private func encoded(status: OSStatus, sample: CMSampleBuffer?) {
 +    private func encoded(status: OSStatus, sample: CMSampleBuffer?, epoch: UInt64) {
@@ -7971,16 +8715,17 @@ index f49ac55..a062560 100644
          guard status == noErr, let sample, CMSampleBufferDataIsReady(sample), let format = CMSampleBufferGetFormatDescription(sample), let block = CMSampleBufferGetDataBuffer(sample) else { slots.signal(); report("Hardware encoder produced no frame: \(status)"); return }
          let hevc = CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC
          var sets = [Data]()
-@@ -155,7 +159,7 @@ final class LinkEncoder {
+@@ -155,7 +160,8 @@ final class LinkEncoder {
          let copied = bytes.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!) }
          guard copied == noErr else { slots.signal(); return }
          // VT output is serialized by the encoder when reordering is disabled.
 -        lock.lock(); sequence &+= 1; let n = sequence; let active = !stopped; lock.unlock()
-+        lock.lock(); sequence &+= 1; let n = sequence; let active = !stopped && visible && epoch == visibilityEpoch; lock.unlock()
++        let n=LinkFrameSequence.next()
++        lock.lock(); sequence=n; let active = !stopped && visible && epoch == visibilityEpoch; lock.unlock()
          guard active else { slots.signal(); return }
          do {
              let dimensions = CMVideoFormatDescriptionGetDimensions(format)
-@@ -172,6 +176,17 @@ final class LinkEncoder {
+@@ -172,6 +178,17 @@ final class LinkEncoder {
      func acknowledge(_ sequence: UInt64) {
          if let receipt = credits.consumed(sequence) { retire(receipt) }
      }
@@ -7999,21 +8744,24 @@ index f49ac55..a062560 100644
          slots.signal()
          guard receipt.consumed else { return }
 diff --git a/ios/Henge/Link/LinkViews.swift b/ios/Henge/Link/LinkViews.swift
-index 1bc238f..d131252 100644
+index 1bc238f..6db51ad 100644
 --- a/ios/Henge/Link/LinkViews.swift
 +++ b/ios/Henge/Link/LinkViews.swift
-@@ -47,7 +47,10 @@ struct LinkHostView: View {
+@@ -47,7 +47,13 @@ struct LinkHostView: View {
  }
  
  struct LinkViewerView: View {
 +    @AppStorage("henge.link.controlsOnly") private var inputOnly = false
 +    @State private var inputTab = 0
++    @AppStorage("henge.link.controllerVideo") private var controllerVideo=false
++    @State private var fillVideo=false
++    @AppStorage("henge.link.controllerVideoHz") private var controllerVideoHz=60
      @StateObject private var viewer = LinkViewerService()
 +    @ObservedObject private var gamepadPreferences = GamepadPreferences.shared
      @StateObject private var discovery = LinkDiscovery()
      @State private var selected: LinkDiscoveredPeer?
      @State private var saved: LinkSavedPeer?
-@@ -61,12 +64,22 @@ struct LinkViewerView: View {
+@@ -61,13 +67,28 @@ struct LinkViewerView: View {
      @State private var wired = false
      @State private var connecting = false
      @State private var controlsHidden = false
@@ -8024,8 +8772,14 @@ index 1bc238f..d131252 100644
              ZStack(alignment: .top) {
                  Color.black.ignoresSafeArea()
                  if connecting {
-+                    if inputOnly {
-+                        WirelessControlsPanel(status:viewer.status,tuning:gamepadPreferences.value,isDuo:HostScheduling.isDuo,
+-                    LinkVideoSurface(viewer: viewer, toggleControls: toggleControls)
++                    if inputOnly && controllerVideo && viewer.mirrorSupported {
++                        WirelessVideoControls(isDuo:HostScheduling.isDuo,tuning:gamepadPreferences.value,acceptsInput:viewer.ready,
++                            sendPad:{viewer.send(LinkControl(type:"gamepad",gamepad:$0))},sendPointer:{viewer.send($0)},
++                            video:LinkVideoSurface(viewer:viewer,toggleControls:toggleControls,fill:fillVideo,hz:viewer.videoHz),toolbar:controllerVideoToolbar)
++                            .overlay { if !viewer.videoActive { VStack { Text(viewer.status);Button("Retry video") { viewer.setMirror(true,hz:controllerVideoHz) } }.padding().background(.ultraThinMaterial,in:RoundedRectangle(cornerRadius:16)) } }
++                    } else if inputOnly {
++                        WirelessControlsPanel(status:viewer.status,tuning:gamepadPreferences.value,isDuo:HostScheduling.isDuo,acceptsInput:viewer.ready,supportsVideo:viewer.mirrorSupported,enableVideo:{controllerVideo=true;viewer.setMirror(true,hz:controllerVideoHz)},
 +                            mode:Binding(get:{ WirelessControlMode(rawValue:inputTab) ?? .touchpad },set:{inputTab=$0.rawValue}),
 +                            disconnect:{viewer.send(LinkControl(type:"release"));viewer.disconnect();connecting=false},
 +                            configure:{viewer.send(LinkControl(type:"release"));showGamepadSettings=true},
@@ -8033,10 +8787,11 @@ index 1bc238f..d131252 100644
 +                                LinkInputSurface(viewer:viewer,keyboard:mode == .keyboard)
 +                            }
 +                    } else {
-                     LinkVideoSurface(viewer: viewer, toggleControls: toggleControls)
++                    LinkVideoSurface(viewer:viewer,toggleControls:toggleControls,hz:viewer.videoHz)
                          .ignoresSafeArea()
                          .accessibilityLabel("Extended Mac display")
-@@ -81,11 +94,12 @@ struct LinkViewerView: View {
+                         .accessibilityHint("Three-finger tap hides or shows the display controls.")
+@@ -81,11 +102,12 @@ struct LinkViewerView: View {
                                  .accessibilityLabel("Hide display controls. Three-finger tap to show again.")
                          }.padding(8).background(.ultraThinMaterial)
                      }
@@ -8047,11 +8802,11 @@ index 1bc238f..d131252 100644
 -                            Section("Henge Link · display viewer") {
 -                                Text("The Mac runs on your iPad. This device receives its second monitor and sends trackpad and hardware keyboard input. No Mac installation or JIT is required here.")
 +                            Section(inputOnly ? "Henge Link · wireless controls" : "Henge Link · display viewer") {
-+                                Text(inputOnly ? "Open Wireless Controls from the running Mac’s three-finger menu and create a key. This device sends keyboard, touchpad and gamepad input; no video, Mac installation or JIT runs here." : "The Mac runs on your iPad. This device receives its second monitor and sends trackpad and hardware keyboard input. No Mac installation or JIT is required here.")
++                                Text(inputOnly ? "Open Wireless Controls from the running Mac’s three-finger menu and create a key. This device sends keyboard, touchpad and gamepad input. Optional video mirrors the main Mac screen without adding a monitor. No Mac installation or JIT runs here." : "The Mac runs on your iPad. This device receives its second monitor and sends trackpad and hardware keyboard input. No Mac installation or JIT is required here.")
                                  Text("Nearby iPads").font(.headline)
                                  Text(discovery.status).font(.footnote)
                                  ForEach(discovery.peers) { peer in
-@@ -113,7 +127,7 @@ struct LinkViewerView: View {
+@@ -113,7 +135,7 @@ struct LinkViewerView: View {
                                  if !pairingNotice.isEmpty { Text(pairingNotice).font(.footnote) }
                                  Toggle("Wired Ethernet only", isOn: $wired)
                                  Text(wired ? "Use compatible Ethernet adapters, not a plain USB-C cable. Both IP addresses must be on the same local subnet." : "Use the iPad's Wi-Fi IP address. Both devices must be on the same local network, with Wired Ethernet only turned off on both. A guest network may block device-to-device traffic.").font(.footnote)
@@ -8060,7 +8815,7 @@ index 1bc238f..d131252 100644
                                      let screen = UIScreen.main
                                      let scale = screen.nativeScale
                                      let w = Int((geometry.size.width * scale).rounded()), h = Int((geometry.size.height * scale).rounded())
-@@ -123,19 +137,20 @@ struct LinkViewerView: View {
+@@ -123,19 +145,20 @@ struct LinkViewerView: View {
                                      let port = UInt16(portText) ?? 0
                                      guard peer != nil || (manual && !host.isEmpty && port > 0) else { return }
                                      discovery.stop(); controlsHidden = false
@@ -8083,11 +8838,14 @@ index 1bc238f..d131252 100644
          .onAppear {
              do { saved = try LinkPairingStore.shared.load("viewer", as: LinkSavedPeer.self) }
              catch { pairingNotice = error.localizedDescription }
-@@ -162,13 +177,16 @@ struct LinkViewerView: View {
+@@ -162,19 +185,39 @@ struct LinkViewerView: View {
              }
          }
          .onChange(of: viewer.ready) { _, ready in
-+            if ready { viewer.send(LinkControl(type: "visibility", visible: phase == .active)) }
++            if ready {
++                viewer.send(LinkControl(type:"visibility",visible:phase == .active))
++                if inputOnly { viewer.setMirror(controllerVideo,hz:controllerVideoHz) }
++            }
              UIApplication.shared.isIdleTimerDisabled = ready
              // Reveal a real connection failure rather than leaving a hidden
              // error above a frozen last frame. It can still be hidden again.
@@ -8096,24 +8854,62 @@ index 1bc238f..d131252 100644
 +        .onChange(of: inputTab) { _, _ in viewer.send(LinkControl(type:"release")) }
          .statusBarHidden(connecting && controlsHidden)
          .onChange(of: phase) { _, phase in
+-            if phase == .background { viewer.disconnect(); connecting = false; discovery.stop(); UIApplication.shared.isIdleTimerDisabled = false }
+-            else if phase == .active, !connecting { discovery.start(wired: wired) }
 +            viewer.send(LinkControl(type: "visibility", visible: phase == .active))
-             if phase == .background { viewer.disconnect(); connecting = false; discovery.stop(); UIApplication.shared.isIdleTimerDisabled = false }
-             else if phase == .active, !connecting { discovery.start(wired: wired) }
++            if phase == .background { viewer.setForeground(false);discovery.stop();UIApplication.shared.isIdleTimerDisabled=false }
++            else if phase == .active { viewer.setForeground(true);if !connecting { discovery.start(wired:wired) } }
              else if phase == .inactive { viewer.send(LinkControl(type: "release")) }
-@@ -196,6 +214,7 @@ private struct LinkVideoSurface: UIViewRepresentable {
+         }
+         .onDisappear { discovery.stop(); viewer.disconnect(); UIApplication.shared.isIdleTimerDisabled = false }
+     }
++    private var controllerVideoToolbar:some View {
++        HStack(spacing:8) {
++            Button { controllerVideo=false;viewer.setMirror(false) } label: { Image(systemName:"video.slash").frame(width:36,height:36) }.accessibilityLabel("Video off")
++            Spacer(minLength:0)
++            Button { fillVideo.toggle() } label: { Image(systemName:fillVideo ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right").frame(width:36,height:36) }.accessibilityLabel(fillVideo ? "Fit video" : "Fill video")
++            Menu {
++                Picker("Video refresh",selection:$controllerVideoHz) { Text("60 Hz").tag(60);Text("120 Hz · ProMotion").tag(120) }
++            } label: { Text("\(controllerVideoHz)").monospacedDigit().frame(width:36,height:36) }.accessibilityLabel("Video refresh rate")
++            Button { viewer.send(LinkControl(type:"release"));showGamepadSettings=true } label: { Image(systemName:"slider.horizontal.3").frame(width:36,height:36) }.accessibilityLabel("Controller sensitivity and layout settings")
++            Button { viewer.reconnect() } label: { Image(systemName:"arrow.clockwise").frame(width:36,height:36) }.accessibilityLabel("Reconnect")
++            Button { viewer.disconnect();connecting=false } label: { Image(systemName:"xmark.circle.fill").frame(width:36,height:36) }.accessibilityLabel("Disconnect wireless controls")
++        }.font(.callout).padding(8).background(.ultraThinMaterial,in:RoundedRectangle(cornerRadius:14))
++        .onChange(of:controllerVideoHz) { _,value in viewer.setMirror(true,hz:value) }
++    }
+     private func toggleControls() {
+         controlsHidden.toggle()
+         HengeLog.log("link-viewer", "viewer controls hidden=\(controlsHidden); native viewport and video mode unchanged")
+@@ -194,49 +237,46 @@ private struct LinkMainDesktopGuide: View {
+ private struct LinkVideoSurface: UIViewRepresentable {
+     let viewer: LinkViewerService
      let toggleControls: () -> Void
++    var fill=false
++    var hz=60
      func makeUIView(context: Context) -> LinkVideoView {
-         let view = LinkVideoView()
+-        let view = LinkVideoView()
++        let view = LinkVideoView();view.maximumRate=hz;view.videoLayer.videoGravity=fill ? .resizeAspectFill : .resizeAspect
 +        view.rejectedPaste = { HengeLog.log("link-input","Paste rejected: use up to 16 ASCII characters at a time") }
          view.send = { [weak viewer] in viewer?.send($0) }
          view.toggleControls = toggleControls
          viewer.onPixel = { [weak view] pixel in view?.show(pixel) }
-@@ -204,37 +223,10 @@ private struct LinkVideoSurface: UIViewRepresentable {
-     func updateUIView(_ view: LinkVideoView, context: Context) { view.toggleControls = toggleControls }
-     static func dismantleUIView(_ view: LinkVideoView, coordinator: ()) { view.send = nil; view.toggleControls = nil; view.videoLayer.flushAndRemoveImage() }
+         return view
+     }
+-    func updateUIView(_ view: LinkVideoView, context: Context) { view.toggleControls = toggleControls }
+-    static func dismantleUIView(_ view: LinkVideoView, coordinator: ()) { view.send = nil; view.toggleControls = nil; view.videoLayer.flushAndRemoveImage() }
++    func updateUIView(_ view: LinkVideoView, context: Context) { view.toggleControls=toggleControls;view.maximumRate=hz;view.videoLayer.videoGravity=fill ? .resizeAspectFill : .resizeAspect }
++    static func dismantleUIView(_ view: LinkVideoView, coordinator: ()) { view.send = nil; view.toggleControls = nil; view.clearVideo() }
  }
 -private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
++private final class LinkVideoPulse:NSObject {
++    weak var owner:LinkVideoView?
++    @objc func tick(_ display:CADisplayLink) { owner?.presentLatest() }
++}
 +private final class LinkVideoView: LinkInputView {
++    var maximumRate=60
++    private var latest:CVPixelBuffer?
++    private var pulse:CADisplayLink?
++    private var proxy:LinkVideoPulse?
      override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
      var videoLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
 -    var send: ((LinkControl) -> Void)?
@@ -8146,9 +8942,25 @@ index 1bc238f..d131252 100644
 -    }
 +    override init(frame: CGRect) { super.init(frame:frame); videoLayer.videoGravity = .resizeAspect; backgroundColor = .black }
      required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
-     func show(_ pixel: CVPixelBuffer) {
+-    func show(_ pixel: CVPixelBuffer) {
++    func show(_ pixel:CVPixelBuffer) {
++        latest=pixel
++        guard pulse==nil,window != nil else { return }
++        let proxy=LinkVideoPulse();proxy.owner=self;self.proxy=proxy
++        let pulse=CADisplayLink(target:proxy,selector:#selector(LinkVideoPulse.tick(_:)))
++        let maximum=Float(min(min(window?.screen.maximumFramesPerSecond ?? 60,maximumRate),ProcessInfo.processInfo.isLowPowerModeEnabled ? 60 : 120))
++        pulse.preferredFrameRateRange=CAFrameRateRange(minimum:min(30,maximum),maximum:maximum,preferred:maximum)
++        pulse.add(to:.main,forMode:.common);self.pulse=pulse
++    }
++    func clearVideo() { pulse?.invalidate();pulse=nil;proxy=nil;latest=nil;videoLayer.flushAndRemoveImage() }
++    override func didMoveToWindow() { super.didMoveToWindow();if window==nil { clearVideo() } }
++    fileprivate func presentLatest() {
++        pulse?.invalidate();pulse=nil;proxy=nil
++        guard let pixel=latest else { return };latest=nil
          var format: CMVideoFormatDescription?, sample: CMSampleBuffer?
-@@ -245,25 +237,41 @@ private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
+         guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixel, formatDescriptionOut: &format) == noErr, let format else { return }
+         var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
+@@ -245,25 +285,41 @@ private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
          if videoLayer.status == .failed { videoLayer.flush() }
          if videoLayer.isReadyForMoreMediaData { videoLayer.enqueue(sample) }
      }
@@ -8191,7 +9003,7 @@ index 1bc238f..d131252 100644
 +        NavigationStack {
 +            Form {
 +                Section("Another phone as your controls") {
-+                    Text("On the other phone, open Henge → Use as wireless keyboard or gamepad. Both devices must be on the same local network. This mode sends input only and uses no video stream or second monitor.")
++                    Text("On the other phone, open Henge → Use as wireless keyboard or gamepad. Both devices must be on the same local network. Controls start with video off. The viewer can enable a live mirror of the main screen; it does not add a guest monitor.")
 +                    Toggle("Remember pairing in Keychain",isOn:$remember).disabled(link.connected)
 +                    Button("Create secure pairing key") { link.listen(wired:false,remember:remember) }.disabled(link.connected || link.active)
 +                    if !link.key.isEmpty {
@@ -8374,7 +9186,7 @@ index 29c8b3b..8cd13c4 100644
      /// On an iPhone's large screen (iPhone Duo unfolded): fill it, or leave a strip at the right for the status
      /// bar and Henge's controls. Macs that never chose fill it.
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..c28f2c6 100644
+index 34d6a98..860acd8 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
 @@ -23,23 +23,55 @@
@@ -8785,7 +9597,7 @@ index 34d6a98..c28f2c6 100644
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
-@@ -388,6 +565,15 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
+@@ -388,6 +565,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
@@ -8798,10 +9610,21 @@ index 34d6a98..c28f2c6 100644
 +    }
 +    pthread_rwlock_unlock(&api_lock);return result;
 +}
++int henge_vm_audio_event(uint64_t expected,int recover) {
++    if(!lock_running())return -2;
++    int result=expected==atomic_load(&generation) ? hv_vm_audio_event(recover) : -1;
++    pthread_rwlock_unlock(&api_lock);return result;
++}
++void henge_vm_mirror_refresh(void) {
++    if(!lock_running())return;
++    HvVmapple *b=hv_vm_board();
++    if(b && b->pvg)hv_pvg_lite_mirror_refresh(b->pvg);
++    pthread_rwlock_unlock(&api_lock);
++}
  void henge_vm_link_connected(int connected) {
      if (!lock_running()) return;
      HvVmapple *b = hv_vm_board();
-@@ -454,13 +640,51 @@ void henge_vm_set_display_layer(void *layer) {
+@@ -454,13 +651,51 @@ void henge_vm_set_display_layer(void *layer) {
      hv_vm_set_display_layer(layer);
  }
  uint64_t henge_vm_gpu_frames(void) {
@@ -8856,7 +9679,7 @@ index 34d6a98..c28f2c6 100644
      HvBootDisplay d;
      int result = -1;
      if (hv_vm_boot_display(&d) == 0) {
-@@ -509,3 +733,77 @@ uint64_t henge_largest_mapping_mb(void) {
+@@ -509,3 +744,77 @@ uint64_t henge_largest_mapping_mb(void) {
      }
      return 0;
  }
@@ -8935,7 +9758,7 @@ index 34d6a98..c28f2c6 100644
 +    hv_vm_release_input_source(source);pthread_rwlock_unlock(&api_lock);
 +}
 diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
-index b8c41fa..7a0d34b 100644
+index b8c41fa..100feb8 100644
 --- a/ios/Henge/Native/henge-vm.h
 +++ b/ios/Henge/Native/henge-vm.h
 @@ -32,8 +32,32 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
@@ -9026,7 +9849,7 @@ index b8c41fa..7a0d34b 100644
  void henge_vm_log_cache(void);           /* optional per-CPU cache-use diagnostics */
  uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
  uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
-@@ -82,6 +140,9 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
+@@ -82,7 +140,12 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
  /* The panel's physical size; 0, 0 for the default (a ~122 ppi, 1x screen). Before boot. */
  void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm);
  int henge_vm_set_link_display(uint32_t width, uint32_t height, uint32_t width_mm, uint32_t height_mm, uint32_t hz);
@@ -9034,8 +9857,11 @@ index b8c41fa..7a0d34b 100644
 +/* 0: mode copied, -1: absent, -2: lifecycle transition; never blocks UI. */
 +int henge_vm_display_mode(unsigned port,HengeVmDisplayMode *out);
  void henge_vm_link_connected(int connected);
++void henge_vm_mirror_refresh(void);
++int henge_vm_audio_event(uint64_t generation,int recover);
  void henge_vm_key(uint16_t code, int down);
  void henge_vm_key_hid(uint8_t usage, int down); /* a hardware keyboard: iOS gives each key's HID usage */
+ void henge_vm_mouse_move(int dx, int dy);
 diff --git a/ios/Henge/NativeTouchSession.swift b/ios/Henge/NativeTouchSession.swift
 index 25e7bad..246a6f8 100644
 --- a/ios/Henge/NativeTouchSession.swift
@@ -9434,7 +10260,7 @@ index 0000000..3bc275d
 +}
 diff --git a/ios/Henge/Runner/RunnerMode.swift b/ios/Henge/Runner/RunnerMode.swift
 new file mode 100644
-index 0000000..1b3b022
+index 0000000..b73bcc8
 --- /dev/null
 +++ b/ios/Henge/Runner/RunnerMode.swift
 @@ -0,0 +1,201 @@
@@ -9515,7 +10341,7 @@ index 0000000..1b3b022
 +        guard hv_share_runner_status(&companionAge) == 2, (0...70).contains(companionAge) else {
 +            background = "Wait for the Mac companion to report Listener running before preparing CPU background jobs."; return
 +        }
-+        guard LinkHostService.shared.mode == nil else {
++        guard LinkHostService.shared.mode == nil && !LinkHostService.shared.streamsVideo else {
 +            background = "Disconnect the extended display and restart without it before CPU-only background work. Video encoding needs GPU access."; return
 +        }
 +        finishBackground(success: true)
@@ -9855,7 +10681,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..2eb6e9f 100644
+index f84465e..727d4fc 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,18 @@ struct SessionView: View {
@@ -10090,7 +10916,7 @@ index f84465e..2eb6e9f 100644
  
      // A fold/rotation after boot must fit the mode the guest actually received,
      // rather than stretch it by recalculating only the host view's aspect.
-@@ -485,6 +603,23 @@ struct SessionView: View {
+@@ -485,6 +603,24 @@ struct SessionView: View {
      /// The controls a column has too.
      @ViewBuilder private var floatingTools: some View {
          tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
@@ -10099,6 +10925,7 @@ index f84465e..2eb6e9f 100644
 +                Button("Save Mac & Leave",systemImage:"pause.circle") { saveAndLeave() }.disabled(booting || manualSaving)
 +            }
 +            Button(showGamepad ? "Hide Virtual Gamepad" : "Show Virtual Gamepad",systemImage:"gamecontroller") { showGamepad.toggle() }
++            Button("Recover sound",systemImage:"speaker.wave.2") { AudioSessionRecovery.shared.recover() }
 +            Button("Gamepad Settings",systemImage:"slider.horizontal.3") { showGamepadSettings = true }
 +            Button("Wireless Keyboard / Gamepad",systemImage:"antenna.radiowaves.left.and.right") { showWirelessControls = true }
 +            if runner.active { Button("Runner Dashboard",systemImage:"hammer") { runnerDesktop = false } }
@@ -10114,7 +10941,7 @@ index f84465e..2eb6e9f 100644
          pasteTool
          tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
          tool("info.circle", "Details", tint: .white) { showDetails = true }
-@@ -513,12 +648,19 @@ struct SessionView: View {
+@@ -513,12 +649,19 @@ struct SessionView: View {
      }
  
      /// Keeps the pointer in view: the view moves when the pointer nears its edge.
@@ -10135,7 +10962,7 @@ index f84465e..2eb6e9f 100644
              }
              if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / displayAspect)) { map = UIImage(cgImage: image) }
              tick += 1
-@@ -541,10 +683,65 @@ struct SessionView: View {
+@@ -541,10 +684,65 @@ struct SessionView: View {
  
      // MARK: Status
  
@@ -10201,7 +11028,7 @@ index f84465e..2eb6e9f 100644
              Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
          }
          .padding(18)
-@@ -577,12 +774,19 @@ struct SessionView: View {
+@@ -577,12 +775,19 @@ struct SessionView: View {
          NavigationStack {
              List {
                  Section(phase) {
@@ -10222,7 +11049,7 @@ index f84465e..2eb6e9f 100644
                  Section("Display") {
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
-@@ -680,6 +884,8 @@ struct SessionView: View {
+@@ -680,6 +885,8 @@ struct SessionView: View {
      }
  
      private func run(viewport: CGSize) async {
@@ -10231,7 +11058,7 @@ index f84465e..2eb6e9f 100644
          error = nil
          state = 0
          userCode = false
-@@ -693,66 +899,121 @@ struct SessionView: View {
+@@ -693,66 +900,121 @@ struct SessionView: View {
          zoomCentre = CGPoint(x: 0.5, y: 0.5)
          map = nil
          showWallpaperTip = false
@@ -10398,7 +11225,7 @@ index f84465e..2eb6e9f 100644
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
                  typing = false
-@@ -769,38 +1030,61 @@ struct SessionView: View {
+@@ -769,38 +1031,61 @@ struct SessionView: View {
                  }
                  break
              }
@@ -10898,10 +11725,10 @@ index 0000000..5435674
 +HengeGamepadPreview.xcodeproj/
 diff --git a/tests/gamepad-preview/App.swift b/tests/gamepad-preview/App.swift
 new file mode 100644
-index 0000000..88153a2
+index 0000000..8a6b492
 --- /dev/null
 +++ b/tests/gamepad-preview/App.swift
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,76 @@
 +import SwiftUI
 +import Metal
 +
@@ -10915,6 +11742,7 @@ index 0000000..88153a2
 +struct PreviewRoot: View {
 +    @State private var wireless=false
 +    @State private var folded=false
++    @State private var video=false
 +    @State private var settings=false
 +    @State private var mapping=false
 +    @State private var mode=WirelessControlMode.gamepad
@@ -10945,6 +11773,7 @@ index 0000000..88153a2
 +                    if PreviewFixture.profile == "duo-unfolded" {
 +                        Button(folded ? "Unfold" : "Fold") { last = .off;folded.toggle() }.accessibilityIdentifier("fold")
 +                    }
++                    if wireless { Button(video ? "Video off" : "Video") { video.toggle() }.accessibilityIdentifier("video") }
 +                    Button("Settings") { settings=true }.accessibilityIdentifier("settings")
 +                }
 +                HStack {
@@ -10956,7 +11785,11 @@ index 0000000..88153a2
 +                }.font(.caption.monospacedDigit()).lineLimit(1).minimumScaleFactor(0.5).frame(height:22)
 +                ZStack(alignment:.bottom) {
 +                    LinearGradient(colors:[.indigo.opacity(0.45),.gray.opacity(0.2),.black],startPoint:.topLeading,endPoint:.bottomTrailing)
-+                    if wireless {
++                    if wireless && video {
++                        WirelessVideoControls(isDuo:PreviewFixture.profile == "duo-unfolded",tuning:preferences.value,sendPad:receive,sendPointer:point,
++                            video:ZStack { Color.indigo.opacity(0.5);Text("Video layout fixture · production controls").accessibilityIdentifier("video-fixture") },
++                            toolbar:Text("Main Mac screen · fixture").font(.caption))
++                    } else if wireless {
 +                        WirelessControlsPanel(status:"Connected · preview fixture",tuning:preferences.value,isDuo:PreviewFixture.profile == "duo-unfolded",mode:$mode,
 +                            disconnect:{last = .off},configure:{settings=true},sendPad:receive,sendPointer:point) { selected in
 +                                WirelessInputSurface(keyboard:selected == .keyboard,send:point)
@@ -10974,10 +11807,10 @@ index 0000000..88153a2
 +}
 diff --git a/tests/gamepad-preview/GamepadPreviewUITests.swift b/tests/gamepad-preview/GamepadPreviewUITests.swift
 new file mode 100644
-index 0000000..a1f531a
+index 0000000..83e7b87
 --- /dev/null
 +++ b/tests/gamepad-preview/GamepadPreviewUITests.swift
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,109 @@
 +import XCTest
 +import CoreGraphics
 +
@@ -11024,7 +11857,7 @@ index 0000000..a1f531a
 +        let motion=NSPredicate { _,_ in (Int(maximum.value as? String ?? "") ?? -1)>20000 }
 +        XCTAssertEqual(XCTWaiter.wait(for:[XCTNSPredicateExpectation(predicate:motion,object:nil)],timeout:5),.completed,"Stick movement did not reach the production callback")
 +        XCTAssertEqual(app.staticTexts["buttons"].label,"Buttons: 0")
-+        let gamepadPad=app.otherElements["gamepad-touchpad"].firstMatch
++        let gamepadPad=app.descendants(matching:.any).matching(identifier:"gamepad-touchpad").firstMatch
 +        XCTAssertTrue(gamepadPad.waitForExistence(timeout:5))
 +        let padCenter=gamepadPad.coordinate(withNormalizedOffset:CGVector(dx:0.5,dy:0.5))
 +        padCenter.press(forDuration:0.1,thenDragTo:padCenter.withOffset(CGVector(dx:40,dy:8)))
@@ -11044,7 +11877,7 @@ index 0000000..a1f531a
 +        XCTAssertTrue(surface.waitForExistence(timeout:5))
 +        capture("\(PreviewFixture.profile)-wireless-gamepad")
 +        app.buttons["Touchpad"].tap()
-+        let input=app.otherElements["wireless-input-surface"].firstMatch
++        let input=app.descendants(matching:.any).matching(identifier:"wireless-input-surface").firstMatch
 +        XCTAssertTrue(input.waitForExistence(timeout:5))
 +        let center=input.coordinate(withNormalizedOffset:CGVector(dx:0.5,dy:0.5))
 +        center.press(forDuration:0.1,thenDragTo:center.withOffset(CGVector(dx:80,dy:20)))
@@ -11060,7 +11893,7 @@ index 0000000..a1f531a
 +        if PreviewFixture.profile == "duo-unfolded" {
 +            app.buttons["Controller layout"].tap()
 +            app.buttons["Tabletop"].tap()
-+            let tabletop=app.otherElements["tabletop-touchpad"].firstMatch
++            let tabletop=app.descendants(matching:.any).matching(identifier:"tabletop-touchpad").firstMatch
 +            XCTAssertTrue(tabletop.waitForExistence(timeout:5))
 +            XCTAssertLessThan(tabletop.frame.maxY,surface.frame.minY,"The hinge gap must separate the touchpad and controller")
 +            tap(.a)
@@ -11076,7 +11909,13 @@ index 0000000..a1f531a
 +            tap(.a,portrait:true)
 +            XCTAssertEqual(app.staticTexts["buttons"].label,"Buttons: 0")
 +            capture("duo-portrait-gamepad")
-+            app.buttons["fold"].tap();capture("duo-unfolded-restored")
++            app.buttons["video"].tap()
++            XCTAssertTrue(app.otherElements["duo-video-deck"].exists)
++            capture("duo-portrait-ds-video")
++            app.buttons["fold"].tap()
++            XCTAssertTrue(app.otherElements["landscape-video-controller"].exists)
++            capture("duo-landscape-fullscreen-video")
++            app.buttons["video"].tap();capture("duo-unfolded-restored")
 +        }
 +        app.terminate()
 +    }
@@ -11113,10 +11952,10 @@ index 0000000..c1696da
 +workflow with native_duo=true, to retry strict native Duo geometry validation.
 diff --git a/tests/gamepad-preview/project.yml b/tests/gamepad-preview/project.yml
 new file mode 100644
-index 0000000..9769049
+index 0000000..673cf84
 --- /dev/null
 +++ b/tests/gamepad-preview/project.yml
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,81 @@
 +name: HengeGamepadPreview
 +options:
 +  deploymentTarget:
@@ -11138,12 +11977,15 @@ index 0000000..9769049
 +    - ../../ios/Henge/Controls/GamepadTuning.swift
 +    - ../../ios/Henge/Controls/GamepadLayout.swift
 +    - ../../ios/Henge/Controls/PadInput.swift
++    - ../../ios/Henge/Controls/GyroSteeringMath.swift
++    - ../../ios/Henge/Controls/GyroSteering.swift
 +    - ../../ios/Henge/Controls/TouchpadTuning.swift
 +    - ../../ios/Henge/Controls/ControllerPostureLayout.swift
 +    - ../../ios/Henge/Controls/DuoControlPosture.swift
 +    - ../../ios/Henge/Controls/GamepadControllerSurface.swift
 +    - ../../ios/Henge/Controls/GamepadSurface.swift
 +    - ../../ios/Henge/Controls/GamepadSettingsPanel.swift
++    - ../../ios/Henge/Controls/WirelessVideoControls.swift
 +    - ../../ios/Henge/Controls/WirelessControlsPanel.swift
 +    - ../../ios/Henge/Controls/WirelessInputSurface.swift
 +    - ../../ios/Henge/Link/LinkProtocol.swift
@@ -11242,14 +12084,16 @@ index 0000000..5e76514
 +                 uint32_t piece = chunk - off < 8 ? chunk - off : 8;
 diff --git a/tests/link_control_service_fixture.c b/tests/link_control_service_fixture.c
 new file mode 100644
-index 0000000..4be1456
+index 0000000..19a5ddd
 --- /dev/null
 +++ b/tests/link_control_service_fixture.c
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,40 @@
 +/* Native input/GPU boundary spy only. The production host/client services,
 +   schema, TLS transport, pairing and decode worker execute without a VM. */
 +#include "link_control_service_fixture.h"
 +#include <stdatomic.h>
++#include <Block.h>
++static HvPvgLinkFrameHandler primary_handler;
 +static _Atomic unsigned keys,releases,video,displays,held;
 +static _Atomic int cpu_background;
 +int henge_vm_state(void){return 1;}
@@ -11261,6 +12105,13 @@ index 0000000..4be1456
 +}
 +void henge_vm_input_button(unsigned source,int button,int down){(void)source;(void)button;(void)down;}
 +void henge_vm_input_release(unsigned source){if(source==1){atomic_store(&held,0);atomic_fetch_add(&releases,1);}}
++void henge_vm_mirror_refresh(void) {}
++void hv_pvg_link_set_primary_frame_handler(HvPvgLinkFrameHandler handler){
++    if(primary_handler)Block_release(primary_handler);
++    primary_handler=handler ? Block_copy(handler) : NULL;
++    if(handler)atomic_fetch_add(&video,1);
++}
++void test_control_frame(void *texture,void *queue){if(primary_handler)primary_handler(texture,queue,0,NULL,0,0,0,0);}
 +void henge_vm_link_connected(int connected){(void)connected;}
 +int henge_vm_set_link_display(uint32_t w,uint32_t h,uint32_t wm,uint32_t hm,uint32_t hz){
 +    (void)w;(void)h;(void)wm;(void)hm;(void)hz;atomic_fetch_add(&displays,1);return 0;
@@ -11273,13 +12124,16 @@ index 0000000..4be1456
 +unsigned test_control_held(void){return atomic_load(&held);}
 +void test_control_cpu_background(int enabled){atomic_store(&cpu_background,!!enabled);}
 +
-+int henge_vm_display_mode(unsigned port,HengeVmDisplayMode *out){(void)port;(void)out;return -1;}
++int henge_vm_display_mode(unsigned port,HengeVmDisplayMode *out){
++    if(port!=0)return -1;
++    *out=(HengeVmDisplayMode){320,240,70,52,60};return 0;
++}
 diff --git a/tests/link_control_service_fixture.h b/tests/link_control_service_fixture.h
 new file mode 100644
-index 0000000..0b2b481
+index 0000000..ea3c00d
 --- /dev/null
 +++ b/tests/link_control_service_fixture.h
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,9 @@
 +#include "link_bridge_fixture.h"
 +unsigned test_control_keys(void);
 +unsigned test_control_releases(void);
@@ -11287,6 +12141,17 @@ index 0000000..0b2b481
 +unsigned test_control_displays(void);
 +unsigned test_control_held(void);
 +void test_control_cpu_background(int enabled);
++
++void test_control_frame(void *texture,void *queue);
+diff --git a/tests/link_ui_fixture.swift b/tests/link_ui_fixture.swift
+index c682d62..8d8dc78 100644
+--- a/tests/link_ui_fixture.swift
++++ b/tests/link_ui_fixture.swift
+@@ -1,2 +1,4 @@
+ import Foundation
+ enum HengeLog { static func log(_ tag: String, _ message: String) {} }
++
++enum HostScheduling { static var isDuo:Bool { false } }
 diff --git a/tests/mem_programs.S b/tests/mem_programs.S
 index bcbed3f..4913894 100644
 --- a/tests/mem_programs.S
@@ -11354,7 +12219,7 @@ index bcbed3f..4913894 100644
      ldr w2, [x0, #4]
 diff --git a/tests/run_lifecycle_sanitizers.sh b/tests/run_lifecycle_sanitizers.sh
 new file mode 100755
-index 0000000..b3d6747
+index 0000000..b04923c
 --- /dev/null
 +++ b/tests/run_lifecycle_sanitizers.sh
 @@ -0,0 +1,54 @@
@@ -11403,7 +12268,7 @@ index 0000000..b3d6747
 +if check xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -fsanitize=address,undefined -Idevices tests/test_metal_library_cache.m -framework Foundation -framework Metal -o build/test_metal_library_cache; then
 +    check build/test_metal_library_cache build/link/screen.metallib
 +fi
-+if check swiftc -parse-as-library -swift-version 5 ios/Henge/Controls/GamepadState.swift ios/Henge/Controls/GamepadTuning.swift ios/Henge/Controls/GamepadLayout.swift ios/Henge/Controls/PadInput.swift tests/test_gamepad_tuning.swift -o build/test_gamepad_tuning; then
++if check swiftc -parse-as-library -swift-version 5 ios/Henge/Controls/GamepadState.swift ios/Henge/Controls/GamepadTuning.swift ios/Henge/Controls/GamepadLayout.swift ios/Henge/Controls/PadInput.swift ios/Henge/Controls/TouchpadTuning.swift ios/Henge/Controls/ControllerPostureLayout.swift ios/Henge/Controls/GyroSteeringMath.swift tests/test_gamepad_tuning.swift -o build/test_gamepad_tuning; then
 +    check build/test_gamepad_tuning
 +fi
 +if check make build/test_display_router; then check build/test_display_router; fi
@@ -11412,6 +12277,57 @@ index 0000000..b3d6747
 +fi
 +printf '\nExpanded diagnostic pass: %d failed checks\n' "$failures"
 +test "$failures" -eq 0
+diff --git a/tests/test_audio_lifecycle.c b/tests/test_audio_lifecycle.c
+index dc4e6a8..8581661 100644
+--- a/tests/test_audio_lifecycle.c
++++ b/tests/test_audio_lifecycle.c
+@@ -6,10 +6,11 @@
+ #include <string.h>
+ 
+ struct TestAudioUnit { int initialized, running, disposed; AURenderCallbackStruct cb; AudioStreamBasicDescription format; };
+-static struct TestAudioUnit instances[4];
++static struct TestAudioUnit instances[16];
++static int fail_start;
+ static unsigned created, starts, stops, uninits, disposals, pulls;
+ AudioComponent AudioComponentFindNext(AudioComponent previous, const AudioComponentDescription *d) { (void)previous; assert(d->subtype == HV_OUTPUT_UNIT); return instances; }
+-OSStatus AudioComponentInstanceNew(AudioComponent c, AudioComponentInstance *u) { assert(c && created<4); *u=&instances[created++]; return noErr; }
++OSStatus AudioComponentInstanceNew(AudioComponent c, AudioComponentInstance *u) { assert(c && created<16); *u=&instances[created++]; return noErr; }
+ OSStatus AudioUnitSetProperty(AudioComponentInstance u, UInt32 p, UInt32 scope, UInt32 element, const void *value, UInt32 bytes) {
+     assert(scope==kAudioUnitScope_Input && element==0);
+     if (p==kAudioUnitProperty_StreamFormat) { assert(bytes==sizeof u->format); memcpy(&u->format,value,bytes); }
+@@ -17,11 +18,14 @@ OSStatus AudioUnitSetProperty(AudioComponentInstance u, UInt32 p, UInt32 scope,
+     return noErr;
+ }
+ OSStatus AudioUnitInitialize(AudioComponentInstance u) { assert(!u->disposed); u->initialized=1; return noErr; }
+-OSStatus AudioOutputUnitStart(AudioComponentInstance u) { assert(u->initialized && !u->disposed); u->running=1; starts++; return noErr; }
++OSStatus AudioOutputUnitStart(AudioComponentInstance u) { assert(u->initialized && !u->disposed);if(fail_start)return -1; u->running=1; starts++; return noErr; }
+ OSStatus AudioOutputUnitStop(AudioComponentInstance u) { assert(u->running && !u->disposed); u->running=0; stops++; return noErr; }
+ OSStatus AudioUnitUninitialize(AudioComponentInstance u) { assert(!u->running && u->initialized); u->initialized=0; uninits++; return noErr; }
+ OSStatus AudioComponentInstanceDispose(AudioComponentInstance u) { assert(!u->running && !u->initialized && !u->disposed); u->disposed=1; disposals++; return noErr; }
+ uint32_t hv_virtio_snd_pull(HvVirtioSnd *d, void *buf, uint32_t len) { assert(d); pulls++; memset(buf,0,len); return len; }
++void hv_virtio_snd_resume(HvVirtioSnd *d) {
++    if(d->running && d->backend.start && d->backend.start(d->backend.opaque,d->channels,d->format,d->rate_hz))d->backend.start=NULL;
++}
+ int main(void) {
+     HvVirtioSnd d = {0};
+     hv_audio_attach(&d);
+@@ -44,5 +48,16 @@ int main(void) {
+     assert(stops==2 && uninits==2 && disposals==2);
+     hv_audio_detach(&d);
+     assert(stops==3 && uninits==3 && disposals==3 && !unit && !unit_running);
++    hv_audio_attach(&d);d.channels=2;d.format=HV_VSND_FMT_S16;d.rate_hz=48000;d.running=1;
++    assert(d.backend.start(d.backend.opaque,2,HV_VSND_FMT_S16,48000)==0);
++    hv_audio_pause(&d);assert(d.running && !unit && detached);
++    hv_audio_attach(&d);hv_virtio_snd_resume(&d);assert(d.running && unit_running);
++    hv_audio_interrupt(&d);assert(d.running && !unit_running && interrupted);
++    assert(!d.backend.start && start(&d,2,HV_VSND_FMT_S16,48000)==-1);
++    assert(hv_audio_recover(&d)==0 && unit_running && d.running && !interrupted);
++    fail_start=1;assert(hv_audio_recover(&d)==-1 && !d.backend.start && d.running);
++    fail_start=0;assert(hv_audio_recover(&d)==0 && d.backend.start && unit_running && d.running);
++    hv_audio_detach(&d);unsigned count=created;
++    assert(hv_audio_recover(&d)==-1 && created==count);
+     puts("audio lifecycle: render, no duplicate start, stop/uninitialize/dispose, late-start rejection, idempotence and reattach passed");
+ }
 diff --git a/tests/test_bench.c b/tests/test_bench.c
 index b3af248..b8e6466 100644
 --- a/tests/test_bench.c
@@ -12066,10 +12982,10 @@ index 0000000..080debb
 +}
 diff --git a/tests/test_gamepad_tuning.swift b/tests/test_gamepad_tuning.swift
 new file mode 100644
-index 0000000..31f955d
+index 0000000..c308531
 --- /dev/null
 +++ b/tests/test_gamepad_tuning.swift
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,108 @@
 +import Foundation
 +import CoreGraphics
 +
@@ -12138,6 +13054,18 @@ index 0000000..31f955d
 +        precondition(!GamepadState(mouseSpeed:299).valid && !GamepadState(mouseSpeed:2401).valid)
 +        let decoded=try JSONDecoder().decode(GamepadState.self,from:JSONEncoder().encode(remote))
 +        precondition(decoded==remote)
++        var steering=GyroSteeringMath()
++        precondition(steering.update(angle:0,time:1,fullLockDegrees:35,inverted:false)==0)
++        for frame in 1...120 { _=steering.update(angle:Double.pi/3,time:1+Double(frame)/60,fullLockDegrees:35,inverted:false) }
++        precondition(steering.update(angle:Double.pi/3,time:4,fullLockDegrees:35,inverted:false)>32000)
++        let throttle=GamepadState(buttons:1,lx:1000,ly:-20000,rx:500,ry:200,left:0,right:255)
++        let driven=GyroSteeringMath.merge(throttle,steering:-20000,enabled:true)
++        precondition(driven.lx == -20000 && driven.ly == throttle.ly && driven.rx == 500 && driven.right == 255 && driven.buttons == 1)
++        precondition(driven.mappedKeys.contains(4) && driven.mappedKeys.contains(26))
++        precondition(GyroSteeringMath.merge(throttle,steering:20000,enabled:false)==throttle)
++        precondition(GyroSteeringMath.merge(.off,steering:20000,enabled:true) == .off)
++        precondition(steering.update(angle:.nan,time:4,fullLockDegrees:35,inverted:false)==0)
++        precondition(steering.update(angle:0.001,time:5,fullLockDegrees:35,inverted:false)==0)
 +        var motion=TouchpadMotion()
 +        for _ in 0..<7 { precondition(motion.consume(dx:0.5,dy:-0.5,multiplier:0.25)==(0,0)) }
 +        precondition(motion.consume(dx:0.5,dy:-0.5,multiplier:0.25)==(1,-1))
@@ -12444,13 +13372,22 @@ index 060441b..09d8836 100644
  '''
  b=r/'build';b.mkdir(exist_ok=True);p=b/'test_jit_allocation.c';p.write_text(s)
 diff --git a/tests/test_link.swift b/tests/test_link.swift
-index 1ac8d90..0ef4da9 100644
+index 1ac8d90..262d964 100644
 --- a/tests/test_link.swift
 +++ b/tests/test_link.swift
-@@ -22,8 +22,31 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -22,8 +22,40 @@ func mustReject(_ operation: () throws -> Void) {
          dispatchMain()
      }
      static func checks() throws {
++        let firstIdentity=LinkFrameSequence.next(),secondIdentity=LinkFrameSequence.next()
++        require(secondIdentity>firstIdentity,"Encoder replacement must not reuse outstanding ACK identities")
++        var retry=LinkReconnectPolicy()
++        let delays=(0..<12).compactMap { _ in retry.nextDelay() }
++        require(delays.count==12 && delays[0]==0.35 && delays.allSatisfy { $0<=15 },"Reconnect backoff must be bounded")
++        require(retry.nextDelay()==nil,"Retry budget must stop without polling")
++        retry.reset();require(retry.nextDelay()==0.35,"User retry resets backoff")
++        try LinkControl(type:"mirror",down:true).validate()
++        mustReject { try LinkControl(type:"mirror").validate() }
 +        try LinkControl(type:"helloInput").validate()
 +        try LinkControl(type:"readyInput",capabilities:["inputOnly","gamepad"]).validate()
 +        mustReject { try LinkControl(type:"gamepad",gamepad:GamepadState(hat:9)).validate() }
@@ -12479,7 +13416,7 @@ index 1ac8d90..0ef4da9 100644
          try LinkControl(type: "release").validate()
          try LinkControl(type: "videoAck", sequence: 1).validate()
          mustReject { try LinkControl(type: "videoAck", sequence: 0).validate() }
-@@ -191,6 +214,12 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -191,6 +223,12 @@ func mustReject(_ operation: () throws -> Void) {
          var pixels = [UInt8](repeating: 0, count: mode.width * mode.height * 4)
          for i in stride(from: 0, to: pixels.count, by: 4) { pixels[i+2] = 255; pixels[i+3] = 255 }
          texture.replace(region: MTLRegionMake2D(0, 0, mode.width, mode.height), mipmapLevel: 0, withBytes: &pixels, bytesPerRow: mode.width * 4)
@@ -12494,7 +13431,7 @@ index 1ac8d90..0ef4da9 100644
          expected = 1
 diff --git a/tests/test_link_control_services.py b/tests/test_link_control_services.py
 new file mode 100644
-index 0000000..752feee
+index 0000000..4459a02
 --- /dev/null
 +++ b/tests/test_link_control_services.py
 @@ -0,0 +1,15 @@
@@ -12510,17 +13447,18 @@ index 0000000..752feee
 +adapted=out/'LinkServiceMac.swift'
 +adapted.write_text(source.replace('import UIKit\n',''))
 +subprocess.run(['xcrun','--sdk','macosx','clang','-fblocks','-std=c11','-Wall','-Wextra','-Werror','-Itests','-c','tests/link_control_service_fixture.c','-o',str(out/'control_fixture.o')],cwd=root,check=True)
-+files=['ios/Henge/Controls/GamepadState.swift']+[f'ios/Henge/Link/{name}.swift' for name in ['LinkProtocol','LinkPairing','LinkTransport','LinkVideo','LinkFlowControl','LinkDecodeWorker']]
++files=['ios/Henge/Controls/GamepadState.swift']+[f'ios/Henge/Link/{name}.swift' for name in ['LinkProtocol','LinkReconnectPolicy','LinkPairing','LinkTransport','LinkVideo','LinkFlowControl','LinkDecodeWorker']]
 +subprocess.run(['swiftc','-parse-as-library','-swift-version','5','-import-objc-header','tests/link_control_service_fixture.h',*files,str(adapted),'tests/test_link_control_services.swift',str(out/'control_fixture.o'),'-framework','Network','-framework','Security','-framework','Metal','-framework','CoreMedia','-framework','CoreVideo','-framework','VideoToolbox','-o',str(out/'control_services')],cwd=root,check=True)
-+subprocess.run([str(out/'control_services')],cwd=root,check=True,timeout=50)
++subprocess.run([str(out/'control_services')],cwd=root,check=True,timeout=80)
 diff --git a/tests/test_link_control_services.swift b/tests/test_link_control_services.swift
 new file mode 100644
-index 0000000..05e439a
+index 0000000..635d7b8
 --- /dev/null
 +++ b/tests/test_link_control_services.swift
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,84 @@
 +import Foundation
 +import Darwin
++import Metal
 +
 +enum HengeLog { static func log(_ tag:String,_ message:String) { print("\(tag): \(message)") } }
 +@MainActor final class GamepadHub {
@@ -12538,8 +13476,10 @@ index 0000000..05e439a
 +        }
 +    }
 +    static func main() async {
-+        setbuf(stdout,nil); alarm(45)
-+        let host = LinkHostService.shared, viewer = LinkViewerService()
++        setbuf(stdout,nil); alarm(70)
++        guard let gpu=MTLCreateSystemDefaultDevice(),let queue=gpu.makeCommandQueue() else { fatalError("Real Metal device/queue required") }
++        let library=try! gpu.makeLibrary(URL:URL(fileURLWithPath:"build/link/screen.metallib"))
++        let host=LinkHostService(library:library),viewer=LinkViewerService()
 +        host.listen(wired:false)
 +        await wait("listener never opened") { host.port != nil }
 +        var pixels = 0; viewer.onPixel = { _ in pixels += 1 }
@@ -12564,9 +13504,29 @@ index 0000000..05e439a
 +        test_control_cpu_background(0)
 +        viewer.send(LinkControl(type:"key",code:26,down:true))
 +        await wait("foreground input did not return") { test_control_held()==1 }
++        let pairingKey=host.key,listenerPort=host.port
++        viewer.setForeground(false)
++        await wait("background did not release input") { test_control_held()==0 && !host.connected }
++        precondition(host.key==pairingKey && host.port==listenerPort)
++        viewer.setForeground(true)
++        await wait("automatic foreground reconnect failed") { viewer.ready && host.controlOnly }
++        precondition(host.key==pairingKey && host.port==listenerPort && viewer.mirrorSupported)
++        viewer.setMirror(true,hz:120)
++        await wait("primary video mirror handshake failed") { viewer.videoActive && host.mirrorActive }
++        precondition(!host.active && host.controlOnly && host.mode==nil && viewer.videoHz==60 && test_control_displays()==0)
++        let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm,width:320,height:240,mipmapped:false)
++        descriptor.storageMode = .shared;descriptor.usage = [.shaderRead,.renderTarget]
++        let texture=gpu.makeTexture(descriptor:descriptor)!
++        var bytes=[UInt8](repeating:128,count:320*240*4)
++        bytes.withUnsafeMutableBytes { texture.replace(region:MTLRegionMake2D(0,0,320,240),mipmapLevel:0,withBytes:$0.baseAddress!,bytesPerRow:320*4) }
++        test_control_frame(Unmanaged.passUnretained(texture as AnyObject).toOpaque(),Unmanaged.passUnretained(queue as AnyObject).toOpaque())
++        await wait("real mirrored texture did not encode/network/decode") { pixels>0 }
++        viewer.setMirror(false)
++        await wait("mirror video did not stop") { !host.mirrorActive && !viewer.videoActive }
++        precondition(host.controlOnly && test_control_displays()==0)
 +        viewer.disconnect()
 +        await wait("disconnect did not release owned input") { !host.connected && test_control_held()==0 && !GamepadHub.shared.last.connected }
-+        host.stop(); precondition(test_control_video()==0 && test_control_displays()==0 && pixels==0)
++        host.stop();precondition(test_control_video()==1 && test_control_displays()==0 && pixels>0)
 +        // A restored one-port Mac must reject a video peer before allocating an
 +        // encoder or silently changing the guest topology. Controls-only remains valid.
 +        host.listen(wired:false)
@@ -12574,10 +13534,10 @@ index 0000000..05e439a
 +        viewer.connect(host:"127.0.0.1",port:host.port!,key:host.key,wired:false,mode:mode)
 +        await wait("running one-port Mac accepted a new monitor") { host.status.contains("saved second monitor") }
 +        precondition(!viewer.ready && !host.active && host.mode==nil)
-+        precondition(test_control_video()==0 && test_control_displays()==0)
++        precondition(test_control_video()==1 && test_control_displays()==0)
 +        viewer.disconnect();host.stop()
 +        alarm(0)
-+        print("PASS production controls-only host/client over real TLS: negotiation, owned keyboard/gamepad, mapping, CPU gate, releases, disconnect; no video handler, display mode or decoded pixels")
++        print("PASS production controls-only host/client over real TLS: negotiation, owned keyboard/gamepad, mapping, CPU gate, releases, disconnect; opt-in real GPU mirror encode/decode without a second monitor; foreground reconnect preserves pairing")
 +    }
 +}
 diff --git a/tests/test_m4_defaults.swift b/tests/test_m4_defaults.swift
@@ -13770,7 +14730,7 @@ index 01aead4..b1daca1 100644
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..02a7cd0 100644
+index a13a70d..3b6939d 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
 @@ -3,6 +3,9 @@
@@ -13943,7 +14903,7 @@ index a13a70d..02a7cd0 100644
          check("failed boot allows retry", henge_vm_state() == 0 && henge_vm_can_start());
          check("failed boot closes files", fds() == initial_fds);
          check("failed boot joins workers", threads() == initial_threads);
-@@ -150,8 +261,28 @@ int main(void) {
+@@ -150,9 +261,34 @@ int main(void) {
          write_file(rom, code, sizeof code);
          int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          check("resume test boots", rc == 0);
@@ -13970,13 +14930,20 @@ index a13a70d..02a7cd0 100644
 +        hv_vm_touch(1, 0, 100, 100, 1);
 +        hv_vm_touch_button(1);
          henge_vm_mouse_button(1, 1);
++        hv_dev_lock(hv_vm_machine());
++        HvVirtioSnd *sound=hv_vm_board()->snd;
++        sound->channels=2;sound->format=HV_VSND_FMT_S16;sound->rate=HV_VSND_RATE_48000;
++        sound->rate_hz=48000;sound->frame_bytes=4;sound->prepared=1;sound->running=1;
++        hv_dev_unlock(hv_vm_machine());
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "suspend: %s\n", error);
-@@ -160,35 +291,109 @@ int main(void) {
+         check("suspend saves", rc == 0 && henge_vm_state() == 4 && access(snap, F_OK) == 0);
+@@ -160,35 +296,110 @@ int main(void) {
              fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\n");
              return 1;
          }
 -        check("pause releases queued right-Control", !(hv_vm_board()->usb->state[0] & (1u << 4)));
++        check("pause preserves the guest audio stream",hv_vm_board()->snd->running==1 && hv_vm_board()->snd->prepared==1);
 +        uint64_t session_generation=henge_vm_generation();
 +        struct stat original; check("saved file stats",!stat(snap,&original));
 +        CancelAtProgress cancellation={0};
@@ -14092,7 +15059,7 @@ index a13a70d..02a7cd0 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +414,78 @@ int main(void) {
+@@ -209,6 +420,78 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);
@@ -14592,7 +15559,7 @@ index 0000000..1df55f8
 +}
 +@end
 diff --git a/tools/link/check.sh b/tools/link/check.sh
-index c88ebe4..00251c5 100755
+index c88ebe4..e8b6228 100755
 --- a/tools/link/check.sh
 +++ b/tools/link/check.sh
 @@ -7,13 +7,16 @@ build/link/test_pvg_display
@@ -14607,7 +15574,7 @@ index c88ebe4..00251c5 100755
  xcrun -sdk macosx metal -c devices/pvg_screen.metal -o build/link/screen.air
  xcrun -sdk macosx metallib build/link/screen.air -o build/link/screen.metallib
 -swiftc -swift-version 5 ios/Henge/Link/LinkProtocol.swift ios/Henge/Link/LinkPairing.swift ios/Henge/Link/LinkTransport.swift ios/Henge/Link/LinkVideo.swift ios/Henge/Link/LinkFlowControl.swift ios/Henge/Link/LinkDecodeWorker.swift tests/link_flow_checks.swift tests/link_pairing_checks.swift tests/test_link.swift -framework Network -framework Security -framework Metal -framework CoreMedia -framework CoreVideo -framework VideoToolbox -o build/link/test_link
-+swiftc -swift-version 5 ios/Henge/Controls/GamepadState.swift ios/Henge/Link/LinkProtocol.swift ios/Henge/Link/LinkPairing.swift ios/Henge/Link/LinkTransport.swift ios/Henge/Link/LinkVideo.swift ios/Henge/Link/LinkFlowControl.swift ios/Henge/Link/LinkDecodeWorker.swift tests/link_flow_checks.swift tests/link_pairing_checks.swift tests/test_link.swift -framework Network -framework Security -framework Metal -framework CoreMedia -framework CoreVideo -framework VideoToolbox -o build/link/test_link
++swiftc -swift-version 5 ios/Henge/Controls/GamepadState.swift ios/Henge/Link/LinkProtocol.swift ios/Henge/Link/LinkReconnectPolicy.swift ios/Henge/Link/LinkPairing.swift ios/Henge/Link/LinkTransport.swift ios/Henge/Link/LinkVideo.swift ios/Henge/Link/LinkFlowControl.swift ios/Henge/Link/LinkDecodeWorker.swift tests/link_flow_checks.swift tests/link_pairing_checks.swift tests/test_link.swift -framework Network -framework Security -framework Metal -framework CoreMedia -framework CoreVideo -framework VideoToolbox -o build/link/test_link
  SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 -xcrun --sdk iphoneos swiftc -typecheck -swift-version 5 -target arm64-apple-ios17.0 -sdk "$SDK" -import-objc-header tests/link_bridge_fixture.h ios/Henge/Link/*.swift tests/link_ui_fixture.swift
 +xcrun --sdk iphoneos swiftc -typecheck -swift-version 5 -target arm64-apple-ios17.0 -sdk "$SDK" -import-objc-header tests/link_bridge_fixture.h ios/Henge/Controls/*.swift ios/Henge/Link/*.swift tests/link_ui_fixture.swift

@@ -95,6 +95,7 @@ p["HengeIntegratedPullRequestHeads"]=[str(x["sha"]) for x in i["pull_requests"]]
 version_manifest=json.loads(Path(sys.argv[2]).read_text())
 p["CFBundleShortVersionString"]=version_manifest.get("app_version", p["CFBundleShortVersionString"])
 p["CFBundleVersion"]=version_manifest.get("app_build", p["CFBundleVersion"])
+p["NSMotionUsageDescription"]="Use optional motion controls to steer racing games while this controller is visible."
 if version_manifest.get("controls_power"):
     # BGContinuedProcessingTask (including CPU-only requests) needs the
     # processing background mode. Retain existing audio/pairing capabilities.

@@ -22,7 +22,7 @@ for name in managed:
     before = plistlib.loads(subprocess.check_output(['git', 'show', base + ':' + name], cwd=source))
     after = plistlib.loads((source / name).read_bytes())
     differences = {k for k in before.keys() | after.keys() if before.get(k) != after.get(k)}
-    assert differences <= {'CFBundleVersion', 'CFBundleShortVersionString'}, 'Review metadata integration for: ' + name
+    assert differences <= {'CFBundleVersion', 'CFBundleShortVersionString', 'NSMotionUsageDescription'}, 'Review metadata integration for: ' + name
 patch = subprocess.check_output(['git', 'diff', '--binary', base, '--', '.', *[':(exclude)' + p for p in managed]], cwd=source)
 (root / 'audit-repairs.patch').write_bytes(patch)
 digest = hashlib.sha256(patch).hexdigest()
