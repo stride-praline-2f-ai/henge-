@@ -7811,10 +7811,10 @@ index 0000000..5435674
 +HengeGamepadPreview.xcodeproj/
 diff --git a/tests/gamepad-preview/App.swift b/tests/gamepad-preview/App.swift
 new file mode 100644
-index 0000000..62ce386
+index 0000000..d0d3a37
 --- /dev/null
 +++ b/tests/gamepad-preview/App.swift
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,67 @@
 +import SwiftUI
 +import Metal
 +
@@ -7876,7 +7876,6 @@ index 0000000..62ce386
 +                    }
 +                }
 +                .frame(width:width,height:height)
-+                .accessibilityIdentifier("preview-canvas")
 +                Spacer(minLength:0)
 +            }.padding(12).frame(width:geometry.size.width,height:geometry.size.height)
 +            .sheet(isPresented:$settings) { GamepadSettingsPanel(mapping:$mapping,allowsNativeProfile:!wireless) }
@@ -7885,10 +7884,10 @@ index 0000000..62ce386
 +}
 diff --git a/tests/gamepad-preview/GamepadPreviewUITests.swift b/tests/gamepad-preview/GamepadPreviewUITests.swift
 new file mode 100644
-index 0000000..f9dbafb
+index 0000000..6958981
 --- /dev/null
 +++ b/tests/gamepad-preview/GamepadPreviewUITests.swift
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,64 @@
 +import XCTest
 +import CoreGraphics
 +
@@ -7920,7 +7919,8 @@ index 0000000..f9dbafb
 +        XCTAssertTrue(maximum.waitForExistence(timeout:5))
 +        let touchTrace=XCTAttachment(string:surface.value as? String ?? "no touch trace");touchTrace.name="Production touch trace after drag";touchTrace.lifetime = .keepAlways;add(touchTrace)
 +        capture("\(PreviewFixture.profile)-after-stick-drag")
-+        XCTAssertGreaterThan(Int(maximum.label.split(separator:" ").last ?? "0") ?? 0,20000)
++        let motion=NSPredicate { _,_ in (Int(maximum.label.split(separator:" ").last ?? "0") ?? 0)>20000 }
++        XCTAssertEqual(XCTWaiter.wait(for:[XCTNSPredicateExpectation(predicate:motion,object:nil)],timeout:5),.completed,"Stick movement did not reach the production callback")
 +        XCTAssertEqual(app.staticTexts["buttons"].label,"Buttons: 0")
 +        app.buttons["settings"].tap()
 +        XCTAssertTrue(app.navigationBars["Gamepad settings"].waitForExistence(timeout:5))
@@ -11168,7 +11168,7 @@ index c88ebe4..00251c5 100755
 +python3 tests/test_link_control_services.py
 diff --git a/tools/preview_gamepad.py b/tools/preview_gamepad.py
 new file mode 100644
-index 0000000..70e0b88
+index 0000000..b7ee05b
 --- /dev/null
 +++ b/tools/preview_gamepad.py
 @@ -0,0 +1,84 @@
@@ -11183,7 +11183,7 @@ index 0000000..70e0b88
 +folder=root/'tests/gamepad-preview';artifacts=root/'preview-artifacts';artifacts.mkdir(exist_ok=True)
 +viewport=(951,669) if args.profile=='duo-unfolded' else (1376,1032)
 +(folder/'Fixture.swift').write_text('import Foundation\nimport CoreGraphics\nenum PreviewFixture { static let profile='+json.dumps(args.profile)+'; static let viewport=CGSize(width:'+str(viewport[0])+',height:'+str(viewport[1])+') }\n')
-+def output(*cmd):return subprocess.check_output(cmd,text=True)
++def output(*cmd):return subprocess.check_output(cmd,text=True,timeout=60)
 +metadata=json.loads(output('xcrun','simctl','list','--json'))
 +(artifacts/'simulator-inventory.json').write_text(json.dumps(metadata,indent=2)+'\n')
 +runtimes=[r for r in metadata['runtimes'] if r.get('isAvailable') and r.get('name','').startswith('iOS ')]
@@ -11203,7 +11203,7 @@ index 0000000..70e0b88
 +           ('13-inch' in d['name'] or '12.9-inch' in d['name'])]
 + candidates+=sorted(canvases,key=lambda d:('M4' in d['name'],d['name']),reverse=True)
 + for device in candidates:
-+  created=subprocess.run(['xcrun','simctl','create','Henge-'+args.profile,device['identifier'],runtime['identifier']],capture_output=True,text=True)
++  created=subprocess.run(['xcrun','simctl','create','Henge-'+args.profile,device['identifier'],runtime['identifier']],capture_output=True,text=True,timeout=60)
 +  attempts.append(dict(device=device['name'],runtime=runtime['name'],status=created.returncode,error=created.stderr.strip()))
 +  (artifacts/'simulator-selection.json').write_text(json.dumps(attempts,indent=2)+'\n')
 +  if created.returncode==0:udid=created.stdout.strip();break
@@ -11216,10 +11216,10 @@ index 0000000..70e0b88
 +            duo_unfolded_requested=args.profile=='duo-unfolded',fallback_canvas=('duo' not in device['name'].lower()) if args.profile=='duo-unfolded' else ('M4' not in device['name']))
 +(artifacts/'environment.json').write_text(json.dumps(report,indent=2)+'\n')
 +try:
-+ subprocess.run(['xcrun','simctl','boot',udid],check=True)
-+ subprocess.run(['xcrun','simctl','bootstatus',udid,'-b'],check=True,timeout=180)
++ subprocess.run(['xcrun','simctl','boot',udid],check=True,timeout=240)
++ subprocess.run(['xcrun','simctl','bootstatus',udid,'-b'],check=True,timeout=240)
 + for label,command in [('io-help',['xcrun','simctl','io',udid]),('ui-help',['xcrun','simctl','ui',udid]),('displays',['xcrun','simctl','io',udid,'enumerate'])]:
-+  probe=subprocess.run(command,capture_output=True,text=True)
++  probe=subprocess.run(command,capture_output=True,text=True,timeout=60)
 +  (artifacts/(label+'.txt')).write_text(probe.stdout+probe.stderr)
 + if args.profile=='duo-unfolded' and 'duo' in device['name'].lower():
 +  # Xcode 27.2 lists inner LCD-1 as display 3 and outer LCD as display 1.
@@ -11227,7 +11227,7 @@ index 0000000..70e0b88
 +  configuration=[]
 +  for display,power in [('3','on'),('1','off')]:
 +   command=['xcrun','simctl','io',udid,'screenConfig','--display='+display,'power',power]
-+   change=subprocess.run(command,capture_output=True,text=True)
++   change=subprocess.run(command,capture_output=True,text=True,timeout=60)
 +   configuration.append(dict(display=display,power=power,status=change.returncode,output=change.stdout+change.stderr))
 +   (artifacts/'unfolded-configuration.json').write_text(json.dumps(configuration,indent=2)+'\n')
 +   if change.returncode:raise SystemExit('Cannot establish Duo unfolded display state; see unfolded-configuration.json')
@@ -11254,5 +11254,5 @@ index 0000000..70e0b88
 + if not list((artifacts/'screenshots').rglob('*.png')):raise SystemExit('XCTest passed but screenshot export is missing; preview verification incomplete')
 + report['ui_tests']='passed';(artifacts/'environment.json').write_text(json.dumps(report,indent=2)+'\n')
 +finally:
-+ subprocess.run(['xcrun','simctl','shutdown',udid],check=False)
-+ subprocess.run(['xcrun','simctl','delete',udid],check=False)
++ subprocess.run(['xcrun','simctl','shutdown',udid],check=False,timeout=30)
++ subprocess.run(['xcrun','simctl','delete',udid],check=False,timeout=30)
