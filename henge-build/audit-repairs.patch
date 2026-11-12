@@ -5648,10 +5648,10 @@ index 2103167..4dcdfc6 100644
          try fm.createDirectory(at: mac.directory, withIntermediateDirectories: true)
          Machines.excludeFromBackup(Machines.root)
 diff --git a/ios/Henge/InstantResume.swift b/ios/Henge/InstantResume.swift
-index 8b4bf3b..321e9fd 100644
+index 8b4bf3b..b1e8aac 100644
 --- a/ios/Henge/InstantResume.swift
 +++ b/ios/Henge/InstantResume.swift
-@@ -1,93 +1,195 @@
+@@ -1,93 +1,197 @@
  import Foundation
 +import Combine
  import UIKit
@@ -5707,7 +5707,7 @@ index 8b4bf3b..321e9fd 100644
 -        return Date(timeIntervalSince1970: TimeInterval(at))
 +    func bind(_ ticket: ResumeTicket?) {
 +        if let cancelled=lease.bind(ticket) { InstantResume.coordinator.cancelSave(cancelled) }
-     }
++    }
 +    private func expire() {
 +        if let ticket=lease.expire() { InstantResume.coordinator.cancelSave(ticket) }
 +        finish()
@@ -5715,16 +5715,11 @@ index 8b4bf3b..321e9fd 100644
 +    func finish() {
 +        guard lease.finish() else { return }
 +        if task != .invalid { UIApplication.shared.endBackgroundTask(task); task = .invalid }
-+    }
+     }
 +}
  
 -    /// Whether a file is there at all (the Home screen's hint; the start checks it properly).
 -    static func hasSave(for mac: VirtualMac) -> Bool { FileManager.default.fileExists(atPath: file(for: mac).path) }
--
--    /// The file, and a half-written one from a save iOS cut short (the engine writes beside it, then renames).
--    static func discard(for mac: VirtualMac) {
--        try? FileManager.default.removeItem(at: file(for: mac))
--        try? FileManager.default.removeItem(at: mac.directory.appendingPathComponent("resume.hsnap.part"))
 +private final class NativeResumeSave: ResumeSaveWork, @unchecked Sendable {
 +    private let request: OpaquePointer
 +    private let session: ResumeSession
@@ -5738,20 +5733,17 @@ index 8b4bf3b..321e9fd 100644
 +        let outcome = InstantResume.nativeResult { henge_vm_save_run(request,session.path,session.ident,$0,$1) }
 +        var status = HengeSaveProgress(); henge_vm_save_progress(request,&status)
 +        return status.phase == 3 ? .cancelled : outcome
-     }
++    }
 +    func progress() -> ResumeProgress {
 +        var status = HengeSaveProgress(); henge_vm_save_progress(request,&status)
 +        return ResumeProgress(scanned:status.scanned,total:status.total,cancelled:status.cancelled != 0)
 +    }
 +}
  
--    /// Henge stopped being active (the app switcher, a call, Control Center, going home): stop the Mac where it is
--    /// while the GPU is still Henge's, so what only the GPU holds goes back into the Mac's memory.
--    static func pause() {
--        guard enabled, henge_vm_state() == 1 else { return }
--        queue.async {
--            var buffer = [CChar](repeating: 0, count: 256)
--            if henge_vm_pause(&buffer, buffer.count) != 0 { HengeLog.log("resume", "not paused: \(String(cString: buffer))") }
+-    /// The file, and a half-written one from a save iOS cut short (the engine writes beside it, then renames).
+-    static func discard(for mac: VirtualMac) {
+-        try? FileManager.default.removeItem(at: file(for: mac))
+-        try? FileManager.default.removeItem(at: mac.directory.appendingPathComponent("resume.hsnap.part"))
 +enum InstantResume {
 +    static let runtime=ResumeRuntimeRegistry()
 +    static let key = "henge.instantResume"
@@ -5762,8 +5754,8 @@ index 8b4bf3b..321e9fd 100644
 +            number:i["CFBundleVersion"] as? String ?? "?",
 +            source:i["HengeCustomSourceCommit"] as? String ?? i["HengeBuildCommit"] as? String ?? "unstamped",
 +            stamp:i["HengeBuildDate"] as? String ?? "?")
-+    }
-+    static let coordinator = ResumeCoordinator(operations:ResumeOperations(
+     }
++    static let coordinator: ResumeCoordinator = ResumeCoordinator(operations:ResumeOperations(
 +        generation:{henge_vm_generation()},state:{henge_vm_state()},
 +        pause:{generation in nativeResult { henge_vm_pause_generation(generation,$0,$1) }},
 +        foreground:{generation in henge_vm_foreground_generation(generation) == 0 ? .success : .failure("The Mac session changed.")},
@@ -5779,7 +5771,16 @@ index 8b4bf3b..321e9fd 100644
 +            } catch { return .failure("The old saved state could not be removed: \(error.localizedDescription)") }
 +        },
 +        makeSave:{session,background in NativeResumeSave(session,background:background)}
-+    )) { event in
++    )) { event in publish(event) }
+ 
+-    /// Henge stopped being active (the app switcher, a call, Control Center, going home): stop the Mac where it is
+-    /// while the GPU is still Henge's, so what only the GPU holds goes back into the Mac's memory.
+-    static func pause() {
+-        guard enabled, henge_vm_state() == 1 else { return }
+-        queue.async {
+-            var buffer = [CChar](repeating: 0, count: 256)
+-            if henge_vm_pause(&buffer, buffer.count) != 0 { HengeLog.log("resume", "not paused: \(String(cString: buffer))") }
++    private static func publish(_ event:ResumeEvent) {
 +        DispatchQueue.main.async {
 +            guard coordinator.accepts(event.ticket),henge_vm_generation() == event.ticket.generation else { return }
 +            let status=InstantResumeStatus.shared
