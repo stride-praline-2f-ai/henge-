@@ -4558,7 +4558,7 @@ index b65b6ce..5ebbb7a 100644
      }
  }
 diff --git a/ios/Henge/BootDisplay.swift b/ios/Henge/BootDisplay.swift
-index 7392fda..9d2d0b3 100644
+index 7392fda..062c485 100644
 --- a/ios/Henge/BootDisplay.swift
 +++ b/ios/Henge/BootDisplay.swift
 @@ -15,6 +15,7 @@ struct BootDisplay: View {
@@ -4579,7 +4579,18 @@ index 7392fda..9d2d0b3 100644
              var generation = henge_vm_generation()
              // Keep watching the lifecycle after the GPU takes over. Removing
              // GPUScreen clears its last frame on both device and external screens.
-@@ -64,7 +67,9 @@ struct BootDisplay: View {
+@@ -58,13 +61,19 @@ struct BootDisplay: View {
+                     gpuLive = false
+                 } else {
+                     stopped = false
+-                    if !gpuLive && henge_vm_gpu_frames() > 0 {
++                    var observation=HengeVmObservation()
++                    guard henge_vm_try_observation(&observation) != 0 else {
++                        await wakeups.wait(seconds:0.1);continue
++                    }
++                    if !gpuLive && observation.counters.gpu_frames > 0 {
+                         gpuLive = true
+                         image = nil
                      }
                      if !gpuLive { image = Self.snapshot() ?? image }
                  }
@@ -4590,7 +4601,7 @@ index 7392fda..9d2d0b3 100644
              }
          }
      }
-@@ -101,6 +106,8 @@ private struct GPUScreen: UIViewRepresentable {
+@@ -101,6 +110,8 @@ private struct GPUScreen: UIViewRepresentable {
          private let role: DisplayTargetSelection.Role
          private var attached = false
          private var lastSize: CGSize = .zero
@@ -4599,7 +4610,7 @@ index 7392fda..9d2d0b3 100644
  
          init(display: DisplayRouter, role: DisplayTargetSelection.Role, surface: UUID) {
              self.id = surface
-@@ -131,10 +138,14 @@ private struct GPUScreen: UIViewRepresentable {
+@@ -131,10 +142,14 @@ private struct GPUScreen: UIViewRepresentable {
              if !attached {
                  attached = true
                  lastSize = bounds.size
@@ -4615,7 +4626,7 @@ index 7392fda..9d2d0b3 100644
                  display.refresh(id)
              }
          }
-@@ -150,8 +161,10 @@ private struct GPUScreen: UIViewRepresentable {
+@@ -150,8 +165,10 @@ private struct GPUScreen: UIViewRepresentable {
          let metalLayer = view.layer as! CAMetalLayer
          // The guest's display profile is sRGB, and the presenter writes sRGB
          // values. A nil colorspace skips matching on wide-gamut iPad screens.
@@ -6702,7 +6713,7 @@ index 29c8b3b..8cd13c4 100644
      /// On an iPhone's large screen (iPhone Duo unfolded): fill it, or leave a strip at the right for the status
      /// bar and Henge's controls. Macs that never chose fill it.
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..8761045 100644
+index 34d6a98..ca7de90 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
 @@ -23,23 +23,55 @@
@@ -7129,7 +7140,7 @@ index 34d6a98..8761045 100644
  void henge_vm_link_connected(int connected) {
      if (!lock_running()) return;
      HvVmapple *b = hv_vm_board();
-@@ -454,11 +640,48 @@ void henge_vm_set_display_layer(void *layer) {
+@@ -454,13 +640,51 @@ void henge_vm_set_display_layer(void *layer) {
      hv_vm_set_display_layer(layer);
  }
  uint64_t henge_vm_gpu_frames(void) {
@@ -7178,9 +7189,13 @@ index 34d6a98..8761045 100644
 +    pthread_rwlock_unlock(&api_lock);
 +}
  int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride) {
-     if (!lock_running()) return -1;
+-    if (!lock_running()) return -1;
++    if (pthread_rwlock_tryrdlock(&api_lock)) return -1;
++    if (state != 1) { pthread_rwlock_unlock(&api_lock); return -1; }
      HvBootDisplay d;
-@@ -509,3 +732,77 @@ uint64_t henge_largest_mapping_mb(void) {
+     int result = -1;
+     if (hv_vm_boot_display(&d) == 0) {
+@@ -509,3 +733,77 @@ uint64_t henge_largest_mapping_mb(void) {
      }
      return 0;
  }
@@ -7643,10 +7658,10 @@ index 0000000..75cf548
 +}
 diff --git a/ios/Henge/ResumeIdentity.swift b/ios/Henge/ResumeIdentity.swift
 new file mode 100644
-index 0000000..46a6074
+index 0000000..3bc275d
 --- /dev/null
 +++ b/ios/Henge/ResumeIdentity.swift
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,99 @@
 +import Foundation
 +
 +struct ResumeBuildIdentity: Codable, Equatable, Sendable {
@@ -7715,6 +7730,20 @@ index 0000000..46a6074
 +final class ResumeRuntimeRegistry: @unchecked Sendable {
 +    private let lock = NSLock()
 +    private var value: (ResumeConfiguration, UInt64)?
++    private var viewRevision:UInt64=0
++    private var viewActive=false
++    func claimView()->UInt64 {
++        lock.lock();defer {lock.unlock()};viewRevision &+= 1;viewActive=true;return viewRevision
++    }
++    func ownsView(_ revision:UInt64)->Bool {
++        lock.lock();defer {lock.unlock()};return viewActive && viewRevision==revision
++    }
++    @discardableResult func releaseView(_ revision:UInt64)->Bool {
++        lock.lock();defer {lock.unlock()}
++        guard viewActive && viewRevision==revision else {return false};viewActive=false;return true
++    }
++    var hasActiveView:Bool {lock.lock();defer{lock.unlock()};return viewActive}
++
 +    func record(_ configuration:ResumeConfiguration,generation:UInt64) {
 +        lock.lock(); value=(configuration,generation); lock.unlock()
 +    }
@@ -8155,10 +8184,10 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..c5eef79 100644
+index f84465e..12304ab 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
-@@ -9,6 +9,17 @@ struct SessionView: View {
+@@ -9,6 +9,18 @@ struct SessionView: View {
      let close: () -> Void
  
      @StateObject private var display = DisplayRouter()
@@ -8171,12 +8200,13 @@ index f84465e..c5eef79 100644
 +    @ObservedObject private var resumeStatus = InstantResumeStatus.shared
 +    @State private var bootConfiguration: ResumeConfiguration?
 +    @State private var bootGeneration: UInt64 = 0
++    @State private var viewRevision: UInt64 = 0
 +    @State private var booting = false
 +    @State private var manualSaving = false
      @State private var error: String?
      @State private var state: Int32 = 0
      @State private var bootAttempt = 0
-@@ -22,7 +33,7 @@ struct SessionView: View {
+@@ -22,7 +34,7 @@ struct SessionView: View {
      @State private var started = Date()
      @State private var runningScreen: GuestScreenSize?
      @State private var thermalState = ProcessInfo.processInfo.thermalState
@@ -8185,7 +8215,7 @@ index f84465e..c5eef79 100644
      @AppStorage("henge.cpus") private var cpus = 4
      @AppStorage("henge.matchScreenColors") private var matchScreenColors = true
      @AppStorage("henge.display.brightness") private var screenBrightness = 1.0
-@@ -45,6 +56,8 @@ struct SessionView: View {
+@@ -45,6 +57,8 @@ struct SessionView: View {
      @AppStorage("henge.tips.stillWallpaperShown") private var stillWallpaperTipShown = false
      @State private var showWallpaperTip = false
      @State private var confirmStop = false
@@ -8194,7 +8224,7 @@ index f84465e..c5eef79 100644
      @State private var zoomCentre = CGPoint(x: 0.5, y: 0.5) // where the zoomed view is, 0...1 of the Mac's screen
      @State private var map: UIImage?
      @State private var zoomFollowing: Task<Void, Never>?
-@@ -190,12 +203,19 @@ struct SessionView: View {
+@@ -190,12 +204,19 @@ struct SessionView: View {
          } message: {
              Text("This turns the Mac off at once. Anything not saved on it is lost.")
          }
@@ -8217,10 +8247,11 @@ index f84465e..c5eef79 100644
          }
          .onChange(of: nativeTouch.requested) { _, _ in nativeTouch.changedRequest() }
          .onChange(of: pointerNeeded) { needed in
-@@ -204,20 +224,107 @@ struct SessionView: View {
+@@ -204,20 +225,113 @@ struct SessionView: View {
              if needed { nativeTouch.stop() }
          }
          .onChange(of: scenePhase) { phase in
++            guard InstantResume.runtime.ownsView(viewRevision) else { return }
 +            diagnosticCapture.event("scene=\(phase)")
 +            wakeups.signal()
 +            updateZoomFollowing()
@@ -8246,14 +8277,19 @@ index f84465e..c5eef79 100644
 +                }
 +            }
 +        }
-+        .onDisappear {
-+            diagnosticCapture.stop();GamepadHub.shared.releaseAll();runner.end()
-+            if bootGeneration>0,henge_vm_generation() == bootGeneration,henge_vm_state() == 1 {
-+                InstantResume.pause(force:true,generation:bootGeneration)
-+            }
-+        }
 +        .interactiveDismissDisabled(booting || manualSaving)
 +        .disabled(booting)
++        .overlay {
++            if booting {
++                VStack(spacing:12) {
++                    ProgressView()
++                    Text(InstantResume.hasSave(for:mac) ? "Restoring saved Mac…" : "Starting Mac…").font(.headline)
++                    Text("Keep Henge visible while the Mac’s memory and devices are prepared.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                }
++                .padding(24).frame(maxWidth:390).background(Desk.raised,in:RoundedRectangle(cornerRadius:22)).padding(20)
++            }
++        }
 +        .onChange(of:resumeStatus.phase) { _,phase in
 +            if phase == .running { manualSaving=false }
 +            wakeups.signal();updateZoomFollowing()
@@ -8327,7 +8363,7 @@ index f84465e..c5eef79 100644
              if showing {
                  refreshDetails()
                  HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll()
-@@ -228,10 +335,12 @@ struct SessionView: View {
+@@ -228,35 +342,39 @@ struct SessionView: View {
          }
          .onAppear {
              UIApplication.shared.isIdleTimerDisabled = true
@@ -8336,12 +8372,23 @@ index f84465e..c5eef79 100644
              VolumeClicks.shared.start()
          }
          .onDisappear {
-+            Sharing.stopFollowingClipboard()
-             LinkHostService.shared.stop()
-             nativeTouch.stop()
-             UIApplication.shared.isIdleTimerDisabled = false
-@@ -242,21 +351,23 @@ struct SessionView: View {
-             VolumeClicks.shared.stop()
+-            LinkHostService.shared.stop()
+-            nativeTouch.stop()
+-            UIApplication.shared.isIdleTimerDisabled = false
+-            zoomFollowing?.cancel()
+-            StickyKeys.shared.releaseAll()
+-            HardwareKeys.releaseAll()
+-            HardwareMouse.shared.stop()
+-            VolumeClicks.shared.stop()
++            diagnosticCapture.stop();zoomFollowing?.cancel()
++            guard InstantResume.runtime.releaseView(viewRevision) else { return }
++            Sharing.stopFollowingClipboard();LinkHostService.shared.stop();nativeTouch.stop()
++            runner.end();GamepadHub.shared.releaseAll();StickyKeys.shared.releaseAll();HardwareKeys.releaseAll()
++            HardwareMouse.shared.stop();VolumeClicks.shared.stop()
++            UIApplication.shared.isIdleTimerDisabled=false
++            if bootGeneration>0,henge_vm_generation()==bootGeneration,henge_vm_state()==1 {
++                InstantResume.pause(force:true,generation:bootGeneration)
++            }
          }
          .modifier(ExternalMacDisplayModifier(presentation: MacPresentation(display: display, aspect: displayAspect)))
 -        .task { await Sharing.followMacClipboard() }
@@ -8372,7 +8419,7 @@ index f84465e..c5eef79 100644
  
      // A fold/rotation after boot must fit the mode the guest actually received,
      // rather than stretch it by recalculating only the host view's aspect.
-@@ -485,6 +596,23 @@ struct SessionView: View {
+@@ -485,6 +603,23 @@ struct SessionView: View {
      /// The controls a column has too.
      @ViewBuilder private var floatingTools: some View {
          tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
@@ -8396,7 +8443,7 @@ index f84465e..c5eef79 100644
          pasteTool
          tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
          tool("info.circle", "Details", tint: .white) { showDetails = true }
-@@ -513,12 +641,19 @@ struct SessionView: View {
+@@ -513,12 +648,19 @@ struct SessionView: View {
      }
  
      /// Keeps the pointer in view: the view moves when the pointer nears its edge.
@@ -8417,7 +8464,7 @@ index f84465e..c5eef79 100644
              }
              if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / displayAspect)) { map = UIImage(cgImage: image) }
              tick += 1
-@@ -541,10 +676,63 @@ struct SessionView: View {
+@@ -541,10 +683,63 @@ struct SessionView: View {
  
      // MARK: Status
  
@@ -8457,7 +8504,7 @@ index f84465e..c5eef79 100644
 +        }
 +    }
 +    private func saveAndLeave() {
-+        guard let bootConfiguration,!manualSaving else { return }
++        guard InstantResume.runtime.ownsView(viewRevision),let bootConfiguration,!manualSaving else { return }
 +        manualSaving=true
 +        GamepadHub.shared.releaseAll(); HardwareKeys.releaseAll(); HardwareMouse.shared.releaseButtons()
 +        InstantResume.suspend(bootMac ?? mac,configuration:bootConfiguration,leave:true) { left in
@@ -8481,7 +8528,7 @@ index f84465e..c5eef79 100644
              Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
          }
          .padding(18)
-@@ -577,12 +765,19 @@ struct SessionView: View {
+@@ -577,12 +772,19 @@ struct SessionView: View {
          NavigationStack {
              List {
                  Section(phase) {
@@ -8502,15 +8549,16 @@ index f84465e..c5eef79 100644
                  Section("Display") {
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
-@@ -680,6 +875,7 @@ struct SessionView: View {
+@@ -680,6 +882,8 @@ struct SessionView: View {
      }
  
      private func run(viewport: CGSize) async {
++        viewRevision=InstantResume.runtime.claimView()
 +        SessionNativeEvents.start()
          error = nil
          state = 0
          userCode = false
-@@ -693,66 +889,120 @@ struct SessionView: View {
+@@ -693,66 +897,121 @@ struct SessionView: View {
          zoomCentre = CGPoint(x: 0.5, y: 0.5)
          map = nil
          showWallpaperTip = false
@@ -8592,6 +8640,7 @@ index f84465e..c5eef79 100644
 +        bootGeneration=henge_vm_generation();booting=false
 +        LinkHostService.shared.resumeVideoIfNeeded()
 +        guard !Task.isCancelled else {
++            guard !InstantResume.runtime.hasActiveView else { return }
 +            InstantResume.pause(force:true,generation:bootGeneration)
 +            if InstantResume.enabled { InstantResume.suspend(sessionMac,configuration:configuration) }
              return
@@ -8676,7 +8725,7 @@ index f84465e..c5eef79 100644
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
                  typing = false
-@@ -769,38 +1019,59 @@ struct SessionView: View {
+@@ -769,38 +1028,59 @@ struct SessionView: View {
                  }
                  break
              }
@@ -9518,10 +9567,10 @@ index 0000000..4be1456
 +int henge_vm_display_mode(unsigned port,HengeVmDisplayMode *out){(void)port;(void)out;return -1;}
 diff --git a/tests/link_control_service_fixture.h b/tests/link_control_service_fixture.h
 new file mode 100644
-index 0000000..6ea22c8
+index 0000000..0b2b481
 --- /dev/null
 +++ b/tests/link_control_service_fixture.h
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,7 @@
 +#include "link_bridge_fixture.h"
 +unsigned test_control_keys(void);
 +unsigned test_control_releases(void);
@@ -9529,9 +9578,6 @@ index 0000000..6ea22c8
 +unsigned test_control_displays(void);
 +unsigned test_control_held(void);
 +void test_control_cpu_background(int enabled);
-+
-+typedef struct HengeVmDisplayMode { uint32_t width,height,width_mm,height_mm,hz; } HengeVmDisplayMode;
-+int henge_vm_display_mode(unsigned port,HengeVmDisplayMode *out);
 diff --git a/tests/mem_programs.S b/tests/mem_programs.S
 index bcbed3f..4913894 100644
 --- a/tests/mem_programs.S
@@ -11436,10 +11482,10 @@ index 0000000..478d014
 +    print('restore archive: functional failure removes partial archive; cosmetic filtering accepts success')
 diff --git a/tests/test_resume_coordinator.swift b/tests/test_resume_coordinator.swift
 new file mode 100644
-index 0000000..87420b8
+index 0000000..9135173
 --- /dev/null
 +++ b/tests/test_resume_coordinator.swift
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,167 @@
 +import Foundation
 +
 +private final class FakeSave: ResumeSaveWork, @unchecked Sendable {
@@ -11496,6 +11542,11 @@ index 0000000..87420b8
 +    let other=ResumeBuildIdentity(version:"0.3.4",number:"105",source:"another source",stamp:build.stamp)
 +    precondition((try? ResumeConfiguration.decode(text,build:other,macID:id,ecid:UInt64.max,seed:7,ramMB:8192,cpus:4)) == nil)
 +    let registry=ResumeRuntimeRegistry();registry.record(configuration,generation:10)
++    let first=registry.claimView(),second=registry.claimView()
++    precondition(!registry.ownsView(first) && registry.ownsView(second))
++    precondition(!registry.releaseView(first) && registry.hasActiveView)
++    precondition(registry.releaseView(second) && !registry.hasActiveView)
++
 +    precondition(registry.configuration(macID:id,generation:10,state:4)==configuration)
 +    precondition(registry.configuration(macID:id,generation:10,state:2)==nil)
 +    precondition(registry.configuration(macID:UUID(),generation:10,state:1)==nil)
@@ -11969,7 +12020,7 @@ index 01aead4..b1daca1 100644
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..ed3d59a 100644
+index a13a70d..02a7cd0 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
 @@ -3,6 +3,9 @@
@@ -12099,7 +12150,7 @@ index a13a70d..ed3d59a 100644
          henge_vm_balloon(-1);
          henge_vm_set_display_layer(NULL);
          if (!henge_vm_boot_display(&pixels, &width, &height, &stride)) henge_vm_free_display(pixels);
-@@ -76,8 +168,20 @@ static void *read_ui(void *unused) {
+@@ -76,8 +168,22 @@ static void *read_ui(void *unused) {
      }
      return NULL;
  }
@@ -12114,6 +12165,8 @@ index a13a70d..ed3d59a 100644
 +    henge_vm_test_write_lock(1);
 +    check("UI observation never waits for lifecycle writer",henge_vm_try_observation(&observation)==0 &&
 +          henge_vm_display_mode(1,&observed_mode)==-2);
++    const uint8_t *boot_pixels=NULL;int boot_w=0,boot_h=0,boot_stride=0;
++    check("firmware display never waits for lifecycle writer",henge_vm_boot_display(&boot_pixels,&boot_w,&boot_h,&boot_stride)==-1);
 +    henge_vm_trim_memory(); /* memory warnings also cannot block on the writer */
 +    henge_vm_test_write_lock(0);
 +    check("observation resumes after lifecycle ownership",henge_vm_try_observation(&observation)==1 && observation.counters.state==0);
@@ -12121,7 +12174,7 @@ index a13a70d..ed3d59a 100644
      char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
      if (!mkdtemp(dir) || hv_jit_region_open(&jit, 8 << 20)) return 1;
      snprintf(rom, sizeof rom, "%s/rom", dir);
-@@ -91,6 +195,10 @@ int main(void) {
+@@ -91,6 +197,10 @@ int main(void) {
      write_file(aux, NULL, 1 << 20);
      mapping = (HengeDualMapping){.rx_addr = (uint8_t *)jit.base,
          .rw_addr = (uint8_t *)jit.base + jit.rw_diff, .size = jit.capacity * 4};
@@ -12132,7 +12185,7 @@ index a13a70d..ed3d59a 100644
      pthread_t reader;
      if (pthread_create(&reader, NULL, read_ui, NULL)) return 1;
      /* Warm the process-wide pointer queue before counting worker threads. */
-@@ -102,6 +210,7 @@ int main(void) {
+@@ -102,6 +212,7 @@ int main(void) {
      /* Missing ROM fails after disks, RAM and device workers were created. */
      for (int i = 0; i < 3; i++) {
          check("failed boot reports an error", henge_vm_boot(rom, disk, aux, 1, 0, 64, 4, error, sizeof error) != 0);
@@ -12140,7 +12193,7 @@ index a13a70d..ed3d59a 100644
          check("failed boot allows retry", henge_vm_state() == 0 && henge_vm_can_start());
          check("failed boot closes files", fds() == initial_fds);
          check("failed boot joins workers", threads() == initial_threads);
-@@ -150,8 +259,28 @@ int main(void) {
+@@ -150,8 +261,28 @@ int main(void) {
          write_file(rom, code, sizeof code);
          int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          check("resume test boots", rc == 0);
@@ -12169,7 +12222,7 @@ index a13a70d..ed3d59a 100644
          henge_vm_mouse_button(1, 1);
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "suspend: %s\n", error);
-@@ -160,35 +289,109 @@ int main(void) {
+@@ -160,35 +291,109 @@ int main(void) {
              fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\n");
              return 1;
          }
@@ -12289,7 +12342,7 @@ index a13a70d..ed3d59a 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +412,78 @@ int main(void) {
+@@ -209,6 +414,78 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);
