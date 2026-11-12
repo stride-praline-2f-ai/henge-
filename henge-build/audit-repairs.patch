@@ -2682,7 +2682,7 @@ index c355628..1d576e3 100644
 +    if (changed) hv_machine_wake(x->m);
 +}
 diff --git a/devices/xhci.h b/devices/xhci.h
-index cf4acc4..b86729d 100644
+index cf4acc4..86e074e 100644
 --- a/devices/xhci.h
 +++ b/devices/xhci.h
 @@ -4,17 +4,19 @@
@@ -2722,7 +2722,7 @@ index cf4acc4..b86729d 100644
      uint32_t rhead, rtail;
      uint8_t state[8];      /* modifiers, reserved, six keys: the current report */
      uint64_t delivered;
-+    uint8_t key_owners[256]; /* physical, remote keyboard, mapped gamepad, reserved */
++    uint8_t key_owners[256]; /* physical, remote keyboard, mapped gamepad, local gamepad touchpad */
      /* Magic Trackpad 2: the fingers on the pad and their reports (Apple
         multitouch format, report ID 2: 12-byte prefix plus 9 bytes a finger). */
      struct HvTpFinger {
@@ -2751,6 +2751,23 @@ index cf4acc4..b86729d 100644
  /* The same, by Linux input key code (what the host UI produces). */
  void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down);
  /* Any thread: a Magic Trackpad 2 touch. phase: 0 down, 1 move, 2 up. id: a
+diff --git a/docs/controller-posture/PROGRESS.md b/docs/controller-posture/PROGRESS.md
+new file mode 100644
+index 0000000..bbd6ce1
+--- /dev/null
++++ b/docs/controller-posture/PROGRESS.md
+@@ -0,0 +1,11 @@
++# Controller posture integration
++
++Implemented in source (cloud validation pending):
++- Reuse existing keyboard + touchpad mode; clearer combined label and gesture hint.
++- Local/wireless gamepad central touchpad uses existing Link gestures, with separate local pointer ownership from mapped gamepad buttons.
++- Pointer/scroll sensitivity persisted on controller; fractional motion retained without timers.
++- Duo gamepad layout menu: Automatic, Wide, Portrait, Tabletop. Portrait has a large upper touchpad and rearranged full-size controls. Tabletop separates upper touchpad and lower controls around the active horizontal reserved region; manual fallback uses a visible-free 32pt gap. Automatic does not infer hinge angles or activate on iPads.
++- Geometry/layout change releases held gamepad and pointer input; native surface cancels fingers on geometry change.
++- Tests: geometry overlap/bounds, posture selection, fractional motion/normalisation/persistence, source ownership and real production Simulator UI interactions.
++
++Next: compile against actual Xcode SDK, run native + production controller UI tests and inspect screenshots. No IPA requested for this development checkpoint. The USB touchscreen replacement remains a separate integration requirement; current controller touchpad is pointer input and requires no CoreHID entitlement.
 diff --git a/docs/desktop-heat-20261111.md b/docs/desktop-heat-20261111.md
 new file mode 100644
 index 0000000..17638b3
@@ -3409,6 +3426,1396 @@ index 55c66e6..fe9dd9e 100644
  11. showOnLayer/presentLoop choose a shared-memory scanout texture, composite
      screen and premultiplied cursor via native Metal, and present CAMetalDrawable.
      No ordinary CPU full-frame readback is introduced. The presentation worker
+diff --git a/docs/upstream-review/2026-11-12-decisions.md b/docs/upstream-review/2026-11-12-decisions.md
+new file mode 100644
+index 0000000..6a2a3d7
+--- /dev/null
++++ b/docs/upstream-review/2026-11-12-decisions.md
+@@ -0,0 +1,26 @@
++# Upstream review, 12 November 2026
++
++Reviewed current main 1812892e129c149cf68cfa0f5e26de7f92e94fba and inventoried all 69 PRs (open/closed). Main's 44 commits since the integrated 8048e4a base affect direct Mac Apps / translation-layer loading, not the VM core, devices or host. They are not evidence of a macOS-desktop or Roblox FPS gain. Full inventory is adjacent; no blanket merge or hardware measurement is claimed.
++
++| PR | Decision / concrete integration concern |
++| --- | --- |
++| 32 | Implement new entitlement-free emulated USB touchscreen for supported macOS 27.2+ guests. Must move its port from 3 to 4, preserve gamepad port 3, reconcile snapshots and guest-helper packaging. Pending. |
++| 103 | Reuse the horizontal active reserved-region API for controller posture; do not import a second SessionView layout engine. Manual override when no region is reported. Actual SDK/UI validation pending. |
++| 123 | Useful windowed iPad absolute-pointer path; also claims USB port 3. Requires port reconciliation and pointer-lock/relative-event deduplication. Not imported blindly. |
++| 72 | Useful separately configurable keyboard shortcut interception and focus-loss release; reconcile current StickyKeys and input owners before adoption. |
++| 130 | Multi-device JIT pairing candidate validation may improve attach reliability, not steady FPS. Needs ordered candidate/cancellation tests. |
++| 128 | Forward genuine debugger faults rather than treating every stop as a JIT BRK. Valuable stability change; test alongside existing trap guard/detachment. |
++| 126 | OpenGL renderer-name metadata could avoid software fallback in affected apps. Whole-RAM scan budget is process-static; must become per-VM before adoption. Its F20 wake heuristic misclassifies an unchanged damage-driven desktop as asleep, so reject that heuristic. No evidence this accelerates Roblox's Metal path. |
++| 121 | Required companion if adopting newer Chromium high-address holds. Current fork has no corresponding reservation path, so it cannot fix current VM RAM/FPS. |
++| 117 | Selected late Metal store-action correctness fix already integrated and tested. Large LLVM/iOS17 renderer replacement would conflict with retained iOS27 native renderer. |
++| 108 / 109 / 106 | Duo screen fit / scaled pointer-click equivalents already integrated; do not duplicate. |
++| 112 | Keep existing atomic GPU timing. PR's unsynchronised last-completion state and duplicate callbacks are inferior. |
++| 92 | Fork already hashes all surface bytes and validates full uploads; do not describe it as sampled hashing or add a second scanner. |
++| 98 | Preserve fractional/coalesced hardware scrolling; shared touchpad sensitivities improve the existing gesture path without another timer. |
++| 78 / 80 / 81 | Configurable JIT size and experimental superblocks already exist. Aggressive QoS/more code is not proven cooler or faster under Low Power Mode. Retain safe defaults. |
++| 74 / 76 / 77 | DAV caching/locks/restart are potentially useful for shared files. Restart patch's volatile globals lack safe in-flight draining; not safe to merge unchanged. |
++| 79 / 82 / 87 / 90 / 93 | Input/geometry overlap with current three-finger menu, native touch, saved display config and pointer scaling. Preserve one authoritative path and settings. |
++| 83 / 84 / 91 / 100 | Emulated Bluetooth/camera/microphone are separate feature work, not physical USB passthrough or a VM speed fix. |
++| 114 / 115 / 127 / 129 | JIS keyboard / external downloads / new-disk sizing / direct-app bundle compatibility are scoped usability fixes, not measured macOS guest performance improvements. |
++
++Existing cooling diagnosis remains: latest supplied slow-FPS logs used the older 0.3.3 binary with six guest CPUs, 10GB RAM, experimental grouped/superblock paths and detailed counters under Low Power Mode. Normal thermal state does not imply spare CPU scheduling capacity; host presentation counts are not game FPS. Preserve controlled four-vCPU/eight-GB defaults, Retina quality, and disabled expensive release diagnostics. Do not promise a frame-rate improvement from these controller changes.
+diff --git a/docs/upstream-review/2026-11-12-inventory.json b/docs/upstream-review/2026-11-12-inventory.json
+new file mode 100644
+index 0000000..c2a9184
+--- /dev/null
++++ b/docs/upstream-review/2026-11-12-inventory.json
+@@ -0,0 +1,1352 @@
++{
++  "main": "1812892e129c149cf68cfa0f5e26de7f92e94fba",
++  "reviewed": "2026-11-12T18:10:38.503Z",
++  "pulls": [
++    {
++      "number": 121,
++      "title": "Release unused Mac app address reservations before VM creation",
++      "state": "open",
++      "sha": "3ff3bea1a76a1e70c1e6e989feeafdd700de348c",
++      "url": "https://github.com/Leviidev/Henge/pull/121",
++      "files": [
++        "ios/Henge/Machines.swift",
++        "ios/Henge/Native/henge-ios-jit.c",
++        "ios/Henge/Native/henge-ios-jit.h",
++        "ios/Henge/Native/henge-vm.c",
++        "tests/test_jit_high_room.py",
++        "tests/test_vm_lifecycle.c"
++      ]
++    },
++    {
++      "number": 130,
++      "title": "JIT helper: use this device's RemotePairing port, not another device's",
++      "state": "open",
++      "sha": "17e0bca8f509dca6580593654c2dcf055a185210",
++      "url": "https://github.com/Leviidev/Henge/pull/130",
++      "files": [
++        "ios/HengeJITHelper/HengeJITHelper.swift",
++        "ios/HengeJITHelper/RSDPortResolver.swift"
++      ]
++    },
++    {
++      "number": 115,
++      "title": "Add External Drive support",
++      "state": "open",
++      "sha": "58838ac8a15076e422c0bb82a1d0b228e460b5eb",
++      "url": "https://github.com/Leviidev/Henge/pull/115",
++      "files": [
++        ".DS_Store",
++        "Makefile",
++        "ios/.DS_Store",
++        "ios/Henge/DownloadStorage.swift",
++        "ios/Henge/InstallView.swift",
++        "ios/Henge/Installer.swift",
++        "ios/scripts/check_display.sh",
++        "tests/test_download_storage.swift",
++        "third_party/.DS_Store"
++      ]
++    },
++    {
++      "number": 129,
++      "title": "Mac apps: CFBundleGetMainBundle answers the app's own bundle",
++      "state": "open",
++      "sha": "e5fdc4954d2e8040db3d83a5b7714168f05fd43c",
++      "url": "https://github.com/Leviidev/Henge/pull/129",
++      "files": [
++        "tl/Makefile",
++        "tl/loader/tl_bundle.m",
++        "tl/loader/tl_loader.c",
++        "tl/loader/tl_loader.h",
++        "tl/tests/fwapp.m"
++      ]
++    },
++    {
++      "number": 128,
++      "title": "JIT script: only a brk is a command, and other stops go back to the thread with their signal",
++      "state": "open",
++      "sha": "217952d1ac2f38f338efc2235406b0f318bc805a",
++      "url": "https://github.com/Leviidev/Henge/pull/128",
++      "files": [
++        "Makefile",
++        "ios/Henge/Resources/henge-jit.js",
++        "tests/test_jit_script.js"
++      ]
++    },
++    {
++      "number": 126,
++      "title": "OpenGL renderer for the paravirtual GPU, and wake the display on pointer input",
++      "state": "open",
++      "sha": "20e5530f185f1b93286802edb37079c588176ead",
++      "url": "https://github.com/Leviidev/Henge/pull/126",
++      "files": [
++        "core/machine.h",
++        "core/sysreg.c",
++        "devices/gl_personality.h",
++        "devices/pvg_lite.c",
++        "devices/pvg_lite.h",
++        "devices/pvg_metal.m",
++        "devices/vmapple.c",
++        "host/vm.c"
++      ]
++    },
++    {
++      "number": 127,
++      "title": "Add disk size selection",
++      "state": "open",
++      "sha": "7d680c44529253fb1eb6df3cabdffd9da6e9cb8c",
++      "url": "https://github.com/Leviidev/Henge/pull/127",
++      "files": [
++        "ios/Henge/InstallView.swift",
++        "ios/Henge/Installer.swift",
++        "ios/Henge/Machines.swift",
++        "tests/check_install_disk_size.py"
++      ]
++    },
++    {
++      "number": 72,
++      "title": "Add optional Control shortcuts for Mac apps and Spotlight",
++      "state": "open",
++      "sha": "d7306e9f80cf778f8b014191f601d523df0ac505",
++      "url": "https://github.com/Leviidev/Henge/pull/72",
++      "files": [
++        "Makefile",
++        "README.md",
++        "ios/Henge/Hardware.swift",
++        "ios/Henge/HardwareShortcutMapper.swift",
++        "ios/Henge/HengeApp.swift",
++        "ios/Henge/SettingsView.swift",
++        "ios/README.md",
++        "tests/test_hardware_shortcuts.swift"
++      ]
++    },
++    {
++      "number": 123,
++      "title": "Stage Manager: no pointer lock in a window; the Mac's pointer follows the iPad's through a USB absolute pointer",
++      "state": "open",
++      "sha": "d7a08f2434a371e503576c278ec1bef0bacd3e5d",
++      "url": "https://github.com/Leviidev/Henge/pull/123",
++      "files": [
++        "devices/xhci.c",
++        "devices/xhci.h",
++        "host/vm.c",
++        "host/vm.h",
++        "ios/Henge/Hardware.swift",
++        "ios/Henge/Native/henge-vm.c",
++        "ios/Henge/Native/henge-vm.h",
++        "ios/Henge/SessionView.swift",
++        "ios/Henge/Trackpad.swift"
++      ]
++    },
++    {
++      "number": 32,
++      "title": "native multitouch support",
++      "state": "open",
++      "sha": "385a4f6e4c60916ccff70ef736eda9d6cabe2932",
++      "url": "https://github.com/Leviidev/Henge/pull/32",
++      "files": [
++        "Makefile",
++        "devices/pvg.h",
++        "devices/pvg_mac.m",
++        "devices/xhci.c",
++        "devices/xhci.h",
++        "docs/native-touch.md",
++        "host/main.c",
++        "host/native_touch.c",
++        "host/native_touch.h",
++        "host/share.c",
++        "host/vm.c",
++        "ios/Henge/HengeBridge.h",
++        "ios/Henge/NativeTouchSession.swift",
++        "ios/Henge/NativeTouchSurface.swift",
++        "ios/Henge/SessionView.swift",
++        "ios/project.yml",
++        "tests/test_guest_connection.py",
++        "tests/test_guest_connection.swift",
++        "tests/test_native_touch.c",
++        "tests/test_native_touch_packaging.py",
++        "tests/test_native_touch_session.swift",
++        "tests/test_usb_touchscreen.c",
++        "tools/check_native_touch.sh",
++        "tools/henge-agent.m",
++        "tools/henge-touch-agent.swift",
++        "tools/native-touch-probe.swift",
++        "tools/native-touch/GuestConnection.swift",
++        "tools/native-touch/NativeTouchContact.swift",
++        "tools/native-touch/NativeTouchDescriptor.swift",
++        "tools/native-touch/SystemNativeTouchDevice.swift",
++        "tools/native-touch/USBTouchTransport.swift",
++        "tools/package_native_touch.py"
++      ]
++    },
++    {
++      "number": 51,
++      "title": "Add experimental Rosetta support with an optional engine and 4 KB cache",
++      "state": "open",
++      "sha": "2ad95c2365f3358c28c8fc5087ed955ed5f2afcf",
++      "url": "https://github.com/Leviidev/Henge/pull/51",
++      "files": [
++        ".github/workflows/build-henge.yml",
++        ".gitignore",
++        "Makefile",
++        "core/classify.c",
++        "core/cpu.h",
++        "core/dispatch.c",
++        "core/exception.c",
++        "core/machine.c",
++        "core/machine.h",
++        "core/mmu.c",
++        "core/mmu.h",
++        "core/rosetta.c",
++        "core/rosetta.h",
++        "core/sysreg.c",
++        "core/translate.c",
++        "core/translate.h",
++        "docs/rosetta-experiment.md",
++        "host/enter.S",
++        "host/snapshot.c",
++        "ios/Engine/henge-engine-api.c",
++        "ios/Engine/henge-engine-api.h",
++        "ios/Henge/HengeApp.swift",
++        "ios/Henge/HomeView.swift",
++        "ios/Henge/InstallView.swift",
++        "ios/Henge/Installer.swift",
++        "ios/Henge/InstantResume.swift",
++        "ios/Henge/JIT/JITBootstrap.swift",
++        "ios/Henge/JIT/JITSetup.swift",
++        "ios/Henge/JIT/JITSetupView.swift",
++        "ios/Henge/Native/henge-brk.S",
++        "ios/Henge/Native/henge-ios-jit.c",
++        "ios/Henge/Native/henge-ios-jit.h",
++        "ios/Henge/Native/henge-vm.c",
++        "ios/Henge/Native/henge-vm.h",
++        "ios/Henge/Resources/henge-jit.js",
++        "ios/Henge/SessionView.swift",
++        "ios/Henge/SettingsView.swift",
++        "ios/engine-mainline.txt",
++        "ios/project.yml",
++        "ios/scripts/check_jit.sh",
++        "ios/scripts/fetch_deps.sh",
++        "ios/scripts/package_ipa.sh",
++        "tests/arm_guest.c",
++        "tests/classify_cases.s",
++        "tests/jit_programs.S",
++        "tests/rosetta_4k_programs.S",
++        "tests/rosetta_guest.c",
++        "tests/rosetta_guest_extended.c",
++        "tests/rosetta_programs.S",
++        "tests/support/ios_jit_runtime.c",
++        "tests/support/ios_jit_runtime.h",
++        "tests/support/ios_jit_services.swift",
++        "tests/support/ios_jit_uikit.swift",
++        "tests/support/os/proc.h",
++        "tests/test_classify.c",
++        "tests/test_devices.c",
++        "tests/test_engine_selection.c",
++        "tests/test_ios_jit.swift",
++        "tests/test_jit.c",
++        "tests/test_mmu.c",
++        "tests/test_rosetta.c",
++        "tests/test_rosetta_4k.c",
++        "tests/test_tso.c",
++        "tests/test_vm_lifecycle.c",
++        "tests/tso_programs.S",
++        "tests/verify_guest_engines.sh",
++        "tools/bench_rosetta.py",
++        "tools/build_ios_engines.py",
++        "tools/build_ios_restore.sh",
++        "tools/build_simulator_lab.sh",
++        "tools/check_engine_selection.sh",
++        "tools/check_simulator_cpu.sh",
++        "tools/run_engine_matrix.py",
++        "tools/simulator_engine_lab.m",
++        "tools/simulator_lab.m"
++      ]
++    },
++    {
++      "number": 117,
++      "title": "Sonoma on iPadOS 17: renderer fixes and on-device shader compilation",
++      "state": "open",
++      "sha": "bc51b56e9e91e27d13ff4f1f48deb9a81360dd6f",
++      "url": "https://github.com/Leviidev/Henge/pull/117",
++      "files": [
++        ".github/workflows/build-henge.yml",
++        ".gitignore",
++        "Makefile",
++        "README.md",
++        "compat/ondevice-shaders/.gitignore",
++        "compat/ondevice-shaders/HGOnDeviceAIR.cpp",
++        "compat/ondevice-shaders/HGOnDeviceAIR.h",
++        "compat/ondevice-shaders/HGOnDeviceCompiler.exports",
++        "compat/ondevice-shaders/HGOnDeviceShaderProvider.h",
++        "compat/ondevice-shaders/HGOnDeviceShaderProvider.mm",
++        "compat/ondevice-shaders/LICENSE-LLVM.txt",
++        "compat/ondevice-shaders/README.md",
++        "compat/ondevice-shaders/air_transform.cpp",
++        "compat/ondevice-shaders/build_provider.py",
++        "compat/ondevice-shaders/harden_llvm.py",
++        "compat/ondevice-shaders/llvm-air-embedding.patch",
++        "compat/ondevice-shaders/llvm-hardening-manifest.json",
++        "compat/ondevice-shaders/native_provider_tests.mm",
++        "compat/ondevice-shaders/pvg_shader_profile.h",
++        "compat/ondevice-shaders/rebuild_llvm.py",
++        "core/dispatch.c",
++        "core/machine.h",
++        "devices/HGOnDeviceShaderProvider.h",
++        "devices/panic_candidates.h",
++        "devices/pvg_agx_journal.h",
++        "devices/pvg_lite.c",
++        "devices/pvg_lite.h",
++        "devices/pvg_metal.m",
++        "devices/pvg_render_status.h",
++        "devices/pvg_replay_queue.h",
++        "devices/pvg_shader_broker.h",
++        "devices/pvg_shader_profile.h",
++        "devices/pvg_store_action.h",
++        "devices/pvg_surface_copyback.h",
++        "devices/pvg_surface_pages.h",
++        "devices/pvg_texture_record.h",
++        "devices/pvg_viewport_replay.h",
++        "devices/virtio_blk.c",
++        "devices/virtio_blk.h",
++        "devices/vmapple.c",
++        "docs/licensing.md",
++        "host/lifecycle_gate.c",
++        "host/lifecycle_gate.h",
++        "host/vm.c",
++        "host/vm.h",
++        "ios/Henge/Hardware.swift",
++        "ios/Henge/HengeApp.swift",
++        "ios/Henge/JIT/JITBootstrap.swift",
++        "ios/Henge/Native/henge-vm.c",
++        "ios/Henge/Native/henge-vm.h",
++        "ios/Henge/Resources/legal/LICENSE-LLVM.txt",
++        "ios/Henge/SessionView.swift",
++        "ios/Henge/Trackpad.swift",
++        "ios/project.yml",
++        "ios/scripts/package_ipa.sh",
++        "ios/scripts/shader_profile.py",
++        "tests/agx_journal/normal_a.metal",
++        "tests/agx_journal/normal_b.metal",
++        "tests/agx_journal/normal_journal_test.m",
++        "tests/build_ondevice_fixtures.py",
++        "tests/pvg_preflight_body.m",
++        "tests/pvg_replay_queue_control.m",
++        "tests/pvg_shader_request_api.m",
++        "tests/pvg_task_lifecycle_body.m",
++        "tests/shader_profile_fixture.m",
++        "tests/shader_profile_selection.m",
++        "tests/test_lifecycle_gate.c",
++        "tests/test_panic_candidates.c",
++        "tests/test_pvg_complaint_concurrency.py",
++        "tests/test_pvg_local_provider_binding.py",
++        "tests/test_pvg_mapper_queue.py",
++        "tests/test_pvg_merged_lifecycle_queue.py",
++        "tests/test_pvg_ordinary_texture.c",
++        "tests/test_pvg_ordinary_texture.py",
++        "tests/test_pvg_preflight.py",
++        "tests/test_pvg_render_status.py",
++        "tests/test_pvg_replay_queue.py",
++        "tests/test_pvg_shader_request_api.py",
++        "tests/test_pvg_store_action.c",
++        "tests/test_pvg_store_action.m",
++        "tests/test_pvg_surface_copyback.c",
++        "tests/test_pvg_surface_copyback.m",
++        "tests/test_pvg_surface_pages.c",
++        "tests/test_pvg_task_lifecycle.py",
++        "tests/test_pvg_task_view.py",
++        "tests/test_pvg_texture_record.c",
++        "tests/test_pvg_viewport_replay.m",
++        "tests/test_pvg_viewport_replay.py",
++        "tests/test_virtio_discard.c",
++        "tests/test_vm_natural_exit_paused.py",
++        "tests/test_vm_pause.c",
++        "tl/Makefile",
++        "tools/compat/build_ondevice_provider.py",
++        "tools/compat/check_ondevice_provider.py",
++        "tools/compat/test_ondevice_provider_package.py"
++      ]
++    },
++    {
++      "number": 111,
++      "title": "Sonoma on iPadOS 17: rendering fixes and on-device shader packaging",
++      "state": "closed",
++      "sha": "e8ce2372ec1884d617f66f13d32080d1175069d6",
++      "url": "https://github.com/Leviidev/Henge/pull/111",
++      "files": [
++        ".gitattributes",
++        ".github/workflows/build-henge.yml",
++        ".gitignore",
++        "Makefile",
++        "README.md",
++        "compat/dynamic-libraries/.gitignore",
++        "compat/dynamic-libraries/README.md",
++        "compat/dynamic-libraries/build.py",
++        "compat/dynamic-libraries/compiler/close_air.cpp",
++        "compat/dynamic-libraries/compiler/closure.py",
++        "compat/dynamic-libraries/compiler/compile_requests.py",
++        "compat/dynamic-libraries/compiler/dynamic_peer_http.py",
++        "compat/dynamic-libraries/compiler/lower_closures.py",
++        "compat/dynamic-libraries/compiler/metallib_catalog.py",
++        "compat/dynamic-libraries/compiler/recipe.py",
++        "compat/dynamic-libraries/compiler/toolchain.py",
++        "compat/dynamic-libraries/configure.py",
++        "compat/dynamic-libraries/controls/alpha.metal",
++        "compat/dynamic-libraries/controls/async_lifetime.m",
++        "compat/dynamic-libraries/controls/beta.metal",
++        "compat/dynamic-libraries/controls/build_controls.py",
++        "compat/dynamic-libraries/controls/container_pack.py",
++        "compat/dynamic-libraries/controls/dependency_snapshot.m",
++        "compat/dynamic-libraries/controls/dynamic-consumer.metal",
++        "compat/dynamic-libraries/controls/dynamic-source.metal",
++        "compat/dynamic-libraries/controls/path_runner.m",
++        "compat/dynamic-libraries/controls/review_results.py",
++        "compat/dynamic-libraries/guest/adapter.m",
++        "compat/dynamic-libraries/guest/install.sh",
++        "compat/dynamic-libraries/guest/run.sh",
++        "compat/dynamic-libraries/guest/runtime.m",
++        "compat/dynamic-libraries/guest/transport.m",
++        "compat/dynamic-libraries/guest/uninstall.sh",
++        "compat/dynamic-libraries/serve.py",
++        "compat/dynamic-libraries/tests/native_integration.py",
++        "compat/dynamic-libraries/tests/test_review_results.py",
++        "compat/guest-provisioning/HGGuestAPFS.c",
++        "compat/guest-provisioning/HGGuestAPFS.h",
++        "compat/guest-provisioning/HGGuestAttachment.h",
++        "compat/guest-provisioning/HGGuestAttachment.m",
++        "compat/guest-provisioning/HGGuestClone.c",
++        "compat/guest-provisioning/HGGuestClone.h",
++        "compat/guest-provisioning/HGGuestCodeIdentity.c",
++        "compat/guest-provisioning/HGGuestCodeIdentity.h",
++        "compat/guest-provisioning/HGGuestDisk.c",
++        "compat/guest-provisioning/HGGuestDisk.h",
++        "compat/guest-provisioning/HGGuestMedia.h",
++        "compat/guest-provisioning/HGGuestMedia.m",
++        "compat/guest-provisioning/HGGuestPayload.h",
++        "compat/guest-provisioning/HGGuestPayload.m",
++        "compat/guest-provisioning/HGGuestPayloadDelivery.h",
++        "compat/guest-provisioning/HGGuestPayloadDelivery.m",
++        "compat/guest-provisioning/HGGuestPeer.h",
++        "compat/guest-provisioning/HGGuestPeer.m",
++        "compat/guest-provisioning/HGGuestPublicationIntent.c",
++        "compat/guest-provisioning/HGGuestPublicationIntent.h",
++        "compat/guest-provisioning/HGGuestPublicationMetadata.c",
++        "compat/guest-provisioning/HGGuestPublicationMetadata.h",
++        "compat/guest-provisioning/HGGuestPublicationRollback.c",
++        "compat/guest-provisioning/HGGuestPublicationRollback.h",
++        "compat/guest-provisioning/HGGuestRoleWrite.c",
++        "compat/guest-provisioning/HGGuestRoleWrite.h",
++        "compat/guest-provisioning/HGGuestRoles.c",
++        "compat/guest-provisioning/HGGuestRoles.h",
++        "compat/guest-provisioning/HGGuestSnapshotInvalidation.c",
++        "compat/guest-provisioning/HGGuestSnapshotInvalidation.h",
++        "compat/guest-provisioning/HGGuestWorkspace.c",
++        "compat/guest-provisioning/HGGuestWorkspace.h",
++        "compat/guest-provisioning/HGGuestWriteAuthority.c",
++        "compat/guest-provisioning/HGGuestWriteAuthority.h",
++        "compat/guest-provisioning/README.md",
++        "compat/guest-provisioning/root_helper.c",
++        "compat/ondevice-dynamic/.gitignore",
++        "compat/ondevice-dynamic/HGStatelessLink.h",
++        "compat/ondevice-dynamic/README.md",
++        "compat/ondevice-dynamic/build_control.py",
++        "compat/ondevice-dynamic/build_device.py",
++        "compat/ondevice-dynamic/build_fixtures.py",
++        "compat/ondevice-dynamic/build_service_controls.py",
++        "compat/ondevice-dynamic/device_control.mm",
++        "compat/ondevice-dynamic/guest_control.m",
++        "compat/ondevice-dynamic/native_control.mm",
++        "compat/ondevice-dynamic/qualify_native.py",
++        "compat/ondevice-dynamic/qualify_service.py",
++        "compat/ondevice-dynamic/service_control.mm",
++        "compat/ondevice-dynamic/stateless_link.cpp",
++        "compat/ondevice-shaders/.gitignore",
++        "compat/ondevice-shaders/HGOnDeviceAIR.cpp",
++        "compat/ondevice-shaders/HGOnDeviceAIR.h",
++        "compat/ondevice-shaders/HGOnDeviceCompiler.exports",
++        "compat/ondevice-shaders/HGOnDeviceDynamicService.h",
++        "compat/ondevice-shaders/HGOnDeviceDynamicService.mm",
++        "compat/ondevice-shaders/HGOnDeviceShaderProvider.h",
++        "compat/ondevice-shaders/HGOnDeviceShaderProvider.mm",
++        "compat/ondevice-shaders/LICENSE-LLVM.txt",
++        "compat/ondevice-shaders/README.md",
++        "compat/ondevice-shaders/air_transform.cpp",
++        "compat/ondevice-shaders/build_provider.py",
++        "compat/ondevice-shaders/harden_llvm.py",
++        "compat/ondevice-shaders/llvm-air-embedding.patch"
++      ]
++    },
++    {
++      "number": 114,
++      "title": "Add a Japanese JIS virtual keyboard layout",
++      "state": "open",
++      "sha": "ab4bd16b0d10d56bf2e5391f47abfd16d29b3d03",
++      "url": "https://github.com/Leviidev/Henge/pull/114",
++      "files": [
++        "devices/xhci.c",
++        "devices/xhci.h",
++        "ios/Henge/EngineTuning.swift",
++        "ios/Henge/SettingsView.swift"
++      ]
++    },
++    {
++      "number": 112,
++      "title": "pvg-metal: the log line reports the GPU's real busy time",
++      "state": "open",
++      "sha": "8dff7fd8cf2bced01b98a58a6e738e0d5ec51156",
++      "url": "https://github.com/Leviidev/Henge/pull/112",
++      "files": [
++        "devices/pvg_metal.m"
++      ]
++    },
++    {
++      "number": 105,
++      "title": "iPhone Duo: use the whole inner screen, with an optional side strip for the status bar and controls",
++      "state": "closed",
++      "sha": "895bef1c7992ec0584fbf95bc4b05c197aea187e",
++      "url": "https://github.com/Leviidev/Henge/pull/105",
++      "files": [
++        "ios/Henge/Hardware.swift",
++        "ios/Henge/HomeView.swift",
++        "ios/Henge/MacSettingsView.swift",
++        "ios/Henge/Machines.swift",
++        "ios/Henge/SessionView.swift",
++        "ios/README.md",
++        "ios/scripts/package_ipa.sh"
++      ]
++    },
++    {
++      "number": 108,
++      "title": "iPhone Duo: use the whole inner screen, with an optional side strip for the status bar and controls",
++      "state": "open",
++      "sha": "6d17b5a4f1078c544850c840e9afbbffc031d03d",
++      "url": "https://github.com/Leviidev/Henge/pull/108",
++      "files": [
++        "ios/Henge/Hardware.swift",
++        "ios/Henge/HomeView.swift",
++        "ios/Henge/MacSettingsView.swift",
++        "ios/Henge/Machines.swift",
++        "ios/Henge/SessionView.swift",
++        "ios/README.md",
++        "ios/scripts/package_ipa.sh"
++      ]
++    },
++    {
++      "number": 110,
++      "title": "Show the device's chip in About This Mac instead of \"Apple M1 (Virtual)\"",
++      "state": "open",
++      "sha": "adace317d636e8486f0ce5276790b9e871423a12",
++      "url": "https://github.com/Leviidev/Henge/pull/110",
++      "files": [
++        "host/vm.c",
++        "ios/Henge/Hardware.swift",
++        "ios/Henge/SessionView.swift"
++      ]
++    },
++    {
++      "number": 109,
++      "title": "Fix the pointer drifting from where it clicks at scaled macOS resolutions",
++      "state": "open",
++      "sha": "30420ceac5921525a4f075813f2e3f856a7a82c3",
++      "url": "https://github.com/Leviidev/Henge/pull/109",
++      "files": [
++        "devices/pvg_lite.c",
++        "devices/pvg_lite.h",
++        "devices/pvg_metal.m"
++      ]
++    },
++    {
++      "number": 107,
++      "title": "Show the device's chip in About This Mac instead of \"Apple M1 (Virtual)\"",
++      "state": "closed",
++      "sha": "adace317d636e8486f0ce5276790b9e871423a12",
++      "url": "https://github.com/Leviidev/Henge/pull/107",
++      "files": [
++        "host/vm.c",
++        "ios/Henge/Hardware.swift",
++        "ios/Henge/SessionView.swift"
++      ]
++    },
++    {
++      "number": 106,
++      "title": "Fix the pointer drifting from where it clicks at scaled macOS resolutions",
++      "state": "closed",
++      "sha": "30420ceac5921525a4f075813f2e3f856a7a82c3",
++      "url": "https://github.com/Leviidev/Henge/pull/106",
++      "files": [
++        "devices/pvg_lite.c",
++        "devices/pvg_lite.h",
++        "devices/pvg_metal.m"
++      ]
++    },
++    {
++      "number": 103,
++      "title": "Laptop layout on the iPhone Duo: the Mac above the fold, a keyboard and trackpad below it",
++      "state": "open",
++      "sha": "5cf171d081e465b36de29be0ba5fd56a365a122a",
++      "url": "https://github.com/Leviidev/Henge/pull/103",
++      "files": [
++        "ios/Henge/DuoPosture.swift",
++        "ios/Henge/LaptopDeck.swift",
++        "ios/Henge/SessionView.swift"
++      ]
++    },
++    {
++      "number": 100,
++      "title": "Add microphone input and camera sharing",
++      "state": "open",
++      "sha": "a4dca7b6ad587433e6bc5ba699aba5402edfb505",
++      "url": "https://github.com/Leviidev/Henge/pull/100",
++      "files": [
++        "Makefile",
++        "devices/usb_camera.c",
++        "devices/usb_camera.h",
++        "devices/virtio.c",
++        "devices/virtio.h",
++        "devices/virtio_snd.c",
++        "devices/virtio_snd.h",
++        "devices/vmapple.c",
++        "devices/xhci.c",
++        "devices/xhci.h",
++        "host/snapshot.c",
++        "host/vm.c",
++        "ios/Henge/CameraFrameEncoder.swift",
++        "ios/Henge/GuestMediaCapture.swift",
++        "ios/Henge/Info.plist",
++        "ios/Henge/Native/henge-vm.c",
++        "ios/Henge/Native/henge-vm.h",
++        "ios/Henge/SessionView.swift",
++        "ios/Henge/VolumeClicks.swift",
++        "ios/README.md",
++        "tests/test_camera_encoder.swift",
++        "tests/test_media.c",
++        "tests/test_vm_lifecycle.c",
++        "tools/media-probe-Info.plist",
++        "tools/media-probe.m"
++      ]
++    },
++    {
++      "number": 99,
++      "title": "Add optional two-way clipboard sync for virtual Macs",
++      "state": "open",
++      "sha": "337424bb8d2e9346b4ce782be50e87fccd67705a",
++      "url": "https://github.com/Leviidev/Henge/pull/99",
++      "files": [
++        "host/share.c",
++        "ios/Henge/SessionView.swift",
++        "ios/Henge/Sharing.swift"
++      ]
++    },
++    {
++      "number": 98,
++      "title": "Apply scroll sensitivity to touch and physical input",
++      "state": "open",
++      "sha": "bd5236963fcfc7fb4159fe9fe655c4450f8e4b42",
++      "url": "https://github.com/Leviidev/Henge/pull/98",
++      "files": [
++        "ios/Henge/Hardware.swift",
++        "ios/Henge/ScrollMotion.swift",
++        "ios/Henge/SessionView.swift",
++        "ios/Henge/SettingsView.swift",
++        "ios/Henge/Trackpad.swift"
++      ]
++    },
++    {
++      "number": 94,
++      "title": "iOS 17: relabel the bitcode's own target triple, so pipelines stop failing \"Target OS is incompatible\" (issue 44)",
++      "state": "closed",
++      "sha": "4b1d59c08eed47bdd4caacb9f246802c131b489a",
++      "url": "https://github.com/Leviidev/Henge/pull/94",
++      "files": [
++        "devices/metallib.c",
++        "devices/metallib.h",
++        "devices/pvg_metal.m"
++      ]
++    },
++    {
++      "number": 79,
++      "title": "Trackpad clicks from a gesture engine over the forwarded contacts: a tap clicks, a stationary hold is a true secondary press, and a double-tap-and-hold grabs (+671/-43, 4 files)",
++      "state": "open",
++      "sha": "c422f3b6f30bea3601910fdff4a8b919dfdf8231",
++      "url": "https://github.com/Leviidev/Henge/pull/79",
++      "files": [
++        "Makefile",
++        "ios/Henge/GestureEngine.swift",
++        "ios/Henge/Trackpad.swift",
++        "tests/test_gesture_engine.swift"
++      ]
++    },
++    {
++      "number": 93,
++      "title": "Zoom to the focused input when the keyboard rises, through the one layout rect that rendering and touch conversion both consume, so a tap lands where it is seen at every zoom state",
++      "state": "open",
++      "sha": "2f0a787422220dd00fb7d9f762c88c9f85a43d74",
++      "url": "https://github.com/Leviidev/Henge/pull/93",
++      "files": [
++        "Makefile",
++        "devices/pvg_lite.c",
++        "devices/pvg_lite.h",
++        "devices/xhci.c",
++        "devices/xhci.h",
++        "host/main.c",
++        "host/vm.c",
++        "host/vm.h",
++        "ios/Henge/Hardware.swift",
++        "ios/Henge/Input.swift",
++        "ios/Henge/KeyboardViewport.swift",
++        "ios/Henge/MacSettingsView.swift",
++        "ios/Henge/Machines.swift",
++        "ios/Henge/Native/henge-vm.c",
++        "ios/Henge/Native/henge-vm.h",
++        "ios/Henge/SessionView.swift",
++        "ios/Henge/SettingsView.swift",
++        "ios/Henge/Trackpad.swift",
++        "tests/test_kb_viewport.swift"
++      ]
++    },
++    {
++      "number": 92,
++      "title": "Hash the full surface for change detection and mark surfaces valid only after a complete upload, ending stale and blank tiles",
++      "state": "open",
++      "sha": "084232e337e88b3a691bbc88d71ac47d540ffeb9",
++      "url": "https://github.com/Leviidev/Henge/pull/92",
++      "files": [
++        "devices/pvg_metal.m"
++      ]
++    },
++    {
++      "number": 91,
++      "title": "Microphone: the Mac gets the device's microphone (opt-in)",
++      "state": "open",
++      "sha": "e42cb61ea9259d05ba93baaef01786965e6b52ab",
++      "url": "https://github.com/Leviidev/Henge/pull/91",
++      "files": [
++        "CHANGELOG.md",
++        "devices/virtio_snd.c",
++        "devices/virtio_snd.h",
++        "host/audio_mac.c",
++        "ios/Henge/EngineTuning.swift",
++        "ios/Henge/HengeApp.swift",
++        "ios/Henge/Info.plist",
++        "ios/Henge/Microphone.swift",
++        "ios/Henge/SettingsView.swift"
++      ]
++    },
++    {
++      "number": 90,
++      "title": "Add an absolute USB digitizer so a tap or Pencil click lands where the user points, with the relative trackpad kept as a mode (+570/-20, 11 files)",
++      "state": "open",
++      "sha": "414d55893e6c9b2bd5017e360f5f34ef5f67e233",
++      "url": "https://github.com/Leviidev/Henge/pull/90",
++      "files": [
++        "devices/pvg_lite.c",
++        "devices/pvg_lite.h",
++        "devices/xhci.c",
++        "devices/xhci.h",
++        "host/main.c",
++        "host/vm.c",
++        "host/vm.h",
++        "ios/Henge/Native/henge-vm.c",
++        "ios/Henge/Native/henge-vm.h",
++        "ios/Henge/SessionView.swift",
++        "ios/Henge/Trackpad.swift"
++      ]
++    },
++    {
++      "number": 88,
++      "title": "Serve a folder the user picks instead of only the built-in one, deny the app's own files by name on the requested and the resolved path, and refuse to silently adopt a machine out of a folder being served: 100 wire checks pass",
++      "state": "open",
++      "sha": "e67b3e2f0922a4594d90c6b0330f06150c68a56a",
++      "url": "https://github.com/Leviidev/Henge/pull/88",
++      "files": [
++        "host/share.c",
++        "ios/Henge/ImportGuard.swift",
++        "ios/Henge/Machines.swift",
++        "ios/Henge/SettingsView.swift",
++        "ios/Henge/Sharing.swift"
++      ]
++    },
++    {
++      "number": 87,
++      "title": "Per-machine display profiles instead of one fixed guest size, with the guest size derived from the live scene",
++      "state": "open",
++      "sha": "4a5c2925a1fbfb37bcf6e67eaa98cccb73dba824",
++      "url": "https://github.com/Leviidev/Henge/pull/87",
++      "files": [
++        "ios/Henge/Hardware.swift",
++        "ios/Henge/MacSettingsView.swift",
++        "ios/Henge/Machines.swift",
++        "ios/Henge/SessionView.swift"
++      ]
++    },
++    {
++      "number": 86,
++      "title": "Generalize HV_NET_FWD from a single forward to a comma list of host-to-guest forwards, every forward bound to host loopback and TCP only",
++      "state": "open",
++      "sha": "4c30a9c47c10ea43c0f92ee793ec5be4e582834f",
++      "url": "https://github.com/Leviidev/Henge/pull/86",
++      "files": [
++        "host/net_slirp.c",
++        "host/net_slirp.h"
++      ]
++    },
++    {
++      "number": 85,
++      "title": "Give the guest IPv6 autoconfiguration and the host's DNS search domains: an fd00::/64 address with a v6 resolver, and bare hostnames resolve through the search domains, with IPv4 behavior unchanged",
++      "state": "open",
++      "sha": "66c3950a969d6b6b752d1de0d8bb534bafbca594",
++      "url": "https://github.com/Leviidev/Henge/pull/85",
++      "files": [
++        "host/net_slirp.c",
++        "host/net_slirp.h"
++      ]
++    },
++    {
++      "number": 84,
++      "title": "Add the LE extended advertising model: per-set parameter state stored verbatim for the extended setter family, with 747 harness checks passing",
++      "state": "open",
++      "sha": "0b58f58f6574c5372659f45392a4e6a645a12b6c",
++      "url": "https://github.com/Leviidev/Henge/pull/84",
++      "files": [
++        "Makefile",
++        "core/dispatch.c",
++        "core/exception.c",
++        "core/machine.h",
++        "devices/bt_hci.c",
++        "devices/bt_hci.h",
++        "devices/xhci.c",
++        "devices/xhci.h",
++        "host/dtplant.h",
++        "host/vm.c",
++        "host/vm.h",
++        "ios/Henge/EngineTuning.swift",
++        "ios/Henge/Native/henge-vm.c",
++        "ios/Henge/Native/henge-vm.h",
++        "ios/Henge/SessionView.swift",
++        "tests/fixtures/adt-synthetic.bin",
++        "tests/fixtures/make_adt_fixture.py",
++        "tests/test_bt.c",
++        "tests/test_bt_bdaddr.c",
++        "tests/test_bt_bridge.c",
++        "tests/test_bt_hci21.c",
++        "tests/test_bt_hci_extfeat.c",
++        "tests/test_bt_hci_initseq.c",
++        "tests/test_bt_hci_postinit.c",
++        "tests/test_dtplant.c"
++      ]
++    },
++    {
++      "number": 83,
++      "title": "Add a USB Bluetooth controller the guest stack binds and sustains: an HCI core, its xHCI transport, and fail-closed boot-args delivery, with 553 harness checks passing",
++      "state": "open",
++      "sha": "ac000fb1873c6cd2d9684287e58508965d4f6a40",
++      "url": "https://github.com/Leviidev/Henge/pull/83",
++      "files": [
++        "Makefile",
++        "core/dispatch.c",
++        "core/exception.c",
++        "core/machine.h",
++        "devices/bt_hci.c",
++        "devices/bt_hci.h",
++        "devices/xhci.c",
++        "devices/xhci.h",
++        "host/dtplant.h",
++        "host/vm.c",
++        "host/vm.h",
++        "ios/Henge/EngineTuning.swift",
++        "ios/Henge/Native/henge-vm.c",
++        "ios/Henge/Native/henge-vm.h",
++        "ios/Henge/SessionView.swift",
++        "tests/fixtures/adt-synthetic.bin",
++        "tests/fixtures/make_adt_fixture.py",
++        "tests/test_bt.c",
++        "tests/test_bt_bdaddr.c",
++        "tests/test_bt_bridge.c",
++        "tests/test_bt_hci21.c",
++        "tests/test_bt_hci_extfeat.c",
++        "tests/test_bt_hci_initseq.c",
++        "tests/test_bt_hci_postinit.c",
++        "tests/test_dtplant.c"
++      ]
++    },
++    {
++      "number": 82,
++      "title": "Draw the pointer at a scale computed from the live layer instead of a fixed per-device table, so it sits at its natural size at any guest size and at exactly 1 at native size, and remove the Pointer Size setting",
++      "state": "open",
++      "sha": "ccc7049a4d9f6e29fe661b485cfc3fb9c9c534cd",
++      "url": "https://github.com/Leviidev/Henge/pull/82",
++      "files": [
++        "devices/pvg_metal.m",
++        "ios/Henge/SessionView.swift"
++      ]
++    },
++    {
++      "number": 81,
++      "title": "-1.9 s on cold boot to the hello screen (median 34.2 s against 36.1 s, three runs each): superblocks on by default, so a conditional branch no longer has to end a translation block",
++      "state": "open",
++      "sha": "fc28d264b17b9c57622ab78b78250e32a696c82c",
++      "url": "https://github.com/Leviidev/Henge/pull/81",
++      "files": [
++        "ios/Henge/EngineTuning.swift",
++        "ios/Henge/SettingsView.swift"
++      ]
++    },
++    {
++      "number": 80,
++      "title": "vCPU threads default to the user-interactive quality-of-service class on iOS: -1.6 s on cold boot to the hello screen (median 34.5 s against 36.1 s, three runs each), directional, not proven, at this size on a shared host",
++      "state": "open",
++      "sha": "777e92849b4fc8f8333824f8e8644adf6c5c6f92",
++      "url": "https://github.com/Leviidev/Henge/pull/80",
++      "files": [
++        "host/vm.c"
++      ]
++    },
++    {
++      "number": 78,
++      "title": "Raise the engine code-cache fallback to 1536 MB: a cold boot at 1024 MB retranslates about 0.96M times, and flushes go to zero at 1536 MB",
++      "state": "open",
++      "sha": "7db7f9963fc87d37c0b97027844f5a5df0a43c06",
++      "url": "https://github.com/Leviidev/Henge/pull/78",
++      "files": [
++        "host/vm.c",
++        "host/vm.h"
++      ]
++    },
++    {
++      "number": 77,
++      "title": "Make the WebDAV share restartable: pause and resume re-serve the same root, and a changed root swaps the listener cleanly without a relaunch",
++      "state": "open",
++      "sha": "8ddd360a3daaf248192176108e22848f1cf95148",
++      "url": "https://github.com/Leviidev/Henge/pull/77",
++      "files": [
++        "host/share.c",
++        "host/share.h",
++        "ios/Henge/SessionView.swift",
++        "tools/henge-agent.m"
++      ]
++    },
++    {
++      "number": 76,
++      "title": "Make advertised WebDAV locks exclude: non-owner writes get 423 Locked, the owner's token passes, and UNLOCK releases, with tokens expiring at the advertised 3600 s",
++      "state": "open",
++      "sha": "1e4cfa68d2b2b51e5298fe0ff8c8e93f314e722b",
++      "url": "https://github.com/Leviidev/Henge/pull/76",
++      "files": [
++        "host/share.c"
++      ]
++    },
++    {
++      "number": 74,
++      "title": "Evaluate conditional requests, stop caching share responses, and store PROPPATCH properties, cutting guest file visibility from 69 s to 5 s",
++      "state": "open",
++      "sha": "69fed130221d4a631e050c40ed3cabc3530380d6",
++      "url": "https://github.com/Leviidev/Henge/pull/74",
++      "files": [
++        "host/share.c"
++      ]
++    },
++    {
++      "number": 73,
++      "title": "Seed the 10-byte vPMU SRAM header in new auxiliary storage so macOS 27.2 installs instead of panicking in restore",
++      "state": "open",
++      "sha": "76d19172ada8fc1d8623ec7066e0a615e67f7513",
++      "url": "https://github.com/Leviidev/Henge/pull/73",
++      "files": [
++        "ios/Henge/Native/henge-vm.c"
++      ]
++    },
++    {
++      "number": 68,
++      "title": "Also package .tipa",
++      "state": "closed",
++      "sha": "688faebdbefec15eda8f1952c55d77deb0b5adc2",
++      "url": "https://github.com/Leviidev/Henge/pull/68",
++      "files": [
++        ".github/workflows/build-henge.yml"
++      ]
++    },
++    {
++      "number": 50,
++      "title": "Fix guest shutdown and allow restarting without relaunching Henge",
++      "state": "closed",
++      "sha": "764479128f804d41197d9a5b721f1584230369ff",
++      "url": "https://github.com/Leviidev/Henge/pull/50",
++      "files": [
++        "Makefile",
++        "core/cpu.h",
++        "core/exception.c",
++        "core/machine.c",
++        "core/machine.h",
++        "devices/pvg_colorprobe.h",
++        "devices/pvg_lite.c",
++        "devices/pvg_lite.h",
++        "devices/pvg_metal.m",
++        "devices/virtio_blk.c",
++        "devices/virtio_blk.h",
++        "devices/vmapple.c",
++        "devices/vmapple.h",
++        "docs/architecture.md",
++        "docs/guest-shutdown.md",
++        "host/audio_mac.c",
++        "host/audio_mac.h",
++        "host/disk.c",
++        "host/dns_proxy.c",
++        "host/dns_proxy.h",
++        "host/net_slirp.c",
++        "host/net_slirp.h",
++        "host/vm.c",
++        "host/vm.h",
++        "ios/Henge/BootDisplay.swift",
++        "ios/Henge/Native/henge-vm.c",
++        "ios/Henge/Native/henge-vm.h",
++        "ios/Henge/SessionView.swift",
++        "ios/Henge/StoppedMacView.swift",
++        "tests/test_dns_lifecycle.c",
++        "tests/test_pvg_lifecycle.m",
++        "tests/test_shutdown.c",
++        "tests/test_vm_lifecycle.c"
++      ]
++    },
++    {
++      "number": 39,
++      "title": "Stream the macOS restore ramdisk to reduce peak memory",
++      "state": "closed",
++      "sha": "c20420ac53fc2618f6fb81c9997164fce8d7f9a4",
++      "url": "https://github.com/Leviidev/Henge/pull/39",
++      "files": [
++        "third_party/idevicerestore/src/idevicerestore.c",
++        "third_party/idevicerestore/src/img4.c",
++        "third_party/idevicerestore/src/img4.h",
++        "third_party/idevicerestore/src/ipsw.c",
++        "third_party/idevicerestore/src/recovery.c",
++        "third_party/libirecovery/include/libirecovery.h",
++        "third_party/libirecovery/src/libirecovery.c"
++      ]
++    },
++    {
++      "number": 63,
++      "title": "Fix/optional right middle button swap",
++      "state": "closed",
++      "sha": "090d60052e5df5d0ce9d60432ccb1a79eb71d82f",
++      "url": "https://github.com/Leviidev/Henge/pull/63",
++      "files": [
++        "ios/Henge/Hardware.swift",
++        "ios/Henge/PhysicalMouseButtons.swift",
++        "ios/Henge/SettingsView.swift",
++        "tests/test_physical_mouse_buttons.swift"
++      ]
++    },
++    {
++      "number": 46,
++      "title": "Fix JIT preparation when launching from StikDebug",
++      "state": "closed",
++      "sha": "294d0178896c80291483eb77ae92295ec482bf57",
++      "url": "https://github.com/Leviidev/Henge/pull/46",
++      "files": [
++        "ios/Henge/HengeApp.swift"
++      ]
++    },
++    {
++      "number": 61,
++      "title": "Block duplicate macOS installs during preflight",
++      "state": "closed",
++      "sha": "c8ce5d04dede4c4e95f5f156d93149203bcd46e7",
++      "url": "https://github.com/Leviidev/Henge/pull/61",
++      "files": [
++        "ios/Henge/InstallView.swift",
++        "ios/Henge/Installer.swift"
++      ]
++    },
++    {
++      "number": 60,
++      "title": "Prevent hvsparse from overwriting its input",
++      "state": "closed",
++      "sha": "49239793759786555bf914875fb2bdef7bf14c4a",
++      "url": "https://github.com/Leviidev/Henge/pull/60",
++      "files": [
++        "host/hvsparse.c"
++      ]
++    },
++    {
++      "number": 54,
++      "title": "feat: add magic trackpad emulation on touchscreen",
++      "state": "closed",
++      "sha": "198a77beb8ab1513866ace73daab21083ea8db15",
++      "url": "https://github.com/Leviidev/Henge/pull/54",
++      "files": [
++        "CHANGELOG.md",
++        "README.md",
++        "devices/xhci.c",
++        "devices/xhci.h",
++        "docs/architecture.md",
++        "host/vm.c",
++        "host/vm.h",
++        "ios/Henge/Info.plist",
++        "ios/Henge/Input.swift",
++        "ios/Henge/Native/henge-vm.c",
++        "ios/Henge/Native/henge-vm.h",
++        "ios/Henge/SessionView.swift",
++        "ios/Henge/SettingsView.swift",
++        "ios/Henge/Trackpad.swift",
++        "ios/Henge/VolumeClicks.swift"
++      ]
++    },
++    {
++      "number": 14,
++      "title": "Two-finger scroll: slower, with a speed setting",
++      "state": "closed",
++      "sha": "48ffa577224fe6a16e8ab3588e3061e0a0db0b6b",
++      "url": "https://github.com/Leviidev/Henge/pull/14",
++      "files": [
++        "ios/Henge/SettingsView.swift",
++        "ios/Henge/Trackpad.swift"
++      ]
++    },
++    {
++      "number": 31,
++      "title": "Fix firmware disk capacity and large transfers",
++      "state": "closed",
++      "sha": "4d190b9c016877597d2dc2fa8abf49dd676f1f82",
++      "url": "https://github.com/Leviidev/Henge/pull/31",
++      "files": [
++        "devices/bdif.c",
++        "host/disk.c",
++        "tests/test_devices.c"
++      ]
++    },
++    {
++      "number": 36,
++      "title": "Use temporary disks in device tests",
++      "state": "closed",
++      "sha": "8d31670b49ee4ae5cffb3abc39295e12948d26db",
++      "url": "https://github.com/Leviidev/Henge/pull/36",
++      "files": [
++        "tests/test_devices.c"
++      ]
++    },
++    {
++      "number": 33,
++      "title": "Right button: a Control-click, since macOS's virtio mouse driver drops BTN_RIGHT",
++      "state": "closed",
++      "sha": "f1626ae8fa5973bf488cad321313a43c9dd50c64",
++      "url": "https://github.com/Leviidev/Henge/pull/33",
++      "files": [
++        "host/vm.c"
++      ]
++    },
++    {
++      "number": 52,
++      "title": "JIT helper finds the RemotePairing port itself when Henge could not",
++      "state": "closed",
++      "sha": "2b21cb480493fdf46b4d5b1dfc5b1b038355a734",
++      "url": "https://github.com/Leviidev/Henge/pull/52",
++      "files": [
++        "ios/HengeJITHelper/HengeJITHelper.swift",
++        "ios/HengeJITHelper/Info.plist",
++        "ios/HengeJITHelper/RSDPortResolver.swift"
++      ]
++    },
++    {
++      "number": 35,
++      "title": "Pointer lock log: take the scene from the notification's user info",
++      "state": "closed",
++      "sha": "a894cbaafbbce0ce6dda19ac59da49a84ca0618b",
++      "url": "https://github.com/Leviidev/Henge/pull/35",
++      "files": [
++        "ios/Henge/Hardware.swift"
++      ]
++    },
++    {
++      "number": 27,
++      "title": "feat: github actions CI for development builds",
++      "state": "closed",
++      "sha": "f1441499eace2ada5ab624419faf794f93691233",
++      "url": "https://github.com/Leviidev/Henge/pull/27",
++      "files": [
++        ".github/workflows/build-henge.yml"
++      ]
++    },
++    {
++      "number": 29,
++      "title": "ios: prepare JIT when Henge is launched from StikDebug",
++      "state": "closed",
++      "sha": "115502186db441d0268a526156979f4adb2b18a9",
++      "url": "https://github.com/Leviidev/Henge/pull/29",
++      "files": [
++        "Makefile",
++        "ios/Henge/HengeApp.swift",
++        "ios/Henge/HomeView.swift",
++        "ios/Henge/InstallView.swift",
++        "ios/Henge/Installer.swift",
++        "ios/Henge/JIT/JITSetup.swift",
++        "ios/Henge/JIT/JITSetupView.swift",
++        "ios/Henge/Native/henge-brk.S",
++        "ios/Henge/Native/henge-ios-jit.c",
++        "ios/Henge/Resources/henge-jit.js",
++        "ios/Henge/SessionView.swift",
++        "ios/Henge/SettingsView.swift",
++        "ios/README.md",
++        "ios/scripts/check_jit.sh",
++        "tests/support/ios_jit_runtime.c",
++        "tests/support/ios_jit_runtime.h",
++        "tests/support/ios_jit_services.swift",
++        "tests/support/ios_jit_uikit.swift",
++        "tests/support/os/proc.h",
++        "tests/test_ios_jit.swift"
++      ]
++    },
++    {
++      "number": 7,
++      "title": "Combine the community forks' fixes, plus performance settings and a hideable control bar",
++      "state": "closed",
++      "sha": "c6a52cf1f9f14c3533c05fc563b58d0a93d7a59e",
++      "url": "https://github.com/Leviidev/Henge/pull/7",
++      "files": [
++        "CHANGELOG.md",
++        "Makefile",
++        "README.md",
++        "bitrise.yml",
++        "ci/build-bitrise.sh",
++        "ci/build-stikjit.sh",
++        "ci/stikjit-high-address.patch",
++        "devices/pvg_colorprobe.h",
++        "devices/pvg_lite.c",
++        "devices/pvg_lite.h",
++        "devices/pvg_metal.m",
++        "docs/agents/colorprobe.md",
++        "docs/licensing.md",
++        "host/prof_ios.c",
++        "ios/Henge/BootDisplay.swift",
++        "ios/Henge/EngineTuning.swift",
++        "ios/Henge/ExternalDisplaySceneDelegate.swift",
++        "ios/Henge/ExternalMacDisplay.swift",
++        "ios/Henge/ExternalScreenPlan.swift",
++        "ios/Henge/Hardware.swift",
++        "ios/Henge/Henge.personal.entitlements",
++        "ios/Henge/HengeApp.swift",
++        "ios/Henge/HengeAppDelegate.swift",
++        "ios/Henge/HengeLog.swift",
++        "ios/Henge/Info.plist",
++        "ios/Henge/Input.swift",
++        "ios/Henge/JIT/JITNetworkAdvice.swift",
++        "ios/Henge/JIT/JITPairing.swift",
++        "ios/Henge/JIT/JITSetup.swift",
++        "ios/Henge/JIT/JITSetupView.swift",
++        "ios/Henge/LegacyExternalDisplay.swift",
++        "ios/Henge/MacPresentation.swift",
++        "ios/Henge/MacSettingsView.swift",
++        "ios/Henge/Machines.swift",
++        "ios/Henge/Native/henge-vm.c",
++        "ios/Henge/Native/henge-vm.h",
++        "ios/Henge/SessionView.swift",
++        "ios/Henge/SettingsView.swift",
++        "ios/Henge/Theme.swift",
++        "ios/Henge/Trackpad.swift",
++        "ios/HengeJITHelper/Info.plist",
++        "ios/README.md",
++        "ios/project.yml",
++        "ios/scripts/package_ipa.sh",
++        "tests/display_engine_stub.h",
++        "tests/test_display_router.swift",
++        "tests/test_external_screen_plan.swift",
++        "tests/test_jit_advice.swift",
++        "tests/test_legacy_external_display.swift",
++        "tests/test_scene_manifest.swift",
++        "tools/colorprobe/analyze.py",
++        "tools/colorprobe/probe.sh",
++        "tools/colorprobe/swatches.py",
++        "tools/colorprobe/testpage/index.html"
++      ]
++    },
++    {
++      "number": 4,
++      "title": "iPad: the keyboard's own hide key ends typing",
++      "state": "closed",
++      "sha": "e247196e020d4c93eab1753177c03457e6a587fa",
++      "url": "https://github.com/Leviidev/Henge/pull/4",
++      "files": [
++        "ios/Henge/Input.swift"
++      ]
++    },
++    {
++      "number": 3,
++      "title": "JIT at launch: connect LocalDevVPN first when it is off",
++      "state": "closed",
++      "sha": "e332ee265b738a71085f8b3fb84ad21b5ee93670",
++      "url": "https://github.com/Leviidev/Henge/pull/3",
++      "files": [
++        "ios/Henge/JIT/JITSetup.swift",
++        "ios/Henge/SettingsView.swift"
++      ]
++    },
++    {
++      "number": 8,
++      "title": "Install and run macOS 27.2: three restore fixes and three Metal replay fixes",
++      "state": "closed",
++      "sha": "db1fac3de6d3323cb4277805f0e0556f0ab5505b",
++      "url": "https://github.com/Leviidev/Henge/pull/8",
++      "files": [
++        "devices/bdif.c",
++        "devices/pvg_metal.m",
++        "devices/vmapple.c",
++        "devices/vmapple.h",
++        "third_party/idevicerestore/src/recovery.c"
++      ]
++    },
++    {
++      "number": 6,
++      "title": "Fit the Mac's screen to squarer iPhones, edge to edge",
++      "state": "closed",
++      "sha": "89398116bc4c0210ec0a3fba520a1aa561dfd77c",
++      "url": "https://github.com/Leviidev/Henge/pull/6",
++      "files": [
++        "ios/Henge/Hardware.swift",
++        "ios/Henge/MacSettingsView.swift",
++        "ios/Henge/SessionView.swift"
++      ]
++    },
++    {
++      "number": 5,
++      "title": "Show the float screen as it is: macOS has already encoded it as sRGB",
++      "state": "closed",
++      "sha": "06d2ad06f0fa498548bde53533bd104ee1efd080",
++      "url": "https://github.com/Leviidev/Henge/pull/5",
++      "files": [
++        "devices/pvg_metal.m"
++      ]
++    },
++    {
++      "number": 2,
++      "title": "Keep the JIT region below 0x7000000000",
++      "state": "closed",
++      "sha": "800c55b2f4735e8d6d6375f7b790fb84b07e0eb9",
++      "url": "https://github.com/Leviidev/Henge/pull/2",
++      "files": [
++        "ios/Henge/Native/henge-ios-jit.c"
++      ]
++    },
++    {
++      "number": 1,
++      "title": "Add automatic USB-C external display output on iOS 27",
++      "state": "closed",
++      "sha": "9c99a11f5cfc39293d4da704e8069e7b4796be1f",
++      "url": "https://github.com/Leviidev/Henge/pull/1",
++      "files": [
++        "Makefile",
++        "README.md",
++        "devices/pvg_lite.c",
++        "devices/pvg_metal.m",
++        "host/vm.c",
++        "ios/Henge/BootDisplay.swift",
++        "ios/Henge/DisplayRouter.swift",
++        "ios/Henge/DisplayTargetSelection.swift",
++        "ios/Henge/ExternalMacDisplay.swift",
++        "ios/Henge/InstallView.swift",
++        "ios/Henge/SessionView.swift",
++        "ios/README.md",
++        "ios/scripts/check_display.sh",
++        "tests/test_display_targets.swift"
++      ]
++    }
++  ],
++  "notes": "Inventory of all PRs; not a claim every diff was runtime-tested. Current focus: shared controller UI and entitlement-free USB touchscreen. No blanket upstream merge."
++}
 diff --git a/host/enter.S b/host/enter.S
 index cc902ed..15b606f 100644
 --- a/host/enter.S
@@ -4260,7 +5667,7 @@ index 67fc764..2ca437b 100644
  
  #endif
 diff --git a/host/vm.c b/host/vm.c
-index db95c05..3fd6356 100644
+index db95c05..6b9880e 100644
 --- a/host/vm.c
 +++ b/host/vm.c
 @@ -4,6 +4,7 @@
@@ -4461,12 +5868,12 @@ index db95c05..3fd6356 100644
      dispatch_async_f(pointer_queue(), (void *)(intptr_t)(button << 1 | !!down), button_now);
  }
 +void hv_vm_mouse_button_source(int button,int down,unsigned source) {
-+    if(button<0 || button>2 || source>2)return;
++    if(button<0 || button>2 || source>3)return;
 +    dispatch_async_f(pointer_queue(),(void *)(intptr_t)(source<<3|button<<1|!!down),button_now);
 +}
 +void hv_vm_key_hid_source(uint8_t usage,int down,unsigned source) { hv_xhci_key_source(board.usb,usage,down,source); }
 +void hv_vm_release_input_source(unsigned source) {
-+    if(source<1 || source>2)return;
++    if(source<1 || source>3)return;
 +    hv_xhci_release_source(board.usb,source);
 +    for(int b=0;b<3;b++)hv_vm_mouse_button_source(b,0,source);
 +}
@@ -4639,12 +6046,117 @@ index 7392fda..062c485 100644
      }
  
      func makeUIView(context: Context) -> Screen {
+diff --git a/ios/Henge/Controls/ControllerPostureLayout.swift b/ios/Henge/Controls/ControllerPostureLayout.swift
+new file mode 100644
+index 0000000..6feaff5
+--- /dev/null
++++ b/ios/Henge/Controls/ControllerPostureLayout.swift
+@@ -0,0 +1,45 @@
++import Foundation
++import CoreGraphics
++
++enum ControllerLayoutChoice: String, CaseIterable, Identifiable {
++    case automatic, standard, portrait, tabletop
++    var id: String { rawValue }
++    var title: String {
++        switch self {
++        case .automatic: return "Automatic"
++        case .standard: return "Wide"
++        case .portrait: return "Portrait"
++        case .tabletop: return "Tabletop"
++        }
++    }
++}
++
++/// Geometry only: no guest display changes, polling, or inferred hinge angles.
++struct ControllerPostureLayout {
++    enum Style: Equatable { case standard, portrait, tabletop }
++    let style: Style
++    let upper: CGRect
++    let lower: CGRect
++    let fold: CGRect
++    init(size: CGSize, choice: ControllerLayoutChoice, isDuo: Bool, division: CGRect?) {
++        let bounds=CGRect(origin:.zero,size:size)
++        // A vertical division does not form a laptop deck. Ignore off-window or
++        // tiny regions; a keyboard/sheet can reduce the available window.
++        let candidate=division?.intersection(bounds)
++        let usable=candidate.flatMap { r -> CGRect? in
++            guard !r.isNull,r.width>size.width*0.7,r.height<r.width,
++                  r.minY>=120,size.height-r.maxY>=180 else { return nil }
++            return r
++        }
++        let tabletop=choice == .tabletop || (choice == .automatic && isDuo && usable != nil)
++        if tabletop && size.height>=400 && size.width>=300 {
++            let gap=usable ?? CGRect(x:0,y:size.height*0.5-16,width:size.width,height:32)
++            style = .tabletop;fold=gap
++            upper=CGRect(x:0,y:0,width:size.width,height:gap.minY)
++            lower=CGRect(x:0,y:gap.maxY,width:size.width,height:size.height-gap.maxY)
++        } else {
++            style = choice == .portrait || (choice == .automatic && size.height>size.width*1.15) ? .portrait : .standard
++            upper = .zero;lower=bounds;fold = .zero
++        }
++    }
++}
+diff --git a/ios/Henge/Controls/DuoControlPosture.swift b/ios/Henge/Controls/DuoControlPosture.swift
+new file mode 100644
+index 0000000..4ce55b3
+--- /dev/null
++++ b/ios/Henge/Controls/DuoControlPosture.swift
+@@ -0,0 +1,12 @@
++import SwiftUI
++
++/// Reserved-region coordinates are local to this reader. Only an active,
++/// horizontal division selects tabletop automatically; manual selection remains
++/// useful on compatibility windows or OS versions without posture reporting.
++func controllerDivision(_ geometry: GeometryProxy, isDuo: Bool) -> CGRect? {
++    guard isDuo else { return nil }
++    if #available(iOS 27.1, *) {
++        return geometry.reservedRegions(kind:.division,options:.includeInactive).first(where: { $0.isActive })?.frame
++    }
++    return nil
++}
+diff --git a/ios/Henge/Controls/GamepadControllerSurface.swift b/ios/Henge/Controls/GamepadControllerSurface.swift
+new file mode 100644
+index 0000000..a7e9022
+--- /dev/null
++++ b/ios/Henge/Controls/GamepadControllerSurface.swift
+@@ -0,0 +1,30 @@
++import SwiftUI
++
++/// The controller and pointing pad share existing input paths. No extra ticker.
++struct GamepadControllerSurface: View {
++    let tuning:GamepadTuning
++    var portrait=false
++    var showsTouchpad=true
++    var capturesKeyboard=false
++    let send:(GamepadState)->Void
++    let sendPointer:(LinkControl)->Void
++    var body:some View {
++        GeometryReader { geometry in
++            let pad=PadLayout(bounds:CGRect(origin:.zero,size:geometry.size),size:tuning.normalized.scale,portrait:portrait).touchpadRect
++            ZStack(alignment:.topLeading) {
++                GamepadSurface(tuning:tuning,portrait:portrait,send:send)
++                if showsTouchpad {
++                    WirelessInputSurface(keyboard:false,send:sendPointer,capturesKeyboard:capturesKeyboard,identifier:"gamepad-touchpad")
++                        .background(.black.opacity(tuning.normalized.opacity),in:RoundedRectangle(cornerRadius:12))
++                        .overlay {
++                            RoundedRectangle(cornerRadius:12).strokeBorder(.white.opacity(0.35))
++                                .overlay(alignment:.bottom) { Text("Touchpad").font(.caption2).foregroundStyle(.secondary).padding(4) }
++                                .allowsHitTesting(false)
++                        }
++                        .frame(width:pad.width,height:pad.height)
++                        .offset(x:pad.minX,y:pad.minY)
++                }
++            }
++        }
++    }
++}
 diff --git a/ios/Henge/Controls/GamepadHub.swift b/ios/Henge/Controls/GamepadHub.swift
 new file mode 100644
-index 0000000..edd955a
+index 0000000..437d2f5
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadHub.swift
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,85 @@
 +import UIKit
 +import Combine
 +
@@ -4670,7 +6182,17 @@ index 0000000..edd955a
 +        else { guard local != state else { return }; local = state }
 +        deliver()
 +    }
-+    func releaseAll() { local = .off; remote = .off; releaseDelivered() }
++    func point(_ input:LinkControl) {
++        guard henge_vm_state()==1 else { return }
++        switch input.type {
++        case "move":henge_vm_mouse_move(Int32(input.x ?? 0),Int32(input.y ?? 0))
++        case "scroll":henge_vm_mouse_scroll(Int32(input.x ?? 0),Int32(input.y ?? 0))
++        case "button":if let button=input.code,let down=input.down { henge_vm_input_button(3,Int32(button),down ? 1 : 0) }
++        case "release":henge_vm_input_release(3)
++        default:break
++        }
++    }
++    func releaseAll() { local = .off; remote = .off; releaseDelivered();henge_vm_input_release(3) }
 +    private func releaseDelivered() {
 +        look?.invalidate(); look = nil; proxy = nil; lastLook = 0; lookRemainder = .zero
 +        henge_vm_input_release(2); keys.removeAll(); mouse.removeAll()
@@ -4722,10 +6244,10 @@ index 0000000..edd955a
 +}
 diff --git a/ios/Henge/Controls/GamepadLayout.swift b/ios/Henge/Controls/GamepadLayout.swift
 new file mode 100644
-index 0000000..31d573f
+index 0000000..9d6cc64
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadLayout.swift
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,84 @@
 +import Foundation
 +import CoreGraphics
 +
@@ -4748,11 +6270,43 @@ index 0000000..31d573f
 +struct PadLayout {
 +    let bounds: CGRect
 +    let scale: CGFloat
-+    init(bounds: CGRect, size: Double) {
++    let portrait: Bool
++    init(bounds: CGRect, size: Double, portrait: Bool = false) {
 +        self.bounds = bounds
-+        scale = max(0.01,min(CGFloat(size),min(bounds.width/560,bounds.height/320)))
++        self.portrait=portrait
++        scale = max(0.01,min(CGFloat(size),min(bounds.width/(portrait ? 390 : 560),bounds.height/(portrait ? 700 : 320))))
++    }
++    var touchpadRect: CGRect {
++        if portrait { return mapped(CGRect(x:24,y:24,width:342,height:240)) }
++        let width=min(260*scale,max(1,bounds.width-416*scale))
++        return CGRect(x:bounds.midX-width/2,y:bounds.maxY-178*scale,width:width,height:60*scale)
++    }
++    private func mapped(_ rect: CGRect) -> CGRect {
++        CGRect(x:bounds.midX-195*scale+rect.minX*scale,y:bounds.maxY-700*scale+rect.minY*scale,width:rect.width*scale,height:rect.height*scale)
 +    }
 +    func rect(_ control: PadControl) -> CGRect {
++        if portrait {
++            let r:CGRect
++            switch control {
++            case .move:r=CGRect(x:18,y:392,width:112,height:112)
++            case .look:r=CGRect(x:200,y:566,width:112,height:112)
++            case .a:r=CGRect(x:282,y:492,width:44,height:44)
++            case .b:r=CGRect(x:334,y:440,width:44,height:44)
++            case .x:r=CGRect(x:230,y:440,width:44,height:44)
++            case .y:r=CGRect(x:282,y:388,width:44,height:44)
++            case .lb:r=CGRect(x:18,y:312,width:90,height:40)
++            case .rb:r=CGRect(x:282,y:312,width:90,height:40)
++            case .lt:r=CGRect(x:116,y:304,width:58,height:70)
++            case .rt:r=CGRect(x:216,y:304,width:58,height:70)
++            case .view:r=CGRect(x:137,y:392,width:48,height:34)
++            case .menu:r=CGRect(x:191,y:392,width:48,height:34)
++            case .guide:r=CGRect(x:175,y:450,width:40,height:40)
++            case .leftClick:r=CGRect(x:142,y:508,width:34,height:34)
++            case .rightClick:r=CGRect(x:326,y:592,width:34,height:34)
++            case .dpad:r=CGRect(x:30,y:564,width:88,height:88)
++            }
++            return mapped(r)
++        }
 +        let w = bounds.width/scale
 +        let r: CGRect
 +        switch control {
@@ -4780,10 +6334,10 @@ index 0000000..31d573f
 +
 diff --git a/ios/Henge/Controls/GamepadSettingsPanel.swift b/ios/Henge/Controls/GamepadSettingsPanel.swift
 new file mode 100644
-index 0000000..424b21a
+index 0000000..9261c5e
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadSettingsPanel.swift
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,61 @@
 +import SwiftUI
 +
 +struct GamepadSettingsPanel: View {
@@ -4791,6 +6345,7 @@ index 0000000..424b21a
 +    var allowsNativeProfile = true
 +    @AppStorage("henge.gamepad.profile") private var profile = "generic"
 +    @ObservedObject private var preferences = GamepadPreferences.shared
++    @ObservedObject private var touchpad = TouchpadPreferences.shared
 +    @Environment(\.dismiss) private var dismiss
 +    var body: some View {
 +        NavigationStack {
@@ -4817,6 +6372,12 @@ index 0000000..424b21a
 +                    if mapping {
 +                        adjustment("Mouse look speed",value:$preferences.value.mouseLookSpeed,range:300...2400)
 +                    }
++                }
++                Section("Touchpad") {
++                    adjustment("Touchpad movement speed",value:$touchpad.value.pointerSpeed,range:0.25...3)
++                    adjustment("Touchpad scrolling speed",value:$touchpad.value.scrollSpeed,range:0.25...3)
++                    Text("Applies to wireless touchpad, keyboard view and the gamepad touchpad. Saved on this controller device.").font(.footnote).foregroundStyle(.secondary)
++                    Button("Reset touchpad sensitivity") { touchpad.value=TouchpadTuning() }
 +                }
 +                Section("Overlay") {
 +                    adjustment("Control size",value:$preferences.value.scale,range:0.8...1.15)
@@ -4882,10 +6443,10 @@ index 0000000..77e4f94
 +}
 diff --git a/ios/Henge/Controls/GamepadSurface.swift b/ios/Henge/Controls/GamepadSurface.swift
 new file mode 100644
-index 0000000..aa1f2fd
+index 0000000..38a25b5
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadSurface.swift
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,151 @@
 +import SwiftUI
 +import UIKit
 +
@@ -4893,11 +6454,12 @@ index 0000000..aa1f2fd
 +/// untouched transparent space passes through to the desktop beneath the overlay.
 +struct GamepadSurface: UIViewRepresentable {
 +    var tuning = GamepadTuning()
++    var portrait = false
 +    var send: (GamepadState) -> Void
 +    func makeUIView(context: Context) -> PadView {
-+        let view = PadView(); view.send = send; view.configure(tuning); return view
++        let view = PadView(); view.send = send; view.configure(tuning,portrait:portrait); return view
 +    }
-+    func updateUIView(_ view: PadView, context: Context) { view.send = send; view.configure(tuning) }
++    func updateUIView(_ view: PadView, context: Context) { view.send = send; view.configure(tuning,portrait:portrait) }
 +    static func dismantleUIView(_ view: PadView, coordinator: ()) { view.release(); view.send = nil }
 +}
 +
@@ -4906,6 +6468,7 @@ index 0000000..aa1f2fd
 +    private var input = PadInput()
 +    private var previousBounds = CGRect.null
 +    private var tuning = GamepadTuning()
++    private var portrait = false
 +    private var lastSent = GamepadState.off
 +    private var current = GamepadState()
 +#if DEBUG
@@ -4924,13 +6487,13 @@ index 0000000..aa1f2fd
 +        accessibilityHint = "Use the three-finger controls menu for gamepad settings or to hide the gamepad."
 +    }
 +    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
-+    func configure(_ value: GamepadTuning) {
++    func configure(_ value: GamepadTuning, portrait: Bool) {
 +        let value = value.normalized
-+        guard value != tuning else { return }
-+        tuning = value
++        guard value != tuning || self.portrait != portrait else { return }
++        tuning = value;self.portrait=portrait
 +        if window != nil { cancelTouches() } else { input.release();setNeedsDisplay() }
 +    }
-+    private var layout: PadLayout { PadLayout(bounds:bounds,size:tuning.scale) }
++    private var layout: PadLayout { PadLayout(bounds:bounds,size:tuning.scale,portrait:portrait) }
 +    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
 +        guard bounds.contains(point) else { return false }
 +        return PadControl.allCases.contains { layout.rect($0).contains(point) }
@@ -5104,7 +6667,7 @@ index 0000000..666aca6
 +}
 diff --git a/ios/Henge/Controls/GamepadViews.swift b/ios/Henge/Controls/GamepadViews.swift
 new file mode 100644
-index 0000000..22c945c
+index 0000000..13b637d
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadViews.swift
 @@ -0,0 +1,16 @@
@@ -5113,7 +6676,7 @@ index 0000000..22c945c
 +struct LocalGamepad: View {
 +    @ObservedObject private var preferences = GamepadPreferences.shared
 +    var body: some View {
-+        GamepadSurface(tuning:preferences.value) { GamepadHub.shared.set($0) }
++        GamepadControllerSurface(tuning:preferences.value,send:{ GamepadHub.shared.set($0) },sendPointer:{ GamepadHub.shared.point($0) })
 +            .frame(height:320*preferences.value.normalized.scale)
 +            .onDisappear { GamepadHub.shared.set(.off) }
 +    }
@@ -5170,12 +6733,57 @@ index 0000000..7cc0e18
 +        return state
 +    }
 +}
+diff --git a/ios/Henge/Controls/TouchpadTuning.swift b/ios/Henge/Controls/TouchpadTuning.swift
+new file mode 100644
+index 0000000..f4bf2f7
+--- /dev/null
++++ b/ios/Henge/Controls/TouchpadTuning.swift
+@@ -0,0 +1,39 @@
++import Foundation
++import Combine
++
++struct TouchpadTuning: Codable, Equatable {
++    var pointerSpeed = 1.0
++    var scrollSpeed = 1.0
++    var normalized: Self {
++        var result=self
++        result.pointerSpeed=pointerSpeed.isFinite ? min(3,max(0.25,pointerSpeed)) : 1
++        result.scrollSpeed=scrollSpeed.isFinite ? min(3,max(0.25,scrollSpeed)) : 1
++        return result
++    }
++}
++
++/// Retain fractional motion without timers; reset between gestures or settings.
++struct TouchpadMotion {
++    private var x=0.0,y=0.0
++    mutating func reset() { x=0;y=0 }
++    mutating func consume(dx:Double,dy:Double,multiplier:Double)->(Int,Int) {
++        guard dx.isFinite,dy.isFinite,multiplier.isFinite,multiplier>0 else { reset();return (0,0) }
++        x += dx*multiplier;y += dy*multiplier
++        x=min(4096,max(-4096,x));y=min(4096,max(-4096,y))
++        let output=(Int(x),Int(y));x -= Double(output.0);y -= Double(output.1)
++        return output
++    }
++}
++
++@MainActor final class TouchpadPreferences: ObservableObject {
++    static let shared=TouchpadPreferences()
++    private let defaults:UserDefaults
++    @Published var value:TouchpadTuning {
++        didSet { if let data=try? JSONEncoder().encode(value.normalized) { defaults.set(data,forKey:"henge.touchpad.tuning.v1") } }
++    }
++    init(defaults:UserDefaults = .standard) {
++        self.defaults=defaults
++        if let data=defaults.data(forKey:"henge.touchpad.tuning.v1"),let saved=try? JSONDecoder().decode(TouchpadTuning.self,from:data) { value=saved.normalized }
++        else { value=TouchpadTuning() }
++    }
++}
 diff --git a/ios/Henge/Controls/WirelessControlsPanel.swift b/ios/Henge/Controls/WirelessControlsPanel.swift
 new file mode 100644
-index 0000000..9eb6250
+index 0000000..92c7307
 --- /dev/null
 +++ b/ios/Henge/Controls/WirelessControlsPanel.swift
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,143 @@
 +import SwiftUI
 +
 +enum WirelessControlMode: Int, CaseIterable, Identifiable {
@@ -5185,46 +6793,73 @@ index 0000000..9eb6250
 +    var icon: String { ["cursorarrow.motionlines","keyboard","gamecontroller"][rawValue] }
 +}
 +
-+/// Shared production/preview shell. Transport, pairing and native injection stay
-+/// in LinkViewerService; no second connection or independent input timer.
++/// One transport and input surface for all controller modes. Posture changes
++/// release held input; neither a second connection nor a display timer is used.
 +struct WirelessControlsPanel<Input: View>: View {
 +    let status: String
 +    let tuning: GamepadTuning
++    var isDuo=false
 +    @Binding var mode: WirelessControlMode
 +    let disconnect: () -> Void
 +    let configure: () -> Void
 +    let sendPad: (GamepadState) -> Void
++    let sendPointer: (LinkControl) -> Void
 +    let input: (WirelessControlMode) -> Input
++    @AppStorage("henge.link.controllerLayout") private var layoutChoice = "automatic"
 +    var body: some View {
 +        GeometryReader { geometry in
-+            let wide = geometry.size.width > geometry.size.height * 1.25
++            let choice=ControllerLayoutChoice(rawValue:layoutChoice) ?? .automatic
++            let layout=ControllerPostureLayout(size:geometry.size,choice:choice,isDuo:isDuo,division:controllerDivision(geometry,isDuo:isDuo))
 +            Group {
-+                if wide {
-+                    HStack(spacing:14) {
-+                        Group {
-+                            if geometry.size.height<450 {
-+                                ScrollView(.vertical) { navigation(compact:true) }.scrollIndicators(.hidden)
-+                            } else { navigation(compact:false) }
-+                        }.frame(width:100)
-+                        content
-+                    }
++                if mode == .gamepad && layout.style == .tabletop {
++                    tabletop(layout)
 +                } else {
-+                    VStack(spacing:14) { header; modePicker; content }
++                    standard(wide:geometry.size.width>geometry.size.height*1.25,
++                             short:geometry.size.height<450,portrait:layout.style == .portrait)
 +                }
 +            }
-+            .padding(wide ? 14 : 18)
 +            .background(LinearGradient(colors:[Color(red:0.08,green:0.1,blue:0.16),.black],startPoint:.topLeading,endPoint:.bottomTrailing))
 +            .foregroundStyle(.white)
++            .onChange(of:layout.style) { _,_ in releaseInput() }
++            .onChange(of:layoutChoice) { _,_ in releaseInput() }
 +        }
++    }
++    private func releaseInput() { sendPad(.off);sendPointer(LinkControl(type:"release")) }
++    private func standard(wide:Bool,short:Bool,portrait:Bool) -> some View {
++        Group {
++            if wide {
++                HStack(spacing:14) {
++                    Group {
++                        if short { ScrollView(.vertical) { navigation(compact:true) }.scrollIndicators(.hidden) }
++                        else { navigation(compact:false) }
++                    }.frame(width:100)
++                    content(portrait:portrait)
++                }
++            } else {
++                VStack(spacing:12) { header;modePicker;content(portrait:portrait) }
++            }
++        }.padding(wide ? 14 : 18)
++    }
++    private func tabletop(_ layout:ControllerPostureLayout) -> some View {
++        VStack(spacing:0) {
++            VStack(spacing:10) {
++                header;modePicker
++                pointingPad(identifier:"tabletop-touchpad")
++            }.padding(14).frame(height:layout.upper.height)
++            Color.clear.frame(height:layout.fold.height).allowsHitTesting(false)
++            GamepadControllerSurface(tuning:tuning,showsTouchpad:false,send:sendPad,sendPointer:sendPointer)
++                .padding(.horizontal,12).frame(height:layout.lower.height)
++        }.accessibilityIdentifier("duo-tabletop-controls")
 +    }
 +    private var header: some View {
 +        HStack(spacing:12) {
 +            Image(systemName:"antenna.radiowaves.left.and.right").foregroundStyle(.green)
 +            VStack(alignment:.leading,spacing:3) {
-+                Text("Wireless controls").font(.headline)
++                Text(isDuo ? "Duo wireless controls" : "Wireless controls").font(.headline)
 +                Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(2)
 +            }
-+            Spacer()
++            Spacer(minLength:0)
++            if isDuo && mode == .gamepad { layoutMenu }
 +            settingsButton
 +            Button(action:disconnect) { Image(systemName:"xmark.circle.fill").font(.title2) }
 +                .accessibilityLabel("Disconnect wireless controls")
@@ -5234,6 +6869,14 @@ index 0000000..9eb6250
 +        Picker("Control mode",selection:$mode) {
 +            ForEach(WirelessControlMode.allCases) { control in Label(control.title,systemImage:control.icon).tag(control) }
 +        }.pickerStyle(.segmented)
++    }
++    private var layoutMenu: some View {
++        Menu {
++            Picker("Controller layout",selection:$layoutChoice) {
++                ForEach(ControllerLayoutChoice.allCases) { Text($0.title).tag($0.rawValue) }
++            }
++        } label: { Image(systemName:"rectangle.split.1x2").frame(width:44,height:44) }
++            .accessibilityLabel("Controller layout")
 +    }
 +    private func navigation(compact: Bool) -> some View {
 +        VStack(spacing:compact ? 8 : 18) {
@@ -5245,11 +6888,12 @@ index 0000000..9eb6250
 +                        if compact { Label(control.title,systemImage:control.icon).font(.caption) }
 +                        else { VStack(spacing:6) { Image(systemName:control.icon).font(.title2); Text(control.title).font(.caption) } }
 +                    }
-+                        .frame(maxWidth:.infinity).padding(.vertical,compact ? 8 : 10)
-+                        .background(mode == control ? Color.blue.opacity(0.3) : .clear,in:RoundedRectangle(cornerRadius:14))
++                    .frame(maxWidth:.infinity).padding(.vertical,compact ? 8 : 10)
++                    .background(mode == control ? Color.blue.opacity(0.3) : .clear,in:RoundedRectangle(cornerRadius:14))
 +                }.accessibilityLabel(control.title).accessibilityAddTraits(mode == control ? .isSelected : [])
 +            }
 +            Spacer(minLength:0)
++            if isDuo && mode == .gamepad { layoutMenu }
 +            settingsButton
 +            Button("Disconnect",systemImage:"xmark.circle",action:disconnect).font(.caption)
 +        }.padding(.vertical,8)
@@ -5258,20 +6902,26 @@ index 0000000..9eb6250
 +        Button(action:configure) { Image(systemName:"slider.horizontal.3").font(.title3).frame(width:44,height:44) }
 +            .accessibilityLabel("Controller sensitivity and layout settings")
 +    }
-+    @ViewBuilder private var content: some View {
-+        if mode == .gamepad {
-+            VStack(spacing:4) {
-+                Text("Gamepad").font(.headline).frame(maxWidth:.infinity,alignment:.leading)
-+                GamepadSurface(tuning:tuning,send:sendPad).frame(maxWidth:.infinity,maxHeight:.infinity)
++    private func pointingPad(identifier:String) -> some View {
++        WirelessInputSurface(keyboard:false,send:sendPointer,identifier:identifier)
++            .background(.white.opacity(0.06),in:RoundedRectangle(cornerRadius:24))
++            .overlay(alignment:.bottom) {
++                Text("Touchpad · Tap to click · Two fingers scroll").font(.caption).foregroundStyle(.secondary).padding(10).allowsHitTesting(false)
 +            }
++            .overlay(RoundedRectangle(cornerRadius:24).strokeBorder(.white.opacity(0.12)).allowsHitTesting(false))
++    }
++    @ViewBuilder private func content(portrait:Bool) -> some View {
++        if mode == .gamepad {
++            GamepadControllerSurface(tuning:tuning,portrait:portrait,capturesKeyboard:true,send:sendPad,sendPointer:sendPointer)
++                .frame(maxWidth:.infinity,maxHeight:.infinity)
 +        } else {
-+            VStack(alignment:.leading,spacing:12) {
-+                Label(mode.title,systemImage:mode.icon).font(.headline)
++            VStack(alignment:.leading,spacing:10) {
++                Label(mode == .keyboard ? "Keyboard + touchpad" : "Touchpad",systemImage:mode.icon).font(.headline)
 +                input(mode)
 +                    .frame(maxWidth:.infinity,maxHeight:.infinity)
 +                    .background(.white.opacity(0.06),in:RoundedRectangle(cornerRadius:24))
-+                    .overlay(RoundedRectangle(cornerRadius:24).strokeBorder(.white.opacity(0.12)))
-+                Text(mode == .keyboard ? "Software and hardware keyboards use the shared connection." : "Tap to click · Two fingers scroll · Hold and drag moves windows")
++                    .overlay(RoundedRectangle(cornerRadius:24).strokeBorder(.white.opacity(0.12)).allowsHitTesting(false))
++                Text(mode == .keyboard ? "Type below or use a hardware keyboard. The area above stays a touchpad." : "Tap to click · Two fingers scroll · Hold and drag moves windows")
 +                    .font(.footnote).foregroundStyle(.secondary)
 +            }
 +        }
@@ -5279,10 +6929,10 @@ index 0000000..9eb6250
 +}
 diff --git a/ios/Henge/Controls/WirelessInputSurface.swift b/ios/Henge/Controls/WirelessInputSurface.swift
 new file mode 100644
-index 0000000..3c6f98f
+index 0000000..a2c62de
 --- /dev/null
 +++ b/ios/Henge/Controls/WirelessInputSurface.swift
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,123 @@
 +import SwiftUI
 +import UIKit
 +
@@ -5290,14 +6940,19 @@ index 0000000..3c6f98f
 +class LinkInputView: UIView, UIGestureRecognizerDelegate, UIKeyInput {
 +    var send: ((LinkControl) -> Void)?
 +    var rejectedPaste: (() -> Void)?
-+    var toggleControls: (() -> Void)?
++    var toggleControls: (() -> Void)? { didSet { controlTap?.isEnabled = toggleControls != nil } }
++    private var controlTap:UITapGestureRecognizer?
++    var capturesKeyboard=true
++    var pointerTuning=TouchpadTuning() { didSet { if oldValue != pointerTuning { moveMotion.reset();scrollMotion.reset() } } }
++    private var moveMotion=TouchpadMotion(),scrollMotion=TouchpadMotion()
++
 +    // The surface is a remote trackpad, not a text editor. Keep iOS's system
 +    // three-finger editing menu from taking the local controls gesture.
 +    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
-+    override var canBecomeFirstResponder: Bool { true }
++    override var canBecomeFirstResponder: Bool { capturesKeyboard }
 +    private var heldKeys = Set<Int>()
 +    var keyboardEnabled = false {
-+        didSet { if oldValue != keyboardEnabled { releaseInput(); reloadInputViews(); if window != nil { becomeFirstResponder() } } }
++        didSet { if oldValue != keyboardEnabled { releaseInput(); reloadInputViews(); if window != nil && capturesKeyboard { becomeFirstResponder() } } }
 +    }
 +    override var inputView: UIView? { keyboardEnabled ? nil : UIView(frame:.zero) }
 +    var hasText: Bool { true }
@@ -5305,7 +6960,7 @@ index 0000000..3c6f98f
 +    var autocapitalizationType: UITextAutocapitalizationType = .none
 +    var keyboardType: UIKeyboardType = .asciiCapable
 +    var keyboardAppearance: UIKeyboardAppearance = .dark
-+    func releaseInput() { heldKeys.removeAll(); send?(LinkControl(type:"release")) }
++    func releaseInput() { heldKeys.removeAll();moveMotion.reset();scrollMotion.reset();send?(LinkControl(type:"release")) }
 +    func deleteBackward() { stroke(42,shift:false) }
 +    private func stroke(_ key: Int,shift: Bool) {
 +        let shifted = heldKeys.contains(225)
@@ -5339,7 +6994,7 @@ index 0000000..3c6f98f
 +        accessibilityLabel = "Wireless keyboard and touchpad"
 +        let controls = UITapGestureRecognizer(target: self, action: #selector(toggleViewerControls))
 +        controls.numberOfTouchesRequired = 3; controls.numberOfTapsRequired = 1
-+        addGestureRecognizer(controls)
++        controls.isEnabled=false;controlTap=controls;addGestureRecognizer(controls)
 +        let pointer = UIPanGestureRecognizer(target: self, action: #selector(pointerPan(_:))); pointer.maximumNumberOfTouches = 1; addGestureRecognizer(pointer)
 +        let scroll = UIPanGestureRecognizer(target: self, action: #selector(scroll(_:))); scroll.minimumNumberOfTouches = 2; scroll.maximumNumberOfTouches = 2; addGestureRecognizer(scroll)
 +        let click = UITapGestureRecognizer(target: self, action: #selector(click)); addGestureRecognizer(click); click.require(toFail: pointer)
@@ -5347,7 +7002,7 @@ index 0000000..3c6f98f
 +        let hold = UILongPressGestureRecognizer(target: self, action: #selector(holdButton(_:)))
 +        hold.minimumPressDuration = 0.35; hold.delegate = self; addGestureRecognizer(hold)
 +    }
-+    override func didMoveToWindow() { super.didMoveToWindow(); if window != nil { becomeFirstResponder() } else { releaseInput() } }
++    override func didMoveToWindow() { super.didMoveToWindow(); if window != nil { if capturesKeyboard { becomeFirstResponder() } } else { releaseInput() } }
 +    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
 +        gestureRecognizer is UILongPressGestureRecognizer || other is UILongPressGestureRecognizer
 +    }
@@ -5358,15 +7013,18 @@ index 0000000..3c6f98f
 +    }
 +    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
 +    @objc private func pointerPan(_ pan: UIPanGestureRecognizer) {
-+        let p = pan.translation(in: self)
-+        let dx = max(-4096, min(4096, Int(p.x * contentScaleFactor))), dy = max(-4096, min(4096, Int(p.y * contentScaleFactor)))
-+        pan.setTranslation(CGPoint(x: p.x - CGFloat(dx) / contentScaleFactor, y: p.y - CGFloat(dy) / contentScaleFactor), in: self)
-+        if dx != 0 || dy != 0 { send?(LinkControl(type: "move", x: dx, y: dy)) }
++        if pan.state == .began { moveMotion.reset() }
++        let p=pan.translation(in:self);pan.setTranslation(.zero,in:self)
++        let (dx,dy)=moveMotion.consume(dx:Double(p.x),dy:Double(p.y),multiplier:Double(contentScaleFactor)*pointerTuning.normalized.pointerSpeed)
++        if dx != 0 || dy != 0 { send?(LinkControl(type:"move",x:dx,y:dy)) }
++        if pan.state == .ended || pan.state == .cancelled || pan.state == .failed { moveMotion.reset() }
 +    }
 +    @objc private func scroll(_ pan: UIPanGestureRecognizer) {
-+        let p = pan.translation(in: self)
-+        let x = Int(p.x / 6), y = Int(p.y / 6)
-+        if x != 0 || y != 0 { pan.setTranslation(CGPoint(x: p.x - CGFloat(x * 6), y: p.y - CGFloat(y * 6)), in: self); send?(LinkControl(type: "scroll", x: max(-4096, min(4096, x)), y: max(-4096, min(4096, y)))) }
++        if pan.state == .began { scrollMotion.reset() }
++        let p=pan.translation(in:self);pan.setTranslation(.zero,in:self)
++        let (x,y)=scrollMotion.consume(dx:Double(p.x),dy:Double(p.y),multiplier:pointerTuning.normalized.scrollSpeed/6)
++        if x != 0 || y != 0 { send?(LinkControl(type:"scroll",x:x,y:y)) }
++        if pan.state == .ended || pan.state == .cancelled || pan.state == .failed { scrollMotion.reset() }
 +    }
 +    private func button(_ n: Int) { send?(LinkControl(type: "button", code: n, down: true)); send?(LinkControl(type: "button", code: n, down: false)) }
 +    @objc private func click() { button(0) }
@@ -5383,13 +7041,16 @@ index 0000000..3c6f98f
 +struct WirelessInputSurface: UIViewRepresentable {
 +    let keyboard: Bool
 +    let send: (LinkControl) -> Void
++    var capturesKeyboard = true
++    var identifier = "wireless-input-surface"
++    @ObservedObject private var preferences=TouchpadPreferences.shared
 +    var rejectedPaste: () -> Void = {}
 +    func makeUIView(context: Context) -> LinkInputView {
-+        let view = LinkInputView();view.send = send;view.rejectedPaste = rejectedPaste
++        let view = LinkInputView();view.capturesKeyboard=capturesKeyboard;view.accessibilityIdentifier=identifier;view.pointerTuning=preferences.value;view.send = send;view.rejectedPaste = rejectedPaste
 +        view.keyboardEnabled = keyboard;return view
 +    }
 +    func updateUIView(_ view: LinkInputView,context: Context) {
-+        view.send = send;view.rejectedPaste = rejectedPaste;view.keyboardEnabled = keyboard
++        view.send = send;view.rejectedPaste = rejectedPaste;view.capturesKeyboard=capturesKeyboard;view.accessibilityIdentifier=identifier;view.pointerTuning=preferences.value;view.keyboardEnabled = keyboard
 +    }
 +    static func dismantleUIView(_ view: LinkInputView,coordinator: ()) {
 +        view.releaseInput();view.resignFirstResponder();view.send = nil;view.rejectedPaste = nil
@@ -6338,7 +7999,7 @@ index f49ac55..a062560 100644
          slots.signal()
          guard receipt.consumed else { return }
 diff --git a/ios/Henge/Link/LinkViews.swift b/ios/Henge/Link/LinkViews.swift
-index 1bc238f..454b340 100644
+index 1bc238f..d131252 100644
 --- a/ios/Henge/Link/LinkViews.swift
 +++ b/ios/Henge/Link/LinkViews.swift
 @@ -47,7 +47,10 @@ struct LinkHostView: View {
@@ -6364,11 +8025,11 @@ index 1bc238f..454b340 100644
                  Color.black.ignoresSafeArea()
                  if connecting {
 +                    if inputOnly {
-+                        WirelessControlsPanel(status:viewer.status,tuning:gamepadPreferences.value,
++                        WirelessControlsPanel(status:viewer.status,tuning:gamepadPreferences.value,isDuo:HostScheduling.isDuo,
 +                            mode:Binding(get:{ WirelessControlMode(rawValue:inputTab) ?? .touchpad },set:{inputTab=$0.rawValue}),
 +                            disconnect:{viewer.send(LinkControl(type:"release"));viewer.disconnect();connecting=false},
 +                            configure:{viewer.send(LinkControl(type:"release"));showGamepadSettings=true},
-+                            sendPad:{viewer.send(LinkControl(type:"gamepad",gamepad:$0))}) { mode in
++                            sendPad:{viewer.send(LinkControl(type:"gamepad",gamepad:$0))},sendPointer:{viewer.send($0)}) { mode in
 +                                LinkInputSurface(viewer:viewer,keyboard:mode == .keyboard)
 +                            }
 +                    } else {
@@ -6713,7 +8374,7 @@ index 29c8b3b..8cd13c4 100644
      /// On an iPhone's large screen (iPhone Duo unfolded): fill it, or leave a strip at the right for the status
      /// bar and Henge's controls. Macs that never chose fill it.
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..ca7de90 100644
+index 34d6a98..c28f2c6 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
 @@ -23,23 +23,55 @@
@@ -7262,15 +8923,15 @@ index 34d6a98..ca7de90 100644
 +    return 0;
 +}
 +void henge_vm_input_key(unsigned source,uint8_t usage,int down) {
-+    if(source<1 || source>2 || !lock_running())return;
++    if(source<1 || source>3 || !lock_running())return;
 +    hv_vm_key_hid_source(usage,down,source);pthread_rwlock_unlock(&api_lock);
 +}
 +void henge_vm_input_button(unsigned source,int button,int down) {
-+    if(source<1 || source>2 || !lock_running())return;
++    if(source<1 || source>3 || !lock_running())return;
 +    hv_vm_mouse_button_source(button,down,source);pthread_rwlock_unlock(&api_lock);
 +}
 +void henge_vm_input_release(unsigned source) {
-+    if(source<1 || source>2 || !lock_running())return;
++    if(source<1 || source>3 || !lock_running())return;
 +    hv_vm_release_input_source(source);pthread_rwlock_unlock(&api_lock);
 +}
 diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
@@ -9237,15 +10898,17 @@ index 0000000..5435674
 +HengeGamepadPreview.xcodeproj/
 diff --git a/tests/gamepad-preview/App.swift b/tests/gamepad-preview/App.swift
 new file mode 100644
-index 0000000..d9135a5
+index 0000000..88153a2
 --- /dev/null
 +++ b/tests/gamepad-preview/App.swift
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,70 @@
 +import SwiftUI
 +import Metal
 +
 +@main struct GamepadPreviewApp: App {
-+    init() { UserDefaults.standard.removeObject(forKey:"henge.gamepad.tuning.v1") }
++    init() {
++        for key in ["henge.gamepad.tuning.v1","henge.touchpad.tuning.v1","henge.link.controllerLayout"] { UserDefaults.standard.removeObject(forKey:key) }
++    }
 +    var body: some Scene { WindowGroup { PreviewRoot().preferredColorScheme(.dark) } }
 +}
 +
@@ -9261,6 +10924,10 @@ index 0000000..d9135a5
 +    @State private var pointerMoves=0
 +    @State private var keyPresses=0
 +    @ObservedObject private var preferences=GamepadPreferences.shared
++    private func point(_ control:LinkControl) {
++        if control.type == "move" { pointerMoves += 1 }
++        if control.type == "key" && control.down == true { keyPresses += 1 }
++    }
 +    private func receive(_ state: GamepadState) {
 +        if state.buttons&1 != 0 && last.buttons&1 == 0 { presses += 1 }
 +        maxLeft=max(maxLeft,abs(Int(state.lx)))
@@ -9290,15 +10957,12 @@ index 0000000..d9135a5
 +                ZStack(alignment:.bottom) {
 +                    LinearGradient(colors:[.indigo.opacity(0.45),.gray.opacity(0.2),.black],startPoint:.topLeading,endPoint:.bottomTrailing)
 +                    if wireless {
-+                        WirelessControlsPanel(status:"Connected · preview fixture",tuning:preferences.value,mode:$mode,
-+                            disconnect:{last = .off},configure:{settings=true},sendPad:receive) { selected in
-+                                WirelessInputSurface(keyboard:selected == .keyboard,send:{ control in
-+                                    if control.type == "move" { pointerMoves += 1 }
-+                                    if control.type == "key" && control.down == true { keyPresses += 1 }
-+                                })
++                        WirelessControlsPanel(status:"Connected · preview fixture",tuning:preferences.value,isDuo:PreviewFixture.profile == "duo-unfolded",mode:$mode,
++                            disconnect:{last = .off},configure:{settings=true},sendPad:receive,sendPointer:point) { selected in
++                                WirelessInputSurface(keyboard:selected == .keyboard,send:point)
 +                            }
 +                    } else {
-+                        VStack { Text("Mac display · overlay preview").foregroundStyle(.secondary).padding();Spacer();GamepadSurface(tuning:preferences.value,send:receive).frame(height:320*preferences.value.normalized.scale) }
++                        VStack { Text("Mac display · overlay preview").foregroundStyle(.secondary).padding();Spacer();GamepadControllerSurface(tuning:preferences.value,send:receive,sendPointer:point).frame(height:320*preferences.value.normalized.scale) }
 +                    }
 +                }
 +                .frame(width:width,height:height)
@@ -9310,10 +10974,10 @@ index 0000000..d9135a5
 +}
 diff --git a/tests/gamepad-preview/GamepadPreviewUITests.swift b/tests/gamepad-preview/GamepadPreviewUITests.swift
 new file mode 100644
-index 0000000..4683136
+index 0000000..a1f531a
 --- /dev/null
 +++ b/tests/gamepad-preview/GamepadPreviewUITests.swift
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,103 @@
 +import XCTest
 +import CoreGraphics
 +
@@ -9340,9 +11004,9 @@ index 0000000..4683136
 +            let attachment=XCTAttachment(screenshot:XCUIScreen.main.screenshot());attachment.name=name+"-display";attachment.lifetime = .keepAlways;add(attachment)
 +            let window=XCTAttachment(screenshot:app.screenshot());window.name=name+"-app";window.lifetime = .keepAlways;add(window)
 +        }
-+        func tap(_ control: PadControl) {
++        func tap(_ control: PadControl,portrait:Bool = false) {
 +            let size=surface.frame.size
-+            let r=PadLayout(bounds:CGRect(origin:.zero,size:size),size:1).rect(control)
++            let r=PadLayout(bounds:CGRect(origin:.zero,size:size),size:1,portrait:portrait).rect(control)
 +            surface.coordinate(withNormalizedOffset:CGVector(dx:r.midX/size.width,dy:r.midY/size.height)).tap()
 +        }
 +        capture("\(PreviewFixture.profile)-local-default")
@@ -9360,17 +11024,27 @@ index 0000000..4683136
 +        let motion=NSPredicate { _,_ in (Int(maximum.value as? String ?? "") ?? -1)>20000 }
 +        XCTAssertEqual(XCTWaiter.wait(for:[XCTNSPredicateExpectation(predicate:motion,object:nil)],timeout:5),.completed,"Stick movement did not reach the production callback")
 +        XCTAssertEqual(app.staticTexts["buttons"].label,"Buttons: 0")
++        let gamepadPad=app.otherElements["gamepad-touchpad"].firstMatch
++        XCTAssertTrue(gamepadPad.waitForExistence(timeout:5))
++        let padCenter=gamepadPad.coordinate(withNormalizedOffset:CGVector(dx:0.5,dy:0.5))
++        padCenter.press(forDuration:0.1,thenDragTo:padCenter.withOffset(CGVector(dx:40,dy:8)))
++        XCTAssertGreaterThan(Int(app.staticTexts["moves"].value as? String ?? "") ?? -1,0,"Gamepad touchpad must use the production pointer callback")
 +        app.buttons["settings"].tap()
 +        XCTAssertTrue(app.navigationBars["Gamepad settings"].waitForExistence(timeout:5))
 +        XCTAssertTrue(app.sliders["Movement sensitivity"].exists)
 +        app.sliders["Movement sensitivity"].adjust(toNormalizedSliderPosition:0.7)
++        let sensitivity=app.sliders["Touchpad movement speed"]
++        app.swipeUp()
++        XCTAssertTrue(sensitivity.waitForExistence(timeout:5))
++        sensitivity.adjust(toNormalizedSliderPosition:0.6)
++        XCTAssertTrue(app.sliders["Touchpad scrolling speed"].exists)
 +        capture("\(PreviewFixture.profile)-settings")
 +        app.buttons["Done"].tap()
 +        app.buttons["switch-layout"].tap()
 +        XCTAssertTrue(surface.waitForExistence(timeout:5))
 +        capture("\(PreviewFixture.profile)-wireless-gamepad")
 +        app.buttons["Touchpad"].tap()
-+        let input=app.descendants(matching:.any).matching(identifier:"wireless-input-surface").firstMatch
++        let input=app.otherElements["wireless-input-surface"].firstMatch
 +        XCTAssertTrue(input.waitForExistence(timeout:5))
 +        let center=input.coordinate(withNormalizedOffset:CGVector(dx:0.5,dy:0.5))
 +        center.press(forDuration:0.1,thenDragTo:center.withOffset(CGVector(dx:80,dy:20)))
@@ -9384,7 +11058,24 @@ index 0000000..4683136
 +        app.buttons["Gamepad"].tap()
 +        XCTAssertTrue(surface.waitForExistence(timeout:5))
 +        if PreviewFixture.profile == "duo-unfolded" {
-+            app.buttons["fold"].tap();capture("duo-folded-transition")
++            app.buttons["Controller layout"].tap()
++            app.buttons["Tabletop"].tap()
++            let tabletop=app.otherElements["tabletop-touchpad"].firstMatch
++            XCTAssertTrue(tabletop.waitForExistence(timeout:5))
++            XCTAssertLessThan(tabletop.frame.maxY,surface.frame.minY,"The hinge gap must separate the touchpad and controller")
++            tap(.a)
++            let before=Int(app.staticTexts["moves"].value as? String ?? "") ?? 0
++            let topCenter=tabletop.coordinate(withNormalizedOffset:CGVector(dx:0.5,dy:0.5))
++            topCenter.press(forDuration:0.1,thenDragTo:topCenter.withOffset(CGVector(dx:40,dy:8)))
++            XCTAssertGreaterThan(Int(app.staticTexts["moves"].value as? String ?? "") ?? -1,before)
++            capture("duo-tabletop-gamepad")
++            app.buttons["Controller layout"].tap();app.buttons["Automatic"].tap()
++            app.buttons["fold"].tap()
++            XCTAssertTrue(gamepadPad.waitForExistence(timeout:5))
++            XCTAssertGreaterThan(gamepadPad.frame.height,100,"Portrait must use the large touchpad above full-size controls")
++            tap(.a,portrait:true)
++            XCTAssertEqual(app.staticTexts["buttons"].label,"Buttons: 0")
++            capture("duo-portrait-gamepad")
 +            app.buttons["fold"].tap();capture("duo-unfolded-restored")
 +        }
 +        app.terminate()
@@ -9422,10 +11113,10 @@ index 0000000..c1696da
 +workflow with native_duo=true, to retry strict native Duo geometry validation.
 diff --git a/tests/gamepad-preview/project.yml b/tests/gamepad-preview/project.yml
 new file mode 100644
-index 0000000..0fae2e1
+index 0000000..9769049
 --- /dev/null
 +++ b/tests/gamepad-preview/project.yml
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,78 @@
 +name: HengeGamepadPreview
 +options:
 +  deploymentTarget:
@@ -9447,6 +11138,10 @@ index 0000000..0fae2e1
 +    - ../../ios/Henge/Controls/GamepadTuning.swift
 +    - ../../ios/Henge/Controls/GamepadLayout.swift
 +    - ../../ios/Henge/Controls/PadInput.swift
++    - ../../ios/Henge/Controls/TouchpadTuning.swift
++    - ../../ios/Henge/Controls/ControllerPostureLayout.swift
++    - ../../ios/Henge/Controls/DuoControlPosture.swift
++    - ../../ios/Henge/Controls/GamepadControllerSurface.swift
 +    - ../../ios/Henge/Controls/GamepadSurface.swift
 +    - ../../ios/Henge/Controls/GamepadSettingsPanel.swift
 +    - ../../ios/Henge/Controls/WirelessControlsPanel.swift
@@ -10371,15 +12066,15 @@ index 0000000..080debb
 +}
 diff --git a/tests/test_gamepad_tuning.swift b/tests/test_gamepad_tuning.swift
 new file mode 100644
-index 0000000..1867403
+index 0000000..31f955d
 --- /dev/null
 +++ b/tests/test_gamepad_tuning.swift
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,96 @@
 +import Foundation
 +import CoreGraphics
 +
 +@main struct GamepadTuningChecks {
-+    static func main() throws {
++    @MainActor static func main() throws {
 +        let t = GamepadTuning()
 +        precondition(t.stick(x:0,y:0,right:false) == (0,0))
 +        precondition(t.stick(x:0.1,y:0,right:false) == (0,0))
@@ -10400,16 +12095,19 @@ index 0000000..1867403
 +        }
 +        precondition(GamepadTuning.hat(x:0,y:0)==8)
 +        for size in [CGSize(width:951,height:669),CGSize(width:1376,height:1032),CGSize(width:390,height:844),CGSize(width:844,height:390),CGSize(width:320,height:200)] {
++            for portrait in [false,true] {
 +            for scale in [0.8,1,1.15] {
-+                let bounds=CGRect(origin:.zero,size:size),layout=PadLayout(bounds:bounds,size:scale)
++                let bounds=CGRect(origin:.zero,size:size),layout=PadLayout(bounds:bounds,size:scale,portrait:portrait)
 +                for control in PadControl.allCases {
 +                    let rect=layout.rect(control)
++                    precondition(!rect.intersects(layout.touchpadRect),"touchpad overlaps \(control)")
 +                    precondition(rect.width>0 && rect.height>0 && bounds.contains(rect),"out of bounds \(control) at \(size)")
 +                    for other in PadControl.allCases where other.rawValue>control.rawValue {
 +                        precondition(!rect.intersects(layout.rect(other)),"overlap \(control)/\(other) at \(size)")
 +                    }
 +                }
 +            }
++        }
 +        }
 +        let touchLayout=PadLayout(bounds:CGRect(x:0,y:0,width:951,height:320),size:1)
 +        func center(_ control: PadControl) -> CGPoint { let r=touchLayout.rect(control);return CGPoint(x:r.midX,y:r.midY) }
@@ -10440,6 +12138,31 @@ index 0000000..1867403
 +        precondition(!GamepadState(mouseSpeed:299).valid && !GamepadState(mouseSpeed:2401).valid)
 +        let decoded=try JSONDecoder().decode(GamepadState.self,from:JSONEncoder().encode(remote))
 +        precondition(decoded==remote)
++        var motion=TouchpadMotion()
++        for _ in 0..<7 { precondition(motion.consume(dx:0.5,dy:-0.5,multiplier:0.25)==(0,0)) }
++        precondition(motion.consume(dx:0.5,dy:-0.5,multiplier:0.25)==(1,-1))
++        _=motion.consume(dx:0.5,dy:0.5,multiplier:1);motion.reset()
++        precondition(motion.consume(dx:0.5,dy:0.5,multiplier:1)==(0,0))
++        precondition(motion.consume(dx:.nan,dy:0,multiplier:1)==(0,0))
++        precondition(motion.consume(dx:1e99,dy:-1e99,multiplier:3)==(4096,-4096))
++        precondition(TouchpadTuning(pointerSpeed:.infinity,scrollSpeed:-1).normalized == TouchpadTuning(pointerSpeed:1,scrollSpeed:0.25))
++        let suite="henge.touchpad-test.\(UUID().uuidString)",defaults=UserDefaults(suiteName:suite)!
++        defer { defaults.removePersistentDomain(forName:suite) }
++        let saved=TouchpadPreferences(defaults:defaults)
++        saved.value=TouchpadTuning(pointerSpeed:2.5,scrollSpeed:0.5)
++        precondition(TouchpadPreferences(defaults:defaults).value==saved.value)
++        defaults.set(Data("invalid".utf8),forKey:"henge.touchpad.tuning.v1")
++        precondition(TouchpadPreferences(defaults:defaults).value==TouchpadTuning())
++        let tall=CGSize(width:669,height:951),fold=CGRect(x:0,y:455.5,width:669,height:40)
++        let automatic=ControllerPostureLayout(size:tall,choice:.automatic,isDuo:true,division:fold)
++        precondition(automatic.style == .tabletop && automatic.upper.maxY==fold.minY && automatic.lower.minY==fold.maxY)
++        precondition(ControllerPostureLayout(size:tall,choice:.automatic,isDuo:false,division:fold).style == .portrait)
++        precondition(ControllerPostureLayout(size:tall,choice:.standard,isDuo:true,division:fold).style == .standard)
++        precondition(ControllerPostureLayout(size:tall,choice:.automatic,isDuo:true,division:nil).style == .portrait)
++        precondition(ControllerPostureLayout(size:CGSize(width:951,height:669),choice:.automatic,isDuo:true,division:CGRect(x:455,y:0,width:40,height:669)).style == .standard)
++        precondition(ControllerPostureLayout(size:CGSize(width:390,height:300),choice:.tabletop,isDuo:true,division:nil).style == .standard)
++        let manual=ControllerPostureLayout(size:tall,choice:.tabletop,isDuo:true,division:nil)
++        precondition(manual.style == .tabletop && manual.lower.minY>manual.upper.maxY)
 +        print("Gamepad tuning: radial response, inversion, sensitivity, bounded values, eight-way hat, unfolded Duo/M4/compact non-overlapping layouts, whole-stick arbitration and additive wire compatibility passed")
 +    }
 +}
@@ -12449,10 +14172,10 @@ index a13a70d..02a7cd0 100644
      hv_vm_destroy();
      atomic_store(&reader_done, 1);
 diff --git a/tests/test_xhci_slots.c b/tests/test_xhci_slots.c
-index 41c2faa..c3fd43c 100644
+index 41c2faa..8ba03bf 100644
 --- a/tests/test_xhci_slots.c
 +++ b/tests/test_xhci_slots.c
-@@ -4,10 +4,97 @@
+@@ -4,10 +4,101 @@
  static HvMachine machine;
  static HvXhci controller;
  static uint8_t memory[16384] __attribute__((aligned(16384)));
@@ -12504,6 +14227,10 @@ index 41c2faa..c3fd43c 100644
 +    for(unsigned k=4;k<11;k++)hv_xhci_key_source(x,k,1,2);
 +    assert(x->state[2]==1 && x->state[7]==1);
 +    hv_xhci_release_source(x,2);assert(!x->state[2]);
++    hv_xhci_key_source(x,26,1,0);hv_xhci_key_source(x,26,1,2);hv_xhci_key_source(x,26,1,3);
++    hv_xhci_release_source(x,3);assert(x->state[2]==26);
++    hv_xhci_release_source(x,2);assert(x->state[2]==26);
++    hv_xhci_key_source(x,26,0,0);assert(!x->state[2]);
 +    puts("PASS xHCI gamepad: hotplug, descriptors, real IN transfers, coalescing, overflow neutral and input ownership");
 +}
 +static void compatible_gamepad_checks(void) {
@@ -12550,7 +14277,7 @@ index 41c2faa..c3fd43c 100644
      struct HvXhciIntr *it=&controller.intr[0];
      unsigned count=0;
      for(unsigned type=9;type<=23;type++)for(unsigned slot=0;slot<256;slot++) {
-@@ -25,6 +112,9 @@ int main(void) {
+@@ -25,6 +116,9 @@ int main(void) {
          assert(controller.cmd.dequeue==0x100010);
          count++;
      }

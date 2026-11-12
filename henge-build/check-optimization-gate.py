@@ -50,4 +50,9 @@ if manifest.get('session_responsiveness'):
     assert session.get('source_commit') == validation.get('source_commit'), 'Resume tests used another source'
     assert session.get('coordinator_tests') == 'passed' and session.get('native_lifecycle') == 'passed', 'Resume correctness checks incomplete'
     assert session.get('ios_integration') == 'passed' and session.get('evidence'), 'Resume application integration incomplete'
-print('PASS complete implementation gate:' ,  manifest['audit_repairs_sha256'])
+for feature in ('controller_posture', 'touchscreen_usb'):
+    if manifest.get(feature):
+        proof=state.get(feature,{})
+        assert proof.get('complete') is True and proof.get('evidence'), feature+' integration is incomplete'
+        assert proof.get('source_commit') == validation.get('source_commit'), feature+' tests used another source'
+print('PASS complete implementation gate:'  ,  manifest['audit_repairs_sha256'])
