@@ -475,7 +475,7 @@ index 3a4ee8f..89ad6ac 100644
     can be read before the page ends. On a fault, the instruction abort is taken
     and NULL is returned. */
 diff --git a/core/translate.c b/core/translate.c
-index cebfb7d..a9026d1 100644
+index cebfb7d..f6508c5 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -811,7 +811,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
@@ -528,6 +528,34 @@ index cebfb7d..a9026d1 100644
              KILL(insn);
              continue;
          }
+@@ -1996,13 +2012,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+ /* After the block: each live group's plain copy. Returns -1 if they do not fit. */
+ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_t ntrans) {
+     e->nogroup = 1;
++    uint32_t copy_at[HV_MAX_BLOCK_INSNS];
++    uint16_t copy_end[HV_MAX_BLOCK_INSNS];
++    memset(copy_end, 0xff, sizeof copy_end);
+     for (uint32_t k = 0; k < e->ngrp; k++) {
+         Group *g = &e->grp[k];
+         if (!g->live || g->first >= ntrans) continue;
+         uint32_t end = g->end < ntrans ? g->end : ntrans - 1;
++        /* Overlapping groups often fall back to identical plain suffixes.
++           Reuse only an instruction boundary whose hot rejoin is exactly the
++           same. Every copied instruction starts with scratch reuse disabled,
++           so entering the middle carries no earlier copy's scratch state.
++           Different rejoin points must keep separate copies. */
++        if (copy_end[g->first] == end) {
++            g->copy_at = copy_at[g->first];
++            continue;
++        }
+         g->copy_at = e->n;
+         for (uint32_t i = g->first; i <= end; i++) {
+             if (e->n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->npool + 8 > MAX_LITS || e->nool + 4 > MAX_OOL) return -1;
++            copy_at[i] = e->n;
++            copy_end[i] = (uint16_t)end;
+             e->cur_pc = va + 4ull * i;
+             e->cur_i = i;
+             e->u_prev = e->u_live = 0;
 diff --git a/devices/cursor_damage.h b/devices/cursor_damage.h
 new file mode 100644
 index 0000000..eca2756
@@ -2698,10 +2726,10 @@ index 0000000..c5781b7
 +input ownership and repeated glyph reuse need the next exact-source checkpoint.
 diff --git a/docs/m4-optimisation/WARMUP.md b/docs/m4-optimisation/WARMUP.md
 new file mode 100644
-index 0000000..16d0a85
+index 0000000..93259fb
 --- /dev/null
 +++ b/docs/m4-optimisation/WARMUP.md
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,67 @@
 +# Warm-up follow-up — 12 November 2026
 +
 +Evidence: user Duo iOS 27.2.1 log, custom source 02151cf, build 0.3.2(103).
@@ -2737,6 +2765,38 @@ index 0000000..16d0a85
 +CPU count/QoS, guest RAM/JIT size, graphics quality, refresh, LPM and thermal
 +policies unchanged. No IPA requested. Physical warm-up/cooling comparison pending
 +user early desktop, Roblox loading and settled-game captures on the old release.
++
++## First cloud checkpoint
++Source 80b10dde589ee1d50e4ec6d22cbc327360e70a29 passed run 43136459659:
++native engine, real Metal library/lifecycle checks, ASan/UBSan/concurrency,
++SDK tests and full iOS application compile. No IPA packaged. The real Metal
++regression confirms 100 identical requests reuse one first-function creation.
++
++## New desktop capture and JIT follow-up
++New main-log attachment 20325194-63B0-4024-BA12-5B35CC5BC797 contains the old
++session plus a fresh diagnostic session beginning at app elapsed 1793.611 s.
++All 93 thermal reports in the fresh session say Normal. Full JIT cache resets
++appear in the 60, 130, 180, 250 and 331-second reports. The first capture at
++45.5 s averages about 3.73 aggregate CPU core equivalents; early library loads
++and pipeline creation total about 5 ms and 67 ms respectively at the first GPU
++report. This supports CPU/JIT warm-up as a stronger early desktop target than
++library loading. It does not identify every guest workload or prove a specific
++Roblox asset/texture delay is host shader compilation. Later GPU durations overlap.
++
++Implemented: grouped-memory fallback copies can share identical plain suffixes
++only when their original guest instruction boundaries and hot rejoin endpoints
++match. Every copied instruction already disables scratch reuse; alternate entries
++therefore require no earlier copy's scratch state. Different endpoints remain
++separate. This removes repeated emission and executable bytes, without changing
++fast-path checks, guest CPU count, RAM/JIT size or publication/invalidation.
++The local production-emitter graph test passes ASan/UBSan: a three-overlap fixture
++uses 7 words instead of 15, with all entries reaching the same correct hot join;
++different joins, truncation and overflow are checked. This fixture reduction is
++not a whole-emulator cache reduction or a physical speed/thermal result.
++An added native-vs-JIT program exercises three interleaved same-page and
++cross-page groups in all existing C/EL1/EL0 memory modes. Cloud validation of this
++JIT follow-up is pending; no IPA until correctness checks pass and log findings
++are reconciled.
 diff --git a/docs/optimization-integration.md b/docs/optimization-integration.md
 new file mode 100644
 index 0000000..7c5b2e2
@@ -6997,10 +7057,10 @@ index 0000000..0b2b481
 +unsigned test_control_held(void);
 +void test_control_cpu_background(int enabled);
 diff --git a/tests/mem_programs.S b/tests/mem_programs.S
-index bcbed3f..2b4c47a 100644
+index bcbed3f..4913894 100644
 --- a/tests/mem_programs.S
 +++ b/tests/mem_programs.S
-@@ -355,6 +355,26 @@ PROGRAM groups
+@@ -355,6 +355,60 @@ PROGRAM groups
      ldr x12, [x12, #-8]
  END groups
  
@@ -7024,15 +7084,49 @@ index bcbed3f..2b4c47a 100644
 +    ldr x20, [x23]
 +END groups_increment
 +
++PROGRAM groups_shared
++    // Three interleaved groups with the same extended fallback endpoint.
++    // The first set is same-page; the next set straddles page boundaries so
++    // each group may enter the shared plain suffix at a different instruction.
++    add x1, x0, #0x200
++    add x2, x0, #0x400
++    add x3, x0, #0x600
++    ldr x4, [x1]
++    ldr x5, [x2]
++    ldr x6, [x3]
++    str x5, [x1, #8]
++    str x6, [x2, #8]
++    str x4, [x3, #8]
++    ldr x7, [x1, #8]
++    ldr x8, [x2, #8]
++    ldr x9, [x3, #8]
++    // Redefining the bases closes the first groups, preserving their values.
++    add x1, x0, #0x4000
++    sub x1, x1, #8
++    add x2, x0, #0x8000
++    sub x2, x2, #8
++    add x3, x0, #0xc000
++    sub x3, x3, #8
++    ldr x10, [x1]
++    ldr x11, [x2]
++    ldr x12, [x3]
++    str x11, [x1, #8]
++    str x12, [x2, #8]
++    str x10, [x3, #8]
++    ldr x19, [x1, #8]
++    ldr x20, [x2, #8]
++    ldr x21, [x3, #8]
++END groups_shared
++
  PROGRAM mmio
      str w1, [x0]
      ldr w2, [x0, #4]
 diff --git a/tests/run_lifecycle_sanitizers.sh b/tests/run_lifecycle_sanitizers.sh
 new file mode 100755
-index 0000000..a6dee37
+index 0000000..2357dca
 --- /dev/null
 +++ b/tests/run_lifecycle_sanitizers.sh
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,49 @@
 +#!/bin/bash
 +# Collect independent failures in one diagnostic pass; any failure blocks the IPA.
 +set -uo pipefail
@@ -7065,6 +7159,7 @@ index 0000000..a6dee37
 +    check env TSAN_OPTIONS=halt_on_error=1 build/tsan/test_idle_ticker
 +fi
 +check python3 tests/test_gpu_copy_bounds.py
++check python3 tests/test_group_copy_sharing.py
 +check python3 tests/test_gpu_upload.py
 +check python3 tests/test_surface_hash_limit.py
 +check python3 tests/test_display_snapshot.py
@@ -7782,6 +7877,101 @@ index 0000000..52930cc
 +b=root/'build';b.mkdir(exist_ok=True);c=b/'test_gpu_upload.m';c.write_text(pre+method+post)
 +subprocess.run(['xcrun','--sdk','macosx','clang','-fobjc-arc','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(root/'devices'),str(c),'-framework','Foundation','-framework','Metal','-o',str(b/'test_gpu_upload')],check=True)
 +subprocess.run([str(b/'test_gpu_upload')],check=True)
+diff --git a/tests/test_group_copy_sharing.py b/tests/test_group_copy_sharing.py
+new file mode 100644
+index 0000000..032d060
+--- /dev/null
++++ b/tests/test_group_copy_sharing.py
+@@ -0,0 +1,89 @@
++"""Exercise the production fallback emitter's entry/rejoin graph and bounds.
++
++The native memory differential suite separately executes the real generated A64.
++Here each translated guest instruction occupies one tagged word, allowing exact
++coverage of alternate suffix entries, different joins and truncated blocks.
++"""
++from pathlib import Path
++import subprocess
++
++root = Path(__file__).resolve().parents[1]
++source = (root / 'core/translate.c').read_text()
++start = source.index('static int emit_group_copies(')
++end = source.index('\nstatic int translate_emit(', start)
++production = source[start:end]
++fixture = r'''
++#include <stdint.h>
++#include <string.h>
++#include <assert.h>
++#include <stdio.h>
++#define HV_MAX_BLOCK_INSNS 128
++#define MAX_WORDS 512
++#define WORDS_PER_INSN_MAX 1
++#define MAX_LITS 128
++#define MAX_OOL 128
++#define B_OP 0x14000000u
++typedef struct { uint16_t first,last,end; uint32_t copy_at; int live; } Group;
++typedef struct {
++    Group grp[8]; uint32_t ngrp,n,npool,nool,cur_i,after[128],words[MAX_WORDS];
++    uint64_t cur_pc; int nogroup,u_prev,u_live; uint32_t *w;
++} Emit;
++static uint64_t origin=0x100000;
++static unsigned translated;
++static void put(Emit *e,uint32_t w) { assert(e->n<MAX_WORDS);e->w[e->n++]=w; }
++static void patch_branch(uint32_t *w,int64_t off) { *w=B_OP|((uint32_t)off&0x3ffffff); }
++static int translate_one(Emit *e,uint32_t insn,uint64_t pc) {
++    assert(e->nogroup && !e->u_prev && !e->u_live);
++    assert(pc==origin+4*e->cur_i && pc==e->cur_pc);
++    translated++;put(e,insn);e->u_prev=e->u_live=7;return 0;
++}
++'''
++checks = r'''
++static uint32_t code[128];
++static void init(Emit *e) {
++    memset(e,0,sizeof *e);e->w=e->words;e->n=32;translated=0;
++    for(unsigned i=0;i<128;i++) { code[i]=0x80000000u+i;e->after[i]=i+1; }
++}
++static void path(Emit *e,unsigned group,unsigned last) {
++    unsigned at=e->grp[group].copy_at,guest=e->grp[group].first;
++    while(at>=32 && at<e->n) {
++        uint32_t w=e->words[at];
++        if((w&0xfc000000)==B_OP) {
++            int32_t off=(int32_t)(w<<6)>>6;at=(unsigned)((int)at+off);break;
++        }
++        assert(w==code[guest++]);at++;
++    }
++    assert(guest==last+1 && at==e->after[last]);
++}
++int main(void) {
++    Emit e;init(&e);e.ngrp=3;
++    e.grp[0]=(Group){.first=0,.end=5,.live=1};
++    e.grp[1]=(Group){.first=2,.end=5,.live=1};
++    e.grp[2]=(Group){.first=4,.end=5,.live=1};
++    assert(!emit_group_copies(&e,code,origin,8));
++    assert(translated==6 && e.n==39); // reference emits 12 instructions + three branches (15 words)
++    assert(e.grp[0].copy_at==32 && e.grp[1].copy_at==34 && e.grp[2].copy_at==36);
++    for(unsigned g=0;g<3;g++)path(&e,g,5);
++    init(&e);e.ngrp=2;
++    e.grp[0]=(Group){.first=0,.end=5,.live=1};
++    e.grp[1]=(Group){.first=2,.end=4,.live=1};
++    assert(!emit_group_copies(&e,code,origin,8));
++    assert(translated==9 && e.grp[1].copy_at==39);path(&e,0,5);path(&e,1,4);
++    init(&e);e.ngrp=3;
++    e.grp[0]=(Group){.first=0,.end=9,.live=1};
++    e.grp[1]=(Group){.first=2,.end=7,.live=1};
++    e.grp[2]=(Group){.first=7,.end=9,.live=1}; // outside translated instructions: omitted
++    assert(!emit_group_copies(&e,code,origin,5));
++    assert(translated==5 && e.n==38);path(&e,0,4);path(&e,1,4);
++    init(&e);e.ngrp=1;e.grp[0]=(Group){.first=0,.end=2,.live=1};e.n=MAX_WORDS-1;
++    assert(emit_group_copies(&e,code,origin,4)==-1 && !translated);
++    puts("Grouped fallback copies: shared suffixes 15 -> 7 fixture words, each entry/rejoin, distinct endpoints, truncation and overflow passed");
++}
++'''
++build = root / 'build'
++build.mkdir(exist_ok=True)
++path = build / 'test_group_copy_sharing.c'
++path.write_text(fixture + production + checks)
++subprocess.run(['cc', '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
++                '-fsanitize=address,undefined', str(path), '-o', str(build / 'test_group_copy_sharing')], check=True)
++subprocess.run([str(build / 'test_group_copy_sharing')], check=True, timeout=15)
 diff --git a/tests/test_idle_integration.c b/tests/test_idle_integration.c
 index 2b1be58..cf28a94 100644
 --- a/tests/test_idle_integration.c
@@ -8022,14 +8212,15 @@ index 0000000..70a5fc1
 +    }
 +}
 diff --git a/tests/test_mem.c b/tests/test_mem.c
-index 35ecb46..d2bf9cf 100644
+index 35ecb46..2b46310 100644
 --- a/tests/test_mem.c
 +++ b/tests/test_mem.c
-@@ -16,13 +16,14 @@ DECLARE_PROGRAM(epilogue);
+@@ -16,13 +16,15 @@ DECLARE_PROGRAM(epilogue);
  DECLARE_PROGRAM(dczva);
  DECLARE_PROGRAM(pageend);
  DECLARE_PROGRAM(groups);
 +DECLARE_PROGRAM(groups_increment);
++DECLARE_PROGRAM(groups_shared);
  DECLARE_PROGRAM(mmio);
  extern const char mem_programs_begin[], mem_programs_finish[];
  
@@ -8037,7 +8228,7 @@ index 35ecb46..d2bf9cf 100644
      TEST_PROGRAM(single), TEST_PROGRAM(stolen_mem), TEST_PROGRAM(pairs),   TEST_PROGRAM(simd_mem),
      TEST_PROGRAM(exclusive), TEST_PROGRAM(atomics),  TEST_PROGRAM(literal), TEST_PROGRAM(loops), TEST_PROGRAM(epilogue),
 -    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups),
-+    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups), TEST_PROGRAM(groups_increment),
++    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups), TEST_PROGRAM(groups_increment), TEST_PROGRAM(groups_shared),
  };
  
  #define DATA_SIZE 65536
