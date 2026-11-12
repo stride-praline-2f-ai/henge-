@@ -44,4 +44,10 @@ if manifest.get('advanced_controls'):
         assert all(isinstance(blocked.get(k),int) for k in ('run_id','job_id','artifact_id')), 'Missing failed native Duo evidence'
         assert advanced.get('screenshots_inspected') is True, 'Unfolded viewport needs visual verification'
     assert isinstance(advanced.get('preview_run_id'), int), 'Missing traceable controller preview run'
-print('PASS complete implementation gate:',  manifest['audit_repairs_sha256'])
+session = state.get('session_responsiveness')
+if manifest.get('session_responsiveness'):
+    assert session and session.get('complete') is True, 'Reliable Instant Resume feature is incomplete'
+    assert session.get('source_commit') == validation.get('source_commit'), 'Resume tests used another source'
+    assert session.get('coordinator_tests') == 'passed' and session.get('native_lifecycle') == 'passed', 'Resume correctness checks incomplete'
+    assert session.get('ios_integration') == 'passed' and session.get('evidence'), 'Resume application integration incomplete'
+print('PASS complete implementation gate:' ,  manifest['audit_repairs_sha256'])
