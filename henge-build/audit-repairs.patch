@@ -7401,10 +7401,10 @@ index 25e7bad..246a6f8 100644
           now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
 diff --git a/ios/Henge/ResumeCoordinator.swift b/ios/Henge/ResumeCoordinator.swift
 new file mode 100644
-index 0000000..75cf548
+index 0000000..8bc7214
 --- /dev/null
 +++ b/ios/Henge/ResumeCoordinator.swift
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,261 @@
 +import Foundation
 +
 +struct ResumeSession: Equatable, Sendable {
@@ -7501,6 +7501,16 @@ index 0000000..75cf548
 +        accepts(ticket) && ops.generation() == ticket.generation
 +    }
 +
++    private func live(_ ticket:ResumeTicket)->Bool {
++        guard current(ticket) else {return false}
++        let state=ops.state()
++        guard state==1 || state==4 else {
++            publish(state==0 || state==2 ? .stopped : .failed("The Mac is in another lifecycle transition."),ticket)
++            return false
++        }
++        return true
++    }
++
 +    private func publish(_ phase: ResumePhase, _ ticket: ResumeTicket) {
 +        if current(ticket) { notify(ResumeEvent(ticket: ticket, phase: phase)) }
 +    }
@@ -7510,7 +7520,7 @@ index 0000000..75cf548
 +        publish(.pausing,ticket)
 +        queue.async {
 +            defer { completion() }
-+            guard self.current(ticket), self.ops.state() == 1 || self.ops.state() == 4 else { return }
++            guard self.live(ticket) else { return }
 +            self.publish(.pausing, ticket)
 +            let outcome = self.ops.state() == 4 ? .success : self.ops.pause(generation)
 +            switch outcome {
@@ -7537,7 +7547,7 @@ index 0000000..75cf548
 +                self.publish(.pausing, ticket)
 +                if case .failure(let reason) = self.ops.pause(session.generation) { self.publish(.failed(reason), ticket); return }
 +            }
-+            guard self.current(ticket), self.ops.state() == 4 else { return }
++            guard self.live(ticket), self.ops.state() == 4 else { return }
 +            self.lock.lock(); let cancelled = self.latest == ticket && self.saveCancelled; self.lock.unlock()
 +            if cancelled { self.publish(.paused,ticket); return }
 +            guard let job = self.ops.makeSave(session, background) else {
@@ -7598,7 +7608,7 @@ index 0000000..75cf548
 +            guard self.current(ticket) else { return }
 +            self.publish(.resuming,ticket)
 +            if case .failure(let reason) = self.ops.foreground(session.generation) { self.publish(.failed(reason),ticket); return }
-+            guard self.current(ticket), self.ops.state() == 1 || self.ops.state() == 4 else { return }
++            guard self.live(ticket) else { return }
 +            switch self.ops.resume(session) {
 +            case .success: self.publish(.running,ticket)
 +            case .failure(let reason): self.publish(.failed(reason),ticket)
@@ -11482,10 +11492,10 @@ index 0000000..478d014
 +    print('restore archive: functional failure removes partial archive; cosmetic filtering accepts success')
 diff --git a/tests/test_resume_coordinator.swift b/tests/test_resume_coordinator.swift
 new file mode 100644
-index 0000000..9135173
+index 0000000..b47c32c
 --- /dev/null
 +++ b/tests/test_resume_coordinator.swift
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,180 @@
 +import Foundation
 +
 +private final class FakeSave: ResumeSaveWork, @unchecked Sendable {
@@ -11508,7 +11518,7 @@ index 0000000..9135173
 +    private let lock=NSLock()
 +    var gen:UInt64=1,vm:Int32=1
 +    var pauses=0,resumes=0,stops=0,discards=0,builds=0,completions=0
-+    var pauseFails=false,discardFails=false,file=true
++    var pauseFails=false,discardFails=false,stopFails=false,file=true
 +    var save=FakeSave()
 +    var events:[ResumeEvent]=[]
 +    func access<T>(_ action:(Fixture)->T)->T { lock.lock();defer{lock.unlock()};return action(self) }
@@ -11516,7 +11526,7 @@ index 0000000..9135173
 +        ResumeOperations(generation:{self.access{$0.gen}},state:{self.access{$0.vm}},
 +            pause:{_ in self.access { f in f.pauses+=1;if f.pauseFails{return .failure("pause failed")};f.vm=4;return .success }},
 +            foreground:{_ in .success},resume:{_ in self.access { f in f.resumes+=1;f.file=false;f.vm=1;return .success }},
-+            stop:{_ in self.access{f in f.stops+=1;f.vm=2;return .success}},
++            stop:{_ in self.access{f in f.stops+=1;if f.stopFails{return .failure("stop failed")};f.vm=2;return .success}},
 +            discard:{_ in self.access{f in f.discards+=1;if f.discardFails{return .failure("cannot unlink")};f.file=false;return .success}},
 +            makeSave:{_,_ in self.access{f in f.builds+=1;return f.save}})
 +    }
@@ -11615,6 +11625,19 @@ index 0000000..9135173
 +            c.save(f.session,background:false,leave:true){left in precondition(left);f.access{$0.completions+=1}}
 +            c.drain();precondition(f.vm==2 && f.stops==1 && f.discards==0 && f.file && f.completions==1)
 +            c.foreground(f.session);c.drain();precondition(f.resumes==0)
++        }
++        // A closing failure keeps the committed save and permits recovery.
++        do {
++            let f=Fixture();f.stopFails=true;let c=f.coordinator()
++            c.save(f.session,background:false,leave:true){left in precondition(!left)};c.drain()
++            precondition(f.vm==4 && f.file && f.events.last?.phase == .failed("stop failed"))
++            c.foreground(f.session);c.drain();precondition(f.resumes==1 && f.vm==1)
++        }
++        // Guest shutdown during a queued transition cannot leave the UI busy.
++        do {
++            let f=Fixture();f.vm=2;let c=f.coordinator()
++            c.foreground(f.session);c.drain()
++            precondition(f.events.last?.phase == .stopped && f.resumes==0)
 +        }
 +        // A failed save remains paused and can immediately continue in memory.
 +        do {
