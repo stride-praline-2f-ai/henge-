@@ -65,3 +65,22 @@ The production selector has a regression for this exact inventory shape.
 The next checkpoint attaches Simulator's display host before requesting inner
 screen power, and uses a compact scrollable sidebar in short keyboard windows.
 No native Duo unfolded or guest controller-recognition claim yet.
+
+## Cloud Duo limitation and complete layout alternative
+
+Native Duo probe b3bf5793, run 43158389557/job 130983663525, artifact
+13917861161 failed before app UI tests: the dedicated iOS 27.2 (24B91016s)
+Simulator could not launch the XCTest runner because SpringBoard crashed.
+Earlier native attempts also timed out on the supported inner-display power RPC,
+both before and after automation attached; the runner has no Simulator.app GUI.
+These failures are retained, not reclassified as Henge passes.
+
+The independent preview workflow now runs the complete, unchanged controls
+interaction test at the unfolded 951x669 viewport on the working large M4
+Simulator. An added assertion requires the actual 951-point surface width.
+Artifacts record actual model/runtime and validation_mode=unfolded-viewport-fixture;
+the gate distinguishes passed_layout_fixture from native Duo passed. Native
+fold/hinge transitions remain unverified. Manual workflow input native_duo retries
+the strict native-window test; no app release timer, feature or test is disabled.
+M4 tests retain the actual M4 device type. Neither setup emulates physical chip
+performance, P/E placement, watts or thermals.

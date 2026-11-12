@@ -36,6 +36,12 @@ if manifest.get('advanced_controls'):
     assert advanced and advanced.get('complete') is True, 'Advanced controls integration is incomplete'
     assert advanced.get('source_commit') == validation.get('source_commit'), 'Controller tests used another source'
     assert advanced.get('native_protocol') == 'passed' and advanced.get('swift_input') == 'passed', 'Controller correctness checks incomplete'
-    assert advanced.get('simulator_profiles') == {'duo-unfolded': 'passed', 'm4-13': 'passed'}, 'Required controller layout tests incomplete'
+    profiles=advanced.get('simulator_profiles')
+    assert profiles in ({'duo-unfolded':'passed','m4-13':'passed'}, {'duo-unfolded':'passed_layout_fixture','m4-13':'passed'}), 'Required controller layout tests incomplete'
+    if profiles['duo-unfolded']=='passed_layout_fixture':
+        blocked=advanced.get('native_duo_validation',{})
+        assert blocked.get('state')=='blocked' and len(blocked.get('reason',''))>120, 'Native Duo limitation must be concrete'
+        assert all(isinstance(blocked.get(k),int) for k in ('run_id','job_id','artifact_id')), 'Missing failed native Duo evidence'
+        assert advanced.get('screenshots_inspected') is True, 'Unfolded viewport needs visual verification'
     assert isinstance(advanced.get('preview_run_id'), int), 'Missing traceable controller preview run'
 print('PASS complete implementation gate:',  manifest['audit_repairs_sha256'])
