@@ -71,3 +71,11 @@ Source 2a42d9af9c9c813b1607a72fbadba947ed2c186a passed run 43139025012,
 including the new groups_shared native-vs-JIT program in all four memory modes,
 ASan/UBSan, the shared-copy graph checks, real Metal checks and complete iOS app
 compile. No IPA was packaged. Device warm-up and thermal benefit remain unmeasured.
+
+## Final integrated source validation
+
+Source `d3926d0cb1d05067a7d4525f2c0068afda9b29a7` passed https://github.com/stride-praline-2f-ai/henge-/actions/runs/43160398405; includes real Metal, grouped-memory differential
+and sanitizer checks plus full iPhoneOS Release compilation. Earlier pending
+paragraphs above describe historical checkpoints. Device warm-up benefit remains
+unmeasured; all recorded old-release Normal thermal categories are retained as
+evidence, not extrapolated into a new-build result.

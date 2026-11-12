@@ -1,8 +1,20 @@
-# Integrated source release gate
+# Integrated 0.3.3 source gate
 
-Validated source: `9a037f1f131e1b97cc45f3550d999f9e815efd3a`. Patch: `06781355a3b0782e0c1a5c444793230e8583546c6d23bdf1611257ff216990a2`.
-Cloud run: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43125249456.
+Source `d3926d0cb1d05067a7d4525f2c0068afda9b29a7`, cumulative patch `1e321ed52bee7d1e5a9370512a182ce7e908b2834508c0b6a69001c0cdd5a3e4`.
+Native/full iOS Release compile: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43160398405. Controls UI: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43160398386.
 
-M4 workstreams, shared Duo improvements, controls, Low Power policy and CPU-only runner source are integrated. Native regressions, sanitizers, actual Link host/client TLS negotiation, production Swift/Metal SDK checks, real Metal store-action tests and the complete iOS Release application compile passed.
+All feasible source workstreams are integrated. Retained safe alternatives and
+physical-device limits are recorded in henge-build/optimization-state.json.
+The final metadata-only child requests one IPA; archive inspection remains a
+separate gate. No interim IPA was packaged during these changes.
 
-The next metadata-only child requests one final IPA. Archive production and verification remain pending. Physical-device limitations are recorded in optimization-state.json; no measured cooling, core residency or Roblox-recognition claim.
+New follow-up: exact-binary LRU/function reuse, bounded repeated-warning cache
+retention, shared grouped-memory fallback suffixes, aligned effective JIT limit,
+advanced local/wireless controls with sensitivity/dead-zone/response tuning and
+optional experimental PS4 USB compatibility. Existing Low Power policy, Retina,
+ProMotion choice, idle waits, two-port Link and CPU-only runner paths retained.
+
+Duo UI passes at the exact unfolded 951x669 viewport on a labelled M4 canvas.
+The native Duo cloud runtime failed SpringBoard/XCTest startup; native fold
+transitions remain unverified. No P/E placement, watts, thermal improvement,
+Roblox driver-recognition or game FPS result is claimed from Simulator.
