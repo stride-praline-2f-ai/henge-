@@ -1,0 +1,145 @@
+name: Henge controller previews and protocol checks
+permissions:
+  contents: read
+'on':
+  push:
+    branches:
+    - feature/m4-ultra-efficiency
+    - feature/duo-efficiency
+    paths:
+    - henge-build/**
+    - .github/workflows/henge-gamepad-previews.yml
+  workflow_dispatch: {}
+concurrency:
+  group: henge-gamepad-previews-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: build-request
+        persist-credentials: false
+    - id: pins
+      run: 'python3 - <<''PYPIN''
+
+        import json,os
+
+        m=json.load(open(''build-request/henge-build/manifest.json''))
+
+        with open(os.environ[''GITHUB_OUTPUT''],''a'') as f:f.write(''henge=''+m[''henge_sha'']+''\n'')
+
+        PYPIN'
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Henge
+        ref: ${{ steps.pins.outputs.henge }}
+        path: Henge
+        persist-credentials: false
+    - name: Reconstruct exact pinned and patched source
+      run: 'set -euo pipefail
+
+        python3 - <<''PYPATCH''
+
+        from pathlib import Path
+
+        import hashlib,json,subprocess
+
+        root=Path(''build-request/henge-build'');m=json.loads((root/''manifest.json'').read_text());p=root/''henge.patch''
+
+        assert hashlib.sha256(p.read_bytes()).hexdigest()==m[''patch_sha256'']
+
+        subprocess.run([''git'',''-C'',''Henge'',''apply'',''--check'',str(p.resolve())],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''apply'',str(p.resolve())],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''add'',''-A''],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''-c'',''user.name=Henge CI'',''-c'',''user.email=henge-ci@users.noreply.github.com'',''commit'',''-m'',''Apply
+        pinned custom source for controller review''],check=True)
+
+        PYPATCH
+
+        bash build-request/henge-build/integrate-upstream.sh
+
+        tar -czf gamepad-source.tgz -C Henge ios/Henge/Controls devices/gamepad.h devices/gamepad_ds4.h tests/test_gamepad.c
+        tests/test_gamepad_tuning.swift tests/gamepad-preview tools/preview_gamepad.py
+
+        '
+    - uses: actions/upload-artifact@v4
+      with:
+        name: Henge-gamepad-source-${{ github.sha }}
+        path: gamepad-source.tgz
+        retention-days: 3
+        overwrite: true
+  native:
+    needs: source
+    runs-on: xcode-27
+    timeout-minutes: 20
+    steps:
+    - &id001
+      uses: actions/download-artifact@v4
+      with:
+        name: Henge-gamepad-source-${{ github.sha }}
+    - &id002
+      run: tar -xzf gamepad-source.tgz
+    - &id003
+      name: Select latest installed Xcode
+      run: "python3 - <<'PYXCODE'\nimport glob,os,re,subprocess\nchoices=[]\nfor app in glob.glob('/Applications/Xcode*.app'):\n\
+        \ dev=app+'/Contents/Developer'\n try:\n  version=subprocess.check_output(['xcodebuild','-version'],env={**os.environ,'DEVELOPER_DIR':dev},text=True)\n\
+        \  match=re.search(r'Xcode (\\d+(?:\\.\\d+)*)',version)\n  if match:choices.append((tuple(map(int,match[1].split('.'))),dev,version))\n\
+        \ except subprocess.CalledProcessError:pass\nif not choices:raise SystemExit('No Xcode installed')\nversion,dev,description=max(choices)\n\
+        if version<(27,1):raise SystemExit('Unfolded Duo review requires Xcode 27.1 or newer')\nprint(description+dev)\n\
+        with open(os.environ['GITHUB_ENV'],'a') as f:f.write('DEVELOPER_DIR='+dev+'\\n')\nPYXCODE"
+    - name: Controller packets and pure input model
+      run: 'set -euo pipefail
+
+        mkdir -p preview-artifacts
+
+        xcrun --sdk macosx clang -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -Idevices tests/test_gamepad.c
+        -o preview-artifacts/test_gamepad
+
+        preview-artifacts/test_gamepad
+
+        swiftc -parse-as-library -swift-version 5 ios/Henge/Controls/GamepadState.swift ios/Henge/Controls/GamepadTuning.swift
+        ios/Henge/Controls/GamepadLayout.swift ios/Henge/Controls/PadInput.swift tests/test_gamepad_tuning.swift
+        -o preview-artifacts/test_gamepad_tuning
+
+        preview-artifacts/test_gamepad_tuning
+
+        '
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: Henge-gamepad-native-${{ github.sha }}-${{ github.run_attempt }}
+        path: preview-artifacts
+        retention-days: 7
+  simulator:
+    needs: source
+    runs-on: xcode-27
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+        - duo-unfolded
+        - m4-13
+    steps:
+    - *id001
+    - *id002
+    - *id003
+    - name: Prepare preview generator
+      run: 'command -v xcodegen >/dev/null || brew install xcodegen
+
+        xcodegen --version'
+    - name: Production UI on latest installed simulator
+      run: python3 tools/preview_gamepad.py --profile "${{ matrix.profile }}"
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: Henge-gamepad-${{ matrix.profile }}-${{ github.sha }}-${{ github.run_attempt }}
+        path: preview-artifacts
+        retention-days: 7
+        if-no-files-found: error

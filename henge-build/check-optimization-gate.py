@@ -31,4 +31,11 @@ if m4 is not None:
 controls = state.get('controls_power')
 if controls is not None:
     assert controls.get('complete') is True and all(x.get('state') in ('verified', 'verified_with_safe_alternative') and x.get('evidence') for x in controls.get('workstreams', [])), 'Controls/power engineering gate incomplete'
+advanced = state.get('advanced_controls')
+if manifest.get('advanced_controls'):
+    assert advanced and advanced.get('complete') is True, 'Advanced controls integration is incomplete'
+    assert advanced.get('source_commit') == validation.get('source_commit'), 'Controller tests used another source'
+    assert advanced.get('native_protocol') == 'passed' and advanced.get('swift_input') == 'passed', 'Controller correctness checks incomplete'
+    assert advanced.get('simulator_profiles') == {'duo-unfolded': 'passed', 'm4-13': 'passed'}, 'Required controller layout tests incomplete'
+    assert isinstance(advanced.get('preview_run_id'), int), 'Missing traceable controller preview run'
 print('PASS complete implementation gate:',  manifest['audit_repairs_sha256'])

@@ -65,3 +65,9 @@ An added native-vs-JIT program exercises three interleaved same-page and
 cross-page groups in all existing C/EL1/EL0 memory modes. Cloud validation of this
 JIT follow-up is pending; no IPA until correctness checks pass and log findings
 are reconciled.
+
+## JIT checkpoint validated
+Source 2a42d9af9c9c813b1607a72fbadba947ed2c186a passed run 43139025012,
+including the new groups_shared native-vs-JIT program in all four memory modes,
+ASan/UBSan, the shared-copy graph checks, real Metal checks and complete iOS app
+compile. No IPA was packaged. Device warm-up and thermal benefit remain unmeasured.
