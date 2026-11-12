@@ -7906,10 +7906,10 @@ index 0000000..d9135a5
 +}
 diff --git a/tests/gamepad-preview/GamepadPreviewUITests.swift b/tests/gamepad-preview/GamepadPreviewUITests.swift
 new file mode 100644
-index 0000000..5976569
+index 0000000..f62596d
 --- /dev/null
 +++ b/tests/gamepad-preview/GamepadPreviewUITests.swift
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,71 @@
 +import XCTest
 +import CoreGraphics
 +
@@ -7919,6 +7919,12 @@ index 0000000..5976569
 +        XCUIDevice.shared.orientation = .landscapeLeft
 +        let app=XCUIApplication();app.launch()
 +        XCUIDevice.shared.orientation = .landscapeRight
++        if PreviewFixture.isNativeDuo {
++            let unfolded=NSPredicate { _,_ in app.frame.width>=900 && app.frame.height>=600 }
++            guard XCTWaiter.wait(for:[XCTNSPredicateExpectation(predicate:unfolded,object:nil)],timeout:90) == .completed else {
++                XCTFail("Duo app did not reach the unfolded inner-screen window");return
++            }
++        }
 +        let surface=app.otherElements["gamepad-surface"].firstMatch
 +        guard surface.waitForExistence(timeout:15) else { XCTFail("Production gamepad surface missing");return }
 +        func capture(_ name: String) {
@@ -11217,13 +11223,13 @@ index c88ebe4..00251c5 100755
 +python3 tests/test_link_control_services.py
 diff --git a/tools/preview_gamepad.py b/tools/preview_gamepad.py
 new file mode 100644
-index 0000000..2f0208c
+index 0000000..8ab6641
 --- /dev/null
 +++ b/tools/preview_gamepad.py
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,118 @@
 +"""Actual iOS Simulator UI tests; viewport fixtures are not chip emulation."""
 +from pathlib import Path
-+import argparse,json,os,re,subprocess
++import argparse,json,os,re,subprocess,threading
 +
 +def simulator_pairs(metadata, profile):
 +    """Prefer the requested model across all runtimes, including model-only runtimes."""
@@ -11251,7 +11257,6 @@ index 0000000..2f0208c
 +root=Path(__file__).resolve().parents[1]
 +folder=root/'tests/gamepad-preview';artifacts=root/'preview-artifacts';artifacts.mkdir(exist_ok=True)
 +viewport=(951,669) if args.profile=='duo-unfolded' else (1376,1032)
-+(folder/'Fixture.swift').write_text('import Foundation\nimport CoreGraphics\nenum PreviewFixture { static let profile='+json.dumps(args.profile)+'; static let viewport=CGSize(width:'+str(viewport[0])+',height:'+str(viewport[1])+') }\n')
 +def output(*cmd):return subprocess.check_output(cmd,text=True,timeout=60)
 +def diagnostic(label,command):
 +    # Optional I/O metadata must not prevent the actual app/UI checks.
@@ -11282,37 +11287,51 @@ index 0000000..2f0208c
 +            scope='Production controller UI/input checks only. A20/M4 CPU, GPU, core placement and thermals are not emulated.',
 +            duo_unfolded_requested=args.profile=='duo-unfolded',fallback_canvas=('duo' not in device['name'].lower()) if args.profile=='duo-unfolded' else ('M4' not in device['name']))
 +(artifacts/'environment.json').write_text(json.dumps(report,indent=2)+'\n')
-+try:
-+ subprocess.run(['xcrun','simctl','boot',udid],check=True,timeout=240)
-+ subprocess.run(['xcrun','simctl','bootstatus',udid,'-b'],check=True,timeout=240)
-+ # Booted guest services alone do not establish the Simulator display/IO host.
-+ # Attach the supported Simulator UI before requesting display power changes.
-+ simulator=Path(os.environ['DEVELOPER_DIR'])/'Applications/Simulator.app'
-+ subprocess.run(['open','-a',str(simulator),'--args','-CurrentDeviceUDID',udid],check=True,timeout=30)
-+ diagnostic('displays-before',['xcrun','simctl','io',udid,'enumerate'])
-+ if args.profile=='duo-unfolded' and 'duo' in device['name'].lower():
-+  # Xcode 27.2 lists inner LCD-1 as display 3 and outer LCD as display 1.
-+  # Use the supported screenConfig operation, and fail if it cannot be applied.
-+  configuration=[]
++native_duo=args.profile=='duo-unfolded' and 'duo' in device['name'].lower()
++(folder/'Fixture.swift').write_text('import Foundation\nimport CoreGraphics\nenum PreviewFixture { static let profile='+json.dumps(args.profile)+'; static let viewport=CGSize(width:'+str(viewport[0])+',height:'+str(viewport[1])+'); static let isNativeDuo='+str(native_duo).lower()+' }\n')
++stop_fold=threading.Event();fold_errors=[]
++def unfold_after_ui_launch():
++ configuration=[]
++ try:
++  while not stop_fold.is_set():
++   log=artifacts/'xcodebuild.log'
++   text=''
++   if log.exists():
++    with log.open('rb') as data:
++     data.seek(max(0,log.stat().st_size-65536));text=data.read().decode(errors='replace')
++   if 'Setting up automation session' in text:break
++   stop_fold.wait(1) # CI host only; no timer or worker is added to Henge
++  else:return
 +  for display,power in [('3','on'),('1','off')]:
 +   command=['xcrun','simctl','io',udid,'screenConfig','--display='+display,'power',power]
 +   change=subprocess.run(command,capture_output=True,text=True,timeout=60)
 +   configuration.append(dict(display=display,power=power,status=change.returncode,output=change.stdout+change.stderr))
 +   (artifacts/'unfolded-configuration.json').write_text(json.dumps(configuration,indent=2)+'\n')
-+   if change.returncode:raise SystemExit('Cannot establish Duo unfolded display state; see unfolded-configuration.json')
++   if change.returncode:raise RuntimeError('Duo screen configuration failed')
 +  report['duo_inner_display']='3';report['duo_outer_power']='off'
 +  (artifacts/'environment.json').write_text(json.dumps(report,indent=2)+'\n')
 +  diagnostic('displays-unfolded',['xcrun','simctl','io',udid,'enumerate'])
++ except Exception as error:
++  fold_errors.append(str(error))
++  (artifacts/'unfolded-error.txt').write_text(str(error))
++try:
++ subprocess.run(['xcrun','simctl','boot',udid],check=True,timeout=240)
++ subprocess.run(['xcrun','simctl','bootstatus',udid,'-b'],check=True,timeout=240)
 + subprocess.run(['xcodegen','generate'],cwd=folder,check=True)
 + command=['xcodebuild','-project',str(folder/'HengeGamepadPreview.xcodeproj'),'-scheme','GamepadPreview',
 +          '-destination','id='+udid,'-derivedDataPath',str(root/'build/gamepad-preview'),
 +          '-resultBundlePath',str(artifacts/'GamepadPreview.xcresult'),'-parallel-testing-enabled','NO',
-+          '-test-timeouts-enabled','YES','-default-test-execution-time-allowance','120',
-+          '-maximum-test-execution-time-allowance','180','CODE_SIGNING_ALLOWED=NO','test']
-+ timed_out=False
++          '-test-timeouts-enabled','YES','-default-test-execution-time-allowance','180',
++          '-maximum-test-execution-time-allowance','240','CODE_SIGNING_ALLOWED=NO','test']
++ timed_out=False;fold_thread=None
++ if native_duo:
++  fold_thread=threading.Thread(target=unfold_after_ui_launch,daemon=True);fold_thread.start()
 + with (artifacts/'xcodebuild.log').open('w') as log:
 +  try: result=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,text=True,timeout=900);status=result.returncode
 +  except subprocess.TimeoutExpired:timed_out=True;status=124
++ stop_fold.set()
++ if fold_thread:fold_thread.join(timeout=75)
++ if native_duo and (fold_errors or not report.get('duo_inner_display')):status=status or 1
 + print('\n'.join((artifacts/'xcodebuild.log').read_text().splitlines()[-35:]))
 + if timed_out:print('xcodebuild exceeded the 15-minute preview limit; retained log and failure state')
 + if status:diagnostic('failure-screenshot',['xcrun','simctl','io',udid,'screenshot','--display=1',str(artifacts/'failure-state.png')])
@@ -11323,5 +11342,6 @@ index 0000000..2f0208c
 + if not list((artifacts/'screenshots').rglob('*.png')):raise SystemExit('XCTest passed but screenshot export is missing; preview verification incomplete')
 + report['ui_tests']='passed';(artifacts/'environment.json').write_text(json.dumps(report,indent=2)+'\n')
 +finally:
++ stop_fold.set()
 + diagnostic('cleanup-shutdown',['xcrun','simctl','shutdown',udid])
 + diagnostic('cleanup-delete',['xcrun','simctl','delete',udid])
