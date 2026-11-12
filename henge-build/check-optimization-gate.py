@@ -55,4 +55,8 @@ for feature in ('controller_posture', 'touchscreen_usb', 'disk_expansion'):
         proof=state.get(feature,{})
         assert proof.get('complete') is True and proof.get('evidence'), feature+' integration is incomplete'
         assert proof.get('source_commit') == validation.get('source_commit'), feature+' tests used another source'
+core = state.get('core_efficiency_followup')
+if core:
+    assert core.get('state') == 'verified' and core.get('source_commit') == validation.get('source_commit'), 'Core efficiency follow-up needs exact-source regression proof'
+    assert 'block completion: 64 ready requests / 1 wake;' in core.get('native_check_line',''), 'Missing executed block completion concurrency regression'
 print('PASS complete implementation gate:'  ,  manifest['audit_repairs_sha256'])

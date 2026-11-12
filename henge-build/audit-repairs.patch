@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 81b0736..df8928b 100644
+index 81b0736..d96d85f 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -5,14 +5,14 @@ B = build
@@ -105,8 +105,14 @@ index 81b0736..df8928b 100644
  # Session-owned display routing, independent of JIT, Metal and a connected monitor.
  $(B)/test_display_targets: ios/Henge/DisplayTargetSelection.swift tests/test_display_targets.swift | $(B)
  	xcrun --sdk macosx swiftc $^ -o $@
-@@ -318,3 +342,12 @@ $(B)/test_timer_dispatch: tests/test_timer_dispatch.c $(ENGINE)
+@@ -316,5 +340,18 @@ $(B)/test_cpu_sync: tests/test_cpu_sync.c $(ENGINE)
+ $(B)/test_timer_dispatch: tests/test_timer_dispatch.c $(ENGINE)
+ 	$(CC) $(CFLAGS) $< $(ENGINE) -o $@
  
++# Real disk worker/virtqueue concurrency with explicit RAM/PCI boundaries.
++$(B)/test_blk_completion: tests/test_blk_completion.c devices/virtio_blk.c devices/virtio.c host/disk.c devices/*.h core/*.h host/*.h | $(B)
++	$(CC) $(CFLAGS) -D_DARWIN_C_SOURCE -D_DEFAULT_SOURCE -pthread -O1 -fsanitize=address,undefined tests/test_blk_completion.c devices/virtio_blk.c devices/virtio.c host/disk.c -o $@
++
  $(B)/test_fastmem_bench: tests/test_fastmem_bench.c $(ENGINE)
  	$(CC) $(CFLAGS) tests/test_fastmem_bench.c $(ENGINE) -o $@
 +
@@ -119,7 +125,7 @@ index 81b0736..df8928b 100644
 +	./$(B)/test_usb_touchscreen
 +.PHONY: test-usb-touchscreen
 diff --git a/core/dispatch.c b/core/dispatch.c
-index 12bd4a9..171acf7 100644
+index 12bd4a9..a84daa0 100644
 --- a/core/dispatch.c
 +++ b/core/dispatch.c
 @@ -15,8 +15,11 @@
@@ -286,7 +292,7 @@ index 12bd4a9..171acf7 100644
              uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
              uint32_t worst = 0;
              for (uint32_t h = 0; h < HV_BLOCK_HASH; h++) {
-@@ -924,8 +968,19 @@ static void stop_the_world(HvCpu *cpu) {
+@@ -924,8 +968,21 @@ static void stop_the_world(HvCpu *cpu) {
      }
  }
  
@@ -295,9 +301,11 @@ index 12bd4a9..171acf7 100644
  int hv_run(HvCpu *cpu) {
 -    if (cpu->m->wait_stats && cpu->pc_state && !cpu->pc_state->thread) __atomic_store_n(&cpu->pc_state->thread, mach_thread_self(), __ATOMIC_RELEASE);
 +    if (cpu->index == 0) stats_new_run = 1;
-+    if ((cpu->m->stats_interval || cpu->m->wait_stats) && cpu->pc_state) {
++    if (cpu->pc_state) {
 +        /* Continue creates new host threads. Replace the owned send right on
-+           each run instead of retaining a dead thread's identity indefinitely. */
++           each run instead of retaining a dead thread's identity indefinitely.
++           Keep it even with regular statistics off: bounded, opt-in captures
++           use this identity too. No thread_info calls enter the dispatch loop. */
 +        mach_port_t thread = mach_thread_self();
 +        pthread_mutex_lock(&cpu->pc_state->req_mu);
 +        mach_port_t previous = __atomic_exchange_n(&cpu->pc_state->thread, thread, __ATOMIC_ACQ_REL);
@@ -1313,7 +1321,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..79eb83b 100644
+index 9073d22..95ffd24 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -1397,7 +1405,12 @@ index 9073d22..79eb83b 100644
      uint64_t command_epoch, current_epoch, object_hits, object_reads, page_checks, page_hits;
      struct HvGpuEpochKey object_keys[HV_GPU_EPOCH_SLOTS];
      HvObject *object_values[HV_GPU_EPOCH_SLOTS];
-@@ -167,7 +194,6 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -163,11 +190,10 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+     _Atomic int stopping;
+     dispatch_group_t completions;
+     id<MTLCommandBuffer> last_cb;
+-    double encode_time, gpu_wait_time;
++    double encode_time, gpu_wait_time, capture_log_next;
      _Atomic uint64_t gpu_completed, gpu_duration_ns, gpu_max_ns, gpu_timing_missing;
      HvFramePacing frame_pacing;
      BOOL pacing_pending;
@@ -1730,16 +1743,27 @@ index 9073d22..79eb83b 100644
          }
          [back endEncoding];
      }
-@@ -2263,7 +2351,7 @@ typedef struct {
+@@ -2263,13 +2351,17 @@ typedef struct {
      [self commit:cb channel:ch stamp:stamp complete:YES];
      double t2 = now_seconds();
      encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
 -    if (++execs % 2000 == 0) {
-+    if (++execs % 2000 == 0 && (diagnostics_enabled || gpu_timing || tracing)) {
++    BOOL capture = atomic_load_explicit(&capture_timing, memory_order_relaxed);
++    BOOL capture_report = capture && t2 >= capture_log_next;
++    if (!capture) capture_log_next = 0;
++    if ((++execs % 2000 == 0 && (diagnostics_enabled || gpu_timing || tracing)) || capture_report) {
++        if (capture_report) capture_log_next = t2 + 5;
          static double t0;
          if (!t0) t0 = now_seconds();
          fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, commit/wait CPU time %.2f s\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time);
-@@ -2287,6 +2375,19 @@ typedef struct {
+         encode_time = gpu_wait_time = 0;
+         fprintf(stderr, "hengevm: gpu-execution: enabled=%d completed=%llu duration_ms=%.2f max_ms=%.2f unavailable=%llu (cumulative GPU execution; overlapping buffers can overlap in time)\n",
+-                gpu_timing, (unsigned long long)atomic_load_explicit(&gpu_completed, memory_order_relaxed),
++                gpu_timing || capture, (unsigned long long)atomic_load_explicit(&gpu_completed, memory_order_relaxed),
+                 atomic_load_explicit(&gpu_duration_ns, memory_order_relaxed) / 1e6,
+                 atomic_load_explicit(&gpu_max_ns, memory_order_relaxed) / 1e6,
+                 (unsigned long long)atomic_load_explicit(&gpu_timing_missing, memory_order_relaxed));
+@@ -2287,6 +2379,19 @@ typedef struct {
                  library_load_seconds * 1000, library_load_worst * 1000);
          fprintf(stderr, "hengevm: gpu-pipelines: builds=%llu total_ms=%.2f worst_ms=%.2f (cumulative host pipeline creation, including failures)\n",
                  (unsigned long long)pipeline_builds, pipeline_seconds * 1000, pipeline_worst_seconds * 1000);
@@ -1759,7 +1783,7 @@ index 9073d22..79eb83b 100644
      }
      return YES;
  }
-@@ -2319,14 +2420,27 @@ static const uint8_t *half_to_byte(void) {
+@@ -2319,14 +2424,27 @@ static const uint8_t *half_to_byte(void) {
      memcpy(&hx, (const uint8_t *)a + 0x24, 2), memcpy(&hy, (const uint8_t *)a + 0x26, 2);
      if (!w || !h || w > 512 || h > 512 || stride < (uint64_t)w * 4 || stride > 8192) return;
      uint8_t *bits = malloc((size_t)stride * h);
@@ -1787,7 +1811,7 @@ index 9073d22..79eb83b 100644
      [glyph replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
      if (a[0] == 1) {
          link_cursor=glyph;link_cw=w;link_ch=h;link_hx=hx;link_hy=hy;
-@@ -2336,21 +2450,22 @@ static const uint8_t *half_to_byte(void) {
+@@ -2336,21 +2454,22 @@ static const uint8_t *half_to_byte(void) {
      os_unfair_lock_lock(&screen_lock);
      cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
      cursor_tex = glyph;
@@ -1813,7 +1837,7 @@ index 9073d22..79eb83b 100644
          [self screenChanged];
          return;
      }
-@@ -2439,26 +2554,110 @@ static const uint8_t *half_to_byte(void) {
+@@ -2439,26 +2558,110 @@ static const uint8_t *half_to_byte(void) {
     refresh, so that happens on a thread of its own and never holds up the guest's GPU work:
     this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
  - (void)updatePacingPolicy {
@@ -1934,7 +1958,7 @@ index 9073d22..79eb83b 100644
      if (presenter_running || !layer || !screen_tex || drawable_retry_pending || pacing_pending) return;
      [self updatePacingPolicy];
      double now = now_seconds();
-@@ -2507,6 +2706,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2507,6 +2710,7 @@ static const uint8_t *half_to_byte(void) {
     submit another guest write. All link cursor state belongs to this worker. */
  - (void)sendLinkMapping:(uint64_t)mapping {
      link_mapping=mapping;
@@ -1942,7 +1966,7 @@ index 9073d22..79eb83b 100644
      HvPvgLinkFrameHandler handler=link_frame_handler();
      HvObject *surface=surfaces[@(mapping)];
      if(!handler || !surface)return;
-@@ -2526,6 +2726,29 @@ static const uint8_t *half_to_byte(void) {
+@@ -2526,6 +2730,29 @@ static const uint8_t *half_to_byte(void) {
              (float)(at&0xffff)-link_hx*scale,(float)(at>>16)-link_hy*scale,link_cw*scale,link_ch*scale);
  }
  
@@ -1972,7 +1996,7 @@ index 9073d22..79eb83b 100644
  - (void)showOnLayer:(uint64_t)mapping {
      HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]); /* not met yet: a resumed machine's screen */
      if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
-@@ -2547,28 +2770,49 @@ static const uint8_t *half_to_byte(void) {
+@@ -2547,28 +2774,49 @@ static const uint8_t *half_to_byte(void) {
      screen_dirty = YES;
      [self kickPresenter:YES];
      os_unfair_lock_unlock(&screen_lock);
@@ -2025,7 +2049,7 @@ index 9073d22..79eb83b 100644
              presenter_running = NO;
              [self kickPresenter:NO];
              os_unfair_lock_unlock(&screen_lock);
-@@ -2597,7 +2841,12 @@ static const uint8_t *half_to_byte(void) {
+@@ -2597,7 +2845,12 @@ static const uint8_t *half_to_byte(void) {
              target.drawableSize = want;
              [CATransaction commit];
          }
@@ -2039,7 +2063,7 @@ index 9073d22..79eb83b 100644
          if (!drawable) {
              os_unfair_lock_lock(&screen_lock);
              screen_dirty = YES;
-@@ -2636,6 +2885,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2636,6 +2889,7 @@ static const uint8_t *half_to_byte(void) {
          cw0 = cursor_w, ch0 = cursor_h, hx = cursor_hot_x, hy = cursor_hot_y;
          BOOL same_target = layer_generation == generation && layer == target;
          BOOL same_size = screen_w == W && screen_h == H;
@@ -2047,7 +2071,7 @@ index 9073d22..79eb83b 100644
          if (same_target && same_size) {
              screen_dirty = NO;
              drawable_retry_deadline = 0;
-@@ -2717,11 +2967,13 @@ static const uint8_t *half_to_byte(void) {
+@@ -2717,11 +2971,13 @@ static const uint8_t *half_to_byte(void) {
          // Serialize the final check and commit with set_layer: a switch that has
          // returned must not be followed by a commit to its old target.
          os_unfair_lock_lock(&screen_lock);
@@ -2064,7 +2088,7 @@ index 9073d22..79eb83b 100644
                      os_unfair_lock_unlock(&self->frame_metrics_lock);
                  }];
              }
-@@ -2738,10 +2990,10 @@ static const uint8_t *half_to_byte(void) {
+@@ -2738,10 +2994,10 @@ static const uint8_t *half_to_byte(void) {
  
  /* What the display should show: at most a few times a second by CPU, for tests and the boot's first frames. */
  - (void)present:(uint64_t)mapping {
@@ -2077,7 +2101,7 @@ index 9073d22..79eb83b 100644
          late = NO;
          [self showOnLayer:mapping];
          return;
-@@ -2834,13 +3086,20 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2834,13 +3090,20 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->completions = dispatch_group_create();
          r->device = dev;
          r->queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
@@ -2100,7 +2124,7 @@ index 9073d22..79eb83b 100644
          r->resource_tally = getenv("HV_PVG_TALLY") != NULL;
          r->batch_cache = getenv("HV_GPU_BATCH_CACHE") && !strcmp(getenv("HV_GPU_BATCH_CACHE"), "1");
          r->tasks = [NSMutableDictionary new];
-@@ -2848,6 +3107,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2848,6 +3111,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->surfaces = [NSMutableDictionary new];
          r->planar = [NSMutableDictionary new];
          r->complaints = [NSMutableSet new];
@@ -2125,7 +2149,7 @@ index 9073d22..79eb83b 100644
          r->shot = getenv("HV_PVG_SHOT");
          cp_start(r);
  #if !TARGET_OS_IPHONE
-@@ -2864,6 +3141,32 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2864,6 +3145,32 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
              r->shot_timer = timer;
          }
  #endif
@@ -2158,7 +2182,7 @@ index 9073d22..79eb83b 100644
          fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
          return (HvPvgMetal *)CFBridgingRetain(r);
      }
-@@ -2874,20 +3177,35 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
+@@ -2874,20 +3181,35 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
      @autoreleasepool {
          HvReplay *r = CFBridgingRelease(m);
          atomic_store(&r->stopping, 1);
@@ -2197,7 +2221,7 @@ index 9073d22..79eb83b 100644
          dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
          /* GPU completions may have enqueued a final readback on the worker. */
          dispatch_sync(r->worker, ^{
-@@ -2998,24 +3316,78 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
+@@ -2998,24 +3320,78 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
      }
      r->pacing_pending = NO; r->frame_pacing.next = 0; /* reattaching the same layer also wakes a stopped presenter */
      r->layer = l;
@@ -2277,7 +2301,7 @@ index 9073d22..79eb83b 100644
          [r screenChanged];
          return;
      }
-@@ -3104,6 +3476,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
+@@ -3104,6 +3480,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
          (unsigned long long)m.overflow,(unsigned long long)m.invalid);
  }
  
@@ -2287,7 +2311,7 @@ index 9073d22..79eb83b 100644
  void hv_pvg_metal_link_connected(HvPvgMetal *m,int connected){
      if(!m)return;HvReplay *r=(__bridge HvReplay *)m;
      dispatch_async(r->worker,^{
-@@ -3117,25 +3492,45 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+@@ -3117,25 +3496,45 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
      if(atomic_exchange(&r->link_cursor_queued,1))return;
      dispatch_async(r->worker,^{atomic_store(&r->link_cursor_queued,0);if (!atomic_load(&r->stopping)) [r sendLinkMapping:r->link_mapping];});
  }
@@ -2337,7 +2361,7 @@ index 9073d22..79eb83b 100644
              for (NSNumber *task in r->tasks) {
                  NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
                  for (NSNumber *ref in objs) {
-@@ -3143,79 +3538,117 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -3143,79 +3542,117 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
                      if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
                      if (o->parent && o->parent->heap_whole) continue;
                      if (!cb) cb = [r->queue commandBuffer];
@@ -2585,6 +2609,120 @@ index 0000000..c550603
 +    return h;
 +}
 +#endif
+diff --git a/devices/virtio_blk.c b/devices/virtio_blk.c
+index 873ab5e..559409a 100644
+--- a/devices/virtio_blk.c
++++ b/devices/virtio_blk.c
+@@ -115,7 +115,8 @@ static void *worker(void *opaque) {
+     /* HV_BLK_STATS: requests, bytes, flushes and how busy this worker was, every 10 s. */
+     int stats = getenv("HV_BLK_STATS") != NULL;
+     uint64_t every = stats && atoi(getenv("HV_BLK_STATS")) > 0 ? (uint64_t)atoi(getenv("HV_BLK_STATS")) * 1000000 : 10000000;
+-    uint64_t t_last = now_us(), busy = 0, reqs = 0, bytes = 0, flushes = 0, flush_us = 0;
++    unsigned capture_seen = 0;
++    uint64_t t_last = now_us(), busy = 0, reqs = 0, bytes = 0, flushes = 0, flush_us = 0, max_us = 0;
+     for (;;) {
+         pthread_mutex_lock(&b->mu);
+         while (b->fence || b->claimed == __atomic_load_n(&b->submitted, __ATOMIC_ACQUIRE)) {
+@@ -137,29 +138,45 @@ static void *worker(void *opaque) {
+         b->inflight++;
+         pthread_mutex_unlock(&b->mu);
+ 
+-        uint64_t t0 = stats ? now_us() : 0;
++        unsigned capture = __atomic_load_n(&b->capture_epoch, __ATOMIC_RELAXED);
++        int measuring = stats || (capture & 1);
++        if (!stats && capture != capture_seen) {
++            capture_seen = capture;
++            busy = reqs = bytes = flushes = flush_us = max_us = 0;
++            if (measuring) t_last = now_us();
++        }
++        uint64_t t0 = measuring ? now_us() : 0;
+         if (handle(b, &r->e, &r->written) != 0) r->written = 0;
+-        if (stats) {
++        if (measuring) {
+             uint64_t t1 = now_us();
+             busy += t1 - t0, reqs++, bytes += r->written > 1 ? r->written : readable(&r->e);
++            if (t1 - t0 > max_us) max_us = t1 - t0;
+             if (type == T_FLUSH) flushes++, flush_us += t1 - t0;
+-            if (t1 - t_last > every) {
+-                fprintf(stderr, "virtio-blk %s worker: %.0f req/s %.1f MB/s, %.0f flushes/s (%.1f ms each), busy %.0f%%\n",
+-                        b->disk->offset ? "aux" : "root", reqs * 1e6 / every, bytes * 1e6 / every / (1 << 20), flushes * 1e6 / every,
+-                        flushes ? flush_us / 1000.0 / flushes : 0.0, busy * 100.0 / every);
+-                t_last = t1, busy = reqs = bytes = flushes = flush_us = 0;
++            if (t1 - t_last > (stats ? every : 5000000) &&
++                (stats || capture == __atomic_load_n(&b->capture_epoch, __ATOMIC_RELAXED))) {
++                fprintf(stderr, "virtio-blk %s worker: %.0f req/s %.1f MB/s, %.0f flushes/s (%.1f ms each), busy %.0f%%; service_max_ms=%.2f interval_s=%.3f (host I/O service, not guest asset latency)\n",
++                        b->disk->offset ? "aux" : "root", reqs * 1e6 / (t1-t_last), bytes * 1e6 / (t1-t_last) / (1 << 20), flushes * 1e6 / (t1-t_last),
++                        flushes ? flush_us / 1000.0 / flushes : 0.0, busy * 100.0 / (t1-t_last), max_us / 1000.0, (t1-t_last)/1e6);
++                t_last = t1, busy = reqs = bytes = flushes = flush_us = max_us = 0;
+             }
+         }
+ 
+         pthread_mutex_lock(&b->mu);
+         __atomic_store_n(&r->done, 1, __ATOMIC_RELEASE);
++        /* Must precede completed: drain acquiring the last completion must
++           also observe the publication that makes its final poll effective. */
++        int wake = !__atomic_exchange_n(&b->completion_pending, 1, __ATOMIC_SEQ_CST);
+         b->inflight--;
+         if (fence) b->fence = 0;
+         __atomic_add_fetch(&b->completed, 1, __ATOMIC_RELEASE);
+         pthread_cond_broadcast(&b->done_cv);
+         if (fence) pthread_cond_broadcast(&b->cv);
+         pthread_mutex_unlock(&b->mu);
+-        hv_machine_wake(b->vio.m);
++        /* Publish once per batch, rather than interrupting CPU0 (and issuing
++           SEV to the host cores) separately for every completed DMA. The RMW
++           follows done's release; poll acquires this publication before scan.
++           A completion racing the consumer's clear schedules the next poll. */
++        if (wake) hv_machine_wake(b->vio.m);
+     }
+     return NULL;
+ }
+@@ -197,6 +214,13 @@ void hv_virtio_blk_drain(HvVirtioBlk *b) {
+     hv_virtio_blk_poll(b);
+ }
+ 
++void hv_virtio_blk_capture_timing(HvVirtioBlk *b, int enabled) {
++    if (!b) return;
++    unsigned old = __atomic_load_n(&b->capture_epoch, __ATOMIC_RELAXED);
++    while ((old & 1) != !!enabled &&
++           !__atomic_compare_exchange_n(&b->capture_epoch, &old, old + 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
++}
++
+ void hv_virtio_blk_stop(HvVirtioBlk *b) {
+     if (!b) return;
+     pthread_mutex_lock(&b->mu);
+@@ -241,6 +265,9 @@ void hv_virtio_blk_destroy(HvVirtioBlk *b) {
+    a slot is reused once it and every slot before it are back. */
+ void hv_virtio_blk_poll(HvVirtioBlk *b) {
+     if (!b) return;
++    /* Clear BEFORE scanning: a worker finishing during/after this scan must
++       publish a fresh wake. Empty polls avoid walking all outstanding DMA. */
++    if (!__atomic_exchange_n(&b->completion_pending, 0, __ATOMIC_SEQ_CST)) return;
+     int q = -1;
+     for (uint32_t i = b->published; i != b->submitted; i++) {
+         HvVblkReq *r = &b->ring[i % HV_VBLK_RING];
+diff --git a/devices/virtio_blk.h b/devices/virtio_blk.h
+index e48d5b6..164f44b 100644
+--- a/devices/virtio_blk.h
++++ b/devices/virtio_blk.h
+@@ -34,6 +34,8 @@ typedef struct HvVirtioBlk {
+     HvVblkReq *ring;
+     uint32_t submitted;  /* CPU thread: requests handed to the worker */
+     uint32_t completed;  /* workers: requests done (in any order) */
++    int completion_pending; /* atomic: ready completions not yet claimed by a CPU poll */
++    unsigned capture_epoch; /* atomic: odd while an explicit bounded capture is active */
+     uint32_t claimed;    /* workers: requests taken (under mu) */
+     int inflight;        /* taken, not done */
+     int fence;           /* a flush or barrier waits for everything before it: nothing else is taken meanwhile */
+@@ -48,6 +50,8 @@ typedef struct HvVirtioBlk {
+ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int apple_variant);
+ /* CPU thread: publish finished requests and raise the interrupt. */
+ void hv_virtio_blk_poll(HvVirtioBlk *b);
++/* Reuse worker-owned I/O statistics during a bounded capture; no polling timer. */
++void hv_virtio_blk_capture_timing(HvVirtioBlk *b, int enabled);
+ /* Tests: wait for the worker to finish everything submitted, then publish it. */
+ void hv_virtio_blk_drain(HvVirtioBlk *b);
+ /* After CPUs stop: finish submitted DMA and join workers before disk flush/free. */
 diff --git a/devices/xhci.c b/devices/xhci.c
 index c355628..5e34d41 100644
 --- a/devices/xhci.c
@@ -3548,10 +3686,10 @@ index 0000000..1d6c0b5
 +performance, P/E placement, watts or thermals.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
-index 0000000..00c2479
+index 0000000..df77a2d
 --- /dev/null
 +++ b/docs/m4-optimisation/PROGRESS.md
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,90 @@
 +# Current checkpoint
 +
 +- Reconstructed source inherited at wrapper commit 343d2d84, patch 9ee35476;
@@ -3622,6 +3760,26 @@ index 0000000..00c2479
 +- Checkpoint 6edf085a / run 43106141682 passed ALL native checks, sanitizers and
 +  full iPhoneOS Release app compile. No IPA produced. Later session/input/preset
 +  and cursor commits still require their own full validation.
++
++## M4 76B log follow-up: completion publication and useful core work
++
++Implemented atomic disk-completion batching and an empty-poll fast path in the
++existing controller. Parallel workers and guest flush/barrier ordering stay in
++place. Production worker/virtqueue/file-I/O regression measures 64 ready requests
++with one CPU0 wake versus 64 on the previous source; 4096 racing completions, ring
++wrap, reads/writes, flushes, barriers and stop/restart pass ASan/UBSan locally.
++This is a wake-count result, not a physical FPS or energy measurement.
++
++Bounded captures now obtain the owned Mach thread identity even when regular
++stats are off, including Continue-created threads. The existing Metal worker
++report and disk-worker statistics run during the explicit capture, at most once
++per five seconds of active work, without an added timer. Disk rates use actual
++elapsed time and report maximum host service latency. Default captures remain
++off. Snapshot disk data serializes HvVirtio, not private worker fields; the new
++pending bit and capture epoch are host-only and reconstructed, never restored.
++
++Next: run exact-source macOS native/sanitizer/lifecycle/Metal and full iOS Release
++checks, then the existing M4 and unfolded-Duo UI gates. No partial IPA requested.
 diff --git a/docs/m4-optimisation/SPEC.md b/docs/m4-optimisation/SPEC.md
 new file mode 100644
 index 0000000..87f0a22
@@ -3715,10 +3873,10 @@ index 0000000..98fbd1b
 +Physical Duo/M4 desktop warmup and game performance still require comparison.
 diff --git a/docs/m4-optimisation/VALIDATION.md b/docs/m4-optimisation/VALIDATION.md
 new file mode 100644
-index 0000000..c5781b7
+index 0000000..a61d132
 --- /dev/null
 +++ b/docs/m4-optimisation/VALIDATION.md
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,65 @@
 +# Validation
 +
 +Passed locally: production scheduling policy/detection regression compiled with
@@ -3760,6 +3918,30 @@ index 0000000..c5781b7
 +app compile all passed. Packaging was skipped as required.
 +The newer event-driven session/boot-display waits, explicit M4 preset, optional
 +input ownership and repeated glyph reuse need the next exact-source checkpoint.
++
++## Latest supplied M4 sessions (76B)
++
++Read both logs completely; the app mirror and native log are not independent
++samples. Binary 0.3.4(105), iPad16,5, 2752x2064 Retina, requested60Hz, 1.5GiB JIT.
++4-vCPU runs use14GiB RAM/restored snapshots; 8-vCPU run uses11GiB/cold boot and
++different fastmem/group/superblock settings. Both reached Hot before LPM and
++returned Normal after LPM. Thus neither core-count nor thermal causality is a
++controlled comparison. All bounded captures are LPM/Normal.
++
++Excluding paused states and sub-second epoch-transition samples, median host
++presentations/s by capture: 4CPU 27.55,21.70; 8CPU 15.73,24.36,8.30,15.66,24.71,
++22.37. These are host presents, not Roblox FPS. The old binary includes the
++double-pacing defect removed in current source. One capture includes a full
++JIT reset; later slower captures have little translation work, so recompilation
++is not the sole cause. Repeated memory warnings accompany11/14GiB guest RAM.
++Virtual RAM and process footprint/headroom do not establish resident working set
++or actual page-fault costs. Existing per-vCPU diagnostics all fail unavailable=4
++with stats off; fixed at thread publication rather than enabling costly stats.
++
++No data establishes8CPU as faster, individual P/E residency, shader compilation
++as the asset bottleneck, or stable60FPS. Keep4CPU/8GiB as the reference, preserve
++user choices and Retina/60/120Hz options. New bounded existing-worker reports
++make disk, shader/pipeline reuse and per-vCPU work visible in the next capture.
 diff --git a/docs/m4-optimisation/WARMUP.md b/docs/m4-optimisation/WARMUP.md
 new file mode 100644
 index 0000000..091a0de
@@ -10638,7 +10820,7 @@ index 29c8b3b..00f528f 100644
          all.removeAll { $0.id == id }
          save()
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..de4f02c 100644
+index 34d6a98..1a43113 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
 @@ -3,6 +3,7 @@
@@ -11156,14 +11338,18 @@ index 34d6a98..de4f02c 100644
      HvBootDisplay d;
      int result = -1;
      if (hv_vm_boot_display(&d) == 0) {
-@@ -509,3 +755,77 @@ uint64_t henge_largest_mapping_mb(void) {
+@@ -509,3 +755,81 @@ uint64_t henge_largest_mapping_mb(void) {
      }
      return 0;
  }
 +
 +void henge_vm_capture_timing(int enabled) {
 +    pthread_rwlock_rdlock(&api_lock);
-+    if (state==1 || state==4) (void)hv_pvg_lite_capture_timing(hv_vm_board()->pvg,!!enabled,NULL);
++    if (state==1 || state==4) {
++        (void)hv_pvg_lite_capture_timing(hv_vm_board()->pvg,!!enabled,NULL);
++        hv_virtio_blk_capture_timing(hv_vm_board()->root_blk,enabled);
++        hv_virtio_blk_capture_timing(hv_vm_board()->aux_blk,enabled);
++    }
 +    pthread_rwlock_unlock(&api_lock);
 +}
 +
@@ -13932,6 +14118,99 @@ index b3af248..b8e6466 100644
  };
  
  /* EL0, so the indirect-branch cache takes these low (user) addresses. */
+diff --git a/tests/test_blk_completion.c b/tests/test_blk_completion.c
+new file mode 100644
+index 0000000..a238290
+--- /dev/null
++++ b/tests/test_blk_completion.c
+@@ -0,0 +1,87 @@
++/* Production virtio queue, block workers and file I/O. Only RAM/PCI/CPU-wake
++   boundaries are supplied here so the same concurrency test runs on Linux. */
++#define _DEFAULT_SOURCE 1
++#include "machine.h"
++#include "virtio_blk.h"
++#include <assert.h>
++#include <fcntl.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <time.h>
++
++static unsigned char ram[1<<20];
++static atomic_uint wakes;
++int hv_knob[HV_K_COUNT];
++void *hv_phys_ptr(HvMachine *m,uint64_t a,uint64_t n) {
++    (void)m;return a<=sizeof ram && n<=sizeof ram-a ? ram+a : NULL;
++}
++void hv_dma_written(HvMachine *m,uint64_t a,uint64_t n){(void)m;(void)a;(void)n;}
++void hv_machine_wake(HvMachine *m){(void)m;atomic_fetch_add(&wakes,1);}
++void hv_pci_init(HvPciDev *d,uint16_t a,uint16_t b,uint32_t c,uint16_t e,uint16_t f){
++    (void)a;(void)b;(void)c;(void)e;(void)f;memset(d,0,sizeof *d);
++}
++void hv_pci_add_bar(HvPciDev *d,int b,uint64_t n,int w){(void)d;(void)b;(void)n;(void)w;}
++int hv_pcie_attach(HvPcie *b,HvPciDev *d){(void)b;(void)d;return 0;}
++void hv_pci_set_intx(HvPciDev *d,int l){d->intx=l;}
++static void desc(unsigned i,uint64_t a,uint32_t n,uint16_t flags,uint16_t next){
++    unsigned char *d=ram+16*i;memcpy(d,&a,8);memcpy(d+8,&n,4);memcpy(d+12,&flags,2);memcpy(d+14,&next,2);
++}
++static uint16_t used(void){uint16_t n;memcpy(&n,ram+0x11002,2);return n;}
++static void submit(HvVirtioBlk *b,unsigned n,unsigned type){
++    assert(b->published==b->submitted);
++    uint16_t *avail=(uint16_t *)(ram+0x10000);
++    for(unsigned i=0;i<n;i++){
++        unsigned h=3*i;uint64_t hdr=0x20000+32*i,data=0x30000+512*i,status=0x50000+i;
++        uint32_t words[4]={type,0,i,0};memcpy(ram+hdr,words,sizeof words);ram[status]=0xff;
++        if(type==1)memset(ram+data,(unsigned char)(i+1),512);
++        desc(h,hdr,16,1,h+1);
++        desc(h+1,data,type==4||type==0x10000?0:512,1|(type==0?2:0),h+2);
++        desc(h+2,status,1,2,0);
++        avail[2+avail[1]%256]=(uint16_t)h;avail[1]++;
++    }
++    b->vio.notify(&b->vio,0);
++}
++static void wait_done(HvVirtioBlk *b){
++    struct timespec start,now;clock_gettime(CLOCK_MONOTONIC,&start);
++    while(__atomic_load_n(&b->completed,__ATOMIC_ACQUIRE)!=b->submitted){
++        clock_gettime(CLOCK_MONOTONIC,&now);assert(now.tv_sec-start.tv_sec<10);usleep(100);
++    }
++    /* completed is published before the worker calls the wake boundary. Join
++       makes the deterministic burst's wake count exact without timing sleeps. */
++    hv_virtio_blk_stop(b);
++}
++int main(void){
++    char path[]="/tmp/henge-block-test-XXXXXX";int fd=mkstemp(path);assert(fd>=0);unlink(path);assert(!ftruncate(fd,1<<20));
++    HvDisk disk={.fd=fd,.wfd=-1,.size=1<<20};static HvMachine m;
++    HvVirtioBlk *b=hv_virtio_blk_create(&m,NULL,&disk,0);assert(b);
++    b->vio.q[0]=(HvVirtq){.size=256,.enabled=1,.desc=0,.avail=0x10000,.used=0x11000};
++    hv_virtio_blk_capture_timing(b,1);unsigned epoch=b->capture_epoch;assert(epoch&1);
++    hv_virtio_blk_capture_timing(b,1);assert(b->capture_epoch==epoch);
++    hv_virtio_blk_capture_timing(b,0);assert(b->capture_epoch==epoch+1);
++    submit(b,64,1);wait_done(b);
++    assert(atomic_load(&wakes)==1 && b->completion_pending);
++    hv_virtio_blk_poll(b);assert(used()==64 && !b->completion_pending);
++    for(unsigned i=0;i<64;i++){unsigned char data[512];assert(!hv_disk_read(&disk,512*i,data,512));assert(data[0]==i+1 && ram[0x50000+i]==0);}
++    for(int i=0;i<1000;i++)hv_virtio_blk_poll(b);
++    assert(used()==64 && atomic_load(&wakes)==1);
++    assert(!hv_virtio_blk_start(b));submit(b,64,0);wait_done(b);hv_virtio_blk_poll(b);
++    assert(used()==128 && atomic_load(&wakes)==2);
++    for(unsigned i=0;i<64;i++)assert(ram[0x30000+512*i]==i+1);
++    /* Race real completions against active polling, repeatedly reuse ring slots
++       across wrap and stop/start. A missing publication loses a used entry. */
++    for(int batch=0;batch<64;batch++){
++        assert(!hv_virtio_blk_start(b));unsigned before=used();submit(b,64,0);
++        struct timespec start,now;clock_gettime(CLOCK_MONOTONIC,&start);
++        while(used()!=before+64){
++            hv_virtio_blk_poll(b);clock_gettime(CLOCK_MONOTONIC,&now);assert(now.tv_sec-start.tv_sec<10);
++        }
++        wait_done(b);hv_virtio_blk_poll(b);assert(b->published==b->submitted);
++    }
++    assert(!hv_virtio_blk_start(b));submit(b,1,4);hv_virtio_blk_drain(b);assert(ram[0x50000]==0);
++    submit(b,1,0x10000);hv_virtio_blk_drain(b);assert(ram[0x50000]==0);
++    hv_virtio_blk_stop(b);assert(hv_virtio_blk_idle(b));hv_virtio_blk_destroy(b);close(fd);
++    puts("block completion: 64 ready requests / 1 wake; 4096 raced completions, ring wrap, read/write, flush, barrier and restart passed");
++}
 diff --git a/tests/test_chain_index.py b/tests/test_chain_index.py
 index 88db6e8..8afb1f9 100644
 --- a/tests/test_chain_index.py
@@ -16951,7 +17230,7 @@ index 0000000..f2c797b
 +    return 0;
 +}
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..3b6939d 100644
+index a13a70d..c8ce4ac 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
 @@ -3,6 +3,9 @@
@@ -17034,7 +17313,24 @@ index a13a70d..3b6939d 100644
  HengeDualMapping *henge_ios_jit_get_mapping(void) { return &mapping; }
  void hv_prof_ios_start(void) {}
  int hv_install_start(HvVirtioUsb *usb, const char *ipsw, const char *work, uint64_t ecid,
-@@ -58,6 +117,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
+@@ -29,6 +88,16 @@ int hv_install_start(HvVirtioUsb *usb, const char *ipsw, const char *work, uint6
+ static void check(const char *what, int ok) {
+     if (!ok) { fprintf(stderr, "FAIL: %s\n", what); failures++; }
+ }
++static void check_cpu_identity(void) {
++    HvCpu *cpu=hv_vm_cpu(0);
++    thread_basic_info_data_t info;
++    mach_msg_type_number_t count=THREAD_BASIC_INFO_COUNT;
++    pthread_mutex_lock(&cpu->pc_state->req_mu);
++    mach_port_t thread=__atomic_load_n(&cpu->pc_state->thread,__ATOMIC_ACQUIRE);
++    kern_return_t result=thread ? thread_info(thread,THREAD_BASIC_INFO,(thread_info_t)&info,&count) : KERN_INVALID_ARGUMENT;
++    pthread_mutex_unlock(&cpu->pc_state->req_mu);
++    check("bounded capture can account for the running CPU with regular statistics off",result==KERN_SUCCESS);
++}
+ static int fds(void) {
+     int n = 0;
+     for (int i = 0; i < 2048; i++) if (fcntl(i, F_GETFD) != -1) n++;
+@@ -58,6 +127,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
      if (fd < 0 || (data && write(fd, data, bytes) != (ssize_t)bytes) || ftruncate(fd, bytes)) exit(1);
      close(fd);
  }
@@ -17072,7 +17368,7 @@ index a13a70d..3b6939d 100644
  static void *read_ui(void *unused) {
      (void)unused;
      while (!atomic_load(&reader_done)) {
-@@ -69,6 +159,8 @@ static void *read_ui(void *unused) {
+@@ -69,6 +169,8 @@ static void *read_ui(void *unused) {
          henge_vm_cpus_on();
          henge_vm_link_connected(0);
          henge_vm_gpu_frames();
@@ -17081,7 +17377,7 @@ index a13a70d..3b6939d 100644
          henge_vm_balloon(-1);
          henge_vm_set_display_layer(NULL);
          if (!henge_vm_boot_display(&pixels, &width, &height, &stride)) henge_vm_free_display(pixels);
-@@ -76,8 +168,22 @@ static void *read_ui(void *unused) {
+@@ -76,8 +178,22 @@ static void *read_ui(void *unused) {
      }
      return NULL;
  }
@@ -17105,7 +17401,7 @@ index a13a70d..3b6939d 100644
      char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
      if (!mkdtemp(dir) || hv_jit_region_open(&jit, 8 << 20)) return 1;
      snprintf(rom, sizeof rom, "%s/rom", dir);
-@@ -91,6 +197,10 @@ int main(void) {
+@@ -91,6 +207,10 @@ int main(void) {
      write_file(aux, NULL, 1 << 20);
      mapping = (HengeDualMapping){.rx_addr = (uint8_t *)jit.base,
          .rw_addr = (uint8_t *)jit.base + jit.rw_diff, .size = jit.capacity * 4};
@@ -17116,7 +17412,7 @@ index a13a70d..3b6939d 100644
      pthread_t reader;
      if (pthread_create(&reader, NULL, read_ui, NULL)) return 1;
      /* Warm the process-wide pointer queue before counting worker threads. */
-@@ -102,6 +212,7 @@ int main(void) {
+@@ -102,6 +222,7 @@ int main(void) {
      /* Missing ROM fails after disks, RAM and device workers were created. */
      for (int i = 0; i < 3; i++) {
          check("failed boot reports an error", henge_vm_boot(rom, disk, aux, 1, 0, 64, 4, error, sizeof error) != 0);
@@ -17124,7 +17420,7 @@ index a13a70d..3b6939d 100644
          check("failed boot allows retry", henge_vm_state() == 0 && henge_vm_can_start());
          check("failed boot closes files", fds() == initial_fds);
          check("failed boot joins workers", threads() == initial_threads);
-@@ -150,9 +261,34 @@ int main(void) {
+@@ -150,9 +271,35 @@ int main(void) {
          write_file(rom, code, sizeof code);
          int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          check("resume test boots", rc == 0);
@@ -17145,6 +17441,7 @@ index a13a70d..3b6939d 100644
 +            stats_measure_run();
 +        }
          usleep(50000);
++        check_cpu_identity();
          henge_vm_key_hid(0xe4, 1);
 +        henge_vm_key_hid(0xe1, 1);
 +        henge_vm_key_hid(4, 1);
@@ -17159,7 +17456,7 @@ index a13a70d..3b6939d 100644
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "suspend: %s\n", error);
          check("suspend saves", rc == 0 && henge_vm_state() == 4 && access(snap, F_OK) == 0);
-@@ -160,35 +296,110 @@ int main(void) {
+@@ -160,35 +307,111 @@ int main(void) {
              fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\n");
              return 1;
          }
@@ -17230,6 +17527,7 @@ index a13a70d..3b6939d 100644
 +              continued.blocks >= paused.blocks);
          for (int n = 0; n < 1000 && *count == c1; n++) usleep(1000);
          check("continued: the counter moves", *count > c1);
++        check_cpu_identity();
 +        check("prepare CPU background preserves running VM", henge_vm_prepare_cpu_background(error,sizeof error)==0 &&
 +              henge_vm_state()==1 && henge_vm_cpu_background());
 +        uint64_t bg_count=*count;
@@ -17280,7 +17578,7 @@ index a13a70d..3b6939d 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +420,78 @@ int main(void) {
+@@ -209,6 +432,78 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);
