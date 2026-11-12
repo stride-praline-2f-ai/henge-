@@ -39,5 +39,5 @@ Implementation decisions retained from actual resource ownership:
 
 
 ## Integrated controls/power follow-up
-Shared M4 and Duo changes: demand-driven presentation; notification-cached Low Power Mode policy with an explicit, disabled-by-default next-boot 60Hz guest option; bounded 30s capture using existing session waits; native USB HID gamepad and separately labelled keyboard mapping; authenticated controls-only Link reusing pairing/transport/input gestures. No video codecs in controls-only mode.
+Shared M4 and Duo changes: demand-driven presentation; notification-cached Low Power Mode policy with an user-selectable next-cold-boot60Hz guest option enabled when OS LPM is active, per the latest user preference; bounded 30s capture using existing session waits; native USB HID gamepad and separately labelled keyboard mapping; authenticated controls-only Link reusing pairing/transport/input gestures. No video codecs in controls-only mode.
 Runner: optional experimental CPU-only continued processing, foreground pause/GPU drain, guest-owned ring backpressure, no fabricated completions, foreground replay, persistent-save rejection until graphics restored. Explicit iOS grant required; no PiP keepalive claim. Graphics/Simulator jobs and real guest driver timeout behaviour need device tests. Preserve GPU-granted mode as separate request identity.
