@@ -42,9 +42,13 @@ if manifest.get('controls_power'):
         assert any(value==bundle+suffix or (value.endswith('.*') and (bundle+suffix).startswith(value[:-1])) for value in permitted), 'Runner task ID not permitted: '+suffix
 if manifest.get('controller_posture'):
     assert plist.get('NSMotionUsageDescription'), 'Motion usage description missing'
-    for marker in (b'henge.gyro.lock', b'Henge Link primary mirror snapshot', b'Controller layout',
-                   b'Safe filesystem cloning failed', b'Touchpad movement speed'):
-        assert marker in binary, 'Missing new release runtime: '+repr(marker)
+    # Swift strings of <=15 UTF-8 bytes can be encoded in ARM64 immediates.
+    # Verify the real sensor API selectors and long runtime data instead.
+    markers=(b'startDeviceMotionUpdatesToQueue:withHandler:', b'stopDeviceMotionUpdates',
+             b'Motion unavailable; joystick steering restored', b'Henge Link primary mirror snapshot',
+             b'Controller layout', b'Safe filesystem cloning failed', b'Touchpad movement speed')
+    missing=[repr(marker) for marker in markers if marker not in binary]
+    assert not missing, 'Missing new release runtime markers: '+', '.join(missing)
     assert manifest['native_touch']['ad_hoc_guest_launch_supported'] is True
     assert 'CoreHID' in manifest['native_touch']['signing_requirement']
 sdk=plist.get('DTSDKName', '')
@@ -82,6 +86,8 @@ with tempfile.TemporaryDirectory(prefix='henge-ipa-check-') as directory:
         platforms = re.findall(r'cmd LC_BUILD_VERSION\s+cmdsize \d+\s+platform (\S+)', commands)
         assert [x.upper() for x in platforms] in (['2'], ['IOS']) or ('cmd LC_VERSION_MIN_IPHONEOS' in commands and not platforms), binary.name
         architectures[str(binary.relative_to(app))] = arch
+    linked=subprocess.check_output(['otool','-L',str(app/'Henge')],text=True)
+    assert '/CoreMotion.framework/' in linked, 'Gyro framework not linked in actual application'
     subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
     guest_helpers=json.loads(subprocess.check_output(['python3','Henge/tools/verify_native_touch_package.py',str(app/'henge-touch-agent.tar.gz')],text=True))
     signed = subprocess.run(['codesign', '-d', '--entitlements', ':-', str(app)], check=True, capture_output=True)
@@ -94,7 +100,7 @@ result=Path("Henge-output/Henge-build-verification.json")
 data=json.loads(result.read_text())
 data['guest_usb_companions']=guest_helpers
 data['packaging_validation'] = dict(architectures=architectures, ios_device_platform=True,
-    nested_signature_verified=True, entitlement_values_verified=True,
+    nested_signature_verified=True, entitlement_values_verified=True, core_motion_linked=True,
     distribution_signing='ad hoc; installation tool must sign with its own supported profile')
 state=json.loads(Path('build-request/henge-build/optimization-state.json').read_text())
 data['optimization_validation'] = state.get('final_validation')

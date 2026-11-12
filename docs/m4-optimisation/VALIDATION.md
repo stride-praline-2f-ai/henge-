@@ -29,3 +29,9 @@ M4 logsACBA used 14GiB guest RAM with experimental grouped/superblocks enabled.
 Host presentation samples were14.12..29.60/s (median24.98), not game FPS. The
 production double-cadence bug is fixed; use the existing M4 Automatic4CPU/8GiB
 baseline for comparison. Saved VM settings are not silently overwritten.
+
+Packaging attempt43300161538 compiled and created the archive, then rejected it
+at a raw15-byte Swift preference-key check. Swift small strings can be embedded
+as instruction immediates. The verifier now checks actual CoreMotion linkage,
+start/stop selectors and long steering runtime data, and reports all missing
+markers together. No release artifact was uploaded by that failed run.
