@@ -95,6 +95,12 @@ p["HengeIntegratedPullRequestHeads"]=[str(x["sha"]) for x in i["pull_requests"]]
 version_manifest=json.loads(Path(sys.argv[2]).read_text())
 p["CFBundleShortVersionString"]=version_manifest.get("app_version", p["CFBundleShortVersionString"])
 p["CFBundleVersion"]=version_manifest.get("app_build", p["CFBundleVersion"])
+if version_manifest.get("controls_power"):
+    # BGContinuedProcessingTask (including CPU-only requests) needs the
+    # processing background mode. Retain existing audio/pairing capabilities.
+    modes=list(p.get("UIBackgroundModes", []))
+    if "processing" not in modes: modes.append("processing")
+    p["UIBackgroundModes"]=modes
 with path.open("wb") as f: plistlib.dump(p,f)
 helper=path.parent.parent / "HengeJITHelper" / "Info.plist"
 with helper.open("rb") as f: helper_info=plistlib.load(f)

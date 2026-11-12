@@ -28,6 +28,18 @@ if manifest.get('m4_optimisation'):
         binary = archive.read('Payload/Henge.app/Henge')
     for marker in (b'M4 iPad16,5 ten-core/16GB', b'CAMetalDisplayLink', b'power-state-changed'):
         assert marker in binary, 'Missing integrated M4 runtime marker: ' + repr(marker)
+if manifest.get('controls_power'):
+    with zipfile.ZipFile(ipa) as archive:
+        binary=archive.read('Payload/Henge.app/Henge')
+    for marker in (b'runner CPU background=%d; GPU rings retained',
+                   b'controls-only peer authenticated; no encoder, decoder or second display',
+                   b'BEGIN 30s; aggregate process CPU', b'invalid store action tag %u (%u bytes)'):
+        assert marker in binary, 'Missing controls/power runtime marker: '+repr(marker)
+    assert 'processing' in plist.get('UIBackgroundModes', []), 'CPU continued-processing background mode missing'
+    permitted=plist.get('BGTaskSchedulerPermittedIdentifiers', [])
+    bundle=plist['CFBundleIdentifier']
+    for suffix in ('.runner.cpu','.runner.session'):
+        assert any(value==bundle+suffix or (value.endswith('.*') and (bundle+suffix).startswith(value[:-1])) for value in permitted), 'Runner task ID not permitted: '+suffix
 sdk=plist.get('DTSDKName', '')
 assert sdk.startswith('iphoneos') and tuple(int(x) for x in sdk[8:].split('.')) >= (27, 1), 'Duo fullscreen requires iOS 27.1+ SDK'
 
@@ -81,6 +93,8 @@ if manifest.get('m4_optimisation'):
     data['m4_optimisation'] = dict(manifest['m4_optimisation'],
         runtime_markers_verified=True, physical_energy_verified=False,
         physical_gaming_verified=False, implementation=state['m4_implementation'])
+if manifest.get('controls_power'):
+    data['controls_power']=dict(manifest['controls_power'], runtime_markers_verified=True, background_metadata_verified=True, physical_controller_verified=False, physical_cpu_background_verified=False)
 data["audit_repairs"]={"sha256":manifest["audit_repairs_sha256"],"snapshot_schema":3,"test_allocation_hook_absent":True}
 data["upstream_integration"]={
   **integration,
