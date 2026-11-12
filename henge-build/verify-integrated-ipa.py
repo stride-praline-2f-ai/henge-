@@ -40,6 +40,13 @@ if manifest.get('controls_power'):
     bundle=plist['CFBundleIdentifier']
     for suffix in ('.runner.cpu','.runner.session'):
         assert any(value==bundle+suffix or (value.endswith('.*') and (bundle+suffix).startswith(value[:-1])) for value in permitted), 'Runner task ID not permitted: '+suffix
+if manifest.get('controller_posture'):
+    assert plist.get('NSMotionUsageDescription'), 'Motion usage description missing'
+    for marker in (b'henge.gyro.lock', b'Henge Link primary mirror snapshot', b'Controller layout',
+                   b'Safe filesystem cloning failed', b'Touchpad movement speed'):
+        assert marker in binary, 'Missing new release runtime: '+repr(marker)
+    assert manifest['native_touch']['ad_hoc_guest_launch_supported'] is True
+    assert 'CoreHID' in manifest['native_touch']['signing_requirement']
 sdk=plist.get('DTSDKName', '')
 assert sdk.startswith('iphoneos') and tuple(int(x) for x in sdk[8:].split('.')) >= (27, 1), 'Duo fullscreen requires iOS 27.1+ SDK'
 
