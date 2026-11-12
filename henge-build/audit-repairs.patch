@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 81b0736..d96d85f 100644
+index 81b0736..feefe5d 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -5,14 +5,14 @@ B = build
@@ -105,7 +105,7 @@ index 81b0736..d96d85f 100644
  # Session-owned display routing, independent of JIT, Metal and a connected monitor.
  $(B)/test_display_targets: ios/Henge/DisplayTargetSelection.swift tests/test_display_targets.swift | $(B)
  	xcrun --sdk macosx swiftc $^ -o $@
-@@ -316,5 +340,18 @@ $(B)/test_cpu_sync: tests/test_cpu_sync.c $(ENGINE)
+@@ -316,5 +340,24 @@ $(B)/test_cpu_sync: tests/test_cpu_sync.c $(ENGINE)
  $(B)/test_timer_dispatch: tests/test_timer_dispatch.c $(ENGINE)
  	$(CC) $(CFLAGS) $< $(ENGINE) -o $@
  
@@ -124,15 +124,27 @@ index 81b0736..d96d85f 100644
 +	@mkdir -p $(B)/usb-touch-research
 +	./$(B)/test_usb_touchscreen
 +.PHONY: test-usb-touchscreen
++
++# Partial code-cache eviction against real multi-vCPU translated execution.
++$(B)/test_jit_ring: tests/test_jit_ring.c $(ENGINE)
++	$(CC) $(CFLAGS) -D_DARWIN_C_SOURCE -pthread $< $(ENGINE) -o $@
++$(B)/test_pvg_linear_bounds: tests/test_pvg_linear_bounds.c devices/pvg_linear_bounds.h | $(B)
++	$(CC) $(CFLAGS) -O1 -fsanitize=address,undefined $< -o $@
 diff --git a/core/dispatch.c b/core/dispatch.c
-index 12bd4a9..a84daa0 100644
+index 12bd4a9..83220ad 100644
 --- a/core/dispatch.c
 +++ b/core/dispatch.c
-@@ -15,8 +15,11 @@
+@@ -15,8 +15,17 @@
  #include "mmu.h"
  #include "sysreg.h"
  #include "translate.h"
 +#include "reclaim_pages.h"
++
++static int poison_on(void) {
++    static int poison = -1;
++    if (poison < 0) poison = getenv("HV_JIT_POISON") != NULL;
++    return poison;
++}
  
  void hv_flush_blocks(HvMachine *m) {
 +    size_t retired_bytes = (size_t)m->nblocks * sizeof *m->blocks;
@@ -140,8 +152,13 @@ index 12bd4a9..a84daa0 100644
      /* Every other CPU is parked (stop_the_world): the one moment the TLB layout can change. */
      if ((hv_knob[HV_K_TLBT] != 0) != hv_tlb_tmajor) {
          hv_tlb_tmajor = hv_knob[HV_K_TLBT] != 0;
-@@ -40,6 +43,22 @@ void hv_flush_blocks(HvMachine *m) {
+@@ -37,21 +46,159 @@ void hv_flush_blocks(HvMachine *m) {
+         }
+     memset(m->hash, 0, sizeof m->hash);
+     m->nblocks = 0;
++    m->blocks_wrap = 0;
      m->nslots = 0;
++    m->nslot_free = m->slot_take = 0;
      m->nxchained = 0;
      memset(m->xchain_heads, 0, sizeof m->xchain_heads);
 +    /* The global barrier has retired every reference. Keep address space and
@@ -155,15 +172,243 @@ index 12bd4a9..a84daa0 100644
 +            m->stats.metadata_reclaim_bytes += hv_reclaim_retired_pages(m->blocks, retired_bytes);
 +#define RECLAIM_SLOTS(member) m->stats.metadata_reclaim_bytes += hv_reclaim_retired_pages(m->member, retired_slots * sizeof *m->member)
 +            RECLAIM_SLOTS(slots); RECLAIM_SLOTS(slot_site); RECLAIM_SLOTS(slot_stub);
-+            RECLAIM_SLOTS(slot_cond); RECLAIM_SLOTS(slot_xa); RECLAIM_SLOTS(slot_xpa); RECLAIM_SLOTS(xchained);
++            RECLAIM_SLOTS(slot_cond); RECLAIM_SLOTS(slot_xa); RECLAIM_SLOTS(slot_xpa); RECLAIM_SLOTS(xchained); RECLAIM_SLOTS(slot_free);
 +#undef RECLAIM_SLOTS
 +        }
 +        if (hv_self) hv_fp_enter(hv_self);
 +    }
      hv_jit_reset(&m->jit);
      m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0; /* MB of it to use (testing) */
++    hv_jit_ring(&m->jit, hv_knob[HV_K_JITSEGS] ? (uint32_t)hv_knob[HV_K_JITSEGS] : 8); /* after the limit: segments of what is used */
      /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */
-@@ -257,6 +276,7 @@ static uint32_t wfe(HvCpu *cpu) {
+-    static int poison = -1;
+-    if (poison < 0) poison = getenv("HV_JIT_POISON") != NULL;
+-    m->gen_checks = poison;
+-    if (poison) {
+-        size_t bytes = (size_t)m->jit.capacity * 4;
+-        uint32_t *rw = (uint32_t *)((uint8_t *)m->jit.base + m->jit.rw_diff);
+-        for (size_t i = 0; i < bytes / 4; i++) rw[i] = 0;
+-        hv_jit_finish(&m->jit, m->jit.base, m->jit.capacity);
++    m->gen_checks = poison_on();
++    if (m->gen_checks) hv_jit_poison(&m->jit, m->jit.base, m->jit.capacity);
++}
++
++/* The code cache as a ring: when it fills, only the oldest segment's blocks go, not every block. A full flush made
++   the guest translate its whole working set again at once (a macOS 27 boot on a phone filled 1.5 GB in about three
++   minutes, and every flush after that started the storm over); the blocks kept are mostly the hot ones, and the ones
++   that went come back one by one as they are run.
++
++   What can lead into the segment, and how it stops: the hash and the per-CPU front caches (rebuilt and emptied),
++   the indirect-branch caches and return predictions (emptied, as a flush does), exits chained into its blocks from
++   blocks elsewhere (sent back to their stubs, as hv_invalidate_code does for a page), and a CPU's chunk of space there
++   (seg_epoch). Exits whose own code was there free their slots for new blocks. */
++void hv_evict_blocks(HvMachine *m) {
++    HvJitRegion *r = &m->jit;
++    if (!r->seg_words || __atomic_load_n(&r->too_big, __ATOMIC_RELAXED)) {
++        m->stats.flush_full++;
++        hv_flush_blocks(m);
++        return;
+     }
++    uint64_t t0 = mach_absolute_time();
++    uint32_t seg = hv_jit_evict_next(r);
++    const uint32_t *lo = r->base + (size_t)seg * r->seg_words, *hi = lo + r->seg_words;
++#define GONE(p) ((uintptr_t)(p) >= (uintptr_t)lo && (uintptr_t)(p) < (uintptr_t)hi)
++    m->stats.evictions++;
++    for (int i = 0; i < m->ncpus; i++)
++        if (m->cpus[i]) {
++            hv_ijc_reset(m->cpus[i], 0);
++            hv_ijc_reset(m->cpus[i], 1);
++            hv_ret_clear(m->cpus[i]);
++            memset(m->percpu[i].jc, 0, sizeof m->percpu[i].jc);
++        }
++    /* Blocks: keep the others in the order they were made (blocks whose page's code changed since go too: nothing
++       can look them up again), and hash them anew. The ones made before the ring came round to here first. */
++    int n = 0, wrap = 0;
++    const uint32_t *end = r->base + r->end;
++    for (int i = 0; i < m->nblocks; i++) {
++        HvBlock *b = &m->blocks[i];
++        if (GONE(b->code) || __atomic_load_n(&b->ram->page_gen[b->pg], __ATOMIC_RELAXED) != b->gen) continue;
++        if (n != i) m->blocks[n] = *b;
++        if (m->blocks[n].code >= end && wrap == n) wrap = n + 1;
++        n++;
++    }
++    m->stats.evict_blocks += (uint64_t)(m->nblocks - n);
++    m->nblocks = n;
++    m->blocks_wrap = (uint32_t)wrap;
++    memset(m->hash, 0, sizeof m->hash);
++    for (int i = 0; i < n; i++) {
++        HvBlock *b = &m->blocks[i];
++        uint32_t h = hv_block_hash(b->va, b->pa, b->flags);
++        b->next = m->hash[h];
++        m->hash[h] = b;
++    }
++    uint64_t t1 = mach_absolute_time();
++    m->stats.evict_phase[0] += t1 - t0;
++    /* The words rewritten below, for one instruction-cache pass at the end. */
++    uint32_t **words = m->evict_words;
++    size_t nwords_cap = m->evict_words_cap;
++    size_t nwords = 0;
++    /* Slots: free those whose exit was in the segment (or never placed), unchain those leading into it, and list the
++       chained exits to other pages again by target page (some on the lists went, and the lists run through them). */
++    memset(m->xchain_heads, 0, sizeof m->xchain_heads);
++    m->nxchained = 0;
++    uint32_t nslots = m->nslots < m->max_slots ? m->nslots : m->max_slots, nfree = 0;
++    for (uint32_t idx = 0; idx < nslots; idx++) {
++        uint32_t *site = m->slot_site[idx];
++        if (!site || GONE(site)) {
++            m->slots[idx] = 0;
++            m->slot_site[idx] = NULL;
++            m->slot_cond[idx] = NULL;
++            m->slot_xpa[idx] = 0;
++            m->xchained[idx] = 0;
++            m->slot_free[nfree++] = idx;
++            continue;
++        }
++        m->xchained[idx] = 0;
++        uint64_t to = m->slots[idx];
++        if (to && GONE(to)) {
++            m->slots[idx] = 0;
++            m->slot_xpa[idx] = 0;
++            uint32_t insn = 0x14000000u | (uint32_t)((m->slot_stub[idx] - site) & 0x3ffffff); /* back to its stub */
++            if (nwords + 2 > nwords_cap) {
++                size_t cap = nwords_cap ? nwords_cap * 2 : 65536;
++                uint32_t **w = realloc(words, cap * sizeof *w);
++                if (w) { words = m->evict_words = w; nwords_cap = m->evict_words_cap = cap; }
++            }
++            hv_jit_write(r, site, &insn, 4);
++            if (nwords < nwords_cap) words[nwords++] = site;
++            else hv_jit_finish(r, site, 1);
++            uint32_t *cond = m->slot_cond[idx];
++            if (cond) { /* the hot part's conditional branch went to the exit's B before it was chained */
++                insn = *cond;
++                if (hv_branch_retarget(&insn, site - cond)) {
++                    hv_jit_write(r, cond, &insn, 4);
++                    if (nwords < nwords_cap) words[nwords++] = cond;
++                    else hv_jit_finish(r, cond, 1);
++                }
++            }
++            m->stats.evict_unchained++;
++            continue;
++        }
++        uint64_t xpa = m->slot_xpa[idx];
++        if (xpa) {
++            uint32_t bucket = hv_xchain_bucket(xpa & ~1ull);
++            m->xchained[idx] = m->xchain_heads[bucket];
++            m->xchain_heads[bucket] = idx + 1;
++            m->nxchained++;
++        }
++    }
++    m->nslot_free = nfree;
++    m->slot_take = 0;
++    uint64_t t2 = mach_absolute_time();
++    m->stats.evict_phase[1] += t2 - t1;
++    hv_jit_finish_words(r, words, nwords);
++    m->stats.evict_phase[2] += mach_absolute_time() - t2;
++    if (poison_on()) { /* HV_JIT_POISON: anything still leading into the segment faults there */
++        m->gen_checks = 1;
++        hv_jit_poison(r, (uint32_t *)lo, r->seg_words);
++    }
++#undef GONE
++    m->stats.evict_ticks += mach_absolute_time() - t0;
++}
++
++/* Ask for room: an eviction, unless something wants (or the ring needs) a full flush. */
++static void request_evict(HvMachine *m) {
++    int none = 0;
++    __atomic_compare_exchange_n(&m->flush_pending, &none, m->jit.seg_words ? HV_FLUSH_EVICT : 1, 0, __ATOMIC_SEQ_CST,
++                                __ATOMIC_SEQ_CST);
+ }
+ 
+ /* Parked: not running guest code, nor using its TLB, so other CPUs need not
+@@ -97,7 +244,7 @@ static uint32_t block_flags(HvCpu *cpu) {
+ 
+ /* Finding a block is lock-free (blocks are only ever added, with a release
+    store, until a flush, which stops every CPU); making one takes the
+-   translation lock. Returns NULL if the translations must all be dropped first
++   translation lock. Returns NULL if translations must be dropped first
+    (m->flush_pending is set: the dispatcher does that, then tries again). */
+ #define hash_of hv_block_hash
+ #define find hv_block_find
+@@ -129,6 +276,7 @@ static void block_dump(const HvBlock *b, const uint32_t *code) {
+ 
+ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
+     HvMachine *m = cpu->m;
++    int failed = 0;
+     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
+     __typeof__(cpu->pc_state->jc[0]) *jc = cpu->pc_state->jc;
+     HvBlock *c = jc[j].va == va ? jc[j].b : NULL;
+@@ -161,7 +309,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+     uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
+     uint8_t phase0 = cpu->pc_state ? __atomic_load_n(&cpu->pc_state->phase, __ATOMIC_RELAXED) : 0;
+     if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_TRANSLATE, __ATOMIC_RELAXED);
+-    int failed = hv_translate_emit(m, &nb, code, avail) != 0;
++    failed = hv_translate_emit(m, &nb, code, avail) != 0;
+     if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, phase0, __ATOMIC_RELAXED);
+     if (failed) goto flush_unlocked;
+     if (m->stats_interval) {
+@@ -182,12 +330,11 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+         return b;
+     }
+     /* ...and place it in the region (space is reserved atomically, so no lock either)... */
+-    size_t used0 = m->jit.used;
+-    if (hv_translate_place(m, &nb) != 0) { /* JIT region full: start over */
++    if (hv_translate_place(m, &nb) != 0) { /* JIT region full: make room */
+         pthread_mutex_lock(&m->tr_mu);
+-        m->stats.flush_full++;
+         m->stats.flush_capacity++;
+-        goto flush;
++        if (!m->jit.seg_words) m->stats.flush_full++;
++        goto evict;
+     }
+     if (m->gen_checks && nb.jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST))
+         fprintf(stderr, "hengevm: cpu %u translated across a flush: gen %u to %u, placed at rx+%llx, used %llx, active %d\n", cpu->index, nb.jit_gen, m->jit_gen, (unsigned long long)(nb.code - m->jit.base) * 4, (unsigned long long)m->jit.used * 4, cpu->pc_state->active);
+@@ -201,23 +348,24 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+             m->stats.tr_wait_ticks += mach_absolute_time() - w0;
+         }
+     }
+-    b = find(m, h, va, pa, flags, gen); /* another CPU may have just made it: ours is dropped (its space stays used until a flush) */
++    b = find(m, h, va, pa, flags, gen); /* another CPU may have just made it: ours is dropped (its space stays used until its segment is taken back) */
+     if (b) {
+         __atomic_fetch_add(&m->stats.duplicate_place_late, 1, __ATOMIC_RELAXED);
+         pthread_mutex_unlock(&m->tr_mu);
+         jc[j].va = va, jc[j].b = b;
+         return b;
+     }
+-    if ((uint32_t)m->nblocks >= m->max_blocks || m->flush_pending) {
+-        m->stats.flush_full++;
+-        if ((uint32_t)m->nblocks >= m->max_blocks) m->stats.flush_block_limit++;
+-        goto flush;
++    if (m->flush_pending) goto flush;
++    if ((uint32_t)m->nblocks >= m->max_blocks) {
++        if (!m->jit.seg_words) m->stats.flush_full++;
++        m->stats.flush_block_limit++;
++        goto evict;
+     }
+     b = &m->blocks[m->nblocks];
+     *b = nb;
+     m->stats.translations++;
+     if (m->stats_interval) {
+-        m->stats.translated_words += m->jit.used - used0;
++        m->stats.translated_words += hv_translate_pending_words();
+         static uint64_t seen_va[1 << 18], seen_vapa[1 << 18]; /* was this code translated before? (hashed, so approximate) */
+         uint32_t hv = (uint32_t)(((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull >> 40);
+         uint32_t hp = (uint32_t)((((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull ^ pa * 0xc2b2ae3d27d4eb4full) >> 40);
+@@ -231,10 +379,13 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+     __atomic_store_n(&m->hash[h], b, __ATOMIC_RELEASE);
+     pthread_mutex_unlock(&m->tr_mu);
+     return b;
++evict:
++    request_evict(m);
++    goto flush;
+ flush_unlocked:
+     pthread_mutex_lock(&m->tr_mu);
++    if (failed) __atomic_store_n(&m->flush_pending, 1, __ATOMIC_SEQ_CST);
+ flush:
+-    __atomic_store_n(&m->flush_pending, 1, __ATOMIC_SEQ_CST);
+     pthread_mutex_unlock(&m->tr_mu);
+     hv_machine_kick_all(m);
+     return NULL;
+@@ -257,6 +408,7 @@ static uint32_t wfe(HvCpu *cpu) {
      uint64_t page = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
      if (spin || va == ~0ull || (size != 1 && size != 2 && size != 4 && size != 8) || (va & (size - 1)) ||
          e->read_tag == HV_TLB_INVALID || e->read_tag + HV_TLB_ADJ != page) {
@@ -171,7 +416,7 @@ index 12bd4a9..a84daa0 100644
          __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED); /* let another CPU run: the dispatcher's way */
          return 0;
      }
-@@ -284,7 +304,7 @@ static uint32_t wfe(HvCpu *cpu) {
+@@ -284,7 +436,7 @@ static uint32_t wfe(HvCpu *cpu) {
          }
          if (v != want || __atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED)) break;
          if (mach_absolute_time() >= deadline) {
@@ -180,7 +425,7 @@ index 12bd4a9..a84daa0 100644
              __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
              break;
          }
-@@ -292,7 +312,7 @@ static uint32_t wfe(HvCpu *cpu) {
+@@ -292,7 +444,7 @@ static uint32_t wfe(HvCpu *cpu) {
          else __asm__ volatile("yield" ::: "memory");
      }
      __asm__ volatile("clrex" ::: "memory");
@@ -189,7 +434,58 @@ index 12bd4a9..a84daa0 100644
      return 0;
  }
  
-@@ -602,16 +622,41 @@ static void print_profile(HvMachine *m) {
+@@ -440,13 +592,8 @@ void hv_debug_el0_in_kernel(HvCpu *cpu, const char *what) {
+         {
+             HvMachine *m = cpu->m;
+             uint32_t *host = (uint32_t *)(uintptr_t)cpu->helper_ret; /* the block's blr into hv_helper_entry */
+-            int lo = 0, hi = m->nblocks - 1;
+-            while (lo < hi) {
+-                int mid = (lo + hi + 1) / 2;
+-                if (m->blocks[mid].code <= host) lo = mid;
+-                else hi = mid - 1;
+-            }
+-            HvBlock *b = m->nblocks ? &m->blocks[lo] : NULL;
++            HvBlock *b = hv_block_at(m, host);
++            int lo = b ? (int)(b - m->blocks) : 0;
+             fprintf(stderr, "hengevm: el0 runs kernel code: block %llx flags %u (index %d of %d), flushes %llu, last stub %llx, "
+                             "miss site %llx\n  recent:", b ? (unsigned long long)b->va : 0ull, b ? b->flags : 0, lo, m->nblocks,
+                     (unsigned long long)m->stats.block_flushes, (unsigned long long)cpu->last_stub,
+@@ -520,9 +667,7 @@ static int wait_for_interrupt(HvCpu *cpu) {
+     return 0;
+ }
+ 
+-/* --profile: which guest blocks the sampled host PCs were in. Blocks are laid
+-   out in the JIT region in the order they were made, so a binary search over
+-   m->blocks finds the one holding a PC. */
++/* --profile: which guest blocks the sampled host PCs were in (hv_block_at). */
+ static void print_profile(HvMachine *m) {
+     enum { SLOTS = 4096 };
+     static struct { uint64_t va; uint32_t flags, n, ninsns; } top[SLOTS];
+@@ -536,7 +681,8 @@ static void print_profile(HvMachine *m) {
+     for (; m->prof_tail != head; m->prof_tail++) {
+         uint32_t *pc = (uint32_t *)(uintptr_t)m->prof[m->prof_tail & (HV_PROF_RING - 1)];
+         total++;
+-        if (pc < m->jit.base || pc >= m->jit.base + m->jit.used || !m->nblocks) {
++        HvBlock *b = pc >= m->jit.base && pc < m->jit.base + hv_jit_extent(&m->jit) ? hv_block_at(m, pc) : NULL;
++        if (!b) {
+             outside++;
+             Dl_info di;
+             const char *name = dladdr(pc, &di) && di.dli_sname ? di.dli_sname : "?";
+@@ -555,13 +701,6 @@ static void print_profile(HvMachine *m) {
+             if (k < nfn) fn[k].n++;
+             continue;
+         }
+-        int lo = 0, hi = m->nblocks - 1;
+-        while (lo < hi) {
+-            int mid = (lo + hi + 1) / 2;
+-            if (m->blocks[mid].code <= pc) lo = mid;
+-            else hi = mid - 1;
+-        }
+-        HvBlock *b = &m->blocks[lo];
+         uint32_t h = (uint32_t)((b->va >> 2) ^ b->flags) & (SLOTS - 1);
+         int probes = 0;
+         while (top[h].n && (top[h].va != b->va || top[h].flags != b->flags) && ++probes < 64) h = (h + 1) & (SLOTS - 1);
+@@ -602,16 +741,41 @@ static void print_profile(HvMachine *m) {
      }
  }
  
@@ -234,7 +530,7 @@ index 12bd4a9..a84daa0 100644
      if (!force && now - last_t < (uint64_t)m->stats_interval * 24000000ull) {
          hv_fp_enter(cpu);
          return;
-@@ -619,6 +664,8 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -619,38 +783,36 @@ static void print_stats(HvCpu *cpu, int force) {
      double dt = (double)(now - last_t) / 24e6;
      HvStats *s = &m->stats;
  #define RATE(f) ((double)(s->f - last.f) / dt)
@@ -242,8 +538,17 @@ index 12bd4a9..a84daa0 100644
 +            RATE(vmem_read_reuses), (double)s->metadata_reclaim_bytes / (1 << 20));
      fprintf(stderr,
              "stats %5.0fs: blocks %.2fM/s, translated %.0f/s (again: va %.0f%% va+pa %.0f%%; %.0f%% of time, %.1f insns, %.1fx), slow mem %.0fK/s, mrs %.0fK/s msr %.0fK/s sys %.0fK/s, "
-             "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), blocks held %d (%.0f MB, %llu full flushes), chained %.0f/s ijc fills %.0fK/s resets %.0f/s, el%u pc %llx\n",
-@@ -632,25 +679,20 @@ static void print_stats(HvCpu *cpu, int force) {
+-            "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), blocks held %d (%.0f MB, %llu full flushes), chained %.0f/s ijc fills %.0fK/s resets %.0f/s, el%u pc %llx\n",
++            "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), blocks held %d (%.0f MB, %llu full flushes, %llu evictions: %.0f ms (blocks %.0f, exits %.0f, icache %.0f), %.0fK blocks dropped, %.0fK exits unchained), chained %.0f/s ijc fills %.0fK/s resets %.0f/s, el%u pc %llx\n",
+             (double)(now - start_t) / 24e6, RATE(blocks) / 1e6, RATE(translations), 100.0 * RATE(retrans_va) / (RATE(translations) + 1e-9), 100.0 * RATE(retrans_vapa) / (RATE(translations) + 1e-9), 100.0 * (double)(s->translate_ticks - last.translate_ticks) / (double)(now - last_t), RATE(translated_insns) / (RATE(translations) + 1e-9), RATE(translated_words) / (RATE(translated_insns) + 1e-9), RATE(helper[HV_OP_MEM]) / 1e3,
+             RATE(helper[HV_OP_MRS]) / 1e3, RATE(helper[HV_OP_MSR]) / 1e3, RATE(helper[HV_OP_SYS]) / 1e3,
+             RATE(exceptions), RATE(interrupts), RATE(tlb_flushes), RATE(fetch_walks) / 1e3, RATE(wfi),
+             100.0 * (double)(s->wfi_ticks - last.wfi_ticks) / (double)(now - last_t), RATE(block_flushes), RATE(flush_smc),
+-            RATE(flush_ic), RATE(flush_full), m->nblocks, (double)m->jit.used * 4 / (1 << 20), (unsigned long long)s->flush_full, RATE(chained), RATE(ijc_fills) / 1e3, RATE(ijc_resets), cpu->el,
++            RATE(flush_ic), RATE(flush_full), m->nblocks, (double)hv_jit_extent(&m->jit) * 4 / (1 << 20), (unsigned long long)s->flush_full,
++            (unsigned long long)s->evictions, (double)s->evict_ticks / 24e3, (double)s->evict_phase[0] / 24e3, (double)s->evict_phase[1] / 24e3, (double)s->evict_phase[2] / 24e3, (double)s->evict_blocks / 1e3, (double)s->evict_unchained / 1e3, RATE(chained), RATE(ijc_fills) / 1e3, RATE(ijc_resets), cpu->el,
+             (unsigned long long)cpu->pc);
+     {
          double tot = 0;
          for (int k = 0; k < 6; k++) tot += RATE(why[k]);
          /* How much of the interval the CPU thread actually ran: below 100% means the host took it away. */
@@ -281,7 +586,7 @@ index 12bd4a9..a84daa0 100644
          fprintf(stderr, "  whole-TLB flushes/s: TLBI all here %.0f, TLBI all shared %.0f, SCTLR %.0f, TTBR1 %.0f, TCR %.0f, MAIR %.0f, range of all %.0f, requests overflowed %.0f\n",
                  RATE(flush_why[0]), RATE(flush_why[1]), RATE(flush_why[2]), RATE(flush_why[3]), RATE(flush_why[4]), RATE(flush_why[5]),
                  RATE(flush_why[6]), RATE(flush_why[7]));
-@@ -664,7 +706,9 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -664,7 +826,9 @@ static void print_stats(HvCpu *cpu, int force) {
                      RATE(flush_checked), RATE(flush_check_entries), RATE(flush_check_bad), RATE(flush_check_af));
          fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
                  RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
@@ -292,7 +597,35 @@ index 12bd4a9..a84daa0 100644
              uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
              uint32_t worst = 0;
              for (uint32_t h = 0; h < HV_BLOCK_HASH; h++) {
-@@ -924,8 +968,21 @@ static void stop_the_world(HvCpu *cpu) {
+@@ -795,7 +959,7 @@ static void print_stats(HvCpu *cpu, int force) {
+    jump gets a block that just wrote its own page back to the dispatcher. */
+ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
+     uint32_t idx = (uint32_t)(slot - m->slots);
+-    if (m->gen_checks && (b->jit_gen != m->jit_gen || (m->slot_site[idx] && (uint64_t)(m->slot_site[idx] - m->jit.base) >= m->jit.used)))
++    if (m->gen_checks && (b->jit_gen != m->jit_gen || (m->slot_site[idx] && (uint64_t)(m->slot_site[idx] - m->jit.base) >= hv_jit_extent(&m->jit))))
+         fprintf(stderr, "hengevm: chain slot %u site %p to rx+%llx va %llx: block gen %u now %u\n", idx, (void *)m->slot_site[idx], (unsigned long long)(b->code - m->jit.base) * 4, (unsigned long long)b->va, b->jit_gen, m->jit_gen);
+     uint64_t xa = m->slot_xa[idx];
+     if (xa) {
+@@ -890,7 +1054,7 @@ static void stop_the_world(HvCpu *cpu) {
+     pthread_mutex_lock(&m->stw_mu);
+     if (__atomic_load_n(&m->flush_pending, __ATOMIC_SEQ_CST) && !m->stw_active) {
+         __atomic_store_n(&m->stw_active, 1, __ATOMIC_SEQ_CST);
+-        __atomic_store_n(&m->flush_pending, 0, __ATOMIC_SEQ_CST);
++        int kind = __atomic_exchange_n(&m->flush_pending, 0, __ATOMIC_SEQ_CST);
+         pthread_mutex_unlock(&m->stw_mu);
+         hv_machine_kick_all(m);
+         if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_FLUSH, __ATOMIC_RELAXED);
+@@ -907,7 +1071,8 @@ static void stop_the_world(HvCpu *cpu) {
+         }
+         if (m->gen_checks) for (int i = 0; i < m->ncpus; i++) if (m->cpus[i] && m->cpus[i] != cpu && m->cpus[i]->pc_state->active) fprintf(stderr, "hengevm: flush while cpu %d is active\n", i);
+         pthread_mutex_lock(&m->tr_mu);
+-        hv_flush_blocks(m);
++        if (kind == HV_FLUSH_EVICT) hv_evict_blocks(m);
++        else hv_flush_blocks(m);
+         pthread_mutex_unlock(&m->tr_mu);
+         if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_RUN, __ATOMIC_RELAXED);
+         pthread_mutex_lock(&m->stw_mu);
+@@ -924,8 +1089,21 @@ static void stop_the_world(HvCpu *cpu) {
      }
  }
  
@@ -315,11 +648,41 @@ index 12bd4a9..a84daa0 100644
      hv_big_lock(cpu->m);
      hv_fp_enter(cpu);
      int r = run(cpu, 0);
+@@ -1054,15 +1232,15 @@ static int run_loop(HvCpu *cpu, int one) {
+             continue;
+         }
+         last_fault = ~0ull;
+-        uint64_t flushes = m->stats.block_flushes;
++        uint64_t flushes = m->stats.block_flushes + m->stats.evictions;
+         HvBlock *b = lookup(cpu, cpu->pc, pa, block_flags(cpu), code, avail);
+-        /* A full flush while translating freed the slot the last exit came through,
+-           and new blocks may have it now: chaining it would rewrite one of theirs. */
+-        if (m->stats.block_flushes != flushes) pending_chain = NULL;
++        /* A flush or eviction while translating may have freed the slot the last exit came
++           through, and new blocks may have it now: chaining it would rewrite one of theirs. */
++        if (m->stats.block_flushes + m->stats.evictions != flushes) pending_chain = NULL;
+         if (!b) {
+             /* Everything is about to be dropped, or just was (another CPU may have
+                done the flush this lookup asked for): try again after. */
+-            if (m->flush_pending || __atomic_load_n(&m->stw_active, __ATOMIC_SEQ_CST) || m->stats.block_flushes != flushes) continue;
++            if (m->flush_pending || __atomic_load_n(&m->stw_active, __ATOMIC_SEQ_CST) || m->stats.block_flushes + m->stats.evictions != flushes) continue;
+             fprintf(stderr, "hengevm: cannot translate block at %llx\n", (unsigned long long)cpu->pc);
+             park(cpu);
+             return HV_EXIT_UNSUPPORTED;
+@@ -1155,7 +1333,7 @@ static int run_loop(HvCpu *cpu, int one) {
+         cpu->icount++;
+         m->stats.blocks++;
+         if (m->stats_interval && cpu->index == 0 && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);
+-        if (m->gen_checks && ((uint64_t)(b->code - m->jit.base) >= m->jit.used || b->jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)))
++        if (m->gen_checks && ((uint64_t)(b->code - m->jit.base) >= hv_jit_extent(&m->jit) || b->jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)))
+             fprintf(stderr, "hengevm: cpu %u entering %p (rx+%llx, used %llx) for va %llx: block gen %u, now %u, maker %u\n", cpu->index, (void *)b->code, (unsigned long long)(b->code - m->jit.base) * 4, (unsigned long long)m->jit.used * 4, (unsigned long long)b->va, b->jit_gen, m->jit_gen, b->maker);
+         hv_enter(cpu, b->code);
+ 
 diff --git a/core/dispatch.h b/core/dispatch.h
-index c341d16..fba956a 100644
+index c341d16..3d49220 100644
 --- a/core/dispatch.h
 +++ b/core/dispatch.h
-@@ -9,6 +9,10 @@
+@@ -9,9 +9,16 @@
  int hv_run(HvCpu *cpu);
  /* Runs a single block (after interrupt checks). */
  int hv_run_one(HvCpu *cpu);
@@ -328,10 +691,17 @@ index c341d16..fba956a 100644
 +   thread while another thread owns this CPU's guest register state. */
 +void hv_dispatch_log_stats(HvCpu *cpu);
  
- /* Drops every translated block (the JIT region is reused from the start). */
+-/* Drops every translated block (the JIT region is reused from the start). */
++/* Drops every translated block (the JIT region is reused from the start). Every CPU stopped. */
  void hv_flush_blocks(HvMachine *m);
++/* Takes back the oldest segment of the code cache (ring): drops the blocks there and undoes the exits chained into
++   them; the rest stay. A full flush when there is no ring or it cannot make room. Every CPU stopped. */
++void hv_evict_blocks(HvMachine *m);
+ 
+ void hv_enter(HvCpu *cpu, void *block);
+ /* While hv_run runs, the host FPCR/FPSR hold the guest's; these move them in and out. */
 diff --git a/core/fastmem_log.c b/core/fastmem_log.c
-index a41d6d2..7d260b9 100644
+index a41d6d2..fa6964e 100644
 --- a/core/fastmem_log.c
 +++ b/core/fastmem_log.c
 @@ -21,13 +21,14 @@ void hv_fastmem_log(HvMachine *m, FILE *out) {
@@ -352,11 +722,55 @@ index a41d6d2..7d260b9 100644
  #ifdef __APPLE__
      if (getenv("HV_TASK_STATS") && !strcmp(getenv("HV_TASK_STATS"), "1")) {
          task_power_info_data_t power = {0};
+@@ -58,13 +59,15 @@ void hv_fastmem_log(HvMachine *m, FILE *out) {
+             (unsigned long long)__atomic_load_n(&m->stats.duplicate_place_avoided, __ATOMIC_RELAXED),
+             (unsigned long long)__atomic_load_n(&m->stats.duplicate_bytes_avoided, __ATOMIC_RELAXED),
+             (unsigned long long)__atomic_load_n(&m->stats.duplicate_place_late, __ATOMIC_RELAXED));
+-    uint64_t words = __atomic_load_n(&m->jit.used, __ATOMIC_RELAXED);
++    uint64_t words = hv_jit_extent(&m->jit);
+     uint64_t capacity = m->jit.limit && m->jit.limit < m->jit.capacity ? m->jit.limit : m->jit.capacity;
+     fprintf(out, "jit-cache: storage=RAM persistent=no precompile_all=no used=%.1fMiB capacity=%.1fMiB full=%.1f%% blocks=%d full_flushes=%llu resets=%llu (fresh at app launch; guest disk/browser caches are separate)\n",
+             (double)words * 4 / (1u << 20), (double)capacity * 4 / (1u << 20),
+             capacity ? 100.0 * (double)words / (double)capacity : 0.0, m->nblocks,
+             (unsigned long long)__atomic_load_n(&m->stats.flush_full, __ATOMIC_RELAXED),
+             (unsigned long long)__atomic_load_n(&m->stats.block_flushes, __ATOMIC_RELAXED));
++    fprintf(out,"jit-ring: segments=%u evictions=%llu blocks_dropped=%llu exits_repaired=%llu (quiescent oldest-segment reuse; full flush fallback retained)\n",
++        m->jit.nseg,(unsigned long long)m->stats.evictions,(unsigned long long)m->stats.evict_blocks,(unsigned long long)m->stats.evict_unchained);
+     fprintf(out, "fastmem: mode=%s counters=%s (cumulative; diagnostic counting adds overhead)\n",
+             m->fastmem_enabled ? "on" : "off", m->fastmem_diagnostics ? "on" : "off");
+     if (m->fastmem_enabled) fprintf(out, "fastmem-layout: tagged-multiwindow entries=262144 per-PAN bytes-per-CPU=10485760 (bounded allocation; exact VA tags; all kernel windows)\n");
 diff --git a/core/machine.c b/core/machine.c
-index 7a01fdc..64b016b 100644
+index 7a01fdc..cfd74ad 100644
 --- a/core/machine.c
 +++ b/core/machine.c
-@@ -219,10 +219,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+@@ -23,7 +23,7 @@ extern void hv_xjump_thunk(void);
+ static int init_rest(HvMachine *m);
+ 
+ int hv_knob[HV_K_COUNT];
+-static const char *const hv_knob_names[HV_K_COUNT] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK", "HV_SYNC_WAIT", "HV_SWITCH_FLUSH", "HV_RANGE_DROP", "HV_MOVIMM", "HV_PREDSTAT", "HV_WALK_LOG", "HV_HOIST_CHECK", "HV_IJC_PAGES", "HV_DNS_PROXY"};
++static const char *const hv_knob_names[HV_K_COUNT] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK", "HV_SYNC_WAIT", "HV_SWITCH_FLUSH", "HV_RANGE_DROP", "HV_MOVIMM", "HV_PREDSTAT", "HV_WALK_LOG", "HV_HOIST_CHECK", "HV_IJC_PAGES", "HV_DNS_PROXY", "HV_JIT_SEGMENTS"};
+ 
+ static void knobs_init(void) {
+     for (int i = 0; i < HV_K_COUNT; i++)
+@@ -110,6 +110,7 @@ static int init_rest(HvMachine *m) {
+     /* So the tests can run the translator these ways too (the iOS and --phone paths read them in knobs_init). */
+     hv_knob[HV_K_SUPERBLOCKS] = getenv("HV_SUPERBLOCKS") ? atoi(getenv("HV_SUPERBLOCKS")) : 0;
+     fprintf(stderr, "efficiency-v3: superblocks=%d (experimental) wait-probes=%d jit-finish=batched branch-patch=full-barrier (relaxed request falls back safely); indexed chain repair and full invalidation barriers retained\n", hv_knob[HV_K_SUPERBLOCKS] != 0, m->wait_stats);
++    if (getenv("HV_JIT_SEGMENTS")) hv_knob[HV_K_JITSEGS] = atoi(getenv("HV_JIT_SEGMENTS"));
+     /* The exact check for an access in a page's last 15 bytes, in the access's out-of-line path (code size only):
+        on the phone, Golden Gate's boot and login send 80-240K such accesses a second to the helper without it. It
+        costs ~13% of the code (Mac 2026-11-09: 296-300 against 259-261 bytes a block), and the phone's code cache
+@@ -139,6 +140,9 @@ static int init_rest(HvMachine *m) {
+     m->quiesce_initialized=hv_quiesce_init(&m->quiesce)==0;
+     m->quiesce_enabled=m->quiesce_initialized && (!getenv("HV_STW_WAIT") || strcmp(getenv("HV_STW_WAIT"),"0"));
+     fprintf(stderr,"henge: flush-wait: mode=%s; short spin then event wake, own requests serviced, 100us missed-wake fallback; guest WFE/timers unchanged\n",m->quiesce_enabled?"event":"legacy-yield");
++    m->slot_free = calloc(m->max_slots, sizeof *m->slot_free);
++    if (!m->slot_free) return -1;
++    hv_jit_ring(&m->jit, hv_knob[HV_K_JITSEGS] ? (uint32_t)hv_knob[HV_K_JITSEGS] : 8);
+     for (int i = 0; i < HV_MAX_CPUS; i++) { /* untouched pages cost nothing, so every CPU gets its tables now */
+         HvPerCpu *p = &m->percpu[i];
+         p->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
+@@ -219,10 +223,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
  #define HV_ULF_WAKE_ALL 0x100u
  #define HV_ULF_NO_ERRNO 0x1000000u
  
@@ -374,7 +788,7 @@ index 7a01fdc..64b016b 100644
  }
  
  void hv_cpu_ack_wake(HvCpu *cpu) {
-@@ -262,6 +266,13 @@ void hv_cpu_process_requests(HvCpu *cpu) {
+@@ -262,6 +270,13 @@ void hv_cpu_process_requests(HvCpu *cpu) {
  
  void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
      HvPerCpu *t = target->pc_state, *s = self ? self->pc_state : NULL;
@@ -388,7 +802,7 @@ index 7a01fdc..64b016b 100644
      HvMachine *mm = target->m;
      uint64_t t0 = mm->stats_interval ? mach_absolute_time() : 0;
      if (s) {
-@@ -271,6 +282,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -271,6 +286,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
      int sleep = hv_knob[HV_K_SYNCWAIT], probed = !t0 || !mm->wait_stats, probed_long = !t0 || !mm->wait_stats;
      if (s && mm->wait_stats) __atomic_store_n(&s->phase, HV_PHASE_SYNC, __ATOMIC_RELAXED);
      for (uint32_t spins = 0;; spins++) {
@@ -396,7 +810,7 @@ index 7a01fdc..64b016b 100644
          uint64_t ack = __atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE);
          if (ack >= seq) break;
          if (!probed && !(spins & 63) && mach_absolute_time() - t0 >= 2400) { /* 100 us: what is it doing? */
-@@ -295,10 +307,12 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -295,10 +311,12 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
          if (self) hv_cpu_process_requests(self);
          if (sleep && spins >= 64) {
              __atomic_add_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
@@ -411,7 +825,7 @@ index 7a01fdc..64b016b 100644
                  if (rc == -ETIMEDOUT && s) __atomic_add_fetch(&s->sync_timeouts, 1, __ATOMIC_RELAXED);
                  if (rc < 0 && rc != -ETIMEDOUT && rc != -EINTR) {
                      if (s) __atomic_add_fetch(&s->sync_errors, 1, __ATOMIC_RELAXED);
-@@ -396,18 +410,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
+@@ -396,18 +414,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
      return marked;
  }
  
@@ -440,7 +854,43 @@ index 7a01fdc..64b016b 100644
      if (marked) __asm__ volatile("sev" ::: "memory");
      return marked;
  }
-@@ -622,6 +643,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
+@@ -467,6 +492,8 @@ void hv_machine_free(HvMachine *m) {
+     free(m->slot_xa);
+     free(m->slot_xpa);
+     free(m->xchained);
++    free(m->slot_free);
++    free(m->evict_words);
+     if (m->locks_initialized) {
+         pthread_mutex_destroy(&m->big_mu);
+         pthread_cond_destroy(&m->big_cv);
+@@ -514,6 +541,26 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
+     return NULL;
+ }
+ 
++HvBlock *hv_block_at(HvMachine *m, const uint32_t *pc) {
++    /* Blocks are in the order they were made, which is the order of their code except where the ring came round:
++       [0, blocks_wrap) are the older ones, at or past the ring's end. Nearest, not exact: CPUs place code in chunks of
++       their own, so neighbours in the list can be out of order by up to a chunk. */
++    int n = m->nblocks, wrap = (int)m->blocks_wrap;
++    if (wrap > n) wrap = n;
++    int lo = 0, hi = n - 1;
++    if (m->jit.seg_words && wrap) {
++        if (pc >= m->jit.base + m->jit.end) hi = wrap - 1;
++        else lo = wrap;
++    }
++    if (lo > hi) return NULL;
++    while (lo < hi) {
++        int mid = (lo + hi + 1) / 2;
++        if (m->blocks[mid].code && m->blocks[mid].code <= pc) lo = mid;
++        else hi = mid - 1;
++    }
++    return &m->blocks[lo];
++}
++
+ uint32_t *hv_smc_counts;
+ uint64_t *hv_smc_last;
+ uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
+@@ -622,6 +669,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
  
  /* MMIO is accessed in naturally sized pieces of at most 8 bytes. */
  int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
@@ -448,7 +898,7 @@ index 7a01fdc..64b016b 100644
      void *p = hv_phys_ptr(m, pa, len);
      if (p) {
          memcpy(buf, p, len);
-@@ -640,8 +662,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
+@@ -640,8 +688,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
  }
  
  int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
@@ -460,10 +910,26 @@ index 7a01fdc..64b016b 100644
          uint64_t off = pa - r->pa;
          uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
 diff --git a/core/machine.h b/core/machine.h
-index cafe156..34d2a44 100644
+index cafe156..806de84 100644
 --- a/core/machine.h
 +++ b/core/machine.h
-@@ -127,6 +127,7 @@ typedef struct HvStats {
+@@ -62,12 +62,15 @@ typedef struct HvBlock {
+ #define HV_MAX_BLOCKS (3 << 20) /* a macOS boot runs well over a million distinct blocks; a full flush retranslates them all */
+ #define HV_PROF_RING (1 << 16)
+ #define HV_MAX_SLOTS (6 << 20)  /* chainable exits: about two per block */
++#define HV_FLUSH_EVICT 2        /* flush_pending: the code cache is full; taking back its oldest segment will do */
+ 
+ /* Counters for --stats: where the time goes. */
+ typedef struct HvStats {
+     uint64_t duplicate_place_avoided, duplicate_bytes_avoided, duplicate_place_late;
+     uint64_t flush_capacity, flush_block_limit, jit_tail_allocations;
+     uint64_t blocks, translations, block_flushes;
++    uint64_t evictions, evict_ticks, evict_blocks, evict_unchained; /* code-cache segments taken back, host ticks it took, blocks dropped, chained exits undone */
++    uint64_t evict_phase[3];  /* of those ticks: caches, blocks and hash; the slots; the instruction-cache lines */
+     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
+     uint64_t chained, ijc_fills, ijc_resets;
+     uint64_t xchained;
+@@ -127,6 +130,7 @@ typedef struct HvStats {
      uint64_t helper[12];      /* by HV_OP_* */
      uint64_t tlb_flushes, fetch_walks, exceptions, interrupts;
      uint64_t wfi, wfi_ticks;  /* WFI exits, host ticks spent asleep */
@@ -471,7 +937,7 @@ index cafe156..34d2a44 100644
  } HvStats;
  
  #define HV_MAX_CPUS 8
-@@ -203,8 +204,9 @@ typedef struct HvPerCpu {
+@@ -203,8 +207,9 @@ typedef struct HvPerCpu {
      int active, tlb_live;
      uint64_t timer_deadline;
      uint32_t timer_deadline_valid;
@@ -482,7 +948,16 @@ index cafe156..34d2a44 100644
      uint32_t ack_waiters;        /* CPUs asleep in hv_cpu_sync waiting for ack_seq to move (HV_SYNC_WAIT) */
      uint32_t walk_seq;           /* odd while it walks page tables and fills its TLB (see hv_tlbi_drop_remote_va) */
      uint64_t walk_page[8];       /* the page walk k (walk_seq 2k -> 2k+1) fills, at [k % 8]; HV_WALK_ANY: a process switch */
-@@ -263,6 +265,7 @@ typedef struct HvMachine {
+@@ -232,7 +237,7 @@ typedef struct HvMachine {
+     HvBlock *blocks;
+     int nblocks;
+     uint32_t max_blocks, max_slots; /* sized from the JIT region (machine.c) */
+-    int flush_pending;   /* set by helpers; the dispatcher flushes once the block has left */
++    int flush_pending;   /* set by helpers; the dispatcher flushes once the block has left. HV_FLUSH_EVICT: only room is needed */
+ 
+     void *gic;
+     /* Devices: called between blocks every so often and while the CPU waits.
+@@ -263,6 +268,7 @@ typedef struct HvMachine {
      uint64_t watch_pa;   /* debugging: the same by physical address */
      HvStats stats;
      int deadline_kicks_enabled;
@@ -490,6 +965,45 @@ index cafe156..34d2a44 100644
      int wait_stats;
      int jit_tail_enabled;
      int chain;               /* block chaining and the indirect-branch cache are enabled */
+@@ -282,6 +288,10 @@ typedef struct HvMachine {
+     uint32_t xchain_heads[HV_XCHAIN_BUCKETS];
+     uint64_t xchain_examined, xchain_removed;
+     uint32_t nslots;
++    uint32_t *slot_free, nslot_free, slot_take;
++    uint32_t blocks_wrap;
++    uint32_t **evict_words;
++    size_t evict_words_cap;
+     HvCpu *cpu;              /* CPU 0: the one that polls devices */
+     HvCpu *cpus[HV_MAX_CPUS]; /* every CPU, so device and invalidation code can ask them to leave */
+     int ncpus;
+@@ -316,7 +326,7 @@ static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
+     return (uint32_t)(h ^ (h >> 29)) & (HV_BLOCK_HASH - 1);
+ }
+ 
+-/* Lock-free: blocks are only added (release store) until a flush, which stops every CPU. */
++/* Lock-free: blocks are only added (release store) until a flush or an eviction, which stop every CPU. */
+ static inline HvBlock *hv_block_find(HvMachine *m, uint32_t h, uint64_t va, uint64_t pa, uint32_t flags, uint32_t gen) {
+     for (HvBlock *b = __atomic_load_n(&m->hash[h], __ATOMIC_ACQUIRE); b; b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE))
+         if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return b;
+@@ -333,6 +343,9 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
+                         void (*write)(void *, uint64_t, uint64_t, unsigned), const char *name);
+ 
+ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa);
++/* Diagnostics: the block whose code starts at or before host address pc (nearest), or NULL. */
++HvBlock *hv_block_at(HvMachine *m, const uint32_t *pc);
++
+ /* Drop the translations made from the RAM page holding pa (it was written, or the guest invalidated it). */
+ void hv_invalidate_code(HvMachine *m, uint64_t pa);
+ void hv_ret_clear(HvCpu *cpu);
+@@ -340,7 +353,7 @@ int hv_ic_ivau_drops(void);
+ /* Settings that say how to translate or wait, to compare ways of doing it in one running guest
+    ("knob NAME VALUE" in HV_INPUT_FILE; a new way starts from an empty code cache). Each starts
+    from the environment variable named in hv_knob_names. */
+-enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK, HV_K_SYNCWAIT, HV_K_SWITCHFLUSH, HV_K_RANGEDROP, HV_K_MOVIMM, HV_K_PREDSTAT, HV_K_WALKLOG, HV_K_HOIST, HV_K_IJCPAGES, HV_K_DNSPROXY, HV_K_COUNT };
++enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK, HV_K_SYNCWAIT, HV_K_SWITCHFLUSH, HV_K_RANGEDROP, HV_K_MOVIMM, HV_K_PREDSTAT, HV_K_WALKLOG, HV_K_HOIST, HV_K_IJCPAGES, HV_K_DNSPROXY, HV_K_JITSEGS, HV_K_COUNT };
+ extern int hv_knob[HV_K_COUNT];
+ int hv_knob_set(HvMachine *m, const char *name, int value);
+ /* Debugging (HV_WATCH): which pages keep losing their translations. */
 diff --git a/core/memop.c b/core/memop.c
 index bfbac5e..80e65ef 100644
 --- a/core/memop.c
@@ -564,10 +1078,32 @@ index 3a4ee8f..89ad6ac 100644
     can be read before the page ends. On a fault, the instruction abort is taken
     and NULL is returned. */
 diff --git a/core/translate.c b/core/translate.c
-index cebfb7d..0afb579 100644
+index cebfb7d..9b91feb 100644
 --- a/core/translate.c
 +++ b/core/translate.c
-@@ -811,7 +811,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
+@@ -398,9 +398,18 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
+     uint32_t slot_index = ~0u;
+     int same_page = (target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) == e->page;
+     uint64_t xa = same_page ? 0 : cross_addend(e, target);
+-    if (same_page || xa) {
+-        slot_index = __atomic_fetch_add(&e->m->nslots, 1, __ATOMIC_RELAXED); /* translations run in parallel */
+-        if (slot_index >= e->m->max_slots) slot_index = ~0u; /* out of slots until the next flush: no chaining */
++    /* Only an exit the block keeps a site for (nsite) gets a slot: placing records where its code is, which is how
++       an eviction knows the slot is free again once that code is gone. */
++    if ((same_page || xa) && e->nsite < MAX_OOL) {
++        /* Translations run in parallel. The counters are looked at before they are bumped, so that a long run with
++           no eviction or flush cannot take them round past 2^32 and hand out a slot in use. */
++        HvMachine *m = e->m;
++        uint32_t k = __atomic_load_n(&m->slot_take, __ATOMIC_RELAXED) < m->nslot_free ? __atomic_fetch_add(&m->slot_take, 1, __ATOMIC_RELAXED) : ~0u;
++        if (k < m->nslot_free) slot_index = m->slot_free[k]; /* freed by the last eviction */
++        else if (__atomic_load_n(&m->nslots, __ATOMIC_RELAXED) < m->max_slots) {
++            slot_index = __atomic_fetch_add(&m->nslots, 1, __ATOMIC_RELAXED);
++            if (slot_index >= m->max_slots) slot_index = ~0u;
++        } /* else out of slots until an eviction or flush: no chaining */
+     }
+     if (slot_index == ~0u) {
+         /* Another page may be remapped under us, so look it up by VA instead of chaining. */
+@@ -811,7 +820,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
  /* Ends the block (returns 1), or 0 for a conditional branch the block goes on past. */
  static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
      if ((insn & 0x7c000000) == 0x14000000) { /* B, BL */
@@ -576,7 +1112,7 @@ index cebfb7d..0afb579 100644
          if (insn >> 31) {
              if (use_ras(e)) put_call(e, pc + 4);
              else put_const_to(e, 30, pc + 4);
-@@ -820,7 +820,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -820,7 +829,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
          return 1;
      }
      if ((insn & 0xff000000) == 0x54000000) { /* B.cond, BC.cond */
@@ -585,7 +1121,7 @@ index cebfb7d..0afb579 100644
          uint32_t cond = insn & 0xf;
          if (cond >= 14) {
              put_branch_exit(e, target, 1);
-@@ -836,7 +836,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -836,7 +845,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
      }
      /* CBZ/CBNZ (imm19) and TBZ/TBNZ (imm14) */
      int tb = (insn & 0x7e000000) == 0x36000000;
@@ -594,7 +1130,7 @@ index cebfb7d..0afb579 100644
      uint32_t bare = tb ? insn & ~(0x3fffu << 5) : insn & ~(0x7ffffu << 5);
      int rt = insn & 0x1f;
      if (!is_stolen(rt)) {
-@@ -1915,6 +1915,22 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1915,6 +1924,22 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
          if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) break;
          if (kind == HV_INSN_COPY && (insn & 0xfffff01fu) == 0xd503201fu) continue; /* hints (NOP, BTI): no register */
          if (kind == HV_INSN_COPY || kind == HV_INSN_PCREL || kind == HV_INSN_LOAD_LITERAL) {
@@ -617,7 +1153,7 @@ index cebfb7d..0afb579 100644
              KILL(insn);
              continue;
          }
-@@ -1996,13 +2012,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1996,13 +2021,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
  /* After the block: each live group's plain copy. Returns -1 if they do not fit. */
  static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_t ntrans) {
      e->nogroup = 1;
@@ -645,9 +1181,18 @@ index cebfb7d..0afb579 100644
              e->cur_pc = va + 4ull * i;
              e->cur_i = i;
              e->u_prev = e->u_live = 0;
-@@ -2119,7 +2149,11 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
+@@ -2113,13 +2152,20 @@ static __thread struct {
+     HvMachine *m;
+     uint64_t gen;
+     uint32_t *hot, *cold;
++    uint32_t seg, epoch;  /* the ring segment it is in, and that segment's epoch then (taken back since: gone) */
+ } chunk;
+ 
+ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_at, uint32_t **cold_at) {
      uint64_t gen = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST);
-     if (chunk.m != m || chunk.gen != gen || !chunk.hot || (size_t)(chunk.cold - chunk.hot) < (size_t)hot + cold) {
+-    if (chunk.m != m || chunk.gen != gen || !chunk.hot || (size_t)(chunk.cold - chunk.hot) < (size_t)hot + cold) {
++    if (chunk.m != m || chunk.gen != gen || !chunk.hot || (size_t)(chunk.cold - chunk.hot) < (size_t)hot + cold ||
++        (m->jit.seg_words && m->jit.seg_epoch[chunk.seg] != chunk.epoch)) {
          size_t want = JIT_CHUNK_WORDS;
 -        if (want > m->jit.capacity) want = m->jit.capacity;
 +        // Respect the effective comparison-cache bound before asking for a
@@ -655,9 +1200,21 @@ index cebfb7d..0afb579 100644
 +        size_t capacity = m->jit.limit && m->jit.limit < m->jit.capacity ? m->jit.limit : m->jit.capacity;
 +        capacity &= ~(size_t)1; // reserve and placement require 8-byte alignment
 +        if (want > capacity) want = capacity;
++        if (m->jit.seg_words && want > m->jit.seg_words) want = m->jit.seg_words;
          if (want < (size_t)hot + cold) want = (size_t)hot + cold;
          uint32_t *p = hv_jit_reserve(&m->jit, want);
          if (!p && m->jit_tail_enabled && want > (size_t)hot + cold) {
+@@ -2131,6 +2177,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
+         }
+         if (!p) { chunk.hot = NULL; return -1; }
+         chunk.m = m, chunk.gen = gen, chunk.hot = p, chunk.cold = p + ((want + 1) & ~(size_t)1);
++        if (m->jit.seg_words) {
++            chunk.seg = (uint32_t)((size_t)(p - m->jit.base) / m->jit.seg_words);
++            chunk.epoch = m->jit.seg_epoch[chunk.seg];
++        }
+     }
+     *hot_at = chunk.hot;
+     chunk.hot += hot;
 diff --git a/devices/cursor_damage.h b/devices/cursor_damage.h
 new file mode 100644
 index 0000000..eca2756
@@ -1073,6 +1630,25 @@ index 3afe521..981c205 100644
 +int hv_pvg_mac_pointer(int *x, int *y);
  
  #endif
+diff --git a/devices/pvg_linear_bounds.h b/devices/pvg_linear_bounds.h
+new file mode 100644
+index 0000000..c7be4cf
+--- /dev/null
++++ b/devices/pvg_linear_bounds.h
+@@ -0,0 +1,13 @@
++#ifndef HENGE_PVG_LINEAR_BOUNDS_H
++#define HENGE_PVG_LINEAR_BOUNDS_H
++#include <stdint.h>
++/* PR137: the final row needs visible pixels, not trailing row padding. Use
++   subtraction and division so malformed guest dimensions cannot wrap a sum. */
++static inline int hv_pvg_linear_bounds(uint64_t width,uint64_t height,uint64_t bpp,
++                                     uint64_t offset,uint64_t row,uint64_t length,uint64_t align) {
++    return width && height && bpp && width<=UINT64_MAX/bpp && offset<=length &&
++        width*bpp<=length-offset && row>=width*bpp &&
++        (!align || (!(row%align) && !(offset%align))) &&
++        height-1<=(length-offset-width*bpp)/row;
++}
++#endif
 diff --git a/devices/pvg_link.h b/devices/pvg_link.h
 index 4deff97..d0ff98b 100644
 --- a/devices/pvg_link.h
@@ -1321,7 +1897,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..95ffd24 100644
+index 9073d22..3f08ab0 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -1336,7 +1912,7 @@ index 9073d22..95ffd24 100644
  #include <stdatomic.h>
  #include <os/lock.h>
  #import <Foundation/Foundation.h>
-@@ -16,13 +21,20 @@
+@@ -16,13 +21,21 @@
  #import <TargetConditionals.h>
  #import <IOSurface/IOSurfaceRef.h>
  #include <string.h>
@@ -1348,6 +1924,7 @@ index 9073d22..95ffd24 100644
  #include "frame_metrics.h"
  #include "gpu_epoch_cache.h"
  #include "planar_registry.h"
++#include "pvg_linear_bounds.h"
  #include "metal_library_cache.h"
 +#include "resource_policy.h"
 +#include "scheduling.h"
@@ -1357,7 +1934,7 @@ index 9073d22..95ffd24 100644
  
  #include "display_settings.h"
  static int cursor_scale(void) { return (int)hv_display_settings_get().scale; }
-@@ -35,6 +47,7 @@ static int cursor_scale(void) { return (int)hv_display_settings_get().scale; }
+@@ -35,6 +48,7 @@ static int cursor_scale(void) { return (int)hv_display_settings_get().scale; }
  #include <string.h>
  
  #include "pvg_lite.h"
@@ -1365,7 +1942,7 @@ index 9073d22..95ffd24 100644
  
  #if !TARGET_OS_IPHONE
  #import <CoreGraphics/CoreGraphics.h>
-@@ -120,7 +133,13 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
+@@ -120,7 +134,13 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
  
  /* The registration lock never crosses encoding, callbacks or network operations. */
  static os_unfair_lock link_handler_lock = OS_UNFAIR_LOCK_INIT;
@@ -1380,7 +1957,7 @@ index 9073d22..95ffd24 100644
  void hv_pvg_link_set_frame_handler(HvPvgLinkFrameHandler handler) {
      os_unfair_lock_lock(&link_handler_lock);
      link_handler = [handler copy];
-@@ -135,6 +154,7 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -135,6 +155,7 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
  @interface HvReplay : NSObject {
  @public
      HvPvgLite *lite;
@@ -1388,7 +1965,7 @@ index 9073d22..95ffd24 100644
      id<MTLDevice> device;
      id<MTLCommandQueue> queue;
      dispatch_queue_t worker;
-@@ -149,9 +169,16 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -149,9 +170,16 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      uint64_t execs, draws, heap_bytes, synced, remaps;
      _Atomic uint64_t failed;
      HvMetalLibraryCache *library_cache; /* serial GPU worker only; exact binary keys */
@@ -1405,7 +1982,7 @@ index 9073d22..95ffd24 100644
      uint64_t command_epoch, current_epoch, object_hits, object_reads, page_checks, page_hits;
      struct HvGpuEpochKey object_keys[HV_GPU_EPOCH_SLOTS];
      HvObject *object_values[HV_GPU_EPOCH_SLOTS];
-@@ -163,11 +190,10 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -163,11 +191,10 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      _Atomic int stopping;
      dispatch_group_t completions;
      id<MTLCommandBuffer> last_cb;
@@ -1418,7 +1995,7 @@ index 9073d22..95ffd24 100644
      int pacing_fps;
      BOOL pacing_policy_logged;
  
-@@ -193,6 +219,17 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -193,6 +220,17 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      uint64_t frames, frames_shot;
      /* Showing frames with the GPU: a layer the app gave us. No copies, no conversion on a CPU. */
      CAMetalLayer *layer; /* screen_lock protects the target and its generation */
@@ -1436,7 +2013,7 @@ index 9073d22..95ffd24 100644
      uint64_t layer_generation;
      __weak CAMetalLayer *prepared_layer; /* presenter only: each target needs its own setup */
      id<MTLRenderPipelineState> screen_pipe, linear_pipe, cursor_pipe;
-@@ -206,7 +243,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -206,7 +244,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      BOOL link_cursor_shown;
      _Atomic int link_cursor_queued;
      _Atomic uint64_t gpu_frames;
@@ -1447,7 +2024,7 @@ index 9073d22..95ffd24 100644
      os_unfair_lock frame_metrics_lock;
      struct HvFrameMetrics frame_metrics;
      dispatch_queue_t presenter;
-@@ -216,6 +255,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -216,6 +256,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      BOOL drawable_retry_pending;
      double drawable_retry_cooldown; /* fresh work coalesces one wake at its expiry */
      uint64_t screen_requests; /* fresh frames/cursor changes, not automatic retries */
@@ -1457,7 +2034,7 @@ index 9073d22..95ffd24 100644
      double drawable_retry_deadline; /* at most two seconds of retrying an unavailable target */
      uint32_t screen_w, screen_h;
      id<MTLBuffer> test_readback; /* HV_PVG_GPU_TEST: the drawable's pixels for screenshots */
-@@ -227,13 +269,33 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -227,12 +270,32 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
  - (void)complain:(NSString *)what;
  - (HvObject *)object:(uint32_t)ref task:(uint32_t)task;
  - (void)drawCursor;
@@ -1475,8 +2052,8 @@ index 9073d22..95ffd24 100644
 +- (void)requestDisplayPulse;
 +- (void)displayPulse:(CAMetalDisplayLink *)link update:(CAMetalDisplayLinkUpdate *)update;
 +#endif
- @end
- 
++@end
++
 +#if TARGET_OS_IPHONE
 +@interface HvDisplayPulse : NSObject <CAMetalDisplayLinkDelegate>
 +@property(nonatomic, weak) HvReplay *owner;
@@ -1486,13 +2063,37 @@ index 9073d22..95ffd24 100644
 +    HvReplay *owner=self.owner;
 +    if(owner)[owner displayPulse:link update:update];else link.paused=YES;
 +}
-+@end
+ @end
 +#endif
-+
+ 
  /* What Metal asks while it reads a serialized pipeline. */
  @interface HvContext : NSObject {
- @public
-@@ -457,6 +519,20 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+@@ -270,7 +333,7 @@ static BOOL linear_texture_fits(id<MTLDevice> device, MTLTextureDescriptor *t, u
+     NSUInteger bpp = pixel_bytes(t.pixelFormat);
+     if (!bpp) return YES; /* not checked: as before */
+     NSUInteger align = [device minimumLinearTextureAlignmentForPixelFormat:t.pixelFormat];
+-    BOOL ok = row >= t.width * bpp && (!align || (row % align == 0 && offset % align == 0)) && offset + row * t.height <= length;
++    BOOL ok = hv_pvg_linear_bounds(t.width,t.height,bpp,offset,row,length,align);
+     if (!ok) {
+         static int told;
+         if (told++ < 8) fprintf(stderr, "hengevm: pvg-metal: a %lux%lu format %lu texture can't sit on rows of %llu bytes at %llu in %lu: left empty\n",
+@@ -447,9 +510,13 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+ - (BOOL)hadLookupFailure { return failure != nil; }
+ - (NSString *)firstFailureReason { return failure; }
+ - (id)functionWithFunctionRef:(unsigned long long)ref {
++    if (!ref) {
++        if (standIn && !failure) failure = @"function ref 0 in a compute pipeline";
++        return standIn;
++    }
+     HvObject *o = [replay object:(uint32_t)ref task:task];
+-    if (!o || !o->object) {
+-        if (!failure) failure = [NSString stringWithFormat:@"function %llu", ref];
++    if (!o || !o->object || (o->entry[0] & 0xff) != OBJ_FUNCTION) {
++        if (!failure) failure = [NSString stringWithFormat:@"missing or non-function object %llu", ref];
+         return standIn;
+     }
+     return o->object;
+@@ -457,6 +524,20 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
  @end
  
  @implementation HvReplay
@@ -1513,7 +2114,11 @@ index 9073d22..95ffd24 100644
  
  - (void)complain:(NSString *)what {
      if ([complaints containsObject:what]) return;
-@@ -488,8 +564,11 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+@@ -485,19 +566,27 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+     }
+     struct __attribute__((packed)) { uint64_t off; uint32_t len; uint32_t tag, size; } h;
+     if (hv_pvg_lite_task_read(lite, task, at, &h, sizeof h)) return nil;
++    if (h.tag != 15) { [self complain:@"function record tag is not 15"]; return nil; }
      NSMutableData *lib = [NSMutableData dataWithLength:h.len];
      if (hv_pvg_lite_task_read(lite, task, h.off, lib.mutableBytes, h.len)) return nil;
      __block NSError *err = nil;
@@ -1525,8 +2130,12 @@ index 9073d22..95ffd24 100644
 +        if (begin >= self->cache_budget_deadline) [self refreshCacheBudget];
          dispatch_data_t data = dispatch_data_create(lib.bytes, lib.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
          id<MTLLibrary> result = [self->device newLibraryWithData:data error:&err];
++        if (result && result.functionNames.count != 1) {
++            [self complain:@"guest function library must contain exactly one function"];
++            result = nil;
++        }
          double seconds = now_seconds() - begin;
-@@ -497,7 +576,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+         self->library_load_seconds += seconds;
          if (seconds > self->library_load_worst) self->library_load_worst = seconds;
          return result;
      }];
@@ -1535,7 +2144,7 @@ index 9073d22..95ffd24 100644
          [self complain:[NSString stringWithFormat:@"library: %@", err.localizedDescription]];
          return nil;
      }
-@@ -509,11 +588,11 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+@@ -509,29 +598,49 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
          if (tf && keep) {
              NSString *dir = [[[NSString stringWithUTF8String:tf] stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"shaders"];
              [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -1546,10 +2155,77 @@ index 9073d22..95ffd24 100644
      }
 -    return [library newFunctionWithName:library.functionNames.firstObject];
 +    return function;
++}
++
++- (id)pipelineDescriptor:(uint32_t)tag data:(NSData *)all task:(uint32_t)task {
++    const uint32_t *w = all.bytes;
++    id<HvMetalSPI> spi = (id)device;
++    HvContext *ctx = [HvContext new];
++    ctx->replay = self, ctx->task = task;
++    if (tag == 0xb) ctx->standIn = [self computeStandIn];
++    dispatch_data_t data = dispatch_data_create((const uint8_t *)all.bytes + 16, w[3], NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
++    id descriptor = tag == 0xe ? [spi newRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx]
++                  : tag == 0x33 ? [spi newTileRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx]
++                                : [spi newComputePipelineDescriptorWithSerializedData:data deserializationContext:ctx];
++    if (!descriptor || ctx->failure) {
++        [self complain:[NSString stringWithFormat:@"%@ descriptor %u: %@", tag == 0xb ? @"compute" : @"pipeline", tag, ctx->failure]];
++        return nil;
++    }
++    id function = tag == 0xe ? [(MTLRenderPipelineDescriptor *)descriptor vertexFunction]
++                : tag == 0x33 ? [(MTLTileRenderPipelineDescriptor *)descriptor tileFunction]
++                              : [(MTLComputePipelineDescriptor *)descriptor computeFunction];
++    if (!function) {
++        [self complain:[NSString stringWithFormat:@"pipeline %u without its %s function", tag, tag == 0xe ? "vertex" : tag == 0x33 ? "tile" : "compute"]];
++        return nil;
++    }
++    return descriptor;
  }
  
  - (id)makeSerialized:(uint64_t)at length:(uint32_t)size task:(uint32_t)task {
-@@ -838,15 +917,10 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
++    if (size < 4) return nil;
+     NSMutableData *all = [NSMutableData dataWithLength:size];
+     if (hv_pvg_lite_task_read(lite, task, at, all.mutableBytes, size)) return nil;
+     const uint32_t *w = all.bytes;
+     uint32_t tag = w[0];
++    if ((tag == 0xe || tag == 0x33 || tag == 0xb) && (size < 16 || w[3] > size - 16)) {
++        [self complain:@"serialized pipeline payload exceeds its record"]; return nil;
++    }
+     if (tag == 0xe || tag == 0x33) { /* render or tile pipeline: {tag, size, ref, length, data} */
+-        id<HvMetalSPI> spi = (id)device;
+-        HvContext *ctx = [HvContext new];
+-        ctx->replay = self, ctx->task = task;
+-        dispatch_data_t data = dispatch_data_create((const uint8_t *)all.bytes + 16, w[3], NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+-        id descriptor = tag == 0xe ? [spi newRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx]
+-                                   : [spi newTileRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx];
+-        if (!descriptor || ctx->failure) {
+-            [self complain:[NSString stringWithFormat:@"pipeline descriptor %u: %@", tag, ctx->failure]];
+-            return nil;
+-        }
++        id descriptor = [self pipelineDescriptor:tag data:all task:task];
++        if (!descriptor) return nil;
+         NSError *err = nil;
+         double pipeline_start = now_seconds();
+         id state = tag == 0xe ? [device newRenderPipelineStateWithDescriptor:descriptor error:&err]
+@@ -560,16 +669,8 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+         return state;
+     }
+     if (tag == 0xb) { /* compute pipeline: {tag, size, ref, length, data} */
+-        id<HvMetalSPI> spi = (id)device;
+-        HvContext *ctx = [HvContext new];
+-        ctx->replay = self, ctx->task = task;
+-        dispatch_data_t data = dispatch_data_create((const uint8_t *)all.bytes + 16, w[3], NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+-        ctx->standIn = [self computeStandIn];
+-        id descriptor = [spi newComputePipelineDescriptorWithSerializedData:data deserializationContext:ctx];
+-        if (!descriptor || ctx->failure) {
+-            [self complain:[NSString stringWithFormat:@"compute descriptor: %@", ctx->failure]];
+-            return nil;
+-        }
++        id descriptor = [self pipelineDescriptor:tag data:all task:task];
++        if (!descriptor) return nil;
+         NSError *err = nil;
+         double pipeline_start = now_seconds();
+         id state = [device newComputePipelineStateWithDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
+@@ -838,15 +939,10 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
      return made;
  }
  
@@ -1568,7 +2244,7 @@ index 9073d22..95ffd24 100644
  }
  
  static uint64_t guest_hash(HvObject *s) { return hash_bytes(s->mapped + s->first, s->alloc); }
-@@ -863,7 +937,7 @@ static void sync_iosurface(HvObject *s) {
+@@ -863,7 +959,7 @@ static void sync_iosurface(HvObject *s) {
      if (!s->iosurface) return;
      const uint8_t *from = s->mapped + s->first;
      BOOL by_plane = s->plane_count && IOSurfaceGetPlaneCount(s->iosurface) >= s->plane_count;
@@ -1577,7 +2253,7 @@ index 9073d22..95ffd24 100644
      uint32_t changed = 0;
      uint64_t *have = s->shared_hashes ? (uint64_t *)s->shared_hashes.mutableBytes : s->plane_hash;
      if (by_plane) {
-@@ -876,9 +950,9 @@ static void sync_iosurface(HvObject *s) {
+@@ -876,9 +972,9 @@ static void sync_iosurface(HvObject *s) {
      } else {
          uint64_t hash = guest_hash(s);
          if (hash == s->content_hash) return;
@@ -1589,7 +2265,7 @@ index 9073d22..95ffd24 100644
      /* HV_PVG_HOST_DUMP=prefix (debugging): the host surface as it is just before the guest's pixels go over it,
         for the first few multi-plane surfaces, with its layout in a .txt beside it: did the GPU draw something here
         that this copy throws away? */
-@@ -907,7 +981,6 @@ static void sync_iosurface(HvObject *s) {
+@@ -907,7 +1003,6 @@ static void sync_iosurface(HvObject *s) {
             requested. Copy each changed video plane through its actual host layout. */
          for (uint32_t i = 0; i < s->plane_count && i < 4; i++) {
              if (!(changed & 1u << i)) continue;
@@ -1597,7 +2273,7 @@ index 9073d22..95ffd24 100644
              uint8_t *dst = IOSurfaceGetBaseAddressOfPlane(s->iosurface, i);
              size_t dst_row = IOSurfaceGetBytesPerRowOfPlane(s->iosurface, i);
              size_t rows = MIN((size_t)s->plane_h[i], IOSurfaceGetHeightOfPlane(s->iosurface, i));
-@@ -916,10 +989,13 @@ static void sync_iosurface(HvObject *s) {
+@@ -916,10 +1011,13 @@ static void sync_iosurface(HvObject *s) {
              size_t bytes = MIN((size_t)src_row, dst_row);
              for (size_t y = 0; y < rows; y++)
                  memcpy(dst + y * dst_row, from + src_off + y * src_row, bytes);
@@ -1612,7 +2288,7 @@ index 9073d22..95ffd24 100644
      }
      IOSurfaceUnlock(s->iosurface, 0, NULL);
      const char *dump = getenv("HV_PVG_SURFACE_DUMP");
-@@ -988,18 +1064,18 @@ static void sync_surface_once(HvReplay *r, HvObject *s, uint64_t epoch) {
+@@ -988,18 +1086,18 @@ static void sync_surface_once(HvReplay *r, HvObject *s, uint64_t epoch) {
      }
      surface->surface_w = (uint32_t)sw, surface->surface_h = (uint32_t)sh;
      uint64_t n = surface->length >> 14;
@@ -1635,7 +2311,7 @@ index 9073d22..95ffd24 100644
          vm_prot_t cur, max;
          vm_remap(mach_task_self(), &to, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
      }
-@@ -1233,30 +1309,38 @@ static BOOL has_guest_pages(HvObject *o) {
+@@ -1233,30 +1331,38 @@ static BOOL has_guest_pages(HvObject *o) {
  }
  
  /* Between guest memory and the GPU's own copy, in the layout the guest was told. */
@@ -1683,7 +2359,7 @@ index 9073d22..95ffd24 100644
              if (down)
                  [*blit copyFromTexture:tex sourceSlice:s sourceLevel:m sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, d)
                                toBuffer:copy destinationOffset:from destinationBytesPerRow:row destinationBytesPerImage:image];
-@@ -1264,6 +1348,7 @@ static BOOL has_guest_pages(HvObject *o) {
+@@ -1264,6 +1370,7 @@ static BOOL has_guest_pages(HvObject *o) {
                  [*blit copyFromBuffer:copy sourceOffset:from sourceBytesPerRow:row sourceBytesPerImage:image
                             sourceSize:MTLSizeMake(w, h, d) toTexture:tex destinationSlice:s destinationLevel:m destinationOrigin:MTLOriginMake(0, 0, 0)];
          }
@@ -1691,7 +2367,7 @@ index 9073d22..95ffd24 100644
  }
  
  /* The guest asks to see what the GPU made: {task, count, refs}. */
-@@ -1278,8 +1363,7 @@ static BOOL has_guest_pages(HvObject *o) {
+@@ -1278,8 +1385,7 @@ static BOOL has_guest_pages(HvObject *o) {
          HvObject *o = objs[@(a[2 + i])];
          if (!o || !o->guest_backed || !o->host_valid) continue;
          if (!cb) cb = [queue commandBuffer];
@@ -1701,7 +2377,7 @@ index 9073d22..95ffd24 100644
      }
      [blit endEncoding];
      if (cb) {
-@@ -1459,6 +1543,12 @@ typedef struct {
+@@ -1459,6 +1565,12 @@ typedef struct {
      if (!pipeline_set && draw) return;
      if (tracing && draw) fprintf(stderr, "trace:  draw tag %u\n", tag);
      switch (tag) {
@@ -1714,7 +2390,7 @@ index 9073d22..95ffd24 100644
      case 24: { /* {fence, stages} */
          id f = [self get:U32(0) task:task];
          if (f) [e updateFence:f afterStages:(MTLRenderStages)(U32(4) & 0xffff)];
-@@ -2108,7 +2198,7 @@ typedef struct {
+@@ -2108,7 +2220,7 @@ typedef struct {
              self->failed++;
              fprintf(stderr, "hengevm: pvg-metal: command buffer: %s\n", done.error.localizedDescription.UTF8String);
          }
@@ -1723,7 +2399,7 @@ index 9073d22..95ffd24 100644
          double elapsed = done.GPUEndTime - done.GPUStartTime;
          atomic_fetch_add_explicit(&self->gpu_completed, 1, memory_order_relaxed);
          if (done.GPUStartTime > 0 && elapsed >= 0) {
-@@ -2169,8 +2259,7 @@ typedef struct {
+@@ -2169,8 +2281,7 @@ typedef struct {
          }
          if (res[i * 2 + 1] & 1) o->guest_stale = NO, o->host_valid = NO; /* the guest wrote it */
          if (o->guest_backed && !o->host_valid) {
@@ -1733,7 +2409,7 @@ index 9073d22..95ffd24 100644
          }
          if (res[i * 2 + 1] & 4) sync_after = YES;
      }
-@@ -2254,8 +2343,7 @@ typedef struct {
+@@ -2254,8 +2365,7 @@ typedef struct {
              if (!(res[i * 2 + 1] & 4)) continue;
              HvObject *o = [self object:res[i * 2] task:task];
              if (!o || !o->guest_backed) continue;
@@ -1743,7 +2419,7 @@ index 9073d22..95ffd24 100644
          }
          [back endEncoding];
      }
-@@ -2263,13 +2351,17 @@ typedef struct {
+@@ -2263,13 +2373,17 @@ typedef struct {
      [self commit:cb channel:ch stamp:stamp complete:YES];
      double t2 = now_seconds();
      encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
@@ -1763,7 +2439,7 @@ index 9073d22..95ffd24 100644
                  atomic_load_explicit(&gpu_duration_ns, memory_order_relaxed) / 1e6,
                  atomic_load_explicit(&gpu_max_ns, memory_order_relaxed) / 1e6,
                  (unsigned long long)atomic_load_explicit(&gpu_timing_missing, memory_order_relaxed));
-@@ -2287,6 +2379,19 @@ typedef struct {
+@@ -2287,6 +2401,19 @@ typedef struct {
                  library_load_seconds * 1000, library_load_worst * 1000);
          fprintf(stderr, "hengevm: gpu-pipelines: builds=%llu total_ms=%.2f worst_ms=%.2f (cumulative host pipeline creation, including failures)\n",
                  (unsigned long long)pipeline_builds, pipeline_seconds * 1000, pipeline_worst_seconds * 1000);
@@ -1783,7 +2459,7 @@ index 9073d22..95ffd24 100644
      }
      return YES;
  }
-@@ -2319,14 +2424,27 @@ static const uint8_t *half_to_byte(void) {
+@@ -2319,14 +2446,27 @@ static const uint8_t *half_to_byte(void) {
      memcpy(&hx, (const uint8_t *)a + 0x24, 2), memcpy(&hy, (const uint8_t *)a + 0x26, 2);
      if (!w || !h || w > 512 || h > 512 || stride < (uint64_t)w * 4 || stride > 8192) return;
      uint8_t *bits = malloc((size_t)stride * h);
@@ -1811,7 +2487,7 @@ index 9073d22..95ffd24 100644
      [glyph replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
      if (a[0] == 1) {
          link_cursor=glyph;link_cw=w;link_ch=h;link_hx=hx;link_hy=hy;
-@@ -2336,21 +2454,22 @@ static const uint8_t *half_to_byte(void) {
+@@ -2336,21 +2476,22 @@ static const uint8_t *half_to_byte(void) {
      os_unfair_lock_lock(&screen_lock);
      cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
      cursor_tex = glyph;
@@ -1837,7 +2513,7 @@ index 9073d22..95ffd24 100644
          [self screenChanged];
          return;
      }
-@@ -2439,26 +2558,110 @@ static const uint8_t *half_to_byte(void) {
+@@ -2439,26 +2580,110 @@ static const uint8_t *half_to_byte(void) {
     refresh, so that happens on a thread of its own and never holds up the guest's GPU work:
     this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
  - (void)updatePacingPolicy {
@@ -1958,7 +2634,7 @@ index 9073d22..95ffd24 100644
      if (presenter_running || !layer || !screen_tex || drawable_retry_pending || pacing_pending) return;
      [self updatePacingPolicy];
      double now = now_seconds();
-@@ -2507,6 +2710,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2507,6 +2732,7 @@ static const uint8_t *half_to_byte(void) {
     submit another guest write. All link cursor state belongs to this worker. */
  - (void)sendLinkMapping:(uint64_t)mapping {
      link_mapping=mapping;
@@ -1966,7 +2642,7 @@ index 9073d22..95ffd24 100644
      HvPvgLinkFrameHandler handler=link_frame_handler();
      HvObject *surface=surfaces[@(mapping)];
      if(!handler || !surface)return;
-@@ -2526,6 +2730,29 @@ static const uint8_t *half_to_byte(void) {
+@@ -2526,6 +2752,29 @@ static const uint8_t *half_to_byte(void) {
              (float)(at&0xffff)-link_hx*scale,(float)(at>>16)-link_hy*scale,link_cw*scale,link_ch*scale);
  }
  
@@ -1996,7 +2672,7 @@ index 9073d22..95ffd24 100644
  - (void)showOnLayer:(uint64_t)mapping {
      HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]); /* not met yet: a resumed machine's screen */
      if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
-@@ -2547,28 +2774,49 @@ static const uint8_t *half_to_byte(void) {
+@@ -2547,28 +2796,49 @@ static const uint8_t *half_to_byte(void) {
      screen_dirty = YES;
      [self kickPresenter:YES];
      os_unfair_lock_unlock(&screen_lock);
@@ -2049,7 +2725,7 @@ index 9073d22..95ffd24 100644
              presenter_running = NO;
              [self kickPresenter:NO];
              os_unfair_lock_unlock(&screen_lock);
-@@ -2597,7 +2845,12 @@ static const uint8_t *half_to_byte(void) {
+@@ -2597,7 +2867,12 @@ static const uint8_t *half_to_byte(void) {
              target.drawableSize = want;
              [CATransaction commit];
          }
@@ -2063,7 +2739,7 @@ index 9073d22..95ffd24 100644
          if (!drawable) {
              os_unfair_lock_lock(&screen_lock);
              screen_dirty = YES;
-@@ -2636,6 +2889,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2636,6 +2911,7 @@ static const uint8_t *half_to_byte(void) {
          cw0 = cursor_w, ch0 = cursor_h, hx = cursor_hot_x, hy = cursor_hot_y;
          BOOL same_target = layer_generation == generation && layer == target;
          BOOL same_size = screen_w == W && screen_h == H;
@@ -2071,7 +2747,7 @@ index 9073d22..95ffd24 100644
          if (same_target && same_size) {
              screen_dirty = NO;
              drawable_retry_deadline = 0;
-@@ -2717,11 +2971,13 @@ static const uint8_t *half_to_byte(void) {
+@@ -2717,11 +2993,13 @@ static const uint8_t *half_to_byte(void) {
          // Serialize the final check and commit with set_layer: a switch that has
          // returned must not be followed by a commit to its old target.
          os_unfair_lock_lock(&screen_lock);
@@ -2088,7 +2764,7 @@ index 9073d22..95ffd24 100644
                      os_unfair_lock_unlock(&self->frame_metrics_lock);
                  }];
              }
-@@ -2738,10 +2994,10 @@ static const uint8_t *half_to_byte(void) {
+@@ -2738,10 +3016,10 @@ static const uint8_t *half_to_byte(void) {
  
  /* What the display should show: at most a few times a second by CPU, for tests and the boot's first frames. */
  - (void)present:(uint64_t)mapping {
@@ -2101,7 +2777,7 @@ index 9073d22..95ffd24 100644
          late = NO;
          [self showOnLayer:mapping];
          return;
-@@ -2834,13 +3090,20 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2834,13 +3112,20 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->completions = dispatch_group_create();
          r->device = dev;
          r->queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
@@ -2124,7 +2800,7 @@ index 9073d22..95ffd24 100644
          r->resource_tally = getenv("HV_PVG_TALLY") != NULL;
          r->batch_cache = getenv("HV_GPU_BATCH_CACHE") && !strcmp(getenv("HV_GPU_BATCH_CACHE"), "1");
          r->tasks = [NSMutableDictionary new];
-@@ -2848,6 +3111,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2848,6 +3133,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->surfaces = [NSMutableDictionary new];
          r->planar = [NSMutableDictionary new];
          r->complaints = [NSMutableSet new];
@@ -2149,7 +2825,7 @@ index 9073d22..95ffd24 100644
          r->shot = getenv("HV_PVG_SHOT");
          cp_start(r);
  #if !TARGET_OS_IPHONE
-@@ -2864,6 +3145,32 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2864,6 +3167,32 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
              r->shot_timer = timer;
          }
  #endif
@@ -2182,7 +2858,7 @@ index 9073d22..95ffd24 100644
          fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
          return (HvPvgMetal *)CFBridgingRetain(r);
      }
-@@ -2874,20 +3181,35 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
+@@ -2874,20 +3203,35 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
      @autoreleasepool {
          HvReplay *r = CFBridgingRelease(m);
          atomic_store(&r->stopping, 1);
@@ -2221,7 +2897,17 @@ index 9073d22..95ffd24 100644
          dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
          /* GPU completions may have enqueued a final readback on the worker. */
          dispatch_sync(r->worker, ^{
-@@ -2998,24 +3320,78 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
+@@ -2951,7 +3295,8 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
+                     /* "May be thrown away": Apple's host only marks it purgeable, and the bytes stay
+                        until the system needs the memory. Here they just stay. */
+                 } else if (op == 0x20 && n >= 4) {
+-                    [r->tasks removeObjectForKey:@(args[0] >> 1)];
++                    /* PR133: delete sends a plain id; only define task shifts it. */
++                    [r->tasks removeObjectForKey:@(args[0])];
+                 } else {
+                     hv_pvg_lite_command(lite, cmd, len);
+                     if (op == 8 && n >= 16) {
+@@ -2998,24 +3343,78 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
      }
      r->pacing_pending = NO; r->frame_pacing.next = 0; /* reattaching the same layer also wakes a stopped presenter */
      r->layer = l;
@@ -2301,7 +2987,7 @@ index 9073d22..95ffd24 100644
          [r screenChanged];
          return;
      }
-@@ -3104,6 +3480,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
+@@ -3104,6 +3503,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
          (unsigned long long)m.overflow,(unsigned long long)m.invalid);
  }
  
@@ -2311,7 +2997,7 @@ index 9073d22..95ffd24 100644
  void hv_pvg_metal_link_connected(HvPvgMetal *m,int connected){
      if(!m)return;HvReplay *r=(__bridge HvReplay *)m;
      dispatch_async(r->worker,^{
-@@ -3117,25 +3496,45 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+@@ -3117,25 +3519,45 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
      if(atomic_exchange(&r->link_cursor_queued,1))return;
      dispatch_async(r->worker,^{atomic_store(&r->link_cursor_queued,0);if (!atomic_load(&r->stopping)) [r sendLinkMapping:r->link_mapping];});
  }
@@ -2361,7 +3047,7 @@ index 9073d22..95ffd24 100644
              for (NSNumber *task in r->tasks) {
                  NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
                  for (NSNumber *ref in objs) {
-@@ -3143,79 +3542,117 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -3143,79 +3565,117 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
                      if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
                      if (o->parent && o->parent->heap_whole) continue;
                      if (!cb) cb = [r->queue commandBuffer];
@@ -2386,13 +3072,8 @@ index 9073d22..95ffd24 100644
          dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
      }
 +    return failed ? -1 : 0;
- }
- 
--typedef struct DisplayState {
--    uint64_t on_screen;
--    uint32_t cursor_w, cursor_h, cursor_stride, cursor_shown;
--    int32_t hot_x, hot_y;
--} DisplayState;
++}
++
 +/* Entry is foreground-only, with CPUs stopped and local presentation paused.
 +   Fence both guest and Link submissions before the CPU-only gate is published. */
 +int hv_pvg_metal_background_fence(HvPvgMetal *m) {
@@ -2409,8 +3090,13 @@ index 9073d22..95ffd24 100644
 +    dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
 +    dispatch_sync(r->worker, ^{});
 +    return failed ? -1 : 0;
-+}
-+
+ }
+ 
+-typedef struct DisplayState {
+-    uint64_t on_screen;
+-    uint32_t cursor_w, cursor_h, cursor_stride, cursor_shown;
+-    int32_t hot_x, hot_y;
+-} DisplayState;
 +#include "display_snapshot.h"
  
  size_t hv_pvg_metal_display_state(HvPvgMetal *m, void *out, size_t cap) {
@@ -4412,6 +5098,32 @@ index 55c66e6..fe9dd9e 100644
  11. showOnLayer/presentLoop choose a shared-memory scanout texture, composite
      screen and premultiplied cursor via native Metal, and present CAMetalDrawable.
      No ordinary CPU full-frame readback is introduced. The presentation worker
+diff --git a/docs/upstream-desktop/PROGRESS.md b/docs/upstream-desktop/PROGRESS.md
+new file mode 100644
+index 0000000..c25dca3
+--- /dev/null
++++ b/docs/upstream-desktop/PROGRESS.md
+@@ -0,0 +1,20 @@
++# Desktop integration after 0.3.5
++
++Base delivered commit a3fd806, patch c09b2eb. Latest upstream main e98920c.
++Recent main changes extend the separate AppKit/user-process runtime; there is
++no newer full-VM engine or renderer commit after the pinned8048e4a.
++
++Implemented pending cloud validation:
++- PR133 task-id retirement, function/pipeline record validation, retaining our
++  exact-byte Metal library/function cache and timing.
++- PR137 final visible-row texture bounds with overflow-safe arithmetic.
++- PR132+145 segmented JIT eviction with full-reset fallback, preserving our
++  physical-page chained-exit buckets, event-driven quiescence, duplicate-placement
++  checks, failed-reservation/tail allocation behaviour and full live-branch barriers.
++  Batched instruction publication is only used while all guest CPUs are parked.
++  Repair scratch belongs to each machine and allocation failure uses the correct
++  slower publication path. Added four-vCPU cross-page eviction regression.
++
++Next: exact cloud native checks while porting PR143 guest-backed planar views and
++PR152 persistent pipeline archives; inspect PR157 invalidation/permission safety.
++No new IPA until the combined desktop changes pass their release gate.
 diff --git a/docs/upstream-review/2026-11-12-decisions.md b/docs/upstream-review/2026-11-12-decisions.md
 new file mode 100644
 index 0000000..6a2a3d7
@@ -6075,8 +6787,183 @@ index cc902ed..15b606f 100644
      ldr x0, [x28, #CPU_SP]
      mov sp, x0
      ldr x0, [x28, #CPU_NZCV]
+diff --git a/host/jit_region.c b/host/jit_region.c
+index e1e8e9d..2418352 100644
+--- a/host/jit_region.c
++++ b/host/jit_region.c
+@@ -92,6 +92,31 @@ void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words) {
+     if (start && words) sys_icache_invalidate(start, words * sizeof(uint32_t));
+ }
+ 
++void hv_jit_finish_words(HvJitRegion *region, uint32_t *const *words, size_t n) {
++    (void)region;
++#if TARGET_OS_OSX
++    if (!region->rw_diff) pthread_jit_write_protect_np(1);
++#endif
++    __asm__ volatile("dsb ish" ::: "memory");
++    uintptr_t last = 0;
++    for (size_t k = 0; k < n; k++) {
++        uintptr_t a = (uintptr_t)words[k] & ~(uintptr_t)63;
++        if (a == last) continue;
++        last = a;
++        __asm__ volatile("ic ivau, %0" ::"r"(a) : "memory");
++        if (k % 20 == 19) __asm__ volatile("dsb ish" ::: "memory"); /* as sys_icache_invalidate does, for the CPUs that need it */
++    }
++    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
++}
++
++void hv_jit_poison(HvJitRegion *region, uint32_t *start, size_t words) {
++#if TARGET_OS_OSX
++    if (!region->rw_diff) pthread_jit_write_protect_np(0); /* MAP_JIT: a direct write faults until this */
++#endif
++    memset((uint8_t *)start + region->rw_diff, 0, words * sizeof(uint32_t));
++    hv_jit_finish(region, start, words);
++}
++
+ /* As sys_icache_invalidate does it (libsystem_platform: DSB, IC IVAU per 64-byte line with a DSB after every 20 for
+    the CPUs that need one, DSB, ISB), over both ranges. */
+ static void ic_lines(uint32_t *start, size_t words, int *n) {
+@@ -128,19 +153,74 @@ void hv_jit_finish_branch(HvJitRegion *region, uint32_t *word) {
+     hv_jit_finish(region, word, 1);
+ }
+ 
++static size_t region_cap(const HvJitRegion *region) {
++    return region->limit && region->limit < region->capacity ? region->limit : region->capacity;
++}
++
+ /* Any thread: an even number of words (blocks stay 8-byte aligned), taken atomically. */
+ uint32_t *hv_jit_reserve(HvJitRegion *region, size_t words) {
+     if (words == SIZE_MAX) return NULL;
+     words = (words + 1) & ~(size_t)1;
+-    size_t cap = region->limit && region->limit < region->capacity ? region->limit : region->capacity;
+-    size_t at = __atomic_load_n(&region->used, __ATOMIC_RELAXED);
+-    for (;;) {
+-        if (at > cap || words > cap - at) return NULL;
+-        size_t next = at + words;
+-        if (__atomic_compare_exchange_n(&region->used, &at, next, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return region->base + at;
++    if (!words) return region->base + __atomic_load_n(&region->used,__ATOMIC_RELAXED);
++    size_t seg = region->seg_words;
++    if (!seg) {
++        size_t cap = region->limit && region->limit < region->capacity ? region->limit : region->capacity;
++        size_t at = __atomic_load_n(&region->used, __ATOMIC_RELAXED);
++        for (;;) {
++            if (at > cap || words > cap - at) return NULL;
++            size_t next = at + words;
++            if (__atomic_compare_exchange_n(&region->used, &at, next, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return region->base + at;
++        }
++    }
++    if (words > seg) {
++        __atomic_store_n(&region->too_big, 1, __ATOMIC_RELAXED);
++        return NULL;
+     }
++    /* Within one segment, so taking a segment back never splits a reservation (a CPU's chunk). */
++    size_t at = __atomic_load_n(&region->used, __ATOMIC_RELAXED), to;
++    do {
++        to = at;
++        if (to / seg != (to + words - 1) / seg) to = (to / seg + 1) * seg;
++        if (to + words > region->end) return NULL; /* full: hv_jit_evict_next makes room */
++    } while (!__atomic_compare_exchange_n(&region->used, &at, to + words, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
++    return region->base + to;
+ }
+ 
+ void hv_jit_reset(HvJitRegion *region) {
+     region->used = 0;
++    region->wrapped = 0;
++    region->too_big = 0;
++    region->end = (size_t)region->seg_words * region->nseg;
++    for (uint32_t k = 0; k < HV_JIT_MAX_SEGS; k++) region->seg_epoch[k]++;
++}
++
++void hv_jit_ring(HvJitRegion *region, uint32_t nseg) {
++    if (nseg > HV_JIT_MAX_SEGS) nseg = HV_JIT_MAX_SEGS;
++    size_t seg = nseg >= 2 ? (region_cap(region) / nseg) & ~(size_t)1 : 0;
++    if (seg < 2048) seg = 0, nseg = 0; /* under 8 KB a segment holds too few blocks to be worth keeping the rest */
++    region->seg_words = seg;
++    region->nseg = nseg;
++    hv_jit_reset(region);
++}
++
++uint32_t hv_jit_evict_next(HvJitRegion *region) {
++    size_t seg = region->seg_words, total = seg * region->nseg;
++    uint32_t k;
++    if (region->end >= total) { /* the last segment is in use: round to the first */
++        k = 0;
++        region->used = 0;
++        region->wrapped = 1;
++    } else {
++        k = (uint32_t)(region->end / seg);
++        region->used = region->end; /* past what reservations that failed added */
++    }
++    region->end = (k + 1) * seg;
++    region->seg_epoch[k]++;
++    return k;
++}
++
++size_t hv_jit_extent(const HvJitRegion *region) {
++    if (region->wrapped) return (size_t)region->seg_words * region->nseg;
++    size_t used = region->used, cap = region_cap(region);
++    return used < cap ? used : cap;
+ }
+diff --git a/host/jit_region.h b/host/jit_region.h
+index a2f5a0d..733ac92 100644
+--- a/host/jit_region.h
++++ b/host/jit_region.h
+@@ -4,8 +4,13 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ 
++#define HV_JIT_MAX_SEGS 64
++
+ /* One executable region for translated blocks. Blocks are appended and never
+-   freed one by one; the whole region is reset when it fills.
++   freed one by one. As a ring (hv_jit_ring): the region is cut into segments
++   filled in turn, and when it fills only the oldest segment is taken back
++   (hv_jit_evict_next; the machine drops the blocks in it). Otherwise, or when
++   the ring cannot make room, the whole region is reset.
+ 
+    Two shapes. macOS: one MAP_JIT mapping, made writable per thread while code
+    is copied in (rw_diff is 0). iOS: an executable mapping a debugger granted
+@@ -21,6 +26,14 @@ typedef struct HvJitRegion {
+     size_t used;        /* in instructions */
+     size_t limit;       /* in instructions; 0: all of it (HV_JIT_CAP: a smaller cache in the same region, to compare) */
+     int owned;          /* mapped here (closed here) rather than handed in */
++    /* The ring: seg_words 0 means none. used is where the next reservation goes, end where reservations stop
++       (the start of the oldest code still kept), and a reservation never crosses from one segment into the next. */
++    size_t seg_words;
++    uint32_t nseg;
++    size_t end;
++    int wrapped;        /* written all the way round since the last reset: every segment may hold code */
++    int too_big;        /* a reservation larger than a segment failed: only a reset makes room for it */
++    uint32_t seg_epoch[HV_JIT_MAX_SEGS]; /* bumped as each segment is taken back: space reserved in it before is gone */
+ } HvJitRegion;
+ 
+ int hv_jit_region_open(HvJitRegion *region, size_t bytes);
+@@ -37,8 +50,23 @@ void hv_jit_finish2(HvJitRegion *region, uint32_t *a, size_t na, uint32_t *b, si
+    synchronization. The former relaxed option falls back to this safe path. */
+ void hv_jit_finish_branch(HvJitRegion *region, uint32_t *word);
+ 
++/* After rewriting single words with hv_jit_write while no CPU runs translated code: one barrier for all of them, not
++   one per word (an eviction can undo hundreds of thousands of chained exits). */
++void hv_jit_finish_words(HvJitRegion *region, uint32_t *const *words, size_t n);
++/* Debugging (HV_JIT_POISON): zero `words` instructions at start (an executable address), so running them faults. */
++void hv_jit_poison(HvJitRegion *region, uint32_t *start, size_t words);
++
+ /* Space for `words` instructions, or NULL when the region is full. */
+ uint32_t *hv_jit_reserve(HvJitRegion *region, size_t words);
++/* Back to empty (and the ring, if any, to its first segment). */
+ void hv_jit_reset(HvJitRegion *region);
++/* Use the region (as limited) as a ring of nseg segments, or not (nseg < 2, or segments too small to be worth it).
++   Only while it is empty: right after hv_jit_reset. */
++void hv_jit_ring(HvJitRegion *region, uint32_t nseg);
++/* The ring is full: take back the oldest segment for the next reservations and return its index. Its code must be
++   unreachable before anything runs again (the caller has every CPU stopped). */
++uint32_t hv_jit_evict_next(HvJitRegion *region);
++/* Instructions from base that may hold code: for diagnostics that scan or bound the region. */
++size_t hv_jit_extent(const HvJitRegion *region);
+ 
+ #endif
 diff --git a/host/main.c b/host/main.c
-index eeabe42..5dc6952 100644
+index eeabe42..7035b1a 100644
 --- a/host/main.c
 +++ b/host/main.c
 @@ -8,6 +8,7 @@
@@ -6095,7 +6982,34 @@ index eeabe42..5dc6952 100644
  #include "install.h"
  #include "snapshot.h"
  #include <dispatch/dispatch.h>
-@@ -260,9 +262,16 @@ static void prof_dump(const char *path) {
+@@ -135,14 +137,10 @@ static void prof_sample(thread_act_t th) {
+     HvMachine *hm = hv_vm_machine();
+     pthread_mutex_lock(&prof_mu);
+     prof_total++;
+-    if (pc >= hm->jit.base && pc < hm->jit.base + hm->jit.capacity && hm->nblocks) {
+-        int lo = 0, hi = hm->nblocks - 1;
+-        while (lo < hi) {
+-            int mid = (lo + hi + 1) / 2;
+-            if (hm->blocks[mid].code && hm->blocks[mid].code <= pc) lo = mid;
+-            else hi = mid - 1;
+-        }
+-        HvBlock *b = &hm->blocks[lo];
++    int metadata_locked = pthread_mutex_trylock(&hm->tr_mu) == 0;
++    if (metadata_locked && pc >= hm->jit.base && pc < hm->jit.base + hm->jit.capacity && hm->nblocks) {
++        HvBlock *b = hv_block_at(hm, pc);
++        if (!b) b = &hm->blocks[0];
+         int el = (b->flags & HV_BLOCK_EL1) ? 1 : 0;
+         {
+             ptrdiff_t off = b->code && pc >= b->code ? pc - b->code : -1;
+@@ -176,6 +174,7 @@ static void prof_sample(thread_act_t th) {
+         }
+     }
+     pthread_mutex_unlock(&prof_mu);
++    if (metadata_locked) pthread_mutex_unlock(&hm->tr_mu);
+ }
+ 
+ static thread_act_t prof_threads[HV_MAX_CPUS];
+@@ -260,9 +259,16 @@ static void prof_dump(const char *path) {
     it is, in small steps as a hand makes: macOS accelerates big ones past the target. */
  static void pointer_to(int x, int y) {
      const uint8_t *page = hv_pvg_lite_display_page(board.pvg);
@@ -6115,7 +7029,7 @@ index eeabe42..5dc6952 100644
          if (abs(dx) < 3 && abs(dy) < 3) break;
          int sx = dx > 16 ? 16 : dx < -16 ? -16 : dx, sy = dy > 16 ? 16 : dy < -16 ? -16 : dy;
          hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, sx);
-@@ -557,7 +566,54 @@ static void *input_thread(void *unused) {
+@@ -557,7 +563,54 @@ static void *input_thread(void *unused) {
          at = ftell(f);
          line[strcspn(line, "\n")] = 0;
          int x, y;
@@ -6171,7 +7085,7 @@ index eeabe42..5dc6952 100644
          else if (sscanf(line, "move %d %d", &x, &y) == 2) pointer_to(x, y);
          else if (sscanf(line, "scroll %d %d", &x, &y) == 2) {
              if (y) hv_vm_mouse_wheel(y);
-@@ -712,6 +768,7 @@ static void *input_thread(void *unused) {
+@@ -712,6 +765,7 @@ static void *input_thread(void *unused) {
              usleep(60000);
              key_event(125, 0);
          }
@@ -6179,6 +7093,15 @@ index eeabe42..5dc6952 100644
          else if (sscanf(line, "wait %d", &x) == 1) sleep((unsigned)x);
          else if (!strncmp(line, "type ", 5)) type_text(line + 5);
          else if (!strncmp(line, "prof ", 5)) prof_dump(line + 5);
+@@ -880,7 +934,7 @@ static void *watch_thread(void *unused) {
+         const uint8_t *page = hv_pvg_lite_display_page(board.pvg);
+         fprintf(stderr, "hengevm: watch %ld s: swaps %u on %u;", (long)(time(NULL) - start), page ? *(const volatile uint32_t *)(page + 0xf98) : 0, page ? *(const volatile uint32_t *)(page + 0xfb0) : 0);
+         for (int i = 0; i < ncpus; i++) fprintf(stderr, " %llx@%u", (unsigned long long)hv_vm_cpu(i)->pc, hv_vm_cpu(i)->el);
+-        { HvMachine *wm = hv_vm_machine(); fprintf(stderr, " | jit %llu MB, flushes %llu, ic %llu, code writes %llu", (unsigned long long)wm->jit.used * 4 >> 20, (unsigned long long)wm->stats.block_flushes, (unsigned long long)wm->stats.flush_ic, (unsigned long long)wm->stats.flush_smc);
++        { HvMachine *wm = hv_vm_machine(); fprintf(stderr, " | jit %llu MB, flushes %llu, evictions %llu, ic %llu, code writes %llu", (unsigned long long)hv_jit_extent(&wm->jit) * 4 >> 20, (unsigned long long)wm->stats.block_flushes, (unsigned long long)wm->stats.evictions, (unsigned long long)wm->stats.flush_ic, (unsigned long long)wm->stats.flush_smc);
+           fprintf(stderr, " (cpu %llu dma %llu), %llu translations, blocks now %u; top:", (unsigned long long)hv_smc_cpu, (unsigned long long)hv_smc_dma, (unsigned long long)wm->stats.translations, (unsigned)wm->nblocks);
+           uint32_t seen = 0; uint64_t distinct = 0; (void)seen;
+           uint64_t best[4] = {0}; uint32_t bestn[4] = {0};
 diff --git a/host/native_touch.c b/host/native_touch.c
 index 504e669..3eec420 100644
 --- a/host/native_touch.c
@@ -7152,7 +8075,7 @@ index 67fc764..2ca437b 100644
  
  #endif
 diff --git a/host/vm.c b/host/vm.c
-index db95c05..e964903 100644
+index db95c05..54b5115 100644
 --- a/host/vm.c
 +++ b/host/vm.c
 @@ -4,6 +4,7 @@
@@ -7198,6 +8121,23 @@ index db95c05..e964903 100644
  static int fail(char *err, size_t n, const char *msg) {
      if (err && n) snprintf(err, n, "%s", msg);
      return -1;
+@@ -148,13 +163,13 @@ static struct sigaction prior_ill, prior_bus, prior_segv;
+ static void on_ill(int sig, siginfo_t *info, void *ctx) {
+     ucontext_t *uc = ctx;
+     uint64_t pc = uc->uc_mcontext->__ss.__pc, rx = (uint64_t)(uintptr_t)m.jit.base, size = (uint64_t)m.jit.capacity * 4;
+-    uint64_t used = (uint64_t)m.jit.used * 4;
++    uint64_t used = (uint64_t)hv_jit_extent(&m.jit) * 4;
+     int in_rx = pc >= rx && pc < rx + size;
+     int fetch = (uint64_t)(uintptr_t)info->si_addr == pc;
+     if (sig == SIGILL || in_rx || fetch) {
+-        fprintf(stderr, "hengevm: signal %d in translated code: pc %llx (rx %llx size %llx used %llx, pc is rx%+lld), full flushes %llu, lr %llx, addr %p\n",
++        fprintf(stderr, "hengevm: signal %d in translated code: pc %llx (rx %llx size %llx used %llx, pc is rx%+lld), full flushes %llu, evictions %llu, lr %llx, addr %p\n",
+                 sig, (unsigned long long)pc, (unsigned long long)rx, (unsigned long long)size, (unsigned long long)used, (long long)(pc - rx),
+-                (unsigned long long)m.stats.block_flushes, (unsigned long long)uc->uc_mcontext->__ss.__lr, info->si_addr);
++                (unsigned long long)m.stats.block_flushes, (unsigned long long)m.stats.evictions, (unsigned long long)uc->uc_mcontext->__ss.__lr, info->si_addr);
+         for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%llx%c", i, (unsigned long long)uc->uc_mcontext->__ss.__x[i], i % 6 == 5 ? '\n' : ' ');
+         fprintf(stderr, "\n");
+         fprintf(stderr, "sp=%llx ram %llx size %llx\n", (unsigned long long)uc->uc_mcontext->__ss.__sp, (unsigned long long)(uintptr_t)board.ram, (unsigned long long)board.ram_size);
 @@ -291,6 +306,10 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
      if (hv_vmapple_create(&board, &m, cpus, (c->ram_mb ? c->ram_mb : 2048) << 20, &disk, &aux, &cfg, mac) != 0)
          return fail(err, errlen, "Cannot build the machine (not enough memory for the guest's RAM?).");
@@ -10820,7 +11760,7 @@ index 29c8b3b..00f528f 100644
          all.removeAll { $0.id == id }
          save()
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..1a43113 100644
+index 34d6a98..e4b5955 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
 @@ -3,6 +3,7 @@
@@ -11378,7 +12318,7 @@ index 34d6a98..1a43113 100644
 +        HvMachine *m=hv_vm_machine();
 +        /* Emitters reserve used atomically outside tr_mu. Diagnostics must
 +           match that access rather than take a lock that cannot protect it. */
-+        out->jit_used=__atomic_load_n(&m->jit.used,__ATOMIC_RELAXED)*4;
++        out->jit_used=hv_jit_extent(&m->jit)*4;
 +        size_t cap=__atomic_load_n(&m->jit.capacity,__ATOMIC_RELAXED);
 +        size_t limit=__atomic_load_n(&m->jit.limit,__ATOMIC_RELAXED);
 +        out->jit_capacity=(limit && limit<cap?limit:cap)*4;
@@ -13854,6 +14794,33 @@ index 0000000..5e76514
 +         } else {
 +             for (uint32_t off = 0; off < chunk && !rc; off += 8) { /* MMIO: at most 8 bytes at a time */
 +                 uint32_t piece = chunk - off < 8 ? chunk - off : 8;
+diff --git a/tests/jit_programs.S b/tests/jit_programs.S
+index b149c3a..babc278 100644
+--- a/tests/jit_programs.S
++++ b/tests/jit_programs.S
+@@ -59,6 +59,22 @@ PROGRAM loop
+     b.lt 2b
+ END loop
+ 
++// Hundreds of one-branch blocks, run three times round: under a small code cache
++// (test_jit's ring) segments are taken back while the blocks in the others still
++// have exits chained into them, the back edge included.
++PROGRAM hop
++    mov x0, #0
++    mov x5, #3
++0:
++    .rept 300
++    add x0, x0, #1
++    b 1f
++1:
++    .endr
++    subs x5, x5, #1
++    b.ne 0b
++END hop
++
+ PROGRAM condbr
+     mov x0, #0
+     mov x1, #5
 diff --git a/tests/link_control_service_fixture.c b/tests/link_control_service_fixture.c
 new file mode 100644
 index 0000000..19a5ddd
@@ -15421,6 +16388,66 @@ index 2b1be58..cf28a94 100644
      hv_machine_free(&m);
      puts("native WFI integration: guest timer resumes code, activity callback runs at entry/resume, CPU parks on exit");
  }
+diff --git a/tests/test_jit.c b/tests/test_jit.c
+index 882612c..a7d4cdb 100644
+--- a/tests/test_jit.c
++++ b/tests/test_jit.c
+@@ -14,12 +14,13 @@ DECLARE_PROGRAM(pcrel);
+ DECLARE_PROGRAM(long_block);
+ DECLARE_PROGRAM(pstate_bits);
+ DECLARE_PROGRAM(pac);
++DECLARE_PROGRAM(hop);
+ extern const char jit_programs_begin[], jit_programs_finish[];
+ 
+ static const TestProgram programs[] = {
+     TEST_PROGRAM(arith),   TEST_PROGRAM(loop),   TEST_PROGRAM(condbr),
+     TEST_PROGRAM(csel_ops), TEST_PROGRAM(bl_sub), TEST_PROGRAM(simd_fp),
+-    TEST_PROGRAM(stolen),  TEST_PROGRAM(pcrel),  TEST_PROGRAM(long_block), TEST_PROGRAM(pstate_bits),
++    TEST_PROGRAM(stolen),  TEST_PROGRAM(pcrel),  TEST_PROGRAM(long_block), TEST_PROGRAM(pstate_bits), TEST_PROGRAM(hop),
+ };
+ 
+ int main(void) {
+@@ -145,6 +146,40 @@ int main(void) {
+         small.jit.capacity = mapped_capacity;
+         hv_machine_free(&small);
+     }
++    /* Again with the code cache a ring of two 32 KB segments (whatever HV_JIT_SEGMENTS says), the programs' pages
++       invalidated after every round so they are translated again and the ring comes round about once a round:
++       segments taken back in the middle of programs, with exits chained into their blocks from blocks that stay. */
++    {
++        static HvMachine ring;
++        if (hv_machine_init(&ring, 64 << 10) != 0) return 1;
++        hv_jit_ring(&ring.jit, 2);
++        hv_machine_add_ram(&ring, (uint64_t)(uintptr_t)jit_programs_begin, jit_programs_finish - jit_programs_begin,
++                           (void *)jit_programs_begin, 1);
++        hv_machine_add_ram(&ring, (uint64_t)(uintptr_t)stack, 65536, stack, 0);
++        int bad_rounds = 0;
++        for (int round = 0; round < 64; round++) {
++            for (size_t i = 0; i < count; i++) {
++                static HvCpu init, native, jit;
++                memset(&init, 0, sizeof init);
++                seed_cpu(&init, i * 2 + 1 + (size_t)round, sp);
++                run_native(&programs[i], &init, &native, NULL);
++                int bad = run_jit(&ring, &programs[i], &init, &jit, NULL);
++                if (!bad) bad = compare_cpus(programs[i].name, &native, &jit);
++                if (bad) printf("%-12s with a ring, round %d: FAIL\n", programs[i].name, round);
++                bad_rounds += bad != 0;
++            }
++            uint64_t from = (uint64_t)(uintptr_t)jit_programs_begin & ~16383ull, to = (uint64_t)(uintptr_t)jit_programs_finish;
++            for (uint64_t pa = from; pa < to; pa += 16384) hv_invalidate_code(&ring, pa < (uint64_t)(uintptr_t)jit_programs_begin ? (uint64_t)(uintptr_t)jit_programs_begin : pa);
++        }
++        printf("with a 64 KB ring of %u segments: %llu evictions (%llu blocks dropped, %llu exits unchained), %llu full flushes\n",
++               ring.jit.nseg, (unsigned long long)ring.stats.evictions, (unsigned long long)ring.stats.evict_blocks,
++               (unsigned long long)ring.stats.evict_unchained, (unsigned long long)ring.stats.block_flushes);
++        if (!ring.stats.evictions || !ring.stats.evict_unchained || ring.stats.block_flushes) {
++            printf("ring: expected evictions that undo chained exits, and no full flush: FAIL\n");
++            bad_rounds++;
++        }
++        failed += bad_rounds;
++    }
+     printf("%zu programs x 2 seeds, %d failures, %d blocks translated\n", count, failed, m.nblocks);
+     return failed != 0;
+ }
 diff --git a/tests/test_jit_allocation.py b/tests/test_jit_allocation.py
 index 060441b..09d8836 100644
 --- a/tests/test_jit_allocation.py
@@ -15445,6 +16472,70 @@ index 060441b..09d8836 100644
  }
  '''
  b=r/'build';b.mkdir(exist_ok=True);p=b/'test_jit_allocation.c';p.write_text(s)
+diff --git a/tests/test_jit_ring.c b/tests/test_jit_ring.c
+new file mode 100644
+index 0000000..cd8c30f
+--- /dev/null
++++ b/tests/test_jit_ring.c
+@@ -0,0 +1,58 @@
++#include "machine.h"
++#include "dispatch.h"
++#include <assert.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++/* Real four-vCPU dispatch, translations, cross-page chains and global eviction.
++   Each basic block is on a different page so repair cannot pass on same-page
++   chains alone. No ROM, timer sleeps or device fixture is involved. */
++static HvMachine machine;
++static HvCpu cpus[4];
++static pthread_mutex_t ready_mu=PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t ready_cv=PTHREAD_COND_INITIALIZER;
++static unsigned ready_count;
++static void *run_cpu(void *opaque) {
++    HvCpu *cpu=opaque;hv_self=cpu;
++    pthread_mutex_lock(&ready_mu);
++    if(++ready_count==4)pthread_cond_broadcast(&ready_cv);
++    while(ready_count<4)pthread_cond_wait(&ready_cv,&ready_mu);
++    pthread_mutex_unlock(&ready_mu);
++    int result=hv_run(cpu);
++    return (void *)(uintptr_t)result;
++}
++int main(void) {
++    alarm(60);
++    assert(!hv_machine_init(&machine,64<<10));
++    enum {blocks=512,loops=8,page=16384};
++    void *memory;assert(!posix_memalign(&memory,page,(blocks+1)*page));memset(memory,0,(blocks+1)*page);
++    uint64_t base=(uint64_t)(uintptr_t)memory;
++    assert(!hv_machine_add_ram(&machine,base,(blocks+1)*page,memory,0));
++    for(int i=0;i<blocks;i++) {uint32_t *code=(uint32_t *)((char *)memory+i*page);code[0]=0x91000400;code[1]=0x14000fff;}
++    uint32_t *tail=(uint32_t *)((char *)memory+blocks*page);
++    tail[0]=0xf1000421; // subs x1,x1,#1
++    tail[1]=0x54000040; // b.eq stop (conditional range is only 1MiB)
++    int32_t back=-(blocks*(page/4)+2);
++    tail[2]=0x14000000|((uint32_t)back&0x3ffffff); // b first block
++    machine.stop_pc=base+blocks*page+12;
++    hv_knob[HV_K_JITSEGS]=2;hv_flush_blocks(&machine);
++    uint64_t full=machine.stats.block_flushes;
++    for(int round=0;round<2;round++){
++        ready_count=0;pthread_t threads[4];
++        for(unsigned i=0;i<4;i++){
++            hv_cpu_reset_index(&cpus[i],&machine,i);cpus[i].pc=base;cpus[i].x[1]=loops;
++            assert(!pthread_create(&threads[i],NULL,run_cpu,&cpus[i]));
++        }
++        for(int i=0;i<4;i++){
++            void *result;assert(!pthread_join(threads[i],&result));
++            assert((uintptr_t)result==HV_EXIT_HALT);
++            assert(cpus[i].x[0]==(uint64_t)blocks*loops && cpus[i].x[1]==0);
++        }
++    }
++    assert(machine.stats.evictions>10 && machine.stats.block_flushes==full);
++    printf("JIT ring: four vCPUs, %llu evictions, %llu exits repaired, no capacity full reset; cross-page counters correct\n",
++        (unsigned long long)machine.stats.evictions,(unsigned long long)machine.stats.evict_unchained);
++    hv_machine_free(&machine);free(memory);pthread_cond_destroy(&ready_cv);pthread_mutex_destroy(&ready_mu);
++}
 diff --git a/tests/test_link.swift b/tests/test_link.swift
 index 1ac8d90..1876135 100644
 --- a/tests/test_link.swift
@@ -16139,7 +17230,7 @@ index 553c4b6..64d0cb9 100644
 + puts("iOS profiler lifecycle: off/on/off/on, port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
  }
 diff --git a/tests/test_pvg_lifecycle.m b/tests/test_pvg_lifecycle.m
-index 81cdb83..7e96529 100644
+index 81cdb83..71808f3 100644
 --- a/tests/test_pvg_lifecycle.m
 +++ b/tests/test_pvg_lifecycle.m
 @@ -1,9 +1,15 @@
@@ -16158,7 +17249,7 @@ index 81cdb83..7e96529 100644
  
  /* Exercise real Metal command completion while the guest board is destroyed.
     Empty execs avoid simulator limitations on guest buffer-backed textures. */
-@@ -11,6 +17,73 @@ static HvMachine machine;
+@@ -11,6 +17,86 @@ static HvMachine machine;
  static HvCpu cpus[2];
  static HvVmapple board;
  
@@ -16169,6 +17260,19 @@ index 81cdb83..7e96529 100644
 +- (void)setAdmissionBytes:(NSUInteger)bytes entries:(NSUInteger)entries;
 +- (id<MTLLibrary>)libraryForData:(NSData *)data loader:(id<MTLLibrary>(^)(void))loader;
 +@end
++static void taskRetirement(HvPvgMetal *metal) {
++    id replay=(__bridge id)metal;
++    dispatch_queue_t worker=[replay valueForKey:@"worker"];
++    NSMutableDictionary *tasks=[replay valueForKey:@"tasks"];
++    dispatch_sync(worker, ^{
++        tasks[@1]=[NSMutableDictionary new]; tasks[@2]=[NSMutableDictionary new];
++    });
++    uint32_t *command=calloc(3,sizeof *command);assert(command);
++    command[0]=0x20;command[1]=12;command[2]=2;
++    hv_pvg_metal_submit(metal,board.pvg,0,command,12);
++    dispatch_sync(worker, ^{ assert(tasks[@1] && !tasks[@2]); [tasks removeAllObjects]; });
++}
++
 +static void cachePressure(HvPvgMetal *metal) {
 +    id replay=(__bridge id)metal;
 +    id<CachePressureTesting> cache=[replay valueForKey:@"library_cache"];
@@ -16232,10 +17336,11 @@ index 81cdb83..7e96529 100644
  int main(void) {
      alarm(30);
      for (int cycle = 0; cycle < 6; cycle++) @autoreleasepool {
-@@ -20,19 +93,61 @@ int main(void) {
+@@ -20,19 +106,62 @@ int main(void) {
          hv_vmapple_reset_cpu(&board);
          HvPvgMetal *metal = hv_pvg_metal_create(board.pvg);
          if (!metal) { fprintf(stderr, "Metal replay unavailable; lifecycle test cannot run\n"); return 1; }
++        taskRetirement(metal);
 +        cachePressure(metal);
          CAMetalLayer *layer = [CAMetalLayer layer];
          hv_pvg_metal_set_layer(metal, (__bridge void *)layer);
@@ -16295,6 +17400,27 @@ index 81cdb83..7e96529 100644
 +    puts("Metal lifecycle: 6 cycles, 384 GPU completions drained; both display glyphs restored, malformed input rejected, stale glyphs cleared");
      return 0;
  }
+diff --git a/tests/test_pvg_linear_bounds.c b/tests/test_pvg_linear_bounds.c
+new file mode 100644
+index 0000000..a8d94d6
+--- /dev/null
++++ b/tests/test_pvg_linear_bounds.c
+@@ -0,0 +1,15 @@
++#include "pvg_linear_bounds.h"
++#include <assert.h>
++#include <stdio.h>
++int main(void) {
++    assert(hv_pvg_linear_bounds(72,72,4,11952,1440,114480,16));
++    assert(!hv_pvg_linear_bounds(72,72,4,11952,1440,114479,16));
++    assert(!hv_pvg_linear_bounds(72,72,4,11953,1440,114688,16));
++    assert(!hv_pvg_linear_bounds(72,72,4,11952,1439,114688,16));
++    assert(!hv_pvg_linear_bounds(72,0,4,0,288,114688,16));
++    assert(!hv_pvg_linear_bounds(UINT64_MAX,2,4,0,288,UINT64_MAX,16));
++    assert(!hv_pvg_linear_bounds(72,UINT64_MAX,4,0,288,UINT64_MAX,16));
++    assert(!hv_pvg_linear_bounds(1,2,4,UINT64_MAX,4,UINT64_MAX,0));
++    assert(hv_pvg_linear_bounds(1,1,4,0,4096,4,0));
++    puts("linear texture bounds: final visible row, exact/short lengths, alignment, zero size and overflow passed");
++}
 diff --git a/tests/test_pvg_ports.c b/tests/test_pvg_ports.c
 index 7868300..cf1bc5d 100644
 --- a/tests/test_pvg_ports.c

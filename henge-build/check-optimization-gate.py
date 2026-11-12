@@ -59,4 +59,7 @@ core = state.get('core_efficiency_followup')
 if core:
     assert core.get('state') == 'verified' and core.get('source_commit') == validation.get('source_commit'), 'Core efficiency follow-up needs exact-source regression proof'
     assert 'block completion: 64 ready requests / 1 wake;' in core.get('native_check_line',''), 'Missing executed block completion concurrency regression'
+desktop=state.get('upstream_desktop')
+if desktop:
+    assert desktop.get('complete') and desktop.get('source_commit')==validation.get('source_commit'), 'Desktop PR integration requires exact-source native and graphics proof'
 print('PASS complete implementation gate:'  ,  manifest['audit_repairs_sha256'])
