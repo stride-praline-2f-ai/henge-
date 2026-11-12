@@ -7906,10 +7906,10 @@ index 0000000..d9135a5
 +}
 diff --git a/tests/gamepad-preview/GamepadPreviewUITests.swift b/tests/gamepad-preview/GamepadPreviewUITests.swift
 new file mode 100644
-index 0000000..f62596d
+index 0000000..07a6a6d
 --- /dev/null
 +++ b/tests/gamepad-preview/GamepadPreviewUITests.swift
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,73 @@
 +import XCTest
 +import CoreGraphics
 +
@@ -7920,10 +7920,12 @@ index 0000000..f62596d
 +        let app=XCUIApplication();app.launch()
 +        XCUIDevice.shared.orientation = .landscapeRight
 +        if PreviewFixture.isNativeDuo {
++            if app.frame.width<900 || app.frame.height<600 { print("HENGE_DUO_UNFOLD_REQUIRED") }
 +            let unfolded=NSPredicate { _,_ in app.frame.width>=900 && app.frame.height>=600 }
 +            guard XCTWaiter.wait(for:[XCTNSPredicateExpectation(predicate:unfolded,object:nil)],timeout:90) == .completed else {
 +                XCTFail("Duo app did not reach the unfolded inner-screen window");return
 +            }
++            let geometry=XCTAttachment(string:"Native Duo app window: \(app.frame)");geometry.name="Verified unfolded native Duo window";geometry.lifetime = .keepAlways;add(geometry)
 +        }
 +        let surface=app.otherElements["gamepad-surface"].firstMatch
 +        guard surface.waitForExistence(timeout:15) else { XCTFail("Production gamepad surface missing");return }
@@ -8007,10 +8009,10 @@ index 0000000..dfa98b5
 +preview-artifacts. Run in GitHub Actions; no local Mac is required by the user.
 diff --git a/tests/gamepad-preview/project.yml b/tests/gamepad-preview/project.yml
 new file mode 100644
-index 0000000..c7035c5
+index 0000000..0fae2e1
 --- /dev/null
 +++ b/tests/gamepad-preview/project.yml
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,74 @@
 +name: HengeGamepadPreview
 +options:
 +  deploymentTarget:
@@ -8057,8 +8059,11 @@ index 0000000..c7035c5
 +        - UIInterfaceOrientationLandscapeRight
 +        - UIInterfaceOrientationPortrait
 +        - UIInterfaceOrientationPortraitUpsideDown
-+        UIRequiresFullScreen: true
-+        UIInterfaceOrientation: UIInterfaceOrientationLandscapeRight
++        UIApplicationSceneManifest:
++          UIApplicationSupportsMultipleScenes: false
++          UISceneConfigurations: {}
++        UIRequiredDeviceCapabilities:
++        - arm64
 +  GamepadPreviewUITests:
 +    type: bundle.ui-testing
 +    platform: iOS
@@ -11223,10 +11228,10 @@ index c88ebe4..00251c5 100755
 +python3 tests/test_link_control_services.py
 diff --git a/tools/preview_gamepad.py b/tools/preview_gamepad.py
 new file mode 100644
-index 0000000..8ab6641
+index 0000000..ed4c1ab
 --- /dev/null
 +++ b/tools/preview_gamepad.py
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,122 @@
 +"""Actual iOS Simulator UI tests; viewport fixtures are not chip emulation."""
 +from pathlib import Path
 +import argparse,json,os,re,subprocess,threading
@@ -11299,7 +11304,7 @@ index 0000000..8ab6641
 +   if log.exists():
 +    with log.open('rb') as data:
 +     data.seek(max(0,log.stat().st_size-65536));text=data.read().decode(errors='replace')
-+   if 'Setting up automation session' in text:break
++   if 'HENGE_DUO_UNFOLD_REQUIRED' in text:break
 +   stop_fold.wait(1) # CI host only; no timer or worker is added to Henge
 +  else:return
 +  for display,power in [('3','on'),('1','off')]:
@@ -11327,15 +11332,19 @@ index 0000000..8ab6641
 + if native_duo:
 +  fold_thread=threading.Thread(target=unfold_after_ui_launch,daemon=True);fold_thread.start()
 + with (artifacts/'xcodebuild.log').open('w') as log:
-+  try: result=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,text=True,timeout=900);status=result.returncode
++  try: result=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,text=True,timeout=900,env={**os.environ,'NSUnbufferedIO':'YES'});status=result.returncode
 +  except subprocess.TimeoutExpired:timed_out=True;status=124
 + stop_fold.set()
 + if fold_thread:fold_thread.join(timeout=75)
-+ if native_duo and (fold_errors or not report.get('duo_inner_display')):status=status or 1
++ if native_duo and status==0:
++  # XCTest's required window assertion is authoritative even if an already
++  # satisfied state did not need a power request. Preserve any RPC warning.
++  report['native_duo_unfolded_window_verified']=True
++  if fold_errors:report['optional_display_request_warning']=fold_errors
 + print('\n'.join((artifacts/'xcodebuild.log').read_text().splitlines()[-35:]))
 + if timed_out:print('xcodebuild exceeded the 15-minute preview limit; retained log and failure state')
 + if status:diagnostic('failure-screenshot',['xcrun','simctl','io',udid,'screenshot','--display=1',str(artifacts/'failure-state.png')])
-+ diagnostic('active-display-screenshot',['xcrun','simctl','io',udid,'screenshot','--display='+('3' if report.get('duo_inner_display') else '1'),str(artifacts/'active-display.png')])
++ diagnostic('active-display-screenshot',['xcrun','simctl','io',udid,'screenshot','--display='+('3' if native_duo else '1'),str(artifacts/'active-display.png')])
 + # Kept XCTest screenshot attachments remain available even after a UI failure.
 + subprocess.run(['xcrun','xcresulttool','export','attachments','--path',str(artifacts/'GamepadPreview.xcresult'),'--output-path',str(artifacts/'screenshots')],check=False)
 + if status:raise SystemExit(status)
