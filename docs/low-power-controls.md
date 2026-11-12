@@ -6,7 +6,7 @@ Enable OS Low Power Mode. With the Low Power guest-refresh setting enabled, a co
 
 Three-finger controls → gamecontroller menu → Show Virtual Gamepad. Select native HID or the explicitly labelled keyboard mapping. Mapping provides WASD, Space, auxiliary keys and pointer look/trigger clicks. Native game recognition and camera behaviour require device checks. Hide releases the local controller; pause neutralizes/disconnects it.
 
-For another phone: on the running Mac choose Wireless Keyboard / Gamepad and create a pairing key. On the other phone choose Use as wireless keyboard or gamepad, select the local host and enter its key. Touchpad, ASCII software/hardware keyboard and gamepad share the authenticated Link connection. Both devices need this version. Controls-only mode sends no video and adds no monitor. Keep keys private.
+For another phone: on the running Mac choose Wireless Keyboard / Gamepad and create a pairing key. On the other phone choose Use as wireless keyboard or gamepad, select the local host and enter its key. Touchpad, ASCII software/hardware keyboard and gamepad share the authenticated Link connection. Both devices need this version. Controls-only mode sends no video and adds no monitor. One Link peer is supported; disconnect an extended-display session before switching to controls-only pairing. Keep keys private.
 
 For a useful log: choose Capture Diagnostics (30 seconds) from the same menu; reproduce desktop or gaming work and share henge.log/henge-native.log. Per-access counters stay off. CPU values are aggregate process core equivalents, not P/E residency; GPU buffer-duration sums can overlap and are not utilization/watts/temperature/gameFPS.
 

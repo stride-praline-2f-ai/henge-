@@ -1,6 +1,6 @@
 # Exact source validation
 
-Source `82f33a651f50658e449e3671496628ce0a724b29`, patch `06781355a3b0782e0c1a5c444793230e8583546c6d23bdf1611257ff216990a2`, run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43123278423.
+Source `9a037f1f131e1b97cc45f3550d999f9e815efd3a`, patch `06781355a3b0782e0c1a5c444793230e8583546c6d23bdf1611257ff216990a2`, run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43125249456.
 
 Required checks passed: native JIT/MMU/memory/input/VM lifecycle, sanitizer/concurrency/graphics checks, controls protocol and actual host/client TLS flow, owned releases/CPU gate, SDK typechecking and complete iPhoneOS Release app compile. Native PVG tests cover retained rings/read pointers/stamps/root IRQ, foreground replay and frozen teardown. Actual GPU tests verify late store actions preserve expected RGBA bytes.
 
