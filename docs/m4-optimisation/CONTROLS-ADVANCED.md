@@ -1,6 +1,6 @@
 # Advanced controls — integrated source
 
-Validated source `d3926d0cb1d05067a7d4525f2c0068afda9b29a7`; https://github.com/stride-praline-2f-ai/henge-/actions/runs/43160398405; https://github.com/stride-praline-2f-ai/henge-/actions/runs/43160398386.
+Validated source `5701f45fcd7db0cdd19557b5a0f81924bead210c`; https://github.com/stride-praline-2f-ai/henge-/actions/runs/43176532298; https://github.com/stride-praline-2f-ai/henge-/actions/runs/43176532244.
 
 One multitouch UIKit surface/input model serves the local overlay and controls-only
 Link. The Hide Gamepad bar is removed; use the three-finger menu for visibility

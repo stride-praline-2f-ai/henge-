@@ -79,3 +79,11 @@ and sanitizer checks plus full iPhoneOS Release compilation. Earlier pending
 paragraphs above describe historical checkpoints. Device warm-up benefit remains
 unmeasured; all recorded old-release Normal thermal categories are retained as
 evidence, not extrapolated into a new-build result.
+
+## Final integrated source validation
+
+Source `5701f45fcd7db0cdd19557b5a0f81924bead210c` passed https://github.com/stride-praline-2f-ai/henge-/actions/runs/43176532298; includes real Metal, grouped-memory differential
+and sanitizer checks plus full iPhoneOS Release compilation. Earlier pending
+paragraphs above describe historical checkpoints. Device warm-up benefit remains
+unmeasured; all recorded old-release Normal thermal categories are retained as
+evidence, not extrapolated into a new-build result.

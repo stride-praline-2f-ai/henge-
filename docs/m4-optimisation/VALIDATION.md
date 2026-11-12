@@ -1,7 +1,7 @@
 # Exact integrated validation
 
-Source `d3926d0cb1d05067a7d4525f2c0068afda9b29a7`, patch `1e321ed52bee7d1e5a9370512a182ce7e908b2834508c0b6a69001c0cdd5a3e4`.
-Native/Release application: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43160398405. Controller previews: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43160398386.
+Source `5701f45fcd7db0cdd19557b5a0f81924bead210c`, patch `a690fc757ab4d5638742a9aa442b92bac0a6ae605e552c5f05fe4d00b102a641`.
+Native/Release application: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43176532298. Controller previews: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43176532244.
 
 Passed: pinned source reconstruction; native JIT/MMU/ASID/page-crossing/permission
 differentials including interleaved memory groups; shared-copy emitter graph;
