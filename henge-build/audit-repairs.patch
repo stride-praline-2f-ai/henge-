@@ -3322,10 +3322,10 @@ index cf4acc4..42818a6 100644
  
 diff --git a/docs/controller-posture/PROGRESS.md b/docs/controller-posture/PROGRESS.md
 new file mode 100644
-index 0000000..b2aaa53
+index 0000000..e9725b9
 --- /dev/null
 +++ b/docs/controller-posture/PROGRESS.md
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,51 @@
 +# Controller posture integration
 +
 +Implemented in source (cloud validation pending):
@@ -3371,6 +3371,12 @@ index 0000000..b2aaa53
 +Cloud91f832 passes native JIT/MMU/memory/device and lifecycle/sanitizer suites, including actual37-frame codec/TLS tests at all three canvas sizes and production display pulse fixture. The full SDK check found NativeTouchSurface's upstream Trackpad.revealTap name does not exist in the fork; route its four-finger menu gesture to the existing Trackpad.threeFingerTap notification (one existing SessionView consumer). No duplicated menu path.
 +
 +Cloud83dbcf passes all88 production Swift sources against iPhoneOS27.2 plus JIT/MMU/device/lifecycle/sanitizers. USB's disabled-touch SupportedProtocol fixture still expected upstream two ports; the fork correctly advertises keyboard/trackpad/gamepad(three). Corrected that test expectation; complete actual xHCI USB transfers/lifts/overflow/reset/hotplug/watchdog/coexistence pass locally under ASan/UBSan with explicit Linux-only RAM/PCI/CPU-wake boundaries (not a native machine pass). Native cloud test still uses the real machine/PCI. Helper validation now collects independent compile/package/SDK failures before returning failure, so an earlier fixture error cannot conceal later compiler issues. No test removed or ignored.
++
++M4 production UI83dbcf passed all actual sticks/buttons/touchpad/sensitivity/wireless/keyboard actions (52.104s); artifact13977089573, job131441742613. XCTest PNGs show a rotated/cropped composition despite correct1376x1032 AX window geometry and correct physical touch callbacks. Original images retained. Add direct UIKit window pixel captures to the test-only fixture plus preserved Simulator container images, required outside modal settings, to distinguish compositor capture metadata from actual control layout. No shipping runtime capture/timer added. Exact next-source UI validation still required; physical Duo/M4 remains distinct.
++
++Duo83 actualUI artifacts13979127757/job131441742617 show: (1)local compact gamepad pointer drag produced zero callbacks, (2)tabletop parent accessibilityIdentifier propagated over every child, replacing both native gamepad/touchpad IDs. Remove parent IDs from tabletop/video containers; tests assert video/controller geometry through leaf elements. Use exact unique IDs across AX types because the runtime explicitly reports legacy TextView versus modern Other for UIKeyInput. Replace the separately offset gamepad pointer representable with one native ControllerCanvasView that hosts the existing PadView/LinkInputView, positions both subviews in one coordinate space and preserves transparent hit passthrough. No duplicate input/gyro/transport model; resize cancels held pointer gestures, unchanged updates preserve input. Must verify on actual next-source M4/Duo-canvas UI, including40px pointer drag.
++
++Native4e8946 run43294128029/job131447763306 PASSED all checks including USB/gamepad coexistence, actual ordinary guest helper launch, Swift6 helper, bundle signatures, production phone/simulator SDK, macOSclone/GPT, lifecycle/sanitizers and full iOS Release app compilation. No IPA generated. New UIKit composition and test pixel capture changes still require exact-source gate.
 diff --git a/docs/controller-posture/m4-log-ACBA.json b/docs/controller-posture/m4-log-ACBA.json
 new file mode 100644
 index 0000000..c209542
@@ -7588,11 +7594,12 @@ index 0000000..4ce55b3
 +}
 diff --git a/ios/Henge/Controls/GamepadControllerSurface.swift b/ios/Henge/Controls/GamepadControllerSurface.swift
 new file mode 100644
-index 0000000..295ff20
+index 0000000..86b7db2
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadControllerSurface.swift
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,114 @@
 +import SwiftUI
++import UIKit
 +
 +/// The controller and pointing pad share existing input paths. No extra ticker.
 +struct GamepadControllerSurface: View {
@@ -7604,6 +7611,7 @@ index 0000000..295ff20
 +    let send:(GamepadState)->Void
 +    let sendPointer:(LinkControl)->Void
 +    @ObservedObject private var gyro=GyroSteeringService.shared
++    @ObservedObject private var touchpad=TouchpadPreferences.shared
 +    @Environment(\.scenePhase) private var phase
 +    @State private var owner=UUID()
 +    @State private var latest=GamepadState()
@@ -7613,23 +7621,9 @@ index 0000000..295ff20
 +        send(GyroSteeringMath.merge(state,steering:gyro.axis,enabled:gyro.steering && gyro.owns(owner)))
 +    }
 +    var body:some View {
-+        GeometryReader { geometry in
-+            let pad=PadLayout(bounds:CGRect(origin:.zero,size:geometry.size),size:tuning.normalized.scale,portrait:portrait).touchpadRect
-+            ZStack(alignment:.topLeading) {
-+                GamepadSurface(tuning:tuning,portrait:portrait,acceptsInput:acceptsInput && phase == .active,send:publish)
-+                if showsTouchpad {
-+                    WirelessInputSurface(keyboard:false,send:sendPointer,capturesKeyboard:capturesKeyboard,acceptsInput:acceptsInput && phase == .active,identifier:"gamepad-touchpad")
-+                        .background(.black.opacity(tuning.normalized.opacity),in:RoundedRectangle(cornerRadius:12))
-+                        .overlay {
-+                            RoundedRectangle(cornerRadius:12).strokeBorder(.white.opacity(0.35))
-+                                .overlay(alignment:.bottom) { Text("Touchpad").font(.caption2).foregroundStyle(.secondary).padding(4) }
-+                                .allowsHitTesting(false)
-+                        }
-+                        .frame(width:pad.width,height:pad.height)
-+                        .offset(x:pad.minX,y:pad.minY)
-+                }
-+            }
-+        }
++        ControllerInputCanvas(tuning:tuning,portrait:portrait,showsTouchpad:showsTouchpad,
++                              capturesKeyboard:capturesKeyboard,acceptsInput:acceptsInput && phase == .active,
++                              touchpadTuning:touchpad.value,send:publish,sendPointer:sendPointer)
 +        .overlay(alignment:.top) {
 +            if gyro.enabled {
 +                Button { gyro.calibrate() } label: {
@@ -7646,6 +7640,76 @@ index 0000000..295ff20
 +        }
 +        .onChange(of:gyro.axis) { _,_ in if gyro.owns(owner) { publish(latest) } }
 +        .onChange(of:gyro.enabled) { _,_ in if gyro.owns(owner) { publish(latest) } }
++    }
++}
++
++/// One native coordinate space for the controls and their pointing surface.
++/// UIKit owns both subview frames and hit testing; no offset representable can
++/// be clipped by a separately proposed SwiftUI hit region on compact layouts.
++private struct ControllerInputCanvas:UIViewRepresentable {
++    let tuning:GamepadTuning
++    let portrait:Bool
++    let showsTouchpad:Bool
++    let capturesKeyboard:Bool
++    let acceptsInput:Bool
++    let touchpadTuning:TouchpadTuning
++    let send:(GamepadState)->Void
++    let sendPointer:(LinkControl)->Void
++    func makeUIView(context:Context)->ControllerCanvasView {
++        let view=ControllerCanvasView();updateUIView(view,context:context);return view
++    }
++    func updateUIView(_ view:ControllerCanvasView,context:Context) {
++        view.pad.send=send;view.pointer.send=sendPointer
++        view.configure(tuning:tuning,portrait:portrait,showsTouchpad:showsTouchpad,
++                       capturesKeyboard:capturesKeyboard,acceptsInput:acceptsInput && context.environment.isEnabled,
++                       pointerTuning:touchpadTuning)
++    }
++    static func dismantleUIView(_ view:ControllerCanvasView,coordinator:()) {
++        view.pad.release();view.pointer.releaseInput();view.pointer.resignFirstResponder()
++        view.pad.send=nil;view.pointer.send=nil
++    }
++}
++private final class ControllerCanvasView:UIView {
++    let pad=PadView()
++    let pointer=LinkInputView()
++    private let caption=UILabel()
++    private var tuning=GamepadTuning(),portrait=false,shown=true
++    override init(frame:CGRect) {
++        super.init(frame:frame);backgroundColor = .clear;isMultipleTouchEnabled=true
++        addSubview(pad);addSubview(pointer)
++        pointer.accessibilityIdentifier="gamepad-touchpad"
++        pointer.accessibilityLabel="Gamepad touchpad"
++        pointer.layer.cornerRadius=12;pointer.layer.borderWidth=1
++        pointer.layer.borderColor=UIColor.white.withAlphaComponent(0.35).cgColor
++        caption.text="Touchpad";caption.font = .systemFont(ofSize:10)
++        caption.textColor=UIColor.secondaryLabel;caption.textAlignment = .center
++        caption.isUserInteractionEnabled=false;caption.isAccessibilityElement=false
++        pointer.addSubview(caption)
++    }
++    required init?(coder:NSCoder) { fatalError("made in code") }
++    func configure(tuning:GamepadTuning,portrait:Bool,showsTouchpad:Bool,capturesKeyboard:Bool,acceptsInput:Bool,pointerTuning:TouchpadTuning) {
++        self.tuning=tuning.normalized;self.portrait=portrait;self.shown=showsTouchpad
++        pad.configure(tuning,portrait:portrait,acceptsInput:acceptsInput)
++        pointer.capturesKeyboard=capturesKeyboard;pointer.acceptsInput=acceptsInput && showsTouchpad
++        pointer.pointerTuning=pointerTuning;pointer.isHidden = !showsTouchpad
++        pointer.backgroundColor=UIColor.black.withAlphaComponent(self.tuning.opacity)
++        setNeedsLayout()
++    }
++    override func layoutSubviews() {
++        super.layoutSubviews();pad.frame=bounds
++        let frame=PadLayout(bounds:bounds,size:tuning.scale,portrait:portrait).touchpadRect
++        if pointer.frame != .zero && pointer.frame != frame {
++            pointer.releaseInput()
++            for gesture in pointer.gestureRecognizers ?? [] where gesture.isEnabled {
++                gesture.isEnabled=false;gesture.isEnabled=true
++            }
++        }
++        pointer.frame=frame
++        caption.frame=CGRect(x:4,y:max(0,frame.height-19),width:max(0,frame.width-8),height:15)
++    }
++    override func point(inside point:CGPoint,with event:UIEvent?)->Bool {
++        if shown && pointer.isUserInteractionEnabled && pointer.frame.contains(point) { return true }
++        return pad.point(inside:convert(point,to:pad),with:event)
 +    }
 +}
 diff --git a/ios/Henge/Controls/GamepadHub.swift b/ios/Henge/Controls/GamepadHub.swift
@@ -8386,7 +8450,7 @@ index 0000000..f4bf2f7
 +}
 diff --git a/ios/Henge/Controls/WirelessControlsPanel.swift b/ios/Henge/Controls/WirelessControlsPanel.swift
 new file mode 100644
-index 0000000..a0e490e
+index 0000000..d2481fd
 --- /dev/null
 +++ b/ios/Henge/Controls/WirelessControlsPanel.swift
 @@ -0,0 +1,152 @@
@@ -8458,7 +8522,7 @@ index 0000000..a0e490e
 +            Color.clear.frame(height:layout.fold.height).allowsHitTesting(false)
 +            GamepadControllerSurface(tuning:tuning,acceptsInput:acceptsInput,showsTouchpad:false,send:sendPad,sendPointer:sendPointer)
 +                .padding(.horizontal,12).frame(height:layout.lower.height)
-+        }.accessibilityIdentifier("duo-tabletop-controls")
++        }
 +    }
 +    private var header: some View {
 +        HStack(spacing:12) {
@@ -8684,7 +8748,7 @@ index 0000000..fcfdcfb
 +}
 diff --git a/ios/Henge/Controls/WirelessVideoControls.swift b/ios/Henge/Controls/WirelessVideoControls.swift
 new file mode 100644
-index 0000000..0bb94d7
+index 0000000..00beab4
 --- /dev/null
 +++ b/ios/Henge/Controls/WirelessVideoControls.swift
 @@ -0,0 +1,35 @@
@@ -8711,14 +8775,14 @@ index 0000000..0bb94d7
 +                    Color.clear.frame(height:layout.fold.height).allowsHitTesting(false)
 +                    GamepadControllerSurface(tuning:tuning,acceptsInput:acceptsInput,send:sendPad,sendPointer:sendPointer)
 +                        .frame(height:layout.lower.height)
-+                }.background(.black).accessibilityIdentifier("duo-video-deck")
++                }.background(.black)
 +            } else {
 +                ZStack(alignment:.bottom) {
 +                    video.ignoresSafeArea()
 +                    GamepadControllerSurface(tuning:tuning,acceptsInput:acceptsInput,send:sendPad,sendPointer:sendPointer)
 +                        .frame(height:min(360,geometry.size.height*0.72))
 +                    VStack { toolbar.padding(8);Spacer() }.allowsHitTesting(true)
-+                }.background(.black).accessibilityIdentifier("landscape-video-controller")
++                }.background(.black)
 +            }
 +        }
 +    }
@@ -13211,15 +13275,17 @@ index 0000000..5435674
 +HengeGamepadPreview.xcodeproj/
 diff --git a/tests/gamepad-preview/App.swift b/tests/gamepad-preview/App.swift
 new file mode 100644
-index 0000000..8a6b492
+index 0000000..a2a2c80
 --- /dev/null
 +++ b/tests/gamepad-preview/App.swift
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,96 @@
 +import SwiftUI
 +import Metal
++import UIKit
 +
 +@main struct GamepadPreviewApp: App {
 +    init() {
++        try? FileManager.default.removeItem(at:URL.documentsDirectory.appendingPathComponent("ControlsWindowProof",isDirectory:true))
 +        for key in ["henge.gamepad.tuning.v1","henge.touchpad.tuning.v1","henge.link.controllerLayout"] { UserDefaults.standard.removeObject(forKey:key) }
 +    }
 +    var body: some Scene { WindowGroup { PreviewRoot().preferredColorScheme(.dark) } }
@@ -13237,6 +13303,8 @@ index 0000000..8a6b492
 +    @State private var maxLeft=0
 +    @State private var pointerMoves=0
 +    @State private var keyPresses=0
++    @State private var proofCount=0
++    @State private var proofError=""
 +    @ObservedObject private var preferences=GamepadPreferences.shared
 +    private func point(_ control:LinkControl) {
 +        if control.type == "move" { pointerMoves += 1 }
@@ -13246,6 +13314,20 @@ index 0000000..8a6b492
 +        if state.buttons&1 != 0 && last.buttons&1 == 0 { presses += 1 }
 +        maxLeft=max(maxLeft,abs(Int(state.lx)))
 +        last=state
++    }
++    @MainActor private func saveWindowProof() {
++        do {
++            guard let scene=UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first,
++                  let window=scene.windows.first(where: \.isKeyWindow) else { throw CocoaError(.fileNoSuchFile) }
++            let image=UIGraphicsImageRenderer(bounds:window.bounds).image { context in
++                window.layer.render(in:context.cgContext)
++            }
++            guard let bytes=image.pngData() else { throw CocoaError(.fileWriteUnknown) }
++            let folder=URL.documentsDirectory.appendingPathComponent("ControlsWindowProof",isDirectory:true)
++            try FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
++            try bytes.write(to:folder.appendingPathComponent(String(format:"%02d.png",proofCount+1)),options:.atomic)
++            proofCount += 1;proofError=""
++        } catch { proofError="Window proof: \(error.localizedDescription)" }
 +    }
 +    var body: some View {
 +        GeometryReader { geometry in
@@ -13261,6 +13343,7 @@ index 0000000..8a6b492
 +                    }
 +                    if wireless { Button(video ? "Video off" : "Video") { video.toggle() }.accessibilityIdentifier("video") }
 +                    Button("Settings") { settings=true }.accessibilityIdentifier("settings")
++                    Button { saveWindowProof() } label: { Image(systemName:"camera") }.accessibilityIdentifier("capture-window-proof")
 +                }
 +                HStack {
 +                    Text("A presses: \(presses)").accessibilityIdentifier("a-count")
@@ -13268,6 +13351,7 @@ index 0000000..8a6b492
 +                    Text("Buttons: \(last.buttons)").accessibilityIdentifier("buttons")
 +                    Text("Moves: \(pointerMoves)").accessibilityIdentifier("moves").accessibilityValue(Text(verbatim:String(pointerMoves)))
 +                    Text("Keys: \(keyPresses)").accessibilityIdentifier("keys").accessibilityValue(Text(verbatim:String(keyPresses)))
++                    Text(proofError.isEmpty ? "Proof: \(proofCount)" : proofError).accessibilityIdentifier("window-proof-status").accessibilityValue(Text(verbatim:String(proofCount)))
 +                }.font(.caption.monospacedDigit()).lineLimit(1).minimumScaleFactor(0.5).frame(height:22)
 +                ZStack(alignment:.bottom) {
 +                    LinearGradient(colors:[.indigo.opacity(0.45),.gray.opacity(0.2),.black],startPoint:.topLeading,endPoint:.bottomTrailing)
@@ -13293,10 +13377,10 @@ index 0000000..8a6b492
 +}
 diff --git a/tests/gamepad-preview/GamepadPreviewUITests.swift b/tests/gamepad-preview/GamepadPreviewUITests.swift
 new file mode 100644
-index 0000000..7b36ae3
+index 0000000..fa420ca
 --- /dev/null
 +++ b/tests/gamepad-preview/GamepadPreviewUITests.swift
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,125 @@
 +import XCTest
 +import CoreGraphics
 +
@@ -13319,7 +13403,17 @@ index 0000000..7b36ae3
 +        if PreviewFixture.profile == "duo-unfolded" && !PreviewFixture.isNativeDuo {
 +            XCTAssertEqual(surface.frame.width,951,accuracy:1,"Duo alternative must test the actual unfolded viewport width")
 +        }
++        var proofs=0
 +        func capture(_ name: String) {
++            let camera=app.buttons["capture-window-proof"]
++            // Modal settings cover the fixture toolbar; its image is already
++            // represented by the preceding/following direct window captures.
++            if !name.hasSuffix("-settings") {
++                XCTAssertTrue(camera.isHittable,"Direct window capture must be reachable outside the settings sheet")
++                camera.tap();proofs += 1
++                XCTAssertEqual(app.staticTexts["window-proof-status"].value as? String,String(proofs))
++                print("HENGE_WINDOW_PROOF \(proofs) \(name)")
++            }
 +            let attachment=XCTAttachment(screenshot:XCUIScreen.main.screenshot());attachment.name=name+"-display";attachment.lifetime = .keepAlways;add(attachment)
 +            let window=XCTAttachment(screenshot:app.screenshot());window.name=name+"-app";window.lifetime = .keepAlways;add(window)
 +        }
@@ -13343,7 +13437,10 @@ index 0000000..7b36ae3
 +        let motion=NSPredicate { _,_ in (Int(maximum.value as? String ?? "") ?? -1)>20000 }
 +        XCTAssertEqual(XCTWaiter.wait(for:[XCTNSPredicateExpectation(predicate:motion,object:nil)],timeout:5),.completed,"Stick movement did not reach the production callback")
 +        XCTAssertEqual(app.staticTexts["buttons"].label,"Buttons: 0")
-+        let gamepadPad=app.textViews["gamepad-touchpad"].firstMatch
++        // UIKeyInput is reported as TextView by legacy AX and Other by modern
++        // AX on the installed runtime. Match its unique native identifier.
++        func pointingSurface(_ id:String)->XCUIElement { app.descendants(matching:.any).matching(identifier:id).firstMatch }
++        let gamepadPad=pointingSurface("gamepad-touchpad")
 +        XCTAssertTrue(gamepadPad.waitForExistence(timeout:5))
 +        let padCenter=gamepadPad.coordinate(withNormalizedOffset:CGVector(dx:0.5,dy:0.5))
 +        padCenter.press(forDuration:0.1,thenDragTo:padCenter.withOffset(CGVector(dx:40,dy:8)))
@@ -13363,7 +13460,7 @@ index 0000000..7b36ae3
 +        XCTAssertTrue(surface.waitForExistence(timeout:5))
 +        capture("\(PreviewFixture.profile)-wireless-gamepad")
 +        app.buttons["Touchpad"].tap()
-+        let input=app.textViews["wireless-input-surface"].firstMatch
++        let input=pointingSurface("wireless-input-surface")
 +        XCTAssertTrue(input.waitForExistence(timeout:5))
 +        let center=input.coordinate(withNormalizedOffset:CGVector(dx:0.5,dy:0.5))
 +        center.press(forDuration:0.1,thenDragTo:center.withOffset(CGVector(dx:80,dy:20)))
@@ -13379,7 +13476,7 @@ index 0000000..7b36ae3
 +        if PreviewFixture.profile == "duo-unfolded" {
 +            app.buttons["Controller layout"].tap()
 +            app.buttons["Tabletop"].tap()
-+            let tabletop=app.textViews["tabletop-touchpad"].firstMatch
++            let tabletop=pointingSurface("tabletop-touchpad")
 +            XCTAssertTrue(tabletop.waitForExistence(timeout:5))
 +            XCTAssertLessThan(tabletop.frame.maxY,surface.frame.minY,"The hinge gap must separate the touchpad and controller")
 +            tap(.a)
@@ -13396,10 +13493,13 @@ index 0000000..7b36ae3
 +            XCTAssertEqual(app.staticTexts["buttons"].label,"Buttons: 0")
 +            capture("duo-portrait-gamepad")
 +            app.buttons["video"].tap()
-+            XCTAssertTrue(app.otherElements["duo-video-deck"].exists)
++            let video=app.staticTexts["video-fixture"]
++            XCTAssertTrue(video.waitForExistence(timeout:5))
++            XCTAssertLessThan(video.frame.maxY,surface.frame.minY,"Portrait video stays above the controller deck")
 +            capture("duo-portrait-ds-video")
 +            app.buttons["fold"].tap()
-+            XCTAssertTrue(app.otherElements["landscape-video-controller"].exists)
++            XCTAssertTrue(video.waitForExistence(timeout:5))
++            XCTAssertGreaterThan(surface.frame.width,600,"Unfolding restores the landscape overlay")
 +            capture("duo-landscape-fullscreen-video")
 +            app.buttons["video"].tap();capture("duo-unfolded-restored")
 +        }
@@ -18549,10 +18649,10 @@ index 0000000..68d2542
 +if __name__=='__main__':main()
 diff --git a/tools/preview_gamepad.py b/tools/preview_gamepad.py
 new file mode 100644
-index 0000000..649729a
+index 0000000..4c2fa0b
 --- /dev/null
 +++ b/tools/preview_gamepad.py
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,145 @@
 +"""Actual iOS Simulator UI tests; viewport fixtures are not chip emulation."""
 +from pathlib import Path
 +import argparse,json,os,re,subprocess,threading
@@ -18675,6 +18775,20 @@ index 0000000..649729a
 + if timed_out:print('xcodebuild exceeded the 25-minute preview limit; retained log and failure state')
 + if status:diagnostic('failure-screenshot',['xcrun','simctl','io',udid,'screenshot','--display=1',str(artifacts/'failure-state.png')])
 + diagnostic('active-display-screenshot',['xcrun','simctl','io',udid,'screenshot','--display='+('3' if native_duo else '1'),str(artifacts/'active-display.png')])
++ # Preserve exact UIKit window pixels too: recent Simulator XCTest images can
++ # carry a rotation/crop inconsistent with their correctly reported AX bounds.
++ try:
++  container=Path(output('xcrun','simctl','get_app_container',udid,'com.henge.gamepadpreview','data').strip())
++  proofs=container/'Documents/ControlsWindowProof'
++  if proofs.exists():
++   import shutil
++   shutil.copytree(proofs,artifacts/'ui-window-proof',dirs_exist_ok=True)
++  report['direct_window_captures']=len(list((artifacts/'ui-window-proof').glob('*.png')))
++  if status==0 and report['direct_window_captures']<5:
++   raise RuntimeError('Successful UI test lacks direct UIKit window captures')
++ except Exception as error:
++  (artifacts/'window-proof-error.txt').write_text(str(error))
++  if status==0:raise
 + # Kept XCTest screenshot attachments remain available even after a UI failure.
 + subprocess.run(['xcrun','xcresulttool','export','attachments','--path',str(artifacts/'GamepadPreview.xcresult'),'--output-path',str(artifacts/'screenshots')],check=False)
 + if status:raise SystemExit(status)
