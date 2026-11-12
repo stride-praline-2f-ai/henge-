@@ -1,7 +1,7 @@
 # Exact source validation
 
-Source `f1f492f5ae935791859baa615aa01fe5c21e67bd`; patch `d1494f2e07873e3fb117d9a7b219f579ae9383dbbdda5520153e7436568b60e2`.
-Native/SDK/Release: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43296777053. Production UI: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43296777073.
+Source `1336e6c5da6a4b5498b0705e77c4f6f8bfd11404`; patch `c09b2eb89d4851a04adfa05132afe140cdee42153a78af7086a3608068bb8a9e`.
+Native/SDK/Release: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43308744375. Production UI: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43308744339.
 
 Passed: pinned reconstruction; native JIT/MMU/ASID/permission/page-boundary
 regressions; grouped-memory differential tests; code publication/invalidation;
@@ -30,8 +30,9 @@ Host presentation samples were14.12..29.60/s (median24.98), not game FPS. The
 production double-cadence bug is fixed; use the existing M4 Automatic4CPU/8GiB
 baseline for comparison. Saved VM settings are not silently overwritten.
 
-Packaging attempt43300161538 compiled and created the archive, then rejected it
-at a raw15-byte Swift preference-key check. Swift small strings can be embedded
-as instruction immediates. The verifier now checks actual CoreMotion linkage,
-start/stop selectors and long steering runtime data, and reports all missing
-markers together. No release artifact was uploaded by that failed run.
+The newer76B logs also contain8CPU/11GiB cold boot. Both4CPU/14GiB and8CPU/11GiB
+reachedHot before LPM andNormal after LPM. DifferentRAM/flags/workloads prevent
+an A/B inference. Active capture host-present medians4CPU27.55/21.70 and
+8CPU15.73/24.36/8.30/15.66/24.71/22.37 do not establish8CPU as faster.
+A full JIT reset occurs in one capture; later slow captures have little translation
+work. New bounded CPU/disk/GPU cache reports help separate the remaining causes.

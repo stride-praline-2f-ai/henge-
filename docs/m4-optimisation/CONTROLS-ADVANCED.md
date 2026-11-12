@@ -1,6 +1,6 @@
 # Controls and new release features
 
-Validated source `f1f492f5ae935791859baa615aa01fe5c21e67bd`: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43296777053; https://github.com/stride-praline-2f-ai/henge-/actions/runs/43296777073.
+Validated source `1336e6c5da6a4b5498b0705e77c4f6f8bfd11404`: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43308744375; https://github.com/stride-praline-2f-ai/henge-/actions/runs/43308744339.
 
 Three-finger controls → virtual gamepad. Shared pointer touchpad supports movement
 and scroll sensitivity. Wireless keyboard already includes its own touchpad.
