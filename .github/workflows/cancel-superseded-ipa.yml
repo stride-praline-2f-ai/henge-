@@ -1,0 +1,40 @@
+name: Cancel superseded Henge IPA queue
+on:
+  push:
+    branches: [maintenance/cancel-superseded-ipa-20261112]
+    paths: [.github/workflows/cancel-superseded-ipa.yml]
+permissions:
+  actions: write
+  contents: read
+jobs:
+  cancel-known-superseded:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Cancel only reviewed obsolete IPA runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json,os,urllib.request
+          repo=os.environ['GITHUB_REPOSITORY']
+          assert repo=='stride-praline-2f-ai/henge-'
+          expected={
+            43097588939:'7f25d5e2ebf054b565d63506ea3f7e886a859d03',
+            43097137150:'8f538124ea439b8cbe35de35dc58157e64918da6',
+            43096760096:'5f2a6356790986abb98bf4c0d8fc01bde75c54bc',
+            43096402891:'48a092baf01f4dc8c0a6c3ef4f6379091e2e2fef'}
+          headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+          for run_id,sha in expected.items():
+              url=f'https://api.github.com/repos/{repo}/actions/runs/{run_id}'
+              with urllib.request.urlopen(urllib.request.Request(url,headers=headers),timeout=30) as response: run=json.load(response)
+              assert run['head_sha']==sha and run['head_branch']=='feature/duo-efficiency'
+              assert run['path']=='.github/workflows/henge-duo-checks.yml'
+              assert run['created_at']<'2026-11-12T00:00:00Z'
+              if run['status']=='completed':
+                  print(run_id,'already completed',run['conclusion']);continue
+              assert run['status'] in ('queued','in_progress','waiting','pending','requested')
+              with urllib.request.urlopen(urllib.request.Request(url+'/cancel',headers=headers,data=b'',method='POST'),timeout=30) as response:
+                  assert response.status==202
+              print(run_id,sha,'cancellation accepted')
+          PY
