@@ -4546,10 +4546,10 @@ index 0000000..77e4f94
 +}
 diff --git a/ios/Henge/Controls/GamepadSurface.swift b/ios/Henge/Controls/GamepadSurface.swift
 new file mode 100644
-index 0000000..c2afec8
+index 0000000..aa1f2fd
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadSurface.swift
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,149 @@
 +import SwiftUI
 +import UIKit
 +
@@ -4572,6 +4572,14 @@ index 0000000..c2afec8
 +    private var tuning = GamepadTuning()
 +    private var lastSent = GamepadState.off
 +    private var current = GamepadState()
++#if DEBUG
++    private var debugEvents: [String] = []
++    private func debugRecord(_ name: String) {
++        debugEvents.append(name)
++        if debugEvents.count>12 { debugEvents.removeFirst(debugEvents.count-12) }
++        accessibilityValue=debugEvents.joined(separator:" | ")
++    }
++#endif
 +    override init(frame: CGRect) {
 +        super.init(frame:frame); isMultipleTouchEnabled = true; isOpaque = false; backgroundColor = .clear
 +        isAccessibilityElement = true;accessibilityIdentifier="gamepad-surface"
@@ -4597,6 +4605,9 @@ index 0000000..c2afec8
 +        // fingers unless the actual geometry changes (rotation/unfold/resize).
 +        guard bounds != previousBounds else { return }
 +        previousBounds = bounds
++#if DEBUG
++        debugRecord("bounds=\(bounds)")
++#endif
 +        if !input.fingers.isEmpty { cancelTouches() }
 +        setNeedsDisplay()
 +    }
@@ -4648,18 +4659,34 @@ index 0000000..c2afec8
 +    }
 +    override func touchesBegan(_ touches: Set<UITouch>,with event: UIEvent?) {
 +        for touch in touches { input.begin(Int(bitPattern:ObjectIdentifier(touch)),point:touch.location(in:self),layout:layout) }
++#if DEBUG
++        debugRecord("begin=\(touches.first?.location(in:self) ?? .zero), owners=\(input.fingers.values.map{$0.control.rawValue})")
++#endif
 +        publish()
 +    }
 +    override func touchesMoved(_ touches: Set<UITouch>,with event: UIEvent?) {
-+        for touch in touches { input.move(Int(bitPattern:ObjectIdentifier(touch)),point:touch.location(in:self)) };publish()
++        for touch in touches { input.move(Int(bitPattern:ObjectIdentifier(touch)),point:touch.location(in:self)) }
++#if DEBUG
++        debugRecord("move=\(touches.first?.location(in:self) ?? .zero), owners=\(input.fingers.values.map{$0.control.rawValue})")
++#endif
++        publish()
 +    }
 +    override func touchesEnded(_ touches: Set<UITouch>,with event: UIEvent?) {
-+        for touch in touches { input.end(Int(bitPattern:ObjectIdentifier(touch))) };publish()
++        for touch in touches { input.end(Int(bitPattern:ObjectIdentifier(touch))) }
++#if DEBUG
++        debugRecord("end")
++#endif
++        publish()
 +    }
 +    override func touchesCancelled(_ touches: Set<UITouch>,with event: UIEvent?) { touchesEnded(touches,with:event) }
 +    override func didMoveToWindow() { super.didMoveToWindow(); if window == nil { release() } else { publish() } }
 +    func release() { input.release();current = .off;emit(.off);setNeedsDisplay() }
-+    private func cancelTouches() { input.release();publish() }
++    private func cancelTouches() {
++#if DEBUG
++        debugRecord("layout/tuning release")
++#endif
++        input.release();publish()
++    }
 +    private func emit(_ state: GamepadState) { guard state != lastSent else { return };lastSent=state;send?(state) }
 +    private func publish() {
 +        let state=input.state(tuning:tuning,layout:layout);current=state;emit(state);setNeedsDisplay()
@@ -7784,10 +7811,10 @@ index 0000000..5435674
 +HengeGamepadPreview.xcodeproj/
 diff --git a/tests/gamepad-preview/App.swift b/tests/gamepad-preview/App.swift
 new file mode 100644
-index 0000000..ed1819a
+index 0000000..62ce386
 --- /dev/null
 +++ b/tests/gamepad-preview/App.swift
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,68 @@
 +import SwiftUI
 +import Metal
 +
@@ -7815,8 +7842,8 @@ index 0000000..ed1819a
 +    }
 +    var body: some View {
 +        GeometryReader { geometry in
-+            let viewport=folded ? CGSize(width:390,height:844) : PreviewFixture.viewport
-+            let fit=min(1,min(max(1,geometry.size.width-24)/viewport.width,max(1,geometry.size.height-110)/viewport.height))
++            let width=min(folded ? 390 : PreviewFixture.viewport.width,max(1,geometry.size.width-24))
++            let height=min(folded ? 844 : PreviewFixture.viewport.height,max(1,geometry.size.height-100))
 +            VStack(spacing:8) {
 +                HStack {
 +                    Text("\(PreviewFixture.profile) · layout fixture").font(.caption)
@@ -7833,7 +7860,7 @@ index 0000000..ed1819a
 +                    Text("Buttons: \(last.buttons)").accessibilityIdentifier("buttons")
 +                    Text("Moves: \(pointerMoves)").accessibilityIdentifier("moves")
 +                    Text("Keys: \(keyPresses)").accessibilityIdentifier("keys")
-+                }.font(.caption.monospacedDigit()).frame(height:22)
++                }.font(.caption.monospacedDigit()).lineLimit(1).minimumScaleFactor(0.5).frame(height:22)
 +                ZStack(alignment:.bottom) {
 +                    LinearGradient(colors:[.indigo.opacity(0.45),.gray.opacity(0.2),.black],startPoint:.topLeading,endPoint:.bottomTrailing)
 +                    if wireless {
@@ -7848,31 +7875,31 @@ index 0000000..ed1819a
 +                        VStack { Text("Mac display · overlay preview").foregroundStyle(.secondary).padding();Spacer();GamepadSurface(tuning:preferences.value,send:receive).frame(height:320*preferences.value.normalized.scale) }
 +                    }
 +                }
-+                .frame(width:viewport.width,height:viewport.height)
-+                .scaleEffect(fit,anchor:.top)
-+                .frame(width:viewport.width*fit,height:viewport.height*fit,alignment:.top)
++                .frame(width:width,height:height)
++                .accessibilityIdentifier("preview-canvas")
 +                Spacer(minLength:0)
-+            }.padding(12)
++            }.padding(12).frame(width:geometry.size.width,height:geometry.size.height)
 +            .sheet(isPresented:$settings) { GamepadSettingsPanel(mapping:$mapping,allowsNativeProfile:!wireless) }
 +        }
 +    }
 +}
 diff --git a/tests/gamepad-preview/GamepadPreviewUITests.swift b/tests/gamepad-preview/GamepadPreviewUITests.swift
 new file mode 100644
-index 0000000..703ef25
+index 0000000..f9dbafb
 --- /dev/null
 +++ b/tests/gamepad-preview/GamepadPreviewUITests.swift
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,63 @@
 +import XCTest
 +import CoreGraphics
 +
 +final class GamepadPreviewUITests: XCTestCase {
 +    func testControlsAndLayouts() {
-+        continueAfterFailure=false
++        continueAfterFailure=true
 +        XCUIDevice.shared.orientation = .landscapeLeft
 +        let app=XCUIApplication();app.launch()
++        XCUIDevice.shared.orientation = .landscapeRight
 +        let surface=app.otherElements["gamepad-surface"].firstMatch
-+        XCTAssertTrue(surface.waitForExistence(timeout:15))
++        guard surface.waitForExistence(timeout:15) else { XCTFail("Production gamepad surface missing");return }
 +        func capture(_ name: String) {
 +            let attachment=XCTAttachment(screenshot:app.screenshot());attachment.name=name;attachment.lifetime = .keepAlways;add(attachment)
 +        }
@@ -7882,6 +7909,7 @@ index 0000000..703ef25
 +            surface.coordinate(withNormalizedOffset:CGVector(dx:r.midX/size.width,dy:r.midY/size.height)).tap()
 +        }
 +        capture("\(PreviewFixture.profile)-local-default")
++        let bounds=XCTAttachment(string:app.debugDescription);bounds.name="Initial production UI bounds";bounds.lifetime = .keepAlways;add(bounds)
 +        tap(.a)
 +        XCTAssertEqual(app.staticTexts["a-count"].label,"A presses: 1")
 +        XCTAssertEqual(app.staticTexts["buttons"].label,"Buttons: 0")
@@ -7890,6 +7918,8 @@ index 0000000..703ef25
 +        origin.press(forDuration:0.1,thenDragTo:origin.withOffset(CGVector(dx:r.width,dy:0)))
 +        let maximum=app.staticTexts["left-max"]
 +        XCTAssertTrue(maximum.waitForExistence(timeout:5))
++        let touchTrace=XCTAttachment(string:surface.value as? String ?? "no touch trace");touchTrace.name="Production touch trace after drag";touchTrace.lifetime = .keepAlways;add(touchTrace)
++        capture("\(PreviewFixture.profile)-after-stick-drag")
 +        XCTAssertGreaterThan(Int(maximum.label.split(separator:" ").last ?? "0") ?? 0,20000)
 +        XCTAssertEqual(app.staticTexts["buttons"].label,"Buttons: 0")
 +        app.buttons["settings"].tap()
@@ -7948,10 +7978,10 @@ index 0000000..dfa98b5
 +preview-artifacts. Run in GitHub Actions; no local Mac is required by the user.
 diff --git a/tests/gamepad-preview/project.yml b/tests/gamepad-preview/project.yml
 new file mode 100644
-index 0000000..7c510e6
+index 0000000..c7035c5
 --- /dev/null
 +++ b/tests/gamepad-preview/project.yml
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,71 @@
 +name: HengeGamepadPreview
 +options:
 +  deploymentTarget:
@@ -7998,6 +8028,8 @@ index 0000000..7c510e6
 +        - UIInterfaceOrientationLandscapeRight
 +        - UIInterfaceOrientationPortrait
 +        - UIInterfaceOrientationPortraitUpsideDown
++        UIRequiresFullScreen: true
++        UIInterfaceOrientation: UIInterfaceOrientationLandscapeRight
 +  GamepadPreviewUITests:
 +    type: bundle.ui-testing
 +    platform: iOS
@@ -8178,10 +8210,10 @@ index bcbed3f..4913894 100644
      ldr w2, [x0, #4]
 diff --git a/tests/run_lifecycle_sanitizers.sh b/tests/run_lifecycle_sanitizers.sh
 new file mode 100755
-index 0000000..c966236
+index 0000000..afa2431
 --- /dev/null
 +++ b/tests/run_lifecycle_sanitizers.sh
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,53 @@
 +#!/bin/bash
 +# Collect independent failures in one diagnostic pass; any failure blocks the IPA.
 +set -uo pipefail
@@ -8215,6 +8247,7 @@ index 0000000..c966236
 +fi
 +check python3 tests/test_gpu_copy_bounds.py
 +check python3 tests/test_group_copy_sharing.py
++check python3 tests/test_jit_allocation.py
 +check python3 tests/test_gpu_upload.py
 +check python3 tests/test_surface_hash_limit.py
 +check python3 tests/test_display_snapshot.py
@@ -11135,10 +11168,10 @@ index c88ebe4..00251c5 100755
 +python3 tests/test_link_control_services.py
 diff --git a/tools/preview_gamepad.py b/tools/preview_gamepad.py
 new file mode 100644
-index 0000000..d4a529c
+index 0000000..70e0b88
 --- /dev/null
 +++ b/tools/preview_gamepad.py
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,84 @@
 +"""Actual iOS Simulator UI tests; viewport fixtures are not chip emulation."""
 +from pathlib import Path
 +import argparse,json,os,re,subprocess
@@ -11152,6 +11185,7 @@ index 0000000..d4a529c
 +(folder/'Fixture.swift').write_text('import Foundation\nimport CoreGraphics\nenum PreviewFixture { static let profile='+json.dumps(args.profile)+'; static let viewport=CGSize(width:'+str(viewport[0])+',height:'+str(viewport[1])+') }\n')
 +def output(*cmd):return subprocess.check_output(cmd,text=True)
 +metadata=json.loads(output('xcrun','simctl','list','--json'))
++(artifacts/'simulator-inventory.json').write_text(json.dumps(metadata,indent=2)+'\n')
 +runtimes=[r for r in metadata['runtimes'] if r.get('isAvailable') and r.get('name','').startswith('iOS ')]
 +if not runtimes:raise SystemExit('No installed iOS Simulator runtime; no device test is claimed')
 +# Device types can be installed by an SDK but unsupported by a particular runtime.
@@ -11162,8 +11196,9 @@ index 0000000..d4a529c
 +for runtime in sorted(runtimes,key=lambda r:tuple(map(int,r['version'].split('.'))),reverse=True):
 + supported=runtime.get('supportedDeviceTypes')
 + allowed={d['identifier'] if isinstance(d,dict) else d for d in supported} if supported else None
-+ candidates=[d for d in types if (allowed is None or d['identifier'] in allowed) and
-+             ('duo' in d['name'].lower() if args.profile=='duo-unfolded' else False)]
++ candidates=[d for d in types if args.profile=='duo-unfolded' and 'duo' in d['name'].lower()]
++ if args.profile=='duo-unfolded' and not candidates:
++  candidates=[dict(name='iPhone Duo',identifier='com.apple.CoreSimulator.SimDeviceType.iPhone-Duo')]
 + canvases=[d for d in types if (allowed is None or d['identifier'] in allowed) and 'iPad Pro' in d['name'] and
 +           ('13-inch' in d['name'] or '12.9-inch' in d['name'])]
 + candidates+=sorted(canvases,key=lambda d:('M4' in d['name'],d['name']),reverse=True)
@@ -11178,7 +11213,7 @@ index 0000000..d4a529c
 +            simulator_device=device['name'],runtime=runtime['name'],xcode=output('xcodebuild','-version').strip(),
 +            host_model=output('sysctl','-n','hw.model').strip(),host_cores=output('sysctl','-n','hw.logicalcpu').strip(),
 +            scope='Production controller UI/input checks only. A20/M4 CPU, GPU, core placement and thermals are not emulated.',
-+            duo_unfolded_primary=args.profile=='duo-unfolded',fallback_canvas=('duo' not in device['name'].lower()) if args.profile=='duo-unfolded' else ('M4' not in device['name']))
++            duo_unfolded_requested=args.profile=='duo-unfolded',fallback_canvas=('duo' not in device['name'].lower()) if args.profile=='duo-unfolded' else ('M4' not in device['name']))
 +(artifacts/'environment.json').write_text(json.dumps(report,indent=2)+'\n')
 +try:
 + subprocess.run(['xcrun','simctl','boot',udid],check=True)
@@ -11186,6 +11221,19 @@ index 0000000..d4a529c
 + for label,command in [('io-help',['xcrun','simctl','io',udid]),('ui-help',['xcrun','simctl','ui',udid]),('displays',['xcrun','simctl','io',udid,'enumerate'])]:
 +  probe=subprocess.run(command,capture_output=True,text=True)
 +  (artifacts/(label+'.txt')).write_text(probe.stdout+probe.stderr)
++ if args.profile=='duo-unfolded' and 'duo' in device['name'].lower():
++  # Xcode 27.2 lists inner LCD-1 as display 3 and outer LCD as display 1.
++  # Use the supported screenConfig operation, and fail if it cannot be applied.
++  configuration=[]
++  for display,power in [('3','on'),('1','off')]:
++   command=['xcrun','simctl','io',udid,'screenConfig','--display='+display,'power',power]
++   change=subprocess.run(command,capture_output=True,text=True)
++   configuration.append(dict(display=display,power=power,status=change.returncode,output=change.stdout+change.stderr))
++   (artifacts/'unfolded-configuration.json').write_text(json.dumps(configuration,indent=2)+'\n')
++   if change.returncode:raise SystemExit('Cannot establish Duo unfolded display state; see unfolded-configuration.json')
++  report['duo_inner_display']='3';report['duo_outer_power']='off'
++  (artifacts/'environment.json').write_text(json.dumps(report,indent=2)+'\n')
++  (artifacts/'displays-unfolded.txt').write_text(output('xcrun','simctl','io',udid,'enumerate'))
 + subprocess.run(['xcodegen','generate'],cwd=folder,check=True)
 + command=['xcodebuild','-project',str(folder/'HengeGamepadPreview.xcodeproj'),'-scheme','GamepadPreview',
 +          '-destination','id='+udid,'-derivedDataPath',str(root/'build/gamepad-preview'),
@@ -11199,6 +11247,7 @@ index 0000000..d4a529c
 + print('\n'.join((artifacts/'xcodebuild.log').read_text().splitlines()[-35:]))
 + if timed_out:print('xcodebuild exceeded the 15-minute preview limit; retained log and failure state')
 + if status:subprocess.run(['xcrun','simctl','io',udid,'screenshot','--display=1',str(artifacts/'failure-state.png')],check=False)
++ subprocess.run(['xcrun','simctl','io',udid,'screenshot','--display='+('3' if report.get('duo_inner_display') else '1'),str(artifacts/'active-display.png')],check=False)
 + # Kept XCTest screenshot attachments remain available even after a UI failure.
 + subprocess.run(['xcrun','xcresulttool','export','attachments','--path',str(artifacts/'GamepadPreview.xcresult'),'--output-path',str(artifacts/'screenshots')],check=False)
 + if status:raise SystemExit(status)
