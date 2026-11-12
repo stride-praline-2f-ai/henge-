@@ -53,3 +53,15 @@ are unchanged. The shipping Link keyboard/trackpad surface is extracted with
 callback injection and shared by both production and previews, including real
 software keyboard and pointer gesture checks; no placeholder input panel is
 used. Transport ownership and the protocol remain unchanged.
+
+M4 UI checkpoint: source 7d334542, preview run 43153708430, job
+130968708030 passed actual stick travel/releases, sensitivity settings, wireless
+pad, pointer pan and software-keyboard typing. Counter values now expose raw
+accessibility values separately from localized display text. UIKeyInput is a
+TextView in accessibility, so tests query its identifier across element kinds.
+Duo selection must examine all compatible runtimes before fallback: the runner
+has both generic 27.2 (without Duo) and a dedicated iPhone19,4 27.2 runtime.
+The production selector has a regression for this exact inventory shape.
+The next checkpoint attaches Simulator's display host before requesting inner
+screen power, and uses a compact scrollable sidebar in short keyboard windows.
+No native Duo unfolded or guest controller-recognition claim yet.
