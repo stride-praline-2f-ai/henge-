@@ -3322,10 +3322,10 @@ index cf4acc4..42818a6 100644
  
 diff --git a/docs/controller-posture/PROGRESS.md b/docs/controller-posture/PROGRESS.md
 new file mode 100644
-index 0000000..31b7fec
+index 0000000..b2aaa53
 --- /dev/null
 +++ b/docs/controller-posture/PROGRESS.md
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,45 @@
 +# Controller posture integration
 +
 +Implemented in source (cloud validation pending):
@@ -3369,6 +3369,8 @@ index 0000000..31b7fec
 +Hardware codec fixture now models the production serial GPU worker's requestFrame callback. It verifies paced retry, three-credit blocked-consumer ceiling and final deferred snapshot after ACK (37 actual decoded frames), instead of expecting unpaced burst captures. Full macOS run required before release.
 +
 +Cloud91f832 passes native JIT/MMU/memory/device and lifecycle/sanitizer suites, including actual37-frame codec/TLS tests at all three canvas sizes and production display pulse fixture. The full SDK check found NativeTouchSurface's upstream Trackpad.revealTap name does not exist in the fork; route its four-finger menu gesture to the existing Trackpad.threeFingerTap notification (one existing SessionView consumer). No duplicated menu path.
++
++Cloud83dbcf passes all88 production Swift sources against iPhoneOS27.2 plus JIT/MMU/device/lifecycle/sanitizers. USB's disabled-touch SupportedProtocol fixture still expected upstream two ports; the fork correctly advertises keyboard/trackpad/gamepad(three). Corrected that test expectation; complete actual xHCI USB transfers/lifts/overflow/reset/hotplug/watchdog/coexistence pass locally under ASan/UBSan with explicit Linux-only RAM/PCI/CPU-wake boundaries (not a native machine pass). Native cloud test still uses the real machine/PCI. Helper validation now collects independent compile/package/SDK failures before returning failure, so an earlier fixture error cannot conceal later compiler issues. No test removed or ignored.
 diff --git a/docs/controller-posture/m4-log-ACBA.json b/docs/controller-posture/m4-log-ACBA.json
 new file mode 100644
 index 0000000..c209542
@@ -16661,10 +16663,10 @@ index 01aead4..b1daca1 100644
 +subprocess.run([str(b/'test_surface_hash')],check=True)
 diff --git a/tests/test_usb_touchscreen.c b/tests/test_usb_touchscreen.c
 new file mode 100644
-index 0000000..2cee166
+index 0000000..f2c797b
 --- /dev/null
 +++ b/tests/test_usb_touchscreen.c
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,183 @@
 +/* Exercise the guest-facing USB path, without a ROM or a guest installation. */
 +#include "machine.h"
 +#include "xhci.h"
@@ -16729,7 +16731,8 @@ index 0000000..2cee166
 +    HvXhci *off = hv_xhci_create(&machine, &bus);
 +    assert(off && !off->ts_enabled);
 +    assert((off->pci.bar_read(&off->pci, 0, 4, 4) >> 24) == 3);
-+    assert(((off->pci.bar_read(&off->pci, 0, 0x808, 4) >> 8) & 255) == 2);
++    /* Keyboard, trackpad and the custom gamepad remain advertised without touch. */
++    assert(((off->pci.bar_read(&off->pci, 0, 0x808, 4) >> 8) & 255) == 3);
 +    uint8_t up[HV_TS_REPORT_LEN] = {1};
 +    assert(!hv_xhci_touchscreen_report(off, up));
 +    assert(!hv_xhci_touchscreen_connect(off, 1));
@@ -17447,26 +17450,49 @@ index 509bce1..08f0a4d 100755
  # no linking, .app output, packaging, signing, new entitlement or simulator job.
  python3 - "$SDK" <<'PY'
 diff --git a/tools/check_native_touch.sh b/tools/check_native_touch.sh
-index eac7481..b176603 100755
+index eac7481..9c3d185 100755
 --- a/tools/check_native_touch.sh
 +++ b/tools/check_native_touch.sh
-@@ -1,10 +1,14 @@
+@@ -1,17 +1,34 @@
  #!/bin/bash
 -# Select Xcode 27.3+ with DEVELOPER_DIR. This does not need the external iOS build dependencies.
 +# Select the latest installed Xcode with DEVELOPER_DIR. This does not need the external iOS build dependencies.
  set -euo pipefail
  cd "$(dirname "$0")/.."
 -make test-native-touch build/henge-agent.gz build/henge-touch-agent.gz build/share.o build/native_touch.o
-+python3 tests/test_native_touch_packaging.py
-+make test-native-touch test-guest-connection test-usb-touchscreen build/henge-agent.gz build/henge-touch-agent.tar.gz build/share.o build/native_touch.o
-+python3 tools/verify_native_touch_package.py build/henge-touch-agent.tar.gz
- xcrun --sdk macosx swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
+-xcrun --sdk macosx swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
++failures=0
++check() {
++    if "$@"; then :; else
++        local status=$?
++        printf 'Native touch check failed (%s):' "$status" >&2
++        printf ' %q' "$@" >&2
++        printf '\n' >&2
++        failures=$((failures+1))
++    fi
++}
++check python3 tests/test_native_touch_packaging.py
++check make -k test-native-touch test-guest-connection test-usb-touchscreen build/henge-agent.gz build/henge-touch-agent.tar.gz build/share.o build/native_touch.o
++check build/henge-touch-agent --check-launch
++check python3 tools/verify_native_touch_package.py build/henge-touch-agent.tar.gz
++check xcrun --sdk macosx swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
      -parse-as-library -typecheck tools/henge-touch-agent.swift tools/native-touch/*.swift
-+xcrun --sdk macosx swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
++check xcrun --sdk macosx swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
 +    -parse-as-library tools/native-touch-probe.swift tools/native-touch/*.swift -o build/native-touch-probe
  sdk="$(xcrun --sdk iphonesimulator --show-sdk-path)"
  sources=()
  while IFS= read -r -d '' source; do sources+=("$source"); done < <(find ios/Henge -name '*.swift' -print0)
+-xcrun --sdk iphonesimulator swiftc -typecheck -target arm64-apple-ios17.0-simulator -sdk "$sdk" \
++check xcrun --sdk iphonesimulator swiftc -typecheck -target arm64-apple-ios17.0-simulator -sdk "$sdk" \
+     -import-objc-header ios/Henge/HengeBridge.h -Ihost -Idevices -Icore \
+     "${sources[@]}" ios/HengeJITHelper/HengeJITMessages.swift
+ for source in native_touch share; do
+-    xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -Wall -Wextra -Werror \
++    check xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -Wall -Wextra -Werror \
+         -Ihost -c "host/$source.c" -o "build/${source}_ios.o"
+ done
++
++if (( failures )); then exit 1; fi
 diff --git a/tools/henge-agent.m b/tools/henge-agent.m
 index 62cdaee..2cfeed0 100644
 --- a/tools/henge-agent.m
