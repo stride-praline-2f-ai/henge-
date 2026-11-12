@@ -1,8 +1,16 @@
 diff --git a/Makefile b/Makefile
-index 81b0736..d5315ca 100644
+index 81b0736..df8928b 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
+@@ -5,14 +5,14 @@ B = build
+ 
+ CORE = $(B)/fastmem_log.o $(B)/fastmem.o $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
+        $(B)/exception.o $(B)/sysreg.o $(B)/machine.o
+-HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o $(B)/scheduling.o
++HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o $(B)/disk_resize.o $(B)/scheduling.o
+ DEV = $(B)/pvg_lite.o $(B)/pvg_metal.o $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
+       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/virtio_input.o $(B)/virtio_snd.o $(B)/virtio_usb.o $(B)/virtio_balloon.o $(B)/xhci.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o
+ ENGINE = $(CORE) $(HOST)
  METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
  
  TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
@@ -62,6 +70,15 @@ index 81b0736..d5315ca 100644
  
  test-vm-lifecycle: $(B)/test_vm_lifecycle
  	$(B)/test_vm_lifecycle
+@@ -165,7 +170,7 @@ IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isy
+ IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
+ IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
+ IB = build/ios
+-IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/scheduling.c host/vm.c host/snapshot.c host/net_slirp.c host/dns_proxy.c host/share.c host/native_touch.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
++IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/disk_resize.c host/scheduling.c host/vm.c host/snapshot.c host/net_slirp.c host/dns_proxy.c host/share.c host/native_touch.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
+           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
+ IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
+ 
 @@ -259,6 +264,25 @@ test-native-touch: $(B)/test_native_touch $(B)/test_native_touch_session
  	./$(B)/test_native_touch_session
  .PHONY: test-native-touch
@@ -1296,7 +1313,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..03be0e7 100644
+index 9073d22..2a44dd7 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -1388,12 +1405,14 @@ index 9073d22..03be0e7 100644
      int pacing_fps;
      BOOL pacing_policy_logged;
  
-@@ -193,6 +219,15 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -193,6 +219,17 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      uint64_t frames, frames_shot;
      /* Showing frames with the GPU: a layer the app gave us. No copies, no conversion on a CPU. */
      CAMetalLayer *layer; /* screen_lock protects the target and its generation */
 +    BOOL native_output_selected; /* explicit nil suspends; never re-enable CPU readback */
 +    BOOL display_driven, display_quiesced, display_scene_active, display_arm_pending;
++    BOOL display_pulse_active;
++    uint32_t display_prepared_w,display_prepared_h;
 +#if TARGET_OS_IPHONE
 +    CAMetalDisplayLink *display_link;
 +    id display_delegate, scene_activate_observer, scene_deactivate_observer;
@@ -1404,7 +1423,7 @@ index 9073d22..03be0e7 100644
      uint64_t layer_generation;
      __weak CAMetalLayer *prepared_layer; /* presenter only: each target needs its own setup */
      id<MTLRenderPipelineState> screen_pipe, linear_pipe, cursor_pipe;
-@@ -216,6 +251,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -216,6 +253,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      BOOL drawable_retry_pending;
      double drawable_retry_cooldown; /* fresh work coalesces one wake at its expiry */
      uint64_t screen_requests; /* fresh frames/cursor changes, not automatic retries */
@@ -1414,7 +1433,7 @@ index 9073d22..03be0e7 100644
      double drawable_retry_deadline; /* at most two seconds of retrying an unavailable target */
      uint32_t screen_w, screen_h;
      id<MTLBuffer> test_readback; /* HV_PVG_GPU_TEST: the drawable's pixels for screenshots */
-@@ -227,13 +265,33 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -227,12 +267,32 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
  - (void)complain:(NSString *)what;
  - (HvObject *)object:(uint32_t)ref task:(uint32_t)task;
  - (void)drawCursor;
@@ -1432,24 +1451,23 @@ index 9073d22..03be0e7 100644
 +- (void)requestDisplayPulse;
 +- (void)displayPulse:(CAMetalDisplayLink *)link update:(CAMetalDisplayLinkUpdate *)update;
 +#endif
- @end
- 
++@end
++
 +#if TARGET_OS_IPHONE
 +@interface HvDisplayPulse : NSObject <CAMetalDisplayLinkDelegate>
 +@property(nonatomic, weak) HvReplay *owner;
 +@end
 +@implementation HvDisplayPulse
 +- (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update {
-+    link.paused = YES; // one damage-driven pulse, never an idle refresh loop
-+    [self.owner displayPulse:link update:update];
++    HvReplay *owner=self.owner;
++    if(owner)[owner displayPulse:link update:update];else link.paused=YES;
 +}
-+@end
+ @end
 +#endif
-+
+ 
  /* What Metal asks while it reads a serialized pipeline. */
  @interface HvContext : NSObject {
- @public
-@@ -457,6 +515,20 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+@@ -457,6 +517,20 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
  @end
  
  @implementation HvReplay
@@ -1470,7 +1488,7 @@ index 9073d22..03be0e7 100644
  
  - (void)complain:(NSString *)what {
      if ([complaints containsObject:what]) return;
-@@ -488,8 +560,11 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+@@ -488,8 +562,11 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
      NSMutableData *lib = [NSMutableData dataWithLength:h.len];
      if (hv_pvg_lite_task_read(lite, task, h.off, lib.mutableBytes, h.len)) return nil;
      __block NSError *err = nil;
@@ -1483,7 +1501,7 @@ index 9073d22..03be0e7 100644
          dispatch_data_t data = dispatch_data_create(lib.bytes, lib.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
          id<MTLLibrary> result = [self->device newLibraryWithData:data error:&err];
          double seconds = now_seconds() - begin;
-@@ -497,7 +572,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+@@ -497,7 +574,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
          if (seconds > self->library_load_worst) self->library_load_worst = seconds;
          return result;
      }];
@@ -1492,7 +1510,7 @@ index 9073d22..03be0e7 100644
          [self complain:[NSString stringWithFormat:@"library: %@", err.localizedDescription]];
          return nil;
      }
-@@ -509,11 +584,11 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+@@ -509,11 +586,11 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
          if (tf && keep) {
              NSString *dir = [[[NSString stringWithUTF8String:tf] stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"shaders"];
              [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -1506,7 +1524,7 @@ index 9073d22..03be0e7 100644
  }
  
  - (id)makeSerialized:(uint64_t)at length:(uint32_t)size task:(uint32_t)task {
-@@ -838,15 +913,10 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
+@@ -838,15 +915,10 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
      return made;
  }
  
@@ -1525,7 +1543,7 @@ index 9073d22..03be0e7 100644
  }
  
  static uint64_t guest_hash(HvObject *s) { return hash_bytes(s->mapped + s->first, s->alloc); }
-@@ -863,7 +933,7 @@ static void sync_iosurface(HvObject *s) {
+@@ -863,7 +935,7 @@ static void sync_iosurface(HvObject *s) {
      if (!s->iosurface) return;
      const uint8_t *from = s->mapped + s->first;
      BOOL by_plane = s->plane_count && IOSurfaceGetPlaneCount(s->iosurface) >= s->plane_count;
@@ -1534,7 +1552,7 @@ index 9073d22..03be0e7 100644
      uint32_t changed = 0;
      uint64_t *have = s->shared_hashes ? (uint64_t *)s->shared_hashes.mutableBytes : s->plane_hash;
      if (by_plane) {
-@@ -876,9 +946,9 @@ static void sync_iosurface(HvObject *s) {
+@@ -876,9 +948,9 @@ static void sync_iosurface(HvObject *s) {
      } else {
          uint64_t hash = guest_hash(s);
          if (hash == s->content_hash) return;
@@ -1546,7 +1564,7 @@ index 9073d22..03be0e7 100644
      /* HV_PVG_HOST_DUMP=prefix (debugging): the host surface as it is just before the guest's pixels go over it,
         for the first few multi-plane surfaces, with its layout in a .txt beside it: did the GPU draw something here
         that this copy throws away? */
-@@ -907,7 +977,6 @@ static void sync_iosurface(HvObject *s) {
+@@ -907,7 +979,6 @@ static void sync_iosurface(HvObject *s) {
             requested. Copy each changed video plane through its actual host layout. */
          for (uint32_t i = 0; i < s->plane_count && i < 4; i++) {
              if (!(changed & 1u << i)) continue;
@@ -1554,7 +1572,7 @@ index 9073d22..03be0e7 100644
              uint8_t *dst = IOSurfaceGetBaseAddressOfPlane(s->iosurface, i);
              size_t dst_row = IOSurfaceGetBytesPerRowOfPlane(s->iosurface, i);
              size_t rows = MIN((size_t)s->plane_h[i], IOSurfaceGetHeightOfPlane(s->iosurface, i));
-@@ -916,10 +985,13 @@ static void sync_iosurface(HvObject *s) {
+@@ -916,10 +987,13 @@ static void sync_iosurface(HvObject *s) {
              size_t bytes = MIN((size_t)src_row, dst_row);
              for (size_t y = 0; y < rows; y++)
                  memcpy(dst + y * dst_row, from + src_off + y * src_row, bytes);
@@ -1569,7 +1587,7 @@ index 9073d22..03be0e7 100644
      }
      IOSurfaceUnlock(s->iosurface, 0, NULL);
      const char *dump = getenv("HV_PVG_SURFACE_DUMP");
-@@ -988,18 +1060,18 @@ static void sync_surface_once(HvReplay *r, HvObject *s, uint64_t epoch) {
+@@ -988,18 +1062,18 @@ static void sync_surface_once(HvReplay *r, HvObject *s, uint64_t epoch) {
      }
      surface->surface_w = (uint32_t)sw, surface->surface_h = (uint32_t)sh;
      uint64_t n = surface->length >> 14;
@@ -1592,7 +1610,7 @@ index 9073d22..03be0e7 100644
          vm_prot_t cur, max;
          vm_remap(mach_task_self(), &to, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
      }
-@@ -1233,30 +1305,38 @@ static BOOL has_guest_pages(HvObject *o) {
+@@ -1233,30 +1307,38 @@ static BOOL has_guest_pages(HvObject *o) {
  }
  
  /* Between guest memory and the GPU's own copy, in the layout the guest was told. */
@@ -1640,7 +1658,7 @@ index 9073d22..03be0e7 100644
              if (down)
                  [*blit copyFromTexture:tex sourceSlice:s sourceLevel:m sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, d)
                                toBuffer:copy destinationOffset:from destinationBytesPerRow:row destinationBytesPerImage:image];
-@@ -1264,6 +1344,7 @@ static BOOL has_guest_pages(HvObject *o) {
+@@ -1264,6 +1346,7 @@ static BOOL has_guest_pages(HvObject *o) {
                  [*blit copyFromBuffer:copy sourceOffset:from sourceBytesPerRow:row sourceBytesPerImage:image
                             sourceSize:MTLSizeMake(w, h, d) toTexture:tex destinationSlice:s destinationLevel:m destinationOrigin:MTLOriginMake(0, 0, 0)];
          }
@@ -1648,7 +1666,7 @@ index 9073d22..03be0e7 100644
  }
  
  /* The guest asks to see what the GPU made: {task, count, refs}. */
-@@ -1278,8 +1359,7 @@ static BOOL has_guest_pages(HvObject *o) {
+@@ -1278,8 +1361,7 @@ static BOOL has_guest_pages(HvObject *o) {
          HvObject *o = objs[@(a[2 + i])];
          if (!o || !o->guest_backed || !o->host_valid) continue;
          if (!cb) cb = [queue commandBuffer];
@@ -1658,7 +1676,7 @@ index 9073d22..03be0e7 100644
      }
      [blit endEncoding];
      if (cb) {
-@@ -1459,6 +1539,12 @@ typedef struct {
+@@ -1459,6 +1541,12 @@ typedef struct {
      if (!pipeline_set && draw) return;
      if (tracing && draw) fprintf(stderr, "trace:  draw tag %u\n", tag);
      switch (tag) {
@@ -1671,7 +1689,7 @@ index 9073d22..03be0e7 100644
      case 24: { /* {fence, stages} */
          id f = [self get:U32(0) task:task];
          if (f) [e updateFence:f afterStages:(MTLRenderStages)(U32(4) & 0xffff)];
-@@ -2108,7 +2194,7 @@ typedef struct {
+@@ -2108,7 +2196,7 @@ typedef struct {
              self->failed++;
              fprintf(stderr, "hengevm: pvg-metal: command buffer: %s\n", done.error.localizedDescription.UTF8String);
          }
@@ -1680,7 +1698,7 @@ index 9073d22..03be0e7 100644
          double elapsed = done.GPUEndTime - done.GPUStartTime;
          atomic_fetch_add_explicit(&self->gpu_completed, 1, memory_order_relaxed);
          if (done.GPUStartTime > 0 && elapsed >= 0) {
-@@ -2169,8 +2255,7 @@ typedef struct {
+@@ -2169,8 +2257,7 @@ typedef struct {
          }
          if (res[i * 2 + 1] & 1) o->guest_stale = NO, o->host_valid = NO; /* the guest wrote it */
          if (o->guest_backed && !o->host_valid) {
@@ -1690,7 +1708,7 @@ index 9073d22..03be0e7 100644
          }
          if (res[i * 2 + 1] & 4) sync_after = YES;
      }
-@@ -2254,8 +2339,7 @@ typedef struct {
+@@ -2254,8 +2341,7 @@ typedef struct {
              if (!(res[i * 2 + 1] & 4)) continue;
              HvObject *o = [self object:res[i * 2] task:task];
              if (!o || !o->guest_backed) continue;
@@ -1700,7 +1718,7 @@ index 9073d22..03be0e7 100644
          }
          [back endEncoding];
      }
-@@ -2263,7 +2347,7 @@ typedef struct {
+@@ -2263,7 +2349,7 @@ typedef struct {
      [self commit:cb channel:ch stamp:stamp complete:YES];
      double t2 = now_seconds();
      encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
@@ -1709,7 +1727,7 @@ index 9073d22..03be0e7 100644
          static double t0;
          if (!t0) t0 = now_seconds();
          fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, commit/wait CPU time %.2f s\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time);
-@@ -2287,6 +2371,19 @@ typedef struct {
+@@ -2287,6 +2373,19 @@ typedef struct {
                  library_load_seconds * 1000, library_load_worst * 1000);
          fprintf(stderr, "hengevm: gpu-pipelines: builds=%llu total_ms=%.2f worst_ms=%.2f (cumulative host pipeline creation, including failures)\n",
                  (unsigned long long)pipeline_builds, pipeline_seconds * 1000, pipeline_worst_seconds * 1000);
@@ -1729,7 +1747,7 @@ index 9073d22..03be0e7 100644
      }
      return YES;
  }
-@@ -2319,14 +2416,27 @@ static const uint8_t *half_to_byte(void) {
+@@ -2319,14 +2418,27 @@ static const uint8_t *half_to_byte(void) {
      memcpy(&hx, (const uint8_t *)a + 0x24, 2), memcpy(&hy, (const uint8_t *)a + 0x26, 2);
      if (!w || !h || w > 512 || h > 512 || stride < (uint64_t)w * 4 || stride > 8192) return;
      uint8_t *bits = malloc((size_t)stride * h);
@@ -1757,7 +1775,7 @@ index 9073d22..03be0e7 100644
      [glyph replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
      if (a[0] == 1) {
          link_cursor=glyph;link_cw=w;link_ch=h;link_hx=hx;link_hy=hy;
-@@ -2336,21 +2446,22 @@ static const uint8_t *half_to_byte(void) {
+@@ -2336,21 +2448,22 @@ static const uint8_t *half_to_byte(void) {
      os_unfair_lock_lock(&screen_lock);
      cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
      cursor_tex = glyph;
@@ -1783,7 +1801,7 @@ index 9073d22..03be0e7 100644
          [self screenChanged];
          return;
      }
-@@ -2439,26 +2550,98 @@ static const uint8_t *half_to_byte(void) {
+@@ -2439,26 +2552,110 @@ static const uint8_t *half_to_byte(void) {
     refresh, so that happens on a thread of its own and never holds up the guest's GPU work:
     this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
  - (void)updatePacingPolicy {
@@ -1810,6 +1828,8 @@ index 9073d22..03be0e7 100644
 +   ownership stays on main. The same encoder consumes the supplied drawable. */
 +- (void)requestDisplayPulse {
 +    if (atomic_load(&stopping) || display_arm_pending || display_quiesced || !display_scene_active || !layer || !screen_dirty) return;
++    if(display_pulse_active && display_link_layer==layer && display_link_generation==layer_generation &&
++       display_prepared_w==screen_w && display_prepared_h==screen_h)return;
 +    display_arm_pending = YES;
 +    uint64_t generation = layer_generation;
 +    CAMetalLayer *target = layer;
@@ -1848,12 +1868,13 @@ index 9073d22..03be0e7 100644
 +                [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 +            }
 +            r->display_link_generation = generation;
++            r->display_prepared_w=width;r->display_prepared_h=height;
 +            [r updatePacingPolicy];
 +            float supported = view.window.screen.maximumFramesPerSecond;
 +            if (supported <= 0) supported = 60;
 +            float maximum = r->pacing_fps ? fminf(r->pacing_fps, supported) : supported;
-+            r->display_link.preferredFrameRateRange = CAFrameRateRangeMake(fminf(30, maximum), maximum, maximum);
-+            r->display_link.paused = NO;
++            r->display_link.preferredFrameRateRange = CAFrameRateRangeMake(maximum,maximum,maximum);
++            r->display_pulse_active=YES;r->display_link.paused=NO;
 +            os_unfair_lock_unlock(&r->screen_lock);
 +            [previous invalidate];
 +        });
@@ -1861,16 +1882,25 @@ index 9073d22..03be0e7 100644
 +}
 +- (void)displayPulse:(CAMetalDisplayLink *)link update:(CAMetalDisplayLinkUpdate *)update {
 +    os_unfair_lock_lock(&screen_lock);
-+    if (!atomic_load(&stopping) && !display_quiesced && display_scene_active && screen_dirty &&
-+        layer && link == display_link && layer_generation == display_link_generation) {
-+        [self updatePacingPolicy];
-+        if (hv_pacing_delay(&frame_pacing, now_seconds(), pacing_fps) > 0) {
-+            [self requestDisplayPulse]; // retry on a display pulse, never an unrelated timer
-+        } else {
-+            display_drawable = update.drawable;
-+            [self kickPresenter:NO];
-+        }
++    BOOL current=link==display_link && layer_generation==display_link_generation;
++    UIView *view=[layer.delegate isKindOfClass:UIView.class] ? (UIView *)layer.delegate : nil;
++    UIWindowScene *scene=view.window.windowScene;
++    BOOL visible=scene && scene.activationState==UISceneActivationStateForegroundActive && !view.hidden && view.alpha>0;
++    if(current && !visible)display_scene_active=NO;
++    if(!current || atomic_load(&stopping) || display_quiesced || !display_scene_active || !layer || !screen_dirty){
++        if(current)display_pulse_active=NO;
++        link.paused=YES;os_unfair_lock_unlock(&screen_lock);return;
      }
++    [self updatePacingPolicy];
++    float supported=view.window.screen.maximumFramesPerSecond;if(supported<=0)supported=60;
++    float maximum=pacing_fps ? fminf(pacing_fps,supported) : supported;
++    if(link.preferredFrameRateRange.maximum!=maximum)
++        link.preferredFrameRateRange=CAFrameRateRangeMake(maximum,maximum,maximum);
++    // CAMetalDisplayLink owns the cadence. A second deadline measured from
++    // command commit is late by encoding time and can reject every other tick.
++    // Keep one active stream of pulses while damaged; pause on the first idle
++    // pulse, and never acquire another drawable while one is being encoded.
++    if(!presenter_running && !display_drawable){display_drawable=update.drawable;[self kickPresenter:NO];}
 +    os_unfair_lock_unlock(&screen_lock);
  }
 +#endif
@@ -1892,7 +1922,7 @@ index 9073d22..03be0e7 100644
      if (presenter_running || !layer || !screen_tex || drawable_retry_pending || pacing_pending) return;
      [self updatePacingPolicy];
      double now = now_seconds();
-@@ -2507,6 +2690,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2507,6 +2704,7 @@ static const uint8_t *half_to_byte(void) {
     submit another guest write. All link cursor state belongs to this worker. */
  - (void)sendLinkMapping:(uint64_t)mapping {
      link_mapping=mapping;
@@ -1900,7 +1930,7 @@ index 9073d22..03be0e7 100644
      HvPvgLinkFrameHandler handler=link_frame_handler();
      HvObject *surface=surfaces[@(mapping)];
      if(!handler || !surface)return;
-@@ -2526,6 +2710,29 @@ static const uint8_t *half_to_byte(void) {
+@@ -2526,6 +2724,29 @@ static const uint8_t *half_to_byte(void) {
              (float)(at&0xffff)-link_hx*scale,(float)(at>>16)-link_hy*scale,link_cw*scale,link_ch*scale);
  }
  
@@ -1930,7 +1960,7 @@ index 9073d22..03be0e7 100644
  - (void)showOnLayer:(uint64_t)mapping {
      HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]); /* not met yet: a resumed machine's screen */
      if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
-@@ -2547,28 +2754,49 @@ static const uint8_t *half_to_byte(void) {
+@@ -2547,28 +2768,49 @@ static const uint8_t *half_to_byte(void) {
      screen_dirty = YES;
      [self kickPresenter:YES];
      os_unfair_lock_unlock(&screen_lock);
@@ -1983,7 +2013,7 @@ index 9073d22..03be0e7 100644
              presenter_running = NO;
              [self kickPresenter:NO];
              os_unfair_lock_unlock(&screen_lock);
-@@ -2597,7 +2825,12 @@ static const uint8_t *half_to_byte(void) {
+@@ -2597,7 +2839,12 @@ static const uint8_t *half_to_byte(void) {
              target.drawableSize = want;
              [CATransaction commit];
          }
@@ -1997,7 +2027,7 @@ index 9073d22..03be0e7 100644
          if (!drawable) {
              os_unfair_lock_lock(&screen_lock);
              screen_dirty = YES;
-@@ -2636,6 +2869,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2636,6 +2883,7 @@ static const uint8_t *half_to_byte(void) {
          cw0 = cursor_w, ch0 = cursor_h, hx = cursor_hot_x, hy = cursor_hot_y;
          BOOL same_target = layer_generation == generation && layer == target;
          BOOL same_size = screen_w == W && screen_h == H;
@@ -2005,7 +2035,7 @@ index 9073d22..03be0e7 100644
          if (same_target && same_size) {
              screen_dirty = NO;
              drawable_retry_deadline = 0;
-@@ -2717,7 +2951,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2717,7 +2965,7 @@ static const uint8_t *half_to_byte(void) {
          // Serialize the final check and commit with set_layer: a switch that has
          // returned must not be followed by a commit to its old target.
          os_unfair_lock_lock(&screen_lock);
@@ -2014,7 +2044,7 @@ index 9073d22..03be0e7 100644
              if (frame_metrics_enabled) {
                  [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
                      os_unfair_lock_lock(&self->frame_metrics_lock);
-@@ -2738,10 +2972,10 @@ static const uint8_t *half_to_byte(void) {
+@@ -2738,10 +2986,10 @@ static const uint8_t *half_to_byte(void) {
  
  /* What the display should show: at most a few times a second by CPU, for tests and the boot's first frames. */
  - (void)present:(uint64_t)mapping {
@@ -2027,7 +2057,7 @@ index 9073d22..03be0e7 100644
          late = NO;
          [self showOnLayer:mapping];
          return;
-@@ -2834,13 +3068,19 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2834,13 +3082,19 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->completions = dispatch_group_create();
          r->device = dev;
          r->queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
@@ -2048,7 +2078,7 @@ index 9073d22..03be0e7 100644
          r->resource_tally = getenv("HV_PVG_TALLY") != NULL;
          r->batch_cache = getenv("HV_GPU_BATCH_CACHE") && !strcmp(getenv("HV_GPU_BATCH_CACHE"), "1");
          r->tasks = [NSMutableDictionary new];
-@@ -2848,6 +3088,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2848,6 +3102,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->surfaces = [NSMutableDictionary new];
          r->planar = [NSMutableDictionary new];
          r->complaints = [NSMutableSet new];
@@ -2073,7 +2103,7 @@ index 9073d22..03be0e7 100644
          r->shot = getenv("HV_PVG_SHOT");
          cp_start(r);
  #if !TARGET_OS_IPHONE
-@@ -2864,6 +3122,31 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2864,6 +3136,32 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
              r->shot_timer = timer;
          }
  #endif
@@ -2090,6 +2120,7 @@ index 9073d22..03be0e7 100644
 +            BOOL active = [note.name isEqualToString:UISceneDidActivateNotification];
 +            os_unfair_lock_lock(&owner->screen_lock);
 +            owner->display_scene_active = active;
++            if(!active)owner->display_pulse_active=NO;
 +            if (active) { owner->screen_dirty = YES; [owner kickPresenter:YES]; }
 +            CAMetalDisplayLink *link = owner->display_link;
 +            os_unfair_lock_unlock(&owner->screen_lock);
@@ -2105,7 +2136,7 @@ index 9073d22..03be0e7 100644
          fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
          return (HvPvgMetal *)CFBridgingRetain(r);
      }
-@@ -2874,20 +3157,35 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
+@@ -2874,20 +3172,35 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
      @autoreleasepool {
          HvReplay *r = CFBridgingRelease(m);
          atomic_store(&r->stopping, 1);
@@ -2123,7 +2154,7 @@ index 9073d22..03be0e7 100644
          r->screen_dirty = NO;
 +#if TARGET_OS_IPHONE
 +        CAMetalDisplayLink *retired_link = r->display_link;
-+        r->display_link = nil; r->display_delegate = nil; r->display_drawable = nil;
++        r->display_link = nil; r->display_delegate = nil; r->display_drawable = nil;r->display_pulse_active=NO;
 +#endif
          os_unfair_lock_unlock(&r->screen_lock);
 +#if TARGET_OS_IPHONE
@@ -2144,7 +2175,7 @@ index 9073d22..03be0e7 100644
          dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
          /* GPU completions may have enqueued a final readback on the worker. */
          dispatch_sync(r->worker, ^{
-@@ -2998,24 +3296,67 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
+@@ -2998,24 +3311,67 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
      }
      r->pacing_pending = NO; r->frame_pacing.next = 0; /* reattaching the same layer also wakes a stopped presenter */
      r->layer = l;
@@ -2152,7 +2183,7 @@ index 9073d22..03be0e7 100644
 +    r->display_arm_pending = NO;
 +    r->display_scene_active = YES; // the main-thread scene check verifies the new target
 +#if TARGET_OS_IPHONE
-+    r->display_drawable = nil;
++    r->display_drawable = nil;r->display_pulse_active=NO;
 +    CAMetalDisplayLink *retired_link = nil;
 +    if (r->display_link_layer != l) {
 +        retired_link = r->display_link; r->display_link = nil; r->display_delegate = nil;
@@ -2177,7 +2208,7 @@ index 9073d22..03be0e7 100644
 +    os_unfair_lock_lock(&r->screen_lock);
 +    r->display_quiesced = paused != 0;
 +#if TARGET_OS_IPHONE
-+    r->display_drawable = nil;
++    r->display_drawable = nil;r->display_pulse_active=NO;
 +    CAMetalDisplayLink *link = r->display_link;
 +#endif
 +    if (!paused) { r->screen_dirty = YES; [r kickPresenter:YES]; }
@@ -2213,7 +2244,7 @@ index 9073d22..03be0e7 100644
          [r screenChanged];
          return;
      }
-@@ -3104,6 +3445,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
+@@ -3104,6 +3460,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
          (unsigned long long)m.overflow,(unsigned long long)m.invalid);
  }
  
@@ -2223,7 +2254,7 @@ index 9073d22..03be0e7 100644
  void hv_pvg_metal_link_connected(HvPvgMetal *m,int connected){
      if(!m)return;HvReplay *r=(__bridge HvReplay *)m;
      dispatch_async(r->worker,^{
-@@ -3117,25 +3461,45 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+@@ -3117,25 +3476,45 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
      if(atomic_exchange(&r->link_cursor_queued,1))return;
      dispatch_async(r->worker,^{atomic_store(&r->link_cursor_queued,0);if (!atomic_load(&r->stopping)) [r sendLinkMapping:r->link_mapping];});
  }
@@ -2273,7 +2304,7 @@ index 9073d22..03be0e7 100644
              for (NSNumber *task in r->tasks) {
                  NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
                  for (NSNumber *ref in objs) {
-@@ -3143,79 +3507,117 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -3143,79 +3522,117 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
                      if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
                      if (o->parent && o->parent->heap_whole) continue;
                      if (!cb) cb = [r->queue commandBuffer];
@@ -2298,13 +2329,8 @@ index 9073d22..03be0e7 100644
          dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
      }
 +    return failed ? -1 : 0;
- }
- 
--typedef struct DisplayState {
--    uint64_t on_screen;
--    uint32_t cursor_w, cursor_h, cursor_stride, cursor_shown;
--    int32_t hot_x, hot_y;
--} DisplayState;
++}
++
 +/* Entry is foreground-only, with CPUs stopped and local presentation paused.
 +   Fence both guest and Link submissions before the CPU-only gate is published. */
 +int hv_pvg_metal_background_fence(HvPvgMetal *m) {
@@ -2321,8 +2347,13 @@ index 9073d22..03be0e7 100644
 +    dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
 +    dispatch_sync(r->worker, ^{});
 +    return failed ? -1 : 0;
-+}
-+
+ }
+ 
+-typedef struct DisplayState {
+-    uint64_t on_screen;
+-    uint32_t cursor_w, cursor_h, cursor_stride, cursor_shown;
+-    int32_t hot_x, hot_y;
+-} DisplayState;
 +#include "display_snapshot.h"
  
  size_t hv_pvg_metal_display_state(HvPvgMetal *m, void *out, size_t cap) {
@@ -3258,10 +3289,10 @@ index cf4acc4..42818a6 100644
  
 diff --git a/docs/controller-posture/PROGRESS.md b/docs/controller-posture/PROGRESS.md
 new file mode 100644
-index 0000000..70970bd
+index 0000000..1ee9c96
 --- /dev/null
 +++ b/docs/controller-posture/PROGRESS.md
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,35 @@
 +# Controller posture integration
 +
 +Implemented in source (cloud validation pending):
@@ -3291,6 +3322,36 @@ index 0000000..70970bd
 +- Two signed guest app bundles inside deterministic tar.gz, empty entitlements, architecture/signature/archive-path validation in CI and IPA inspector. Guest helper update required.
 +- Optional video encoding now has explicit60/120Hz capture budgets and one deferred latest-frame refresh after cadence/credit backpressure. Decoder ACK sequence IDs survive encoder replacement; remote display presents at the selected supported cadence with one latest image.
 +- Source4f55 passed all native/sanitizer/SDK/Release app compilation (run43281138121). M4 UI actions reached the final keyboard/gamepad return but exceeded the old180s test allowance; the expanded full-feature suite now has480s. Duo canvas boot timed out externally before app launch; retain run43281138212 evidence and retry exact next source. No ignored failures and no IPA.
++
++## M4 pacing and disk expansion
++- New0.3.4 M4 logsACBA: four vCPUs,14GiB guest RAM, grouped/superblocks enabled;12 LPM diagnostic samples, host presentations14.12..29.60/s (median24.98), Normal thermal category. Not game FPS. Recommend8GiB baseline and experiments off for controlled comparison; do not silently rewrite saved VM RAM.
++- Native CAMetalDisplayLink no longer competes with a commit-relative wall-clock deadline. It remains armed during actual damage, pauses at the first idle pulse, avoids redundant main/presenter preflight while unchanged, and requests the selected supported cadence. Real M4 frame-time improvement remains hardware validation; the old dual gate demonstrably rejects alternate60Hz pulses with2ms commit delay.
++- Offline disk growth: presets128/256/512GiB and custom to2048GiB. Native validated GPT CRC/backup relocation, clone+atomic replacement and original image backup. VM/file locks, no shrink/live/saved-session mutation. APFS is extended using macOS diskutil after next cold boot; recovery partitions are never moved speculatively. Linux production-GPT tests passed ASan/UBSan with independent Python CRC oracle. Cloud macOS tests use the actual filesystem clone API.
++- Cloud3ee78 failed before compilation because changing the reconciliation script's pre-patch helper token changed the patch baseline. Fixed by preserving the reviewed baseline token; cumulative patch itself owns the new tar.gz build phase. Retest next exact source, no waived failure/no IPA.
+diff --git a/docs/controller-posture/m4-log-ACBA.json b/docs/controller-posture/m4-log-ACBA.json
+new file mode 100644
+index 0000000..c209542
+--- /dev/null
++++ b/docs/controller-posture/m4-log-ACBA.json
+@@ -0,0 +1,18 @@
++{
++  "binary": "0.3.4(105)",
++  "device": "iPad16,5",
++  "guest_ram_mb": 14336,
++  "vcpus": 4,
++  "experimental_grouped": true,
++  "experimental_superblocks": true,
++  "samples": 12,
++  "presentations_range": [
++    14.12,
++    29.6
++  ],
++  "median_presentations": 24.98,
++  "thermal_categories": [
++    "0"
++  ],
++  "finding": "Commit-relative extra deadline competes with CAMetalDisplayLink cadence; continuous active display-link pulses avoid per-frame rearm latency. More than the 8GB baseline guest RAM can also add paging pressure. Host presentations are not game FPS; actual improvement requires device verification."
++}
 diff --git a/docs/desktop-heat-20261111.md b/docs/desktop-heat-20261111.md
 new file mode 100644
 index 0000000..17638b3
@@ -5584,6 +5645,136 @@ index 4919f5d..5a6c506 100644
 +int hv_audio_recover(HvVirtioSnd *d);
  
  #endif
+diff --git a/host/disk.c b/host/disk.c
+index ecb059f..f36fffc 100644
+--- a/host/disk.c
++++ b/host/disk.c
+@@ -4,6 +4,7 @@
+ #include "disk.h"
+ 
+ #include <sys/stat.h>
++#include <sys/file.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ 
+@@ -13,6 +14,7 @@ int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
+     d->wfd = -1;
+     d->fd = open(path, readonly ? O_RDONLY : O_RDWR);
+     if (d->fd < 0) return -1;
++    if(flock(d->fd,(readonly ? LOCK_SH : LOCK_EX)|LOCK_NB)){close(d->fd);d->fd=-1;return -1;}
+     struct stat st;
+     if (fstat(d->fd, &st) != 0 || (uint64_t)st.st_size < offset) {
+         close(d->fd);
+diff --git a/host/disk_resize.c b/host/disk_resize.c
+new file mode 100644
+index 0000000..64c747e
+--- /dev/null
++++ b/host/disk_resize.c
+@@ -0,0 +1,90 @@
++#define _POSIX_C_SOURCE 200809L
++#include "disk_resize.h"
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/file.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#ifdef __APPLE__
++#include <sys/clonefile.h>
++#endif
++
++static uint32_t get32(const unsigned char *p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
++static uint64_t get64(const unsigned char *p){return get32(p)|(uint64_t)get32(p+4)<<32;}
++static void put32(unsigned char *p,uint32_t v){for(int i=0;i<4;i++)p[i]=(unsigned char)(v>>(8*i));}
++static void put64(unsigned char *p,uint64_t v){put32(p,(uint32_t)v);put32(p+4,(uint32_t)(v>>32));}
++static uint32_t crc(const void *data,size_t count){const unsigned char *p=data;uint32_t value=~0u;while(count--){value^=*p++;for(int i=0;i<8;i++)value=(value>>1)^((0u-(value&1u))&0xedb88320u);}return ~value;}
++static int transfer(int fd,void *data,size_t count,uint64_t at,int write){
++ unsigned char *p=data;while(count){ssize_t n=write?pwrite(fd,p,count,(off_t)at):pread(fd,p,count,(off_t)at);if(n<0&&errno==EINTR)continue;if(n<=0)return -1;p+=n;count-=(size_t)n;at+=(uint64_t)n;}return 0;
++}
++static int header_valid(unsigned char *h,uint64_t here,uint64_t other){
++ if(memcmp(h,"EFI PART",8)||get32(h+8)!=0x10000||get32(h+12)<92||get32(h+12)>512||get64(h+24)!=here||get64(h+32)!=other)return 0;
++ uint32_t wanted=get32(h+16);put32(h+16,0);uint32_t actual=crc(h,get32(h+12));put32(h+16,wanted);return actual==wanted;
++}
++static void seal(unsigned char *h){put32(h+16,0);put32(h+16,crc(h,get32(h+12)));}
++static int clone_image(const char *source,const char *destination){
++#ifdef __APPLE__
++ return clonefile(source,destination,0);
++#elif defined(HENGE_DISK_RESIZE_TEST)
++ /* Test-only filesystem boundary on Linux; GPT/atomic replacement is production code. */
++ int a=open(source,O_RDONLY),b=open(destination,O_CREAT|O_EXCL|O_WRONLY,0600);if(a<0||b<0){if(a>=0)close(a);if(b>=0)close(b);return -1;}
++ unsigned char buf[65536];ssize_t n;int rc=0;while((n=read(a,buf,sizeof buf))>0)if(transfer(b,buf,(size_t)n,(uint64_t)lseek(b,0,SEEK_CUR),1)||lseek(b,n,SEEK_CUR)<0){rc=-1;break;}if(n<0)rc=-1;close(a);close(b);return rc;
++#else
++ (void)source;(void)destination;errno=ENOTSUP;return -1;
++#endif
++}
++int hv_disk_expand(const char *path,uint64_t bytes,unsigned *last_apfs,char *error,size_t error_bytes){
++ int source=-1,target=-1,dir=-1,rc=-1,backup_linked=0;unsigned char *entries=NULL,*secondary=NULL;
++ char *temp=NULL,*backup=NULL,*parent=NULL;const char *why="Cannot expand this disk";
++ unsigned char front[1024],tail[512];struct stat st;
++ if(last_apfs)*last_apfs=0;
++ if(!path||bytes>(2ull<<40)||bytes%512){why="Choose a whole-GB capacity up to 2048 GB";goto end;}
++ size_t length=strlen(path);temp=calloc(length+64,1);backup=malloc(length+32);parent=strdup(path);
++ if(!temp||!backup||!parent){why="Not enough memory to prepare disk expansion";goto end;}
++ snprintf(backup,length+32,"%s.before-expansion",path);snprintf(temp,length+64,"%s.growing.XXXXXX",path);
++ if(access(backup,F_OK)==0){why="A previous disk backup exists. Export or remove it before expanding again";goto end;}
++ source=open(path,O_RDWR|O_NOFOLLOW);if(source<0||flock(source,LOCK_EX|LOCK_NB)){why="The disk is busy or unavailable; fully shut down the Mac first";goto end;}
++ if(fstat(source,&st)||!S_ISREG(st.st_mode)||st.st_size<34*512||st.st_size%512||bytes<=(uint64_t)st.st_size){why="Expansion must be larger than the current raw disk; shrinking is not supported";goto end;}
++ uint64_t old_last=(uint64_t)st.st_size/512-1,new_last=bytes/512-1;
++ if(transfer(source,front,sizeof front,0,0)||transfer(source,tail,512,old_last*512,0)||!header_valid(front+512,1,old_last)||!header_valid(tail,old_last,1)){why="The disk GPT needs repair in macOS before it can be expanded safely";goto end;}
++ if(front[510]!=0x55||front[511]!=0xaa){why="The protective partition map is invalid";goto end;}
++ int protective=-1;for(int i=0;i<4;i++){unsigned char type=front[446+i*16+4];if(type==0xee&&protective<0)protective=i;else if(type){why="Hybrid partition maps are not supported for expansion";goto end;}}
++ if(protective<0){why="A GPT protective partition is required";goto end;}
++ unsigned char *h=front+512;uint32_t count=get32(h+80),stride=get32(h+84);uint64_t total=(uint64_t)count*stride;
++ if(!count||count>4096||stride<128||stride>1024||stride%8||total>1048576||get32(tail+80)!=count||get32(tail+84)!=stride||memcmp(h+56,tail+56,16)||get32(h+88)!=get32(tail+88)){why="Unsupported or inconsistent GPT partition tables";goto end;}
++ uint64_t sectors=(total+511)/512,first=get64(h+40),last=get64(h+48),table=get64(h+72),old_table=get64(tail+72);
++ if(table<2||table>=first||sectors>first-table||last>=old_table||old_table>=old_last||sectors>old_last-old_table||first>last||get64(tail+40)!=first||get64(tail+48)!=last){why="GPT partition-table bounds are invalid";goto end;}
++ entries=malloc((size_t)total);secondary=malloc((size_t)total);if(!entries||!secondary){why="Not enough memory for the partition map";goto end;}
++ if(transfer(source,entries,(size_t)total,table*512,0)||transfer(source,secondary,(size_t)total,old_table*512,0)||memcmp(entries,secondary,(size_t)total)||crc(entries,(size_t)total)!=get32(h+88)){why="The primary and backup partition tables do not match";goto end;}
++ uint64_t highest=0;unsigned highest_index=0;const unsigned char zero[16]={0},apfs[16]={0xef,0x57,0x34,0x7c,0,0,0xaa,0x11,0xaa,0x11,0,0x30,0x65,0x43,0xec,0xac};
++ for(uint32_t i=0;i<count;i++){const unsigned char *p=entries+(size_t)i*stride;if(!memcmp(p,zero,16))continue;uint64_t a=get64(p+32),b=get64(p+40);if(a<first||b<a||b>last){why="A partition exceeds the GPT usable range";goto end;}if(b>highest){highest=b;highest_index=i+1;}for(uint32_t j=0;j<i;j++){const unsigned char *q=entries+(size_t)j*stride;if(memcmp(q,zero,16)&&a<=get64(q+40)&&get64(q+32)<=b){why="Overlapping partitions require repair before expansion";goto end;}}}
++ if(!highest_index){why="No installed partitions were found";goto end;}
++ unsigned apfs_index=!memcmp(entries+(size_t)(highest_index-1)*stride,apfs,16)?highest_index:0;
++ target=mkstemp(temp);if(target<0){why="Cannot reserve a temporary image path";goto end;}close(target);target=-1;unlink(temp);
++ if(clone_image(path,temp)){why="Safe filesystem cloning failed. Keep the Mac in Henge's local storage and enough storage free";goto end;}
++ target=open(temp,O_RDWR|O_NOFOLLOW);if(target<0||ftruncate(target,(off_t)bytes)){why="Cannot extend the cloned sparse disk";goto end;}
++ uint64_t new_table=new_last-sectors,new_usable=new_table-1;
++ put64(tail+24,new_last);put64(tail+48,new_usable);put64(tail+72,new_table);seal(tail);
++ put64(h+32,new_last);put64(h+48,new_usable);seal(h);
++ put32(front+446+protective*16+12,new_last>0xffffffffu?0xffffffffu:(uint32_t)new_last);
++ if(transfer(target,entries,(size_t)total,new_table*512,1)||transfer(target,tail,512,new_last*512,1)||transfer(target,front,sizeof front,0,1)||fsync(target)){why="Could not commit the expanded GPT; original disk preserved";goto end;}
++ /* Original stays reachable even if replacement or later volume resizing fails. */
++ char *slash=strrchr(parent,'/');if(slash){*slash=0;dir=open(*parent?parent:"/",O_RDONLY);}
++ if(link(path,backup)){why="Cannot preserve the original disk backup";goto end;}backup_linked=1;
++ if(dir>=0)(void)fsync(dir);
++ if(rename(temp,path)){why="Cannot replace the original disk; original remains intact";goto end;}
++ if(dir>=0)(void)fsync(dir);
++ if(last_apfs)*last_apfs=apfs_index;
++ rc=0;
++end:
++ if(rc&&backup_linked)unlink(backup);
++ if(temp)unlink(temp);
++ if(source>=0)close(source);
++ if(target>=0)close(target);
++ if(dir>=0)close(dir);
++ if(rc&&error&&error_bytes)snprintf(error,error_bytes,"%s",why);
++ free(entries);free(secondary);free(temp);free(backup);free(parent);return rc;
++}
+diff --git a/host/disk_resize.h b/host/disk_resize.h
+new file mode 100644
+index 0000000..50a009c
+--- /dev/null
++++ b/host/disk_resize.h
+@@ -0,0 +1,8 @@
++#ifndef HENGE_DISK_RESIZE_H
++#define HENGE_DISK_RESIZE_H
++#include <stddef.h>
++#include <stdint.h>
++/* Offline raw GPT image expansion. Clone, repair both GPTs, fsync and atomically
++   replace; original retained at PATH.before-expansion. Never shrinks/edits APFS. */
++int hv_disk_expand(const char *path,uint64_t bytes,unsigned *last_apfs,char *error,size_t error_bytes);
++#endif
 diff --git a/host/enter.S b/host/enter.S
 index cc902ed..15b606f 100644
 --- a/host/enter.S
@@ -7345,7 +7536,7 @@ index 0000000..4ce55b3
 +}
 diff --git a/ios/Henge/Controls/GamepadControllerSurface.swift b/ios/Henge/Controls/GamepadControllerSurface.swift
 new file mode 100644
-index 0000000..ce1e25a
+index 0000000..295ff20
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadControllerSurface.swift
 @@ -0,0 +1,56 @@
@@ -7373,9 +7564,9 @@ index 0000000..ce1e25a
 +        GeometryReader { geometry in
 +            let pad=PadLayout(bounds:CGRect(origin:.zero,size:geometry.size),size:tuning.normalized.scale,portrait:portrait).touchpadRect
 +            ZStack(alignment:.topLeading) {
-+                GamepadSurface(tuning:tuning,portrait:portrait,send:publish)
++                GamepadSurface(tuning:tuning,portrait:portrait,acceptsInput:acceptsInput && phase == .active,send:publish)
 +                if showsTouchpad {
-+                    WirelessInputSurface(keyboard:false,send:sendPointer,capturesKeyboard:capturesKeyboard,identifier:"gamepad-touchpad")
++                    WirelessInputSurface(keyboard:false,send:sendPointer,capturesKeyboard:capturesKeyboard,acceptsInput:acceptsInput && phase == .active,identifier:"gamepad-touchpad")
 +                        .background(.black.opacity(tuning.normalized.opacity),in:RoundedRectangle(cornerRadius:12))
 +                        .overlay {
 +                            RoundedRectangle(cornerRadius:12).strokeBorder(.white.opacity(0.35))
@@ -7708,10 +7899,10 @@ index 0000000..77e4f94
 +}
 diff --git a/ios/Henge/Controls/GamepadSurface.swift b/ios/Henge/Controls/GamepadSurface.swift
 new file mode 100644
-index 0000000..38a25b5
+index 0000000..64ed4c4
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadSurface.swift
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,156 @@
 +import SwiftUI
 +import UIKit
 +
@@ -7720,11 +7911,12 @@ index 0000000..38a25b5
 +struct GamepadSurface: UIViewRepresentable {
 +    var tuning = GamepadTuning()
 +    var portrait = false
++    var acceptsInput = true
 +    var send: (GamepadState) -> Void
 +    func makeUIView(context: Context) -> PadView {
-+        let view = PadView(); view.send = send; view.configure(tuning,portrait:portrait); return view
++        let view = PadView(); view.send = send; view.configure(tuning,portrait:portrait,acceptsInput:acceptsInput && context.environment.isEnabled); return view
 +    }
-+    func updateUIView(_ view: PadView, context: Context) { view.send = send; view.configure(tuning,portrait:portrait) }
++    func updateUIView(_ view: PadView, context: Context) { view.send = send; view.configure(tuning,portrait:portrait,acceptsInput:acceptsInput && context.environment.isEnabled) }
 +    static func dismantleUIView(_ view: PadView, coordinator: ()) { view.release(); view.send = nil }
 +}
 +
@@ -7734,6 +7926,7 @@ index 0000000..38a25b5
 +    private var previousBounds = CGRect.null
 +    private var tuning = GamepadTuning()
 +    private var portrait = false
++    private var acceptsInput = true
 +    private var lastSent = GamepadState.off
 +    private var current = GamepadState()
 +#if DEBUG
@@ -7752,15 +7945,17 @@ index 0000000..38a25b5
 +        accessibilityHint = "Use the three-finger controls menu for gamepad settings or to hide the gamepad."
 +    }
 +    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
-+    func configure(_ value: GamepadTuning, portrait: Bool) {
++    func configure(_ value: GamepadTuning, portrait: Bool, acceptsInput: Bool) {
 +        let value = value.normalized
-+        guard value != tuning || self.portrait != portrait else { return }
-+        tuning = value;self.portrait=portrait
++        guard value != tuning || self.portrait != portrait || self.acceptsInput != acceptsInput else { return }
++        tuning = value;self.portrait=portrait;self.acceptsInput=acceptsInput
++        isUserInteractionEnabled=acceptsInput
++        if !acceptsInput { release();return }
 +        if window != nil { cancelTouches() } else { input.release();setNeedsDisplay() }
 +    }
 +    private var layout: PadLayout { PadLayout(bounds:bounds,size:tuning.scale,portrait:portrait) }
 +    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-+        guard bounds.contains(point) else { return false }
++        guard acceptsInput,bounds.contains(point) else { return false }
 +        return PadControl.allCases.contains { layout.rect($0).contains(point) }
 +    }
 +    override func layoutSubviews() {
@@ -7822,6 +8017,7 @@ index 0000000..38a25b5
 +        }
 +    }
 +    override func touchesBegan(_ touches: Set<UITouch>,with event: UIEvent?) {
++        guard acceptsInput else { return }
 +        for touch in touches { input.begin(Int(bitPattern:ObjectIdentifier(touch)),point:touch.location(in:self),layout:layout) }
 +#if DEBUG
 +        debugRecord("begin=\(touches.first?.location(in:self) ?? .zero), owners=\(input.fingers.values.map{$0.control.rawValue})")
@@ -8138,10 +8334,10 @@ index 0000000..f4bf2f7
 +}
 diff --git a/ios/Henge/Controls/WirelessControlsPanel.swift b/ios/Henge/Controls/WirelessControlsPanel.swift
 new file mode 100644
-index 0000000..69257d2
+index 0000000..a0e490e
 --- /dev/null
 +++ b/ios/Henge/Controls/WirelessControlsPanel.swift
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,152 @@
 +import SwiftUI
 +
 +enum WirelessControlMode: Int, CaseIterable, Identifiable {
@@ -8269,7 +8465,7 @@ index 0000000..69257d2
 +            .accessibilityLabel("Controller sensitivity and layout settings")
 +    }
 +    private func pointingPad(identifier:String) -> some View {
-+        WirelessInputSurface(keyboard:false,send:sendPointer,identifier:identifier)
++        WirelessInputSurface(keyboard:false,send:sendPointer,acceptsInput:acceptsInput,identifier:identifier)
 +            .background(.white.opacity(0.06),in:RoundedRectangle(cornerRadius:24))
 +            .overlay(alignment:.bottom) {
 +                Text("Touchpad · Tap to click · Two fingers scroll").font(.caption).foregroundStyle(.secondary).padding(10).allowsHitTesting(false)
@@ -8284,6 +8480,7 @@ index 0000000..69257d2
 +            VStack(alignment:.leading,spacing:10) {
 +                Label(mode == .keyboard ? "Keyboard + touchpad" : "Touchpad",systemImage:mode.icon).font(.headline)
 +                input(mode)
++                    .disabled(!acceptsInput)
 +                    .frame(maxWidth:.infinity,maxHeight:.infinity)
 +                    .background(.white.opacity(0.06),in:RoundedRectangle(cornerRadius:24))
 +                    .overlay(RoundedRectangle(cornerRadius:24).strokeBorder(.white.opacity(0.12)).allowsHitTesting(false))
@@ -8295,10 +8492,10 @@ index 0000000..69257d2
 +}
 diff --git a/ios/Henge/Controls/WirelessInputSurface.swift b/ios/Henge/Controls/WirelessInputSurface.swift
 new file mode 100644
-index 0000000..a2c62de
+index 0000000..fcfdcfb
 --- /dev/null
 +++ b/ios/Henge/Controls/WirelessInputSurface.swift
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,134 @@
 +import SwiftUI
 +import UIKit
 +
@@ -8308,6 +8505,14 @@ index 0000000..a2c62de
 +    var rejectedPaste: (() -> Void)?
 +    var toggleControls: (() -> Void)? { didSet { controlTap?.isEnabled = toggleControls != nil } }
 +    private var controlTap:UITapGestureRecognizer?
++    var acceptsInput=true {
++        didSet {
++            guard oldValue != acceptsInput else { return }
++            isUserInteractionEnabled=acceptsInput
++            if !acceptsInput { releaseInput();resignFirstResponder() }
++            else if window != nil && capturesKeyboard && acceptsInput { becomeFirstResponder() }
++        }
++    }
 +    var capturesKeyboard=true
 +    var pointerTuning=TouchpadTuning() { didSet { if oldValue != pointerTuning { moveMotion.reset();scrollMotion.reset() } } }
 +    private var moveMotion=TouchpadMotion(),scrollMotion=TouchpadMotion()
@@ -8315,10 +8520,10 @@ index 0000000..a2c62de
 +    // The surface is a remote trackpad, not a text editor. Keep iOS's system
 +    // three-finger editing menu from taking the local controls gesture.
 +    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
-+    override var canBecomeFirstResponder: Bool { capturesKeyboard }
++    override var canBecomeFirstResponder: Bool { capturesKeyboard && acceptsInput }
 +    private var heldKeys = Set<Int>()
 +    var keyboardEnabled = false {
-+        didSet { if oldValue != keyboardEnabled { releaseInput(); reloadInputViews(); if window != nil && capturesKeyboard { becomeFirstResponder() } } }
++        didSet { if oldValue != keyboardEnabled { releaseInput(); reloadInputViews(); if window != nil && capturesKeyboard && acceptsInput { becomeFirstResponder() } } }
 +    }
 +    override var inputView: UIView? { keyboardEnabled ? nil : UIView(frame:.zero) }
 +    var hasText: Bool { true }
@@ -8337,6 +8542,7 @@ index 0000000..a2c62de
 +        if shift && !shifted { send?(LinkControl(type:"key",code:225,down:false)) }
 +    }
 +    func insertText(_ text: String) {
++        guard acceptsInput else { return }
 +        // Bound pastes and keep enough queue capacity for releases. The
 +        // software keyboard is explicit US ASCII; no text enters diagnostics.
 +        let plain = Array("abcdefghijklmnopqrstuvwxyz1234567890\n\u{1b}\u{8}\t -=[]\\;’`,./")
@@ -8368,7 +8574,7 @@ index 0000000..a2c62de
 +        let hold = UILongPressGestureRecognizer(target: self, action: #selector(holdButton(_:)))
 +        hold.minimumPressDuration = 0.35; hold.delegate = self; addGestureRecognizer(hold)
 +    }
-+    override func didMoveToWindow() { super.didMoveToWindow(); if window != nil { if capturesKeyboard { becomeFirstResponder() } } else { releaseInput() } }
++    override func didMoveToWindow() { super.didMoveToWindow(); if window != nil { if capturesKeyboard && acceptsInput { becomeFirstResponder() } } else { releaseInput() } }
 +    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
 +        gestureRecognizer is UILongPressGestureRecognizer || other is UILongPressGestureRecognizer
 +    }
@@ -8396,6 +8602,7 @@ index 0000000..a2c62de
 +    @objc private func click() { button(0) }
 +    @objc private func rightClick() { button(1) }
 +    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
++        guard acceptsInput else { return }
 +        for press in presses { if let key = press.key, (4...231).contains(key.keyCode.rawValue) { heldKeys.insert(key.keyCode.rawValue); send?(LinkControl(type: "key", code: key.keyCode.rawValue, down: true)) } }
 +    }
 +    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -8408,15 +8615,16 @@ index 0000000..a2c62de
 +    let keyboard: Bool
 +    let send: (LinkControl) -> Void
 +    var capturesKeyboard = true
++    var acceptsInput = true
 +    var identifier = "wireless-input-surface"
 +    @ObservedObject private var preferences=TouchpadPreferences.shared
 +    var rejectedPaste: () -> Void = {}
 +    func makeUIView(context: Context) -> LinkInputView {
-+        let view = LinkInputView();view.capturesKeyboard=capturesKeyboard;view.accessibilityIdentifier=identifier;view.pointerTuning=preferences.value;view.send = send;view.rejectedPaste = rejectedPaste
++        let view = LinkInputView();view.capturesKeyboard=capturesKeyboard;view.acceptsInput=acceptsInput && context.environment.isEnabled;view.accessibilityIdentifier=identifier;view.pointerTuning=preferences.value;view.send = send;view.rejectedPaste = rejectedPaste
 +        view.keyboardEnabled = keyboard;return view
 +    }
 +    func updateUIView(_ view: LinkInputView,context: Context) {
-+        view.send = send;view.rejectedPaste = rejectedPaste;view.capturesKeyboard=capturesKeyboard;view.accessibilityIdentifier=identifier;view.pointerTuning=preferences.value;view.keyboardEnabled = keyboard
++        view.send = send;view.rejectedPaste = rejectedPaste;view.capturesKeyboard=capturesKeyboard;view.acceptsInput=acceptsInput && context.environment.isEnabled;view.accessibilityIdentifier=identifier;view.pointerTuning=preferences.value;view.keyboardEnabled = keyboard
 +    }
 +    static func dismantleUIView(_ view: LinkInputView,coordinator: ()) {
 +        view.releaseInput();view.resignFirstResponder();view.send = nil;view.rejectedPaste = nil
@@ -8460,6 +8668,111 @@ index 0000000..0bb94d7
 +                    VStack { toolbar.padding(8);Spacer() }.allowsHitTesting(true)
 +                }.background(.black).accessibilityIdentifier("landscape-video-controller")
 +            }
++        }
++    }
++}
+diff --git a/ios/Henge/DiskExpansion.swift b/ios/Henge/DiskExpansion.swift
+new file mode 100644
+index 0000000..5a64a14
+--- /dev/null
++++ b/ios/Henge/DiskExpansion.swift
+@@ -0,0 +1,28 @@
++import Foundation
++import Combine
++
++@MainActor final class DiskExpansion:ObservableObject {
++    static let shared=DiskExpansion()
++    @Published private(set) var busy=false
++    struct Outcome {
++        let mac:VirtualMac
++        let lastPartitionIsAPFS:Bool
++    }
++    func expand(_ mac:VirtualMac,toGB gb:Int) async throws -> Outcome {
++        guard !busy,Machines.shared.importing==nil,Machines.shared.exporting==nil,henge_vm_can_start() != 0 else { throw failure("Finish Mac shutdown and any import/export before expanding storage.") }
++        guard !InstantResume.hasSave(for:mac) else { throw failure("Resume and fully shut down this Mac first. A saved session cannot be used after its disk changes.") }
++        guard gb>0,gb<=2048,(Int64(gb) << 30) > mac.diskBytes else { throw failure("Choose a larger whole-GB size, up to 2048 GB.") }
++        busy=true;defer { busy=false }
++        let result=await Task.detached(priority:.utility) { ()->(Int32,String,UInt32) in
++            var error=[CChar](repeating:0,count:512),partition:UInt32=0
++            let rc=henge_disk_expand(mac.disk.path,UInt64(gb)<<30,&partition,&error,error.count)
++            return (rc,String(cString:error),partition)
++        }.value
++        guard result.0==0 else { throw failure(result.1) }
++        var updated=mac;updated.diskBytes=Int64(gb)<<30
++        Machines.shared.update(updated)
++        HengeLog.log("storage","Expanded virtual disk to \(gb) GiB; previous image retained; APFS volume expansion occurs inside macOS")
++        return Outcome(mac:updated,lastPartitionIsAPFS:result.2 != 0)
++    }
++    private func failure(_ message:String)->NSError { NSError(domain:"HengeStorage",code:1,userInfo:[NSLocalizedDescriptionKey:message]) }
++}
+diff --git a/ios/Henge/DiskExpansionView.swift b/ios/Henge/DiskExpansionView.swift
+new file mode 100644
+index 0000000..d5cc2e7
+--- /dev/null
++++ b/ios/Henge/DiskExpansionView.swift
+@@ -0,0 +1,65 @@
++import SwiftUI
++import UIKit
++
++struct DiskExpansionView:View {
++    let mac:VirtualMac
++    let completed:(VirtualMac)->Void
++    @ObservedObject private var expansion=DiskExpansion.shared
++    @Environment(\.dismiss) private var dismiss
++    @State private var capacity="128"
++    @State private var notice=""
++    @State private var finished=false
++    @State private var isLastAPFS=false
++    var body:some View {
++        NavigationStack {
++            Form {
++                Section("Virtual disk capacity") {
++                    Text("Current: \(mac.diskBytes>>30) GB")
++                    HStack {
++                        ForEach([128,256,512],id:\.self) { size in
++                            Button("\(size) GB") { capacity=String(size) }.buttonStyle(.bordered).disabled((Int64(size) << 30) <= mac.diskBytes)
++                        }
++                    }
++                    TextField("Custom size in GB",text:$capacity).keyboardType(.numberPad)
++                    Text("A larger sparse disk reserves virtual capacity; device storage is consumed as macOS writes data. This does not add physical storage to your iPad or iPhone.").font(.footnote)
++                    Text("Fully shut down macOS first. Expansion preserves an original disk backup and repairs both GPT partition maps. Shrinking is not supported.").font(.footnote)
++                    if InstantResume.hasSave(for:mac) { Text("Resume and fully shut down the saved Mac before expanding. Paused/saved state cannot be resized.").foregroundStyle(.orange) }
++                    Button(expansion.busy ? "Expanding…" : "Expand disk") { expand() }
++                        .disabled(expansion.busy || finished || InstantResume.hasSave(for:mac) || !(Int(capacity).map { $0>0 && $0<=2048 && (Int64($0) << 30) > mac.diskBytes } ?? false))
++                    if expansion.busy { ProgressView("Preserving the old image and updating the partition map…") }
++                }
++                if !notice.isEmpty { Section { Text(notice) } }
++                if finished {
++                    Section("Make the new space available in macOS") {
++                        Text("Start the Mac normally. The virtual drive is larger; macOS still needs to enlarge its APFS container before the desktop reports the extra free space.")
++                        if isLastAPFS {
++                            Text("In the guest Terminal, run the command below. It finds the boot volume's APFS container rather than assuming a disk number. macOS may request your administrator password.")
++                            Text(Self.volumeCommand).font(.caption.monospaced()).textSelection(.enabled)
++                            Button("Copy volume expansion command") { UIPasteboard.general.string=Self.volumeCommand }
++                        } else {
++                            Text("Another partition follows the APFS container. Henge preserves it instead of moving recovery/system data. Use Disk Utility inside macOS to manage the new free space, or restore into a larger disk. Automatic container growth cannot cross that partition safely.")
++                        }
++                        Text("The previous image is kept as disk.img.before-expansion in this Mac's folder. It shares unchanged blocks through filesystem cloning. Keep it until the expanded Mac boots and your files are verified; it is not a substitute for an external backup.").font(.footnote)
++                    }
++                }
++            }
++            .navigationTitle("Expand storage")
++            .toolbar { ToolbarItem(placement:.confirmationAction) { Button("Done") { dismiss() }.disabled(expansion.busy) } }
++            .interactiveDismissDisabled(expansion.busy)
++            .onAppear { capacity=String(max(128,Int((mac.diskBytes>>30)+1))) }
++        }
++    }
++    // Plutil extracts the actual running root's container. No guessed disk0s2,
++    // no formatting, partition deletion or APFS metadata writes in iOS.
++    static let volumeCommand="container=$(diskutil info -plist / | plutil -extract APFSContainerReference raw -o - -) && case \"$container\" in disk[0-9]*) sudo diskutil apfs resizeContainer \"$container\" 0 ;; *) echo 'Could not identify the boot APFS container; use Disk Utility.' ;; esac"
++    private func expand() {
++        guard let size=Int(capacity) else { return }
++        Task {
++            do {
++                let result=try await expansion.expand(mac,toGB:size)
++                finished=true;isLastAPFS=result.lastPartitionIsAPFS;completed(result.mac)
++                notice="Virtual disk expanded to \(size) GB. The original image is preserved."
++            } catch { notice=error.localizedDescription }
 +        }
 +    }
 +}
@@ -9090,7 +9403,7 @@ index 0000000..37e561d
 +    }
 +}
 diff --git a/ios/Henge/Link/LinkService.swift b/ios/Henge/Link/LinkService.swift
-index 07cd331..5165619 100644
+index 07cd331..9f0ce76 100644
 --- a/ios/Henge/Link/LinkService.swift
 +++ b/ios/Henge/Link/LinkService.swift
 @@ -7,6 +7,8 @@ import CoreVideo
@@ -9120,7 +9433,7 @@ index 07cd331..5165619 100644
          stop(); let generation = UUID(); token = generation
          do {
              let pairing = try LinkPairingStore.shared.host(remember: remember)
-@@ -34,7 +39,7 @@ final class LinkHostService: ObservableObject {
+@@ -34,15 +39,17 @@ final class LinkHostService: ObservableObject {
                      HengeLog.log("link", text)
                      if !okay {
                          self.releaseInput()
@@ -9129,7 +9442,19 @@ index 07cd331..5165619 100644
                      }
                  }
              }
-@@ -54,11 +59,25 @@ final class LinkHostService: ObservableObject {
+-            channel.onPacket = { [weak self] packet in
++            channel.onPacket = { [weak self,weak channel] packet in
++                guard let channel else { return }
++                let connection=channel.connectionIdentity
+                 guard packet.kind == 1, packet.payload.count <= 65536,
+                       let command = try? JSONDecoder().decode(LinkControl.self, from: packet.payload) else { return }
+                 Task { @MainActor in
+-                    guard let self, self.token == generation else { return }; self.receive(command)
++                    guard let self,self.token==generation,channel.connectionIdentity==connection else { return };self.receive(command)
+                 }
+             }
+             channel.onListening = { [weak self] port in
+@@ -54,11 +61,25 @@ final class LinkHostService: ObservableObject {
      }
      private func receive(_ command: LinkControl) {
          guard (try? command.validate()) != nil else { return }
@@ -9157,7 +9482,7 @@ index 07cd331..5165619 100644
                      guard let transport else { done(false); return }; transport.sendVideo(data, completion: done)
                  }, report: { [weak self] message in
                      HengeLog.log("link", message)
-@@ -68,34 +87,96 @@ final class LinkHostService: ObservableObject {
+@@ -68,34 +89,96 @@ final class LinkHostService: ObservableObject {
                  })
                  encoder = created; mode = proposed
                  transport.onVideoAcknowledged = { [weak created] sequence in created?.acknowledge(sequence) }
@@ -9258,7 +9583,7 @@ index 07cd331..5165619 100644
              hv_pvg_link_set_frame_handler { texture, queue, halfMode, cursor, x, y, w, h in
                  guard let texture, let queue else { return }
                  let t = Unmanaged<AnyObject>.fromOpaque(texture).takeUnretainedValue() as! MTLTexture
-@@ -103,30 +184,52 @@ final class LinkHostService: ObservableObject {
+@@ -103,30 +186,52 @@ final class LinkHostService: ObservableObject {
                  let c = cursor.map { Unmanaged<AnyObject>.fromOpaque($0).takeUnretainedValue() as! MTLTexture }
                  encoder.capture(texture: t, queue: q, halfMode: halfMode, cursorTexture: c, rect: SIMD4(x, y, w, h))
              }
@@ -9321,7 +9646,7 @@ index 07cd331..5165619 100644
          keys.removeAll(); buttons.removeAll()
      }
  }
-@@ -135,61 +238,138 @@ final class LinkHostService: ObservableObject {
+@@ -135,61 +240,138 @@ final class LinkHostService: ObservableObject {
  final class LinkViewerService: ObservableObject {
      @Published private(set) var status = "Select a local iPad or enter its address manually."
      @Published private(set) var ready = false
@@ -9502,12 +9827,16 @@ index 07cd331..5165619 100644
      }
  }
 diff --git a/ios/Henge/Link/LinkTransport.swift b/ios/Henge/Link/LinkTransport.swift
-index ab4d4d8..eafac24 100644
+index ab4d4d8..26e10f5 100644
 --- a/ios/Henge/Link/LinkTransport.swift
 +++ b/ios/Henge/Link/LinkTransport.swift
-@@ -8,6 +8,11 @@ final class LinkTransport {
+@@ -7,7 +7,15 @@ import Security
+ final class LinkTransport {
      let queue = DispatchQueue(label: "henge.link.transport", qos: .userInitiated)
      private let callbackLock = NSLock()
++    private var identity=UUID()
++    var connectionIdentity:UUID { callbackLock.lock();defer { callbackLock.unlock() };return identity }
++    private func invalidateIdentity() { callbackLock.lock();identity=UUID();callbackLock.unlock() }
      private var packetHandler: ((LinkPacket) -> Void)?
 +    private var closedHandler: ((String) -> Void)?
 +    var onClosed: ((String) -> Void)? {
@@ -9517,7 +9846,7 @@ index ab4d4d8..eafac24 100644
      private var statusHandler: ((String, Bool) -> Void)?
      private var listeningHandler: ((UInt16) -> Void)?
      private var acknowledgedHandler: ((UInt64) -> Void)?
-@@ -35,6 +40,8 @@ final class LinkTransport {
+@@ -35,6 +43,8 @@ final class LinkTransport {
      private var ready = false
      private var watchdog: DispatchSourceTimer?
      private var lastReceive = ProcessInfo.processInfo.systemUptime
@@ -9526,7 +9855,20 @@ index ab4d4d8..eafac24 100644
      private var controlWindow: TimeInterval = 0
      private var controlCount = 0
      static let port: UInt16 = 49173
-@@ -148,7 +155,7 @@ final class LinkTransport {
+@@ -134,6 +144,7 @@ final class LinkTransport {
+         }
+     }
+     private func attach(_ c: NWConnection, wired: Bool) {
++        invalidateIdentity()
+         connection = c; parser = LinkParser(); generation &+= 1; let g = generation
+         onStatus?("Connecting securely…", false)
+         c.stateUpdateHandler = { [weak self, weak c] state in
+@@ -144,11 +155,12 @@ final class LinkTransport {
+                 self.ready = true; self.lastReceive = ProcessInfo.processInfo.systemUptime
+                 self.onStatus?(wired ? "TLS connected over Ethernet" : "TLS connected over local network", true)
+                 self.receive(c, generation: g)
++                self.watchdog?.cancel();self.watchdog=nil
+                 let timer = DispatchSource.makeTimerSource(queue: self.queue)
                  timer.schedule(deadline: .now() + 2, repeating: 2, leeway: .milliseconds(200))
                  timer.setEventHandler { [weak self] in
                      guard let self, self.generation == g else { return }
@@ -9535,7 +9877,7 @@ index ab4d4d8..eafac24 100644
                      self.sendControl(LinkControl(type: "ping"))
                  }
                  self.watchdog = timer; timer.resume()
-@@ -227,12 +234,18 @@ final class LinkTransport {
+@@ -227,12 +239,19 @@ final class LinkTransport {
          }
      }
      func stop() { queue.async { [self] in stopNow() } }
@@ -9551,6 +9893,7 @@ index ab4d4d8..eafac24 100644
 -    private func stopNow() {
 -        generation &+= 1; ready = false; videosPending = 0; controlsPending = 0
 +    private func stopNow(keepingListener:Bool = false) {
++        invalidateIdentity()
 +        generation &+= 1; ready = false; videosPending = 0; controlsPending = 0; receiveTimeout = 12
          watchdog?.cancel(); watchdog = nil
          connection?.stateUpdateHandler = nil; connection?.pathUpdateHandler = nil; connection?.cancel(); connection = nil
@@ -10040,18 +10383,21 @@ index c0f52d6..0d81556 100644
                          .frame(maxWidth: .infinity, alignment: .leading)
                          .padding(.horizontal, 4).padding(.bottom, 12)
 diff --git a/ios/Henge/MacSettingsView.swift b/ios/Henge/MacSettingsView.swift
-index 800c854..ae5df85 100644
+index 800c854..b2c51e6 100644
 --- a/ios/Henge/MacSettingsView.swift
 +++ b/ios/Henge/MacSettingsView.swift
-@@ -7,6 +7,7 @@ struct MacSettingsView: View {
+@@ -5,8 +5,10 @@ struct MacSettingsView: View {
+     @ObservedObject private var machines = Machines.shared
+     @Environment(\.dismiss) private var dismiss
      @State private var mac: VirtualMac
++    @State private var showDiskExpansion=false
      @State private var confirmDelete = false
      @State private var movingExport = false
 +    @State private var processHeadroom: UInt64 = 0
      @AppStorage("henge.cpus") private var cpus = 4
  
      init(mac: VirtualMac) { _mac = State(initialValue: mac) }
-@@ -26,16 +27,23 @@ struct MacSettingsView: View {
+@@ -26,16 +28,23 @@ struct MacSettingsView: View {
                  if Device.isPad && ProcessInfo.processInfo.physicalMemory >> 20 >= 14_000 {
                      DeskHeading("Performance")
                      VStack(alignment: .leading, spacing: 12) {
@@ -10080,7 +10426,7 @@ index 800c854..ae5df85 100644
                              .font(.system(size: 13)).foregroundStyle(Desk.dim)
                      }
                      .padding(17)
-@@ -47,7 +55,7 @@ struct MacSettingsView: View {
+@@ -47,7 +56,7 @@ struct MacSettingsView: View {
                      HStack(alignment: .firstTextBaseline) {
                          Text("\(mac.ramMB / 1024) GB").font(.system(size: 26, weight: .bold))
                          Spacer()
@@ -10089,7 +10435,7 @@ index 800c854..ae5df85 100644
                              .font(.system(size: 13)).foregroundStyle(Desk.dim).multilineTextAlignment(.trailing)
                      }
                      Stepper("Memory", value: Binding(get: { mac.ramMB / 1024 }, set: { mac.ramMB = $0 * 1024; save() }), in: Device.memoryChoices)
-@@ -55,12 +63,18 @@ struct MacSettingsView: View {
+@@ -55,12 +64,18 @@ struct MacSettingsView: View {
                      if let note = Device.memoryNote(mac.ramMB / 1024) {
                          Text(note).font(.system(size: 13)).foregroundStyle(Desk.dim)
                      }
@@ -10109,7 +10455,15 @@ index 800c854..ae5df85 100644
                      HStack {
                          Text("CPUs").font(.system(size: 16))
                          Spacer()
-@@ -139,6 +153,7 @@ struct MacSettingsView: View {
+@@ -125,6 +140,7 @@ struct MacSettingsView: View {
+                         Text("of \(ByteText.string(UInt64(max(mac.diskBytes, 0))))").font(.system(size: 16)).foregroundStyle(Desk.dim)
+                     }
+                     DeskBar(fraction: Double(mac.bytesUsed) / Double(max(mac.diskBytes, 1)))
++                    Button("Expand disk capacity…",systemImage:"externaldrive.badge.plus") { showDiskExpansion=true }
+                 }
+                 .padding(17)
+                 .deskCard()
+@@ -139,6 +155,7 @@ struct MacSettingsView: View {
          .background(Desk.page)
          .navigationTitle(mac.name)
          .navigationBarTitleDisplayMode(.inline)
@@ -10117,8 +10471,16 @@ index 800c854..ae5df85 100644
          .onDisappear(perform: save)
          .fileMover(isPresented: $movingExport, file: machines.lastExport) { result in
              switch result {
+@@ -146,6 +163,7 @@ struct MacSettingsView: View {
+             case .failure(let error): machines.lastError = error.localizedDescription
+             }
+         }
++        .sheet(isPresented:$showDiskExpansion) { DiskExpansionView(mac:mac) { updated in mac=updated } }
+         .confirmationDialog("Delete \(mac.name)?", isPresented: $confirmDelete, titleVisibility: .visible) {
+             Button("Delete", role: .destructive) {
+                 machines.delete(mac.id)
 diff --git a/ios/Henge/Machines.swift b/ios/Henge/Machines.swift
-index 29c8b3b..8cd13c4 100644
+index 29c8b3b..00f528f 100644
 --- a/ios/Henge/Machines.swift
 +++ b/ios/Henge/Machines.swift
 @@ -3,7 +3,7 @@ import UIKit
@@ -10140,11 +10502,36 @@ index 29c8b3b..8cd13c4 100644
      var retina: Bool?
      /// On an iPhone's large screen (iPhone Duo unfolded): fill it, or leave a strip at the right for the status
      /// bar and Henge's controls. Macs that never chose fill it.
+@@ -236,7 +237,7 @@ final class Machines: ObservableObject {
+     /// in Documents/Exports, which the Files app can reach. Deleting Henge deletes that folder too,
+     /// so it has to be moved out of Henge before a reinstall that replaces the app's data.
+     func export(_ mac: VirtualMac) {
+-        guard exporting == nil, importing == nil else { return }
++        guard exporting == nil, importing == nil, !DiskExpansion.shared.busy else { return }
+         exporting = mac.name
+         exported = 0
+         lastExport = nil
+@@ -323,6 +324,7 @@ final class Machines: ObservableObject {
+     }
+ 
+     func delete(_ id: UUID) {
++        guard !DiskExpansion.shared.busy else { lastError="Wait for disk expansion to finish before deleting a Mac.";return }
+         try? FileManager.default.removeItem(at: Self.directory(for: id))
+         all.removeAll { $0.id == id }
+         save()
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..860acd8 100644
+index 34d6a98..de4f02c 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
-@@ -23,23 +23,55 @@
+@@ -3,6 +3,7 @@
+ #include "net_slirp.h"
+ #include <sys/mman.h>
+ #include "henge-vm.h"
++#include "disk_resize.h"
+ #include "fastmem.h"
+ 
+ #include <os/proc.h>
+@@ -23,23 +24,55 @@
  
  #include <fcntl.h>
  #include <unistd.h>
@@ -10202,7 +10589,7 @@ index 34d6a98..860acd8 100644
      exit_reason = reason;
      int halt = hv_vm_cpu(0)->halted;
      exit_outcome = HENGE_VM_OUTCOME_ERROR;
-@@ -49,13 +81,12 @@ static void on_exit(int reason) {
+@@ -49,13 +82,12 @@ static void on_exit(int reason) {
      case HV_HALT_HOST: exit_outcome = HENGE_VM_OUTCOME_HOST_STOP; break;
      case HV_HALT_PANIC: exit_outcome = HENGE_VM_OUTCOME_PANIC; break;
      }
@@ -10219,7 +10606,7 @@ index 34d6a98..860acd8 100644
      fprintf(stderr, "henge: the machine stopped (%s, halt reason %d); CPU threads ended, disks flushed%s\n",
              exit_description(), halt, installer_session ? "" : ", machine released");
      pthread_rwlock_unlock(&api_lock);
-@@ -67,6 +98,11 @@ static int begin_start(char *err, size_t errlen) {
+@@ -67,6 +99,11 @@ static int begin_start(char *err, size_t errlen) {
          snprintf(err, errlen, "A Mac app ran in this launch. Quit Henge (swipe it away) and open it again to start a Mac.");
          return -1;
      }
@@ -10231,7 +10618,7 @@ index 34d6a98..860acd8 100644
      pthread_rwlock_wrlock(&api_lock);
      if ((state != 0 && state != 2) || installer_session) {
          snprintf(err, errlen, "%s", installer_session
-@@ -75,26 +111,31 @@ static int begin_start(char *err, size_t errlen) {
+@@ -75,26 +112,31 @@ static int begin_start(char *err, size_t errlen) {
          pthread_rwlock_unlock(&api_lock);
          return -1;
      }
@@ -10268,7 +10655,7 @@ index 34d6a98..860acd8 100644
      pthread_rwlock_unlock(&api_lock);
      return 0;
  }
-@@ -116,9 +157,25 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
+@@ -116,9 +158,25 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
      return hv_snapshot_check(path, ident, bytes, saved_at);
  }
  
@@ -10296,7 +10683,7 @@ index 34d6a98..860acd8 100644
          snprintf(err, errlen, "No Mac is running.");
          return -1;
      }
-@@ -133,21 +190,63 @@ int henge_vm_pause(char *err, size_t errlen) {
+@@ -133,21 +191,63 @@ int henge_vm_pause(char *err, size_t errlen) {
          snprintf(err, errlen, "The Mac stopped by itself.");
          return -1;
      }
@@ -10366,7 +10753,7 @@ index 34d6a98..860acd8 100644
      fprintf(stderr, "henge: %s\n", r ? err : "the paused Mac is saved");
      return r;
  }
-@@ -160,24 +259,87 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
+@@ -160,24 +260,87 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
  }
  
  int henge_vm_continue(void) {
@@ -10457,7 +10844,7 @@ index 34d6a98..860acd8 100644
  static int boot_or_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
                            int cpus, const char *resume, const char *ident, char *err, size_t errlen) {
      { extern void hv_prof_ios_start(void); hv_prof_ios_start(); }
-@@ -192,17 +354,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
+@@ -192,17 +355,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
      fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
              jit->size >> 20);
      if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
@@ -10486,7 +10873,7 @@ index 34d6a98..860acd8 100644
  }
  
  static volatile int install_step = -1;
-@@ -239,7 +409,7 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
+@@ -239,7 +410,7 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
          snprintf(err, errlen, "The installer could not start.");
          return failed_start();
      }
@@ -10495,7 +10882,7 @@ index 34d6a98..860acd8 100644
  }
  
  int henge_install_step(void) { return install_step; }
-@@ -293,22 +463,29 @@ static int lock_running(void) {
+@@ -293,22 +464,29 @@ static int lock_running(void) {
      return 0;
  }
  void henge_vm_stop(void) {
@@ -10536,7 +10923,7 @@ index 34d6a98..860acd8 100644
  }
  
  long henge_vm_balloon(long target_mb) {
-@@ -344,13 +521,13 @@ void henge_vm_log_cache(void) {
+@@ -344,13 +522,13 @@ void henge_vm_log_cache(void) {
  
  uint64_t henge_vm_blocks(void) {
      pthread_rwlock_rdlock(&api_lock);
@@ -10552,7 +10939,24 @@ index 34d6a98..860acd8 100644
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
-@@ -388,6 +565,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
+@@ -378,6 +556,16 @@ void henge_share_set_clipboard(const char *text) { hv_share_set_clipboard(text);
+ char *henge_share_take_clipboard(void) { return hv_share_take_clipboard(); }
+ long henge_share_agent_seen(void) { return hv_share_agent_seen(); }
+ 
++int henge_disk_expand(const char *path,uint64_t bytes,unsigned *last_apfs,char *error,size_t error_bytes) {
++    if(pthread_rwlock_trywrlock(&api_lock)){
++        snprintf(error,error_bytes,"The Mac is busy. Finish shutdown before expanding storage.");return -2;
++    }
++    int result=-1;
++    if((state==0 || state==2) && !installer_session) result=hv_disk_expand(path,bytes,last_apfs,error,error_bytes);
++    else snprintf(error,error_bytes,"Fully shut down the Mac and close its session before expanding storage.");
++    pthread_rwlock_unlock(&api_lock);return result;
++}
++
+ void henge_vm_set_display(uint32_t width, uint32_t height) { hv_pvg_lite_set_mode(width, height); }
+ void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm) { hv_pvg_lite_set_size_mm(width_mm, height_mm); }
+ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,uint32_t height_mm,uint32_t hz) {
+@@ -388,6 +576,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
@@ -10579,7 +10983,7 @@ index 34d6a98..860acd8 100644
  void henge_vm_link_connected(int connected) {
      if (!lock_running()) return;
      HvVmapple *b = hv_vm_board();
-@@ -454,13 +651,51 @@ void henge_vm_set_display_layer(void *layer) {
+@@ -454,13 +662,51 @@ void henge_vm_set_display_layer(void *layer) {
      hv_vm_set_display_layer(layer);
  }
  uint64_t henge_vm_gpu_frames(void) {
@@ -10634,7 +11038,7 @@ index 34d6a98..860acd8 100644
      HvBootDisplay d;
      int result = -1;
      if (hv_vm_boot_display(&d) == 0) {
-@@ -509,3 +744,77 @@ uint64_t henge_largest_mapping_mb(void) {
+@@ -509,3 +755,77 @@ uint64_t henge_largest_mapping_mb(void) {
      }
      return 0;
  }
@@ -10713,7 +11117,7 @@ index 34d6a98..860acd8 100644
 +    hv_vm_release_input_source(source);pthread_rwlock_unlock(&api_lock);
 +}
 diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
-index b8c41fa..100feb8 100644
+index b8c41fa..efb6e08 100644
 --- a/ios/Henge/Native/henge-vm.h
 +++ b/ios/Henge/Native/henge-vm.h
 @@ -32,8 +32,32 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
@@ -10749,7 +11153,7 @@ index b8c41fa..100feb8 100644
  int henge_vm_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
                      int cpus, const char *path, const char *ident, char *err, size_t errlen);
  int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int64_t *saved_at);
-@@ -41,6 +65,9 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
+@@ -41,10 +65,14 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
  /* 0 not started, 1 running, 2 stopped, 3 starting/stopping, 4 paused (saved, or being saved).
     Normal guests are fully released before state 2; installer sessions retain
     their restore stack and can_start stays false. */
@@ -10759,7 +11163,12 @@ index b8c41fa..100feb8 100644
  int henge_vm_state(void);
  /* A new generation starts with each successful boot, even in the same view. */
  uint64_t henge_vm_generation(void);
-@@ -55,6 +82,7 @@ enum HengeVmOutcome {
+ int henge_vm_can_start(void);
++int henge_disk_expand(const char *path,uint64_t bytes,unsigned *last_apfs,char *error,size_t error_bytes);
+ /* Human-readable terminal reason, once state is 2. */
+ const char *henge_vm_exit_reason(void);
+ /* Terminal outcome after state == 2. Generic HALT alone does not prove a
+@@ -55,6 +83,7 @@ enum HengeVmOutcome {
  };
  int henge_vm_exit_outcome(void);
  void henge_vm_stop(void);
@@ -10767,7 +11176,7 @@ index b8c41fa..100feb8 100644
  /* Testing: sets a translation knob (core/machine.h) in the running machine; nonzero if it exists. */
  int henge_vm_knob(const char *name, int value);
  /* The memory balloon (only with HV_BALLOON set before boot): asks the guest to hand over target_mb (when >= 0)
-@@ -62,6 +90,36 @@ int henge_vm_knob(const char *name, int value);
+@@ -62,6 +91,36 @@ int henge_vm_knob(const char *name, int value);
  long henge_vm_balloon(long target_mb);
  
  /* Progress, for the session screen. */
@@ -10804,7 +11213,7 @@ index b8c41fa..100feb8 100644
  void henge_vm_log_cache(void);           /* optional per-CPU cache-use diagnostics */
  uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
  uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
-@@ -82,7 +140,12 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
+@@ -82,7 +141,12 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
  /* The panel's physical size; 0, 0 for the default (a ~122 ppi, 1x screen). Before boot. */
  void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm);
  int henge_vm_set_link_display(uint32_t width, uint32_t height, uint32_t width_mm, uint32_t height_mm, uint32_t hz);
@@ -12733,6 +13142,16 @@ index 0000000..eef5d30
 + c=Path(tmp)/'bench.c';c.write_text(source);exe=Path(tmp)/'bench'
 + subprocess.run(['cc','-O3','-Wall','-Wextra','-Werror','-I'+str(root/'devices'),str(c),'-o',str(exe)],check=True)
 + subprocess.run([str(exe)],check=True)
+diff --git a/tests/disk_resize_driver.c b/tests/disk_resize_driver.c
+new file mode 100644
+index 0000000..e807c5e
+--- /dev/null
++++ b/tests/disk_resize_driver.c
+@@ -0,0 +1,4 @@
++#include "disk_resize.h"
++#include <stdio.h>
++#include <stdlib.h>
++int main(int argc,char **argv){if(argc!=3)return 2;char error[512]={0};unsigned partition=0;int rc=hv_disk_expand(argv[1],strtoull(argv[2],NULL,10),&partition,error,sizeof error);if(rc)fprintf(stderr,"%s\n",error);else printf("%u\n",partition);return rc?1:0;}
 diff --git a/tests/gamepad-preview/.gitignore b/tests/gamepad-preview/.gitignore
 new file mode 100644
 index 0000000..5435674
@@ -13541,12 +13960,83 @@ index bd64ae5..3bb545e 100644
 -    puts("CPU sync: spinning/sleeping, acknowledgement, parked target, missed notification, own requests and tagged multiwindow/PAN cache clears passed");
 +    puts("CPU sync: acknowledgement, parked target, missing notifications, 64 deterministic check-to-syscall races, own requests and multiwindow/PAN clears passed");
  }
+diff --git a/tests/test_disk_resize.py b/tests/test_disk_resize.py
+new file mode 100644
+index 0000000..d3e728a
+--- /dev/null
++++ b/tests/test_disk_resize.py
+@@ -0,0 +1,65 @@
++"""Exercise production GPT expansion independently using Python's CRC32 oracle."""
++from pathlib import Path
++import fcntl
++import hashlib
++import os
++import platform
++import struct
++import subprocess
++import tempfile
++import zlib
++ROOT=Path(__file__).resolve().parents[1]
++B=ROOT/'build/disk-resize';B.mkdir(parents=True,exist_ok=True)
++command=['cc','-std=c11','-Wall','-Wextra','-Werror','-O1','-g','-fsanitize=address,undefined','-Ihost','host/disk_resize.c','tests/disk_resize_driver.c','-o',str(B/'grow')]
++if platform.system()!='Darwin':command.insert(1,'-DHENGE_DISK_RESIZE_TEST')
++subprocess.run(command,cwd=ROOT,check=True)
++SIZE=4*1024*1024
++APFS=bytes.fromhex('ef57347c0000aa11aa1100306543ecac')
++def fixture(path,corrupt=False,recovery=False):
++    sectors=SIZE//512
++    entries=bytearray(128*128);entries[:16]=APFS;entries[16:32]=bytes(range(16))
++    struct.pack_into('<QQ',entries,32,40,sectors-40)
++    if recovery:
++        struct.pack_into('<Q',entries,40,sectors-100)
++        entries[128:144]=b'R'*16;struct.pack_into('<QQ',entries,128+32,sectors-99,sectors-34)
++    def header(here,other,table):
++        h=bytearray(512);h[:8]=b'EFI PART';struct.pack_into('<III',h,8,0x10000,92,0)
++        struct.pack_into('<QQQQ',h,24,here,other,34,sectors-34);h[56:72]=bytes(range(16));struct.pack_into('<QIII',h,72,table,128,128,zlib.crc32(entries))
++        struct.pack_into('<I',h,16,zlib.crc32(h[:92]));return h
++    mbr=bytearray(512);mbr[510:]=b'\x55\xaa';mbr[450]=0xee;struct.pack_into('<II',mbr,454,1,sectors-1)
++    with path.open('wb') as f:
++        f.truncate(SIZE);f.seek(0);f.write(mbr);f.write(header(1,sectors-1,2));f.write(entries)
++        f.seek(100*512);f.write(b'USER DATA MUST SURVIVE')
++        f.seek((sectors-33)*512);f.write(entries);f.write(header(sectors-1,1,sectors-33))
++    if corrupt:
++        with path.open('r+b') as f:f.seek(512+16);f.write(b'bad!')
++def grow(path,size,okay):
++    r=subprocess.run([str(B/'grow'),str(path),str(size)],capture_output=True,text=True)
++    assert (r.returncode==0)==okay,r.stderr
++    return r
++with tempfile.TemporaryDirectory() as folder:
++    root=Path(folder);image=root/'disk.img';fixture(image);original=image.read_bytes()
++    assert grow(image,SIZE*2,True).stdout.strip()=='1'
++    assert image.stat().st_size==SIZE*2
++    assert Path(str(image)+'.before-expansion').read_bytes()==original
++    with image.open('rb') as f:
++        front=f.read(1024);primary=bytearray(front[512:]);f.seek(SIZE*2-512);backup=bytearray(f.read(512))
++        f.seek(100*512);assert f.read(len(b'USER DATA MUST SURVIVE'))==b'USER DATA MUST SURVIVE'
++        for h in [primary,backup]:
++            wanted=struct.unpack_from('<I',h,16)[0];struct.pack_into('<I',h,16,0);assert zlib.crc32(h[:92])==wanted
++        assert struct.unpack_from('<Q',primary,32)[0]==SIZE*2//512-1
++        assert struct.unpack_from('<Q',backup,24)[0]==SIZE*2//512-1
++        assert struct.unpack_from('<Q',primary,48)[0]==SIZE*2//512-34
++        assert struct.unpack_from('<I',front,458)[0]==SIZE*2//512-1
++    before=hashlib.sha256(image.read_bytes()).digest();grow(image,SIZE*3,False);assert hashlib.sha256(image.read_bytes()).digest()==before
++    for kind in ['crc','shrink','locked','non-gpt','recovery']:
++        path=root/kind;fixture(path,corrupt=kind=='crc',recovery=kind=='recovery');old=path.read_bytes()
++        if kind=='non-gpt':path.write_bytes(b'\0'*SIZE);old=path.read_bytes()
++        if kind=='locked':
++            with path.open('r+b') as lock:
++                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);grow(path,SIZE*2,False)
++        else:
++            r=grow(path,SIZE//2 if kind=='shrink' else SIZE*2,kind=='recovery')
++            if kind=='recovery':assert r.stdout.strip()=='0';continue
++        assert path.read_bytes()==old and not Path(str(path)+'.before-expansion').exists()
++print('PASS production disk expansion: GPT CRCs/backup relocation, sparse capacity, original backup, payload preservation, busy/shrink/corrupt/non-GPT rejection; recovery partition is never moved')
 diff --git a/tests/test_display_pulses.py b/tests/test_display_pulses.py
 new file mode 100644
-index 0000000..96d67e8
+index 0000000..3cf3e83
 --- /dev/null
 +++ b/tests/test_display_pulses.py
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,174 @@
 +"""Run production Metal display-link arming/callbacks with controlled queues.
 +The macOS fixture supplies UIKit visibility and a display-link stand-in; queue
 +ordering, generation checks, coalescing and production pacing are exercised.
@@ -13568,7 +14058,6 @@ index 0000000..96d67e8
 +#include <assert.h>
 +#include <math.h>
 +#include "frame_pacing.h"
-+static double now_seconds(void) { return 100; }
 +static NSMutableArray *presenterTasks, *mainTasks;
 +static dispatch_queue_t presenterQueue;
 +static void enqueue(dispatch_queue_t queue, dispatch_block_t task) {
@@ -13624,6 +14113,8 @@ index 0000000..96d67e8
 +    os_unfair_lock screen_lock;
 +    atomic_int stopping;
 +    BOOL display_arm_pending, display_quiesced, display_scene_active, screen_dirty;
++    BOOL display_pulse_active,presenter_running;
++    uint32_t display_prepared_w,display_prepared_h;
 +    uint64_t layer_generation, display_link_generation;
 +    uint32_t screen_w, screen_h;
 +    dispatch_queue_t presenter;
@@ -13689,14 +14180,27 @@ index 0000000..96d67e8
 +    r->screen_dirty=YES;r->layer=[CAMetalLayer layer];r->layer.delegate=(id)view;r->layer_generation++;
 +    view.window.screen.maximumFramesPerSecond=60;request(r);drainOne(presenterTasks);drainOne(mainTasks);
 +    assert(current.invalidated && r->display_link!=current && r->display_link.preferredFrameRateRange.maximum==60);
-+    // A detached view is never treated as an active scene (nil enum is zero).
-+    view.window=nil;request(r);drainOne(presenterTasks);drainOne(mainTasks);
-+    assert(!r->display_scene_active && !r->display_arm_pending);
++    // Both active rates use the actual production callback. Even a deadline
++    // derived from a late commit cannot reject the next system display pulse.
++    r->display_drawable=nil;r->frame_pacing.next=101;
++    int before=r->presents;
++    for(int i=0;i<120;i++){
++        r->screen_dirty=YES;r->display_drawable=nil;
++        [r displayPulse:r->display_link update:update];
++        assert(r->presents==before+i+1);
++    }
++    assert(r->display_link.preferredFrameRateRange.minimum==60);
++    r->screen_dirty=YES;r->display_drawable=nil;r->presenter_running=YES;
++    [r displayPulse:r->display_link update:update];assert(r->presents==before+120 && !r->display_drawable);
++    r->presenter_running=NO;r->display_pulse_active=YES;
++    int preflights=r->preflights;request(r);assert(!presenterTasks.count && r->preflights==preflights);
++    r->screen_w=2064;request(r);drainOne(presenterTasks);drainOne(mainTasks);
++    assert(r->display_prepared_w==2064 && r->layer.drawableSize.width==2064);
++    // A detached view is never treated as active even without a scene event.
++    view.window=nil;r->screen_dirty=YES;r->display_drawable=nil;
++    [r displayPulse:r->display_link update:update];
++    assert(!r->display_scene_active && !r->display_pulse_active && r->display_link.paused);
 +    request(r);assert(!presenterTasks.count && !mainTasks.count);
-+    // A cap waits on a display pulse; it does not deliver early or schedule a timer.
-+    r->display_scene_active=YES;r->pacing_fps=30;r->frame_pacing.next=101;
-+    [r displayPulse:r->display_link update:update];assert(r->presents==1 && presenterTasks.count==1);
-+    drainOne(presenterTasks);drainOne(mainTasks);
 +    atomic_store(&r->stopping,1);request(r);assert(!presenterTasks.count);
 +    puts("display pulses: coalescing, retired generations, scenes, pause, refresh and damage passed");
 +} }
@@ -13935,7 +14439,7 @@ index a801c82..ce611b7 100644
      puts("PASS fastmem benchmark: real EL1/page-table/JIT path; all guest sums identical");
  }
 diff --git a/tests/test_frame_pacing.c b/tests/test_frame_pacing.c
-index 17505fd..df11f23 100644
+index 17505fd..f5c9b34 100644
 --- a/tests/test_frame_pacing.c
 +++ b/tests/test_frame_pacing.c
 @@ -3,6 +3,11 @@
@@ -13950,6 +14454,20 @@ index 17505fd..df11f23 100644
   assert(hv_pacing_fps(60,3,1)==20); assert(hv_pacing_fps(30,0,1)==30);
   assert(hv_pacing_fps(0,3,0)==0); assert(hv_pacing_fps(60,2,0)==60);
   HvFramePacing p={0};unsigned draws=0;
+@@ -14,5 +19,13 @@ int main(void) {
+  assert(hv_pacing_delay(&p,10,0)==0 && p.next==0);
+  hv_pacing_presented(&p,11,60); assert(hv_pacing_delay(&p,12,60)==0);
+  assert(hv_pacing_delay(&p,11,60)>0); // monotonic input; finite deferred wake
++ /* Encoding finishes 2ms after each vblank. A commit-relative second gate
++    rejects the next perfectly valid 60Hz pulse: document the regression. */
++ HvFramePacing competing={0};unsigned admitted=0;
++ for(int frame=0;frame<120;frame++){
++  double pulse=frame/60.0;
++  if(hv_pacing_delay(&competing,pulse,60)<=0){admitted++;hv_pacing_presented(&competing,pulse+0.002,60);}
++ }
++ assert(admitted==60);
+  puts("frame pacing: limits, thermal transitions, protection override, burst coalescing and idle eligibility passed");
+ }
 diff --git a/tests/test_gamepad.c b/tests/test_gamepad.c
 new file mode 100644
 index 0000000..080debb

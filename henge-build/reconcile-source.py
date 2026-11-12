@@ -287,7 +287,7 @@ build_lines=[ln for ln in py.splitlines() if ln.strip().startswith("make ios-lib
 if len(build_lines)!=1: raise SystemExit("Unexpected Xcode native build phase count")
 old_build=build_lines[0]
 build_parts=old_build.split()
-for token in ("build/henge-agent.gz","build/henge-touch-agent.tar.gz","build/tl-samples.dmg"):
+for token in ("build/henge-agent.gz","build/henge-touch-agent.gz","build/tl-samples.dmg"):
     if token not in build_parts: build_parts.append(token)
 new_build=old_build.split("make ios-lib")[0]+" ".join(build_parts)
 py=replace_once(py,old_build,new_build,"retain touch and sample-app resources in build phase")
