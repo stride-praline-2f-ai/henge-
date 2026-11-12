@@ -278,7 +278,7 @@ index a41d6d2..7d260b9 100644
      if (getenv("HV_TASK_STATS") && !strcmp(getenv("HV_TASK_STATS"), "1")) {
          task_power_info_data_t power = {0};
 diff --git a/core/machine.c b/core/machine.c
-index 7a01fdc..d398609 100644
+index 7a01fdc..64b016b 100644
 --- a/core/machine.c
 +++ b/core/machine.c
 @@ -219,10 +219,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
@@ -299,7 +299,21 @@ index 7a01fdc..d398609 100644
  }
  
  void hv_cpu_ack_wake(HvCpu *cpu) {
-@@ -271,6 +275,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -262,6 +266,13 @@ void hv_cpu_process_requests(HvCpu *cpu) {
+ 
+ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+     HvPerCpu *t = target->pc_state, *s = self ? self->pc_state : NULL;
++    /* A completed release-published acknowledgement needs no parked/live
++       transition and no wake of CPUs waiting on us. Own invalidations must
++       still be serviced before returning to the caller. */
++    if (__atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE) >= seq) {
++        if (self) hv_cpu_process_requests(self);
++        return;
++    }
+     HvMachine *mm = target->m;
+     uint64_t t0 = mm->stats_interval ? mach_absolute_time() : 0;
+     if (s) {
+@@ -271,6 +282,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
      int sleep = hv_knob[HV_K_SYNCWAIT], probed = !t0 || !mm->wait_stats, probed_long = !t0 || !mm->wait_stats;
      if (s && mm->wait_stats) __atomic_store_n(&s->phase, HV_PHASE_SYNC, __ATOMIC_RELAXED);
      for (uint32_t spins = 0;; spins++) {
@@ -307,7 +321,7 @@ index 7a01fdc..d398609 100644
          uint64_t ack = __atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE);
          if (ack >= seq) break;
          if (!probed && !(spins & 63) && mach_absolute_time() - t0 >= 2400) { /* 100 us: what is it doing? */
-@@ -295,10 +300,12 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -295,10 +307,12 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
          if (self) hv_cpu_process_requests(self);
          if (sleep && spins >= 64) {
              __atomic_add_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
@@ -322,7 +336,7 @@ index 7a01fdc..d398609 100644
                  if (rc == -ETIMEDOUT && s) __atomic_add_fetch(&s->sync_timeouts, 1, __ATOMIC_RELAXED);
                  if (rc < 0 && rc != -ETIMEDOUT && rc != -EINTR) {
                      if (s) __atomic_add_fetch(&s->sync_errors, 1, __ATOMIC_RELAXED);
-@@ -396,18 +403,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
+@@ -396,18 +410,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
      return marked;
  }
  
@@ -351,7 +365,7 @@ index 7a01fdc..d398609 100644
      if (marked) __asm__ volatile("sev" ::: "memory");
      return marked;
  }
-@@ -622,6 +636,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
+@@ -622,6 +643,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
  
  /* MMIO is accessed in naturally sized pieces of at most 8 bytes. */
  int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
@@ -359,7 +373,7 @@ index 7a01fdc..d398609 100644
      void *p = hv_phys_ptr(m, pa, len);
      if (p) {
          memcpy(buf, p, len);
-@@ -640,8 +655,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
+@@ -640,8 +662,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
  }
  
  int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
@@ -3321,6 +3335,35 @@ index 0000000..4f7f433
 +Cloud tests cannot validate this device's GPU grant, iOS expiration timing,
 +actual GitHub registration with the user's temporary token, or thermal behaviour.
 +Those remain clearly separate from process/control correctness and compilation.
+diff --git a/docs/session-responsiveness/PROGRESS.md b/docs/session-responsiveness/PROGRESS.md
+new file mode 100644
+index 0000000..550b5ce
+--- /dev/null
++++ b/docs/session-responsiveness/PROGRESS.md
+@@ -0,0 +1,23 @@
++# Responsiveness and reliable Instant Resume
++
++Baseline: released0.3.3(104), source704ba172, wrapperhead856f901. User reports
++Low Power desktop loading remains slow; previous host fixtures did not prove a
++device startup improvement. Automatic scheduling already preserves all4vCPU
++priorities. Do not bypass OS clocks, add universal boosts or claim cooling gains.
++
++Found: foreground returns wait behind uncancellable whole-memory saves; stale
++queued lifecycle requests lack generation ownership; expiration ends background
++time without cancelling work; failed native restore deletes recovery files;
++mutable CPU preferences can mislabel saved state; sync-ready waits publish
++unnecessary park/wake events.
++
++In progress: cooperative per-save cancellation/progress, generation-safe native
++transitions and consume-on-success restore; deterministic native regressions;
++already-acknowledged sync fast path retaining own invalidations.
++Next: production Swift coordinator with stale-intent cancellation, exact-once
++background assertions, explicit foreground save-and-leave/recovery/progress,
++self-describing saved configuration; focused Swift/native tests, then cloud
++integration. No IPA or release request until the whole feature gate passes.
++
++Hardware: OS Low Power Mode can reduce CPU performance and display refresh.
++Software changes cannot guarantee normal-mode speed under that OS policy.
 diff --git a/docs/thermal-engineering/architecture.md b/docs/thermal-engineering/architecture.md
 index 55c66e6..fe9dd9e 100644
 --- a/docs/thermal-engineering/architecture.md
@@ -3744,10 +3787,10 @@ index 37b2313..da6d7a1 100644
 +
  #endif
 diff --git a/host/snapshot.c b/host/snapshot.c
-index 383ae01..62b69a3 100644
+index 383ae01..83fbe22 100644
 --- a/host/snapshot.c
 +++ b/host/snapshot.c
-@@ -27,11 +27,24 @@
+@@ -27,11 +27,26 @@
  #include <unistd.h>
  
  #include "pvg_lite.h"
@@ -3760,6 +3803,8 @@ index 383ae01..62b69a3 100644
 +#ifdef HV_SNAPSHOT_TESTING
 +static int snapshot_fail_after = -1;
 +void hv_snapshot_test_fail_after(int n) { snapshot_fail_after = n; }
++static void (*snapshot_progress_hook)(uint64_t);
++void hv_snapshot_test_progress(void (*hook)(uint64_t)) { snapshot_progress_hook = hook; }
 +static void *snapshot_malloc(size_t n) {
 +    if (snapshot_fail_after >= 0 && snapshot_fail_after-- == 0) return NULL;
 +    return malloc(n);
@@ -3773,7 +3818,7 @@ index 383ae01..62b69a3 100644
  #define PAGE 0x4000ull
  #define CHUNK_PAGES 256u
  #define CHUNK_BYTES ((uint64_t)CHUNK_PAGES * PAGE)
-@@ -50,10 +63,11 @@ typedef struct SnapHeader {
+@@ -50,10 +65,11 @@ typedef struct SnapHeader {
      uint32_t ncpus, nram;
      uint64_t ram_size;
      char disk[256];         /* hv_vm_disk_identity when saved: the disk has to be exactly that again */
@@ -3786,7 +3831,7 @@ index 383ae01..62b69a3 100644
      uint64_t len;
  } SecHdr;
  
-@@ -72,6 +86,7 @@ typedef struct ChunkHdr {
+@@ -72,6 +88,7 @@ typedef struct ChunkHdr {
      uint32_t bytes;         /* what follows */
      uint32_t raw;           /* 1: the pages as they are (LZ4 did not make them smaller) */
      uint8_t bitmap[CHUNK_PAGES / 8];
@@ -3794,17 +3839,54 @@ index 383ae01..62b69a3 100644
  } ChunkHdr;
  
  /* A CPU's architectural state: everything but its caches, which a new machine starts empty. */
-@@ -143,7 +158,8 @@ static void w_raw(W *w, const void *d, uint64_t len) {
+@@ -119,11 +136,25 @@ typedef struct W {
+     uint8_t *buf;
+     size_t n, cap;
+     uint64_t total;
++    const HvSnapshotControl *control;
++    uint64_t scanned, ram_total;
+ } W;
+ 
++static int cancelled(const HvSnapshotControl *c) { return c && c->cancelled && c->cancelled(c->context); }
++static int w_cancelled(W *w) {
++    if (!w->err && cancelled(w->control)) w->err = ECANCELED;
++    return w->err != 0;
++}
++static void report_progress(W *w, uint64_t scanned) {
++    if (w->control && w->control->progress) w->control->progress(scanned, w->ram_total, w->control->context);
++#ifdef HV_SNAPSHOT_TESTING
++    if (snapshot_progress_hook) snapshot_progress_hook(scanned);
++#endif
++}
++
+ static void w_flush(W *w) {
+     size_t off = 0;
+-    while (!w->err && off < w->n) {
++    while (!w_cancelled(w) && off < w->n) {
+         ssize_t k = write(w->fd, w->buf + off, w->n - off);
+         if (k < 0 && errno == EINTR) continue;
+         if (k <= 0) w->err = errno ? errno : EIO;
+@@ -134,7 +165,7 @@ static void w_flush(W *w) {
+ 
+ static void w_raw(W *w, const void *d, uint64_t len) {
+     const uint8_t *p = d;
+-    while (len && !w->err) {
++    while (len && !w_cancelled(w)) {
+         size_t room = w->cap - w->n, k = len < room ? (size_t)len : room;
+         memcpy(w->buf + w->n, p, k);
+         w->n += k, p += k, len -= k, w->total += k;
+@@ -143,7 +174,9 @@ static void w_raw(W *w, const void *d, uint64_t len) {
  }
  
  static void w_section(W *w, uint32_t tag, const void *d, uint64_t len) {
 -    SecHdr h = {tag, 0, len};
++    if (w_cancelled(w)) return;
 +    uint64_t signature = hv_surface_hash(d, len);
 +    SecHdr h = {tag, (uint32_t)(signature ^ (signature >> 32)), len};
      w_raw(w, &h, sizeof h);
      w_raw(w, d, len);
  }
-@@ -180,7 +196,9 @@ static int r_raw(R *r, void *d, uint64_t len) {
+@@ -180,7 +213,9 @@ static int r_raw(R *r, void *d, uint64_t len) {
  static int r_section(R *r, uint32_t tag, void *d, uint64_t len) {
      SecHdr h;
      if (r_raw(r, &h, sizeof h) || h.tag != tag || h.len != len) return r->err = r->err ? r->err : EINVAL, -1;
@@ -3815,7 +3897,7 @@ index 383ae01..62b69a3 100644
  }
  
  /* A section of any length (up to max), in memory the caller frees. */
-@@ -191,7 +209,9 @@ static int r_section_any(R *r, uint32_t tag, void **d, uint64_t *len, uint64_t m
+@@ -191,7 +226,9 @@ static int r_section_any(R *r, uint32_t tag, void **d, uint64_t *len, uint64_t m
      *d = malloc(h.len ? h.len : 1);
      if (!*d) return r->err = ENOMEM, -1;
      *len = h.len;
@@ -3826,7 +3908,7 @@ index 383ae01..62b69a3 100644
  }
  
  #define R_RANGE(r, tag, p, from, to) r_section(r, tag, (uint8_t *)(p) + offsetof(__typeof__(*(p)), from), \
-@@ -271,6 +291,12 @@ static void slots_free(Slot *s, int n) {
+@@ -271,8 +308,15 @@ static void slots_free(Slot *s, int n) {
      for (int i = 0; i < n; i++) free(s[i].stage), free(s[i].out), free(s[i].scratch);
  }
  
@@ -3837,13 +3919,26 @@ index 383ae01..62b69a3 100644
 +}
 +
  /* One chunk into a slot: which pages have something, and those pages compressed. */
- static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t index, int use_mincore) {
+-static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t index, int use_mincore) {
++static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t index, int use_mincore,
++                       const HvSnapshotControl *control) {
      uint64_t from = (uint64_t)index * CHUNK_BYTES;
-@@ -298,10 +324,11 @@ static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t ind
+     uint32_t pages = (uint32_t)((size - from < CHUNK_BYTES ? size - from : CHUNK_BYTES) / PAGE);
+     memset(&s->h, 0, sizeof s->h);
+@@ -284,6 +328,7 @@ static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t ind
+        then looks the same while it holds data: file-backed RAM is read whole. */
+     int have_vec = use_mincore && mincore((void *)(base + from), (size_t)pages * PAGE, vec) == 0;
+     for (uint32_t i = 0; i < pages; i++) {
++        if (cancelled(control)) return;
+         const uint8_t *pg = base + from + (uint64_t)i * PAGE;
+         if (have_vec) {
+             int touched = 0;
+@@ -298,10 +343,12 @@ static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t ind
          s->h.stored++;
      }
      size_t raw = (size_t)s->h.stored * PAGE;
 -    if (!raw) return;
++    if (cancelled(control)) return;
 +    if (!raw) { s->h.checksum = chunk_checksum(&s->h, s->stage, 0); return; }
      size_t got = compression_encode_buffer(s->out, CHUNK_BYTES, s->stage, raw, s->scratch, COMPRESSION_LZ4);
      if (got && got < raw) s->h.bytes = (uint32_t)got;
@@ -3852,8 +3947,14 @@ index 383ae01..62b69a3 100644
  }
  
  static double pack_secs, write_secs, wait_secs; /* for the log: compressing, writing, and waiting for a batch to be compressed */
-@@ -316,8 +343,7 @@ static double mono(void) {
+@@ -314,17 +361,20 @@ static double mono(void) {
+ 
+ /* Chunks are compressed a batch at a time on every core, the next batch while the last one is written. */
  static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
++    if (w_cancelled(w)) return -1;
++    const HvSnapshotControl *control = w->control;
++    unsigned batch = control && control->workers ? control->workers : BATCH;
++    if (batch > BATCH) batch = BATCH;
      uint32_t nchunks = (uint32_t)((ram->size + CHUNK_BYTES - 1) / CHUNK_BYTES);
      RamHdr rh = {ram->pa, ram->size, CHUNK_PAGES, nchunks};
 -    w_raw(w, &(SecHdr){TAG('R', 'A', 'M', ' '), 0, sizeof rh}, sizeof(SecHdr));
@@ -3861,8 +3962,75 @@ index 383ae01..62b69a3 100644
 +    w_section(w, TAG('R', 'A', 'M', ' '), &rh, sizeof rh);
      Slot set[2][BATCH];
      memset(set, 0, sizeof set);
-     if (slots_alloc(set[0], BATCH) || slots_alloc(set[1], BATCH)) {
-@@ -392,12 +418,19 @@ static int chunk_unpack(Slot *s, uint8_t *base, uint64_t size) {
+-    if (slots_alloc(set[0], BATCH) || slots_alloc(set[1], BATCH)) {
++    if (slots_alloc(set[0], batch) || slots_alloc(set[1], batch)) {
+         slots_free(set[0], BATCH), slots_free(set[1], BATCH);
+         return w->err = ENOMEM, -1;
+     }
+-    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
++    dispatch_queue_t q = dispatch_get_global_queue(control && control->background ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INITIATED, 0);
+     dispatch_group_t packing = dispatch_group_create();
+     const uint8_t *base = ram->host;
+     uint64_t size = ram->size;
+@@ -332,24 +382,26 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
+     void (^pack)(Slot *, uint32_t, uint32_t) = ^(Slot *sl, uint32_t first, uint32_t n) {
+         dispatch_group_async(packing, q, ^{
+             double t0 = mono();
+-            dispatch_apply(n, q, ^(size_t k) { chunk_pack(&sl[k], base, size, first + (uint32_t)k, !file_backed); });
++            dispatch_apply(n, q, ^(size_t k) { chunk_pack(&sl[k], base, size, first + (uint32_t)k, !file_backed, control); });
+             packed += mono() - t0;
+         });
+     };
+-    uint32_t n0 = nchunks < BATCH ? nchunks : BATCH;
++    uint32_t n0 = nchunks < batch ? nchunks : batch;
+     if (n0) pack(set[0], 0, n0);
+     int cur = 0;
+-    for (uint32_t first = 0; first < nchunks && !w->err; first += BATCH, cur ^= 1) {
+-        uint32_t n = nchunks - first < BATCH ? nchunks - first : BATCH;
++    for (uint32_t first = 0; first < nchunks && !w_cancelled(w); first += batch, cur ^= 1) {
++        uint32_t n = nchunks - first < batch ? nchunks - first : batch;
+         double t0 = mono();
+         dispatch_group_wait(packing, DISPATCH_TIME_FOREVER);
++        if (w_cancelled(w)) break;
+         double t1 = mono();
+-        uint32_t next = first + BATCH;
+-        if (next < nchunks) pack(set[cur ^ 1], next, nchunks - next < BATCH ? nchunks - next : BATCH);
++        uint32_t next = first + batch;
++        if (next < nchunks && !cancelled(control)) pack(set[cur ^ 1], next, nchunks - next < batch ? nchunks - next : batch);
+         Slot *sl = set[cur];
+         /* The batch's chunks at once, each at its own place in the file: past the page cache a write waits for
+            the flash, and one at a time leaves it mostly idle. */
+         w_flush(w);
++        if (w_cancelled(w)) break;
+         uint64_t at[BATCH], pos = w->total;
+         for (uint32_t k = 0; k < n; k++) {
+             at[k] = pos;
+@@ -363,6 +415,7 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
+             struct iovec v[2] = {{&sl[k].h, sizeof sl[k].h}, {sl[k].h.raw ? sl[k].stage : sl[k].out, sl[k].h.bytes}};
+             size_t want = v[0].iov_len + v[1].iov_len, done = 0;
+             while (done < want) {
++                if (cancelled(control)) { failed = ECANCELED; return; }
+                 ssize_t got = pwritev(fd, v, v[1].iov_len ? 2 : 1, (off_t)(atp[k] + done));
+                 if (got < 0 && errno == EINTR) continue;
+                 if (got <= 0) {
+@@ -381,10 +434,16 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
+         if (lseek(fd, (off_t)pos, SEEK_SET) != (off_t)pos && !w->err) w->err = errno;
+         write_secs += mono() - t1;
+         wait_secs += t1 - t0;
++        if (!w_cancelled(w)) {
++            uint64_t scanned = (uint64_t)(first + n) * CHUNK_BYTES;
++            if (scanned > size) scanned = size;
++            report_progress(w, w->scanned + scanned);
++        }
+     }
+     dispatch_group_wait(packing, DISPATCH_TIME_FOREVER);
+     pack_secs += packed;
+     slots_free(set[0], BATCH), slots_free(set[1], BATCH);
++    if (!w_cancelled(w)) w->scanned += size;
+     return w->err ? -1 : 0;
+ }
+ 
+@@ -392,12 +451,19 @@ static int chunk_unpack(Slot *s, uint8_t *base, uint64_t size) {
      uint64_t from = (uint64_t)s->h.index * CHUNK_BYTES;
      if (from >= size) return -1;
      uint32_t pages = (uint32_t)((size - from < CHUNK_BYTES ? size - from : CHUNK_BYTES) / PAGE);
@@ -3882,7 +4050,7 @@ index 383ae01..62b69a3 100644
      uint32_t k = 0;
      for (uint32_t i = 0; i < pages && k < s->h.stored; i++)
          if (s->h.bitmap[i / 8] & (1u << (i % 8))) memcpy(base + from + (uint64_t)i * PAGE, src + (uint64_t)k++ * PAGE, PAGE);
-@@ -442,7 +475,7 @@ static int load_ram(R *r, HvRam *ram) {
+@@ -442,7 +508,7 @@ static int load_ram(R *r, HvRam *ram) {
          dispatch_group_async(unpacking, q, ^{
              double t1 = mono();
              dispatch_apply(n, q, ^(size_t k) {
@@ -3891,7 +4059,7 @@ index 383ae01..62b69a3 100644
              });
              unpacked += mono() - t1;
          });
-@@ -529,12 +562,16 @@ static void save_devices(W *w, HvVmapple *b) {
+@@ -529,12 +595,16 @@ static void save_devices(W *w, HvVmapple *b) {
      }
      size_t pn = hv_pvg_lite_state(b->pvg, NULL, 0);
      uint8_t *pb = malloc(pn);
@@ -3909,10 +4077,18 @@ index 383ae01..62b69a3 100644
      w_section(w, TAG('P', 'V', 'G', 'D'), db, db ? dn : 0);
      free(db);
  }
-@@ -592,12 +629,14 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
+@@ -592,12 +662,23 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
  /* ---- the file ---- */
  
  int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errlen) {
++    return hv_snapshot_save_controlled(path, ident, NULL, err, errlen);
++}
++
++int hv_snapshot_save_controlled(const char *path, const char *ident, const HvSnapshotControl *control,
++                                char *err, size_t errlen) {
++    if (!path || strlen(path) + 6 > 1100 || (ident && strlen(ident) >= 1024))
++        return fail(err,errlen,"The saved-state path or identity is too long.");
++    if (cancelled(control)) return fail(err, errlen, "Saving cancelled; the Mac remains paused in memory.");
 +    if (hv_vm_cpu_background()) return fail(err, errlen, "Return Henge to the foreground before saving a CPU background runner. Graphics commands are still queued in the guest.");
      HvMachine *m = hv_vm_machine();
      HvVmapple *b = hv_vm_board();
@@ -3922,10 +4098,22 @@ index 383ae01..62b69a3 100644
 +    if (!hv_vm_pause_clean()) return fail(err, errlen, "The machine is not paused, or disk/graphics work could not be preserved.");
      if (b->vusb) return fail(err, errlen, "An installer cannot be saved.");
 +    if (hv_vm_sync_disks() != 0) return fail(err, errlen, "The Mac's disks could not be synchronized: %s", strerror(errno));
++    if (cancelled(control)) return fail(err, errlen, "Saving cancelled; the Mac remains paused in memory.");
      struct timespec t0, t1;
      clock_gettime(CLOCK_MONOTONIC, &t0);
      char tmp[1100];
-@@ -624,6 +663,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+@@ -605,7 +686,9 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+     if (fd < 0) return fail(err, errlen, "Cannot write %s: %s", tmp, strerror(errno));
+     fcntl(fd, F_NOCACHE, 1);
+-    W w = {.fd = fd, .cap = 4u << 20};
++    W w = {.fd = fd, .cap = 4u << 20, .control = control};
++    for (int i = 0; i < m->nram; i++) w.ram_total += m->ram[i].size;
++    report_progress(&w, 0);
+     w.buf = malloc(w.cap);
+     if (!w.buf) {
+         close(fd);
+@@ -624,6 +707,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
          unlink(tmp);
          return fail(err, errlen, "Cannot read the disk's details.");
      }
@@ -3933,7 +4121,20 @@ index 383ae01..62b69a3 100644
      w_raw(&w, &h, sizeof h);
      for (int i = 0; i < ncpus; i++) {
          CpuState s;
-@@ -659,9 +699,9 @@ static int read_header(int fd, SnapHeader *h, const char *ident, uint64_t *bytes
+@@ -641,10 +725,12 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+     free(w.buf);
+     int bad = w.err;
+     if (!bad && fsync(fd) != 0) bad = errno;
++    if (!bad && cancelled(control)) bad = ECANCELED;
+     close(fd);
+     if (!bad && rename(tmp, path) != 0) bad = errno;
+     if (bad) {
+         unlink(tmp);
++        if (bad == ECANCELED) return fail(err, errlen, "Saving cancelled; the Mac remains paused in memory.");
+         return fail(err, errlen, "Cannot write the saved Mac: %s", strerror(bad));
+     }
+     clock_gettime(CLOCK_MONOTONIC, &t1);
+@@ -659,11 +745,11 @@ static int read_header(int fd, SnapHeader *h, const char *ident, uint64_t *bytes
      struct stat st;
      Trailer t;
      if (fstat(fd, &st) != 0 || (uint64_t)st.st_size < sizeof *h + sizeof t) return -1;
@@ -3944,10 +4145,45 @@ index 383ae01..62b69a3 100644
 +    if (h->version != SNAP_VERSION || h->header_bytes != sizeof *h || h->fingerprint != fingerprint()) return -3;
 +    if (h->checksum != hv_surface_hash((const uint8_t *)h, offsetof(SnapHeader, checksum))) return -1;
      h->ident[sizeof h->ident - 1] = 0;
-     if (strcmp(h->ident, ident ? ident : "")) return -2;
+-    if (strcmp(h->ident, ident ? ident : "")) return -2;
++    if (ident && strcmp(h->ident, ident)) return -2;
      if (pread(fd, &t, sizeof t, st.st_size - (off_t)sizeof t) != (ssize_t)sizeof t || t.tag != TAG('E', 'N', 'D', ' ') ||
-@@ -695,7 +735,8 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
-     int hr = read_header(fd, &h, ident, NULL);
+         t.total != (uint64_t)st.st_size)
+         return -1;
+@@ -675,12 +761,26 @@ int hv_snapshot_check(const char *path, const char *ident, uint64_t *bytes, int6
+     int fd = open(path, O_RDONLY);
+     if (fd < 0) return -1;
+     SnapHeader h;
+-    int r = read_header(fd, &h, ident, bytes);
++    int r = read_header(fd, &h, ident ? ident : "", bytes);
+     close(fd);
+     if (!r && saved_at) *saved_at = h.saved_at;
+     return r;
+ }
+ 
++int hv_snapshot_inspect(const char *path, char *ident, size_t capacity, HvSnapshotInfo *info) {
++    int fd = open(path, O_RDONLY);
++    if (fd < 0) return -1;
++    SnapHeader h;
++    uint64_t bytes = 0;
++    int r = read_header(fd, &h, NULL, &bytes);
++    close(fd);
++    if (r) return r;
++    if (!ident || capacity <= strlen(h.ident)) return -1;
++    memcpy(ident, h.ident, strlen(h.ident) + 1);
++    if (info) *info = (HvSnapshotInfo){bytes, h.ram_size >> 20, h.saved_at, h.ncpus};
++    return 0;
++}
++
+ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t errlen) {
+     HvMachine *m = hv_vm_machine();
+     HvVmapple *b = hv_vm_board();
+@@ -692,10 +792,11 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
+     if (fd < 0) return fail(err, errlen, "No saved Mac: %s", strerror(errno));
+     fcntl(fd, F_NOCACHE, 1);
+     SnapHeader h;
+-    int hr = read_header(fd, &h, ident, NULL);
++    int hr = read_header(fd, &h, ident ? ident : "", NULL);
      if (hr) {
          close(fd);
 -        return fail(err, errlen, hr == -2 ? "The saved Mac is from another build of Henge or another disk." : "The saved Mac is incomplete or damaged.");
@@ -3956,7 +4192,7 @@ index 383ae01..62b69a3 100644
      }
      char disk_now[256];
      h.disk[sizeof h.disk - 1] = 0;
-@@ -728,7 +769,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
+@@ -728,7 +829,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
      if (!bad) bad = r_raw(&r, &t, sizeof t) || t.tag != TAG('E', 'N', 'D', ' ');
      free(r.buf);
      close(fd);
@@ -3965,6 +4201,35 @@ index 383ae01..62b69a3 100644
      free(display);
      if (bad) return fail(err, errlen, "The saved Mac could not be read (%s).", strerror(r.err ? r.err : EINVAL));
      /* The guest's clock goes on as far as the wall clock went since it stopped (see hv_vm_resume_counter). */
+diff --git a/host/snapshot.h b/host/snapshot.h
+index 67fc764..2ca437b 100644
+--- a/host/snapshot.h
++++ b/host/snapshot.h
+@@ -14,8 +14,24 @@
+    The disk is not in the file: it has to be exactly as it was when the file was written, so a file must be resumed at
+    most once, and never after the Mac has run on without it. */
+ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errlen);
++/* Callbacks may run on packing workers. Cancellation must be thread safe and
++   stay set for this operation; progress runs on the writer. No file format or
++   guest state changes. All workers finish before this function returns. */
++typedef struct HvSnapshotControl {
++    int (*cancelled)(void *context);
++    void (*progress)(uint64_t scanned, uint64_t total, void *context);
++    void *context;
++    unsigned workers; /* 0: existing batch size; otherwise 1..8 */
++    int background;   /* deferrable compression, never a vCPU QoS change */
++} HvSnapshotControl;
++int hv_snapshot_save_controlled(const char *path, const char *ident, const HvSnapshotControl *control,
++                                char *err, size_t errlen);
+ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t errlen);
+ /* 0 if path holds a complete snapshot made with ident by this build; its size in bytes and when it was made. */
+ int hv_snapshot_check(const char *path, const char *ident, uint64_t *bytes, int64_t *saved_at);
++typedef struct HvSnapshotInfo { uint64_t bytes, ram_mb; int64_t saved_at; uint32_t cpus; } HvSnapshotInfo;
++/* Read only the validated header/trailer, never allocate guest RAM. The caller
++   must validate its own identity/build before attempting a restore. */
++int hv_snapshot_inspect(const char *path, char *ident, size_t ident_capacity, HvSnapshotInfo *info);
+ 
+ #endif
 diff --git a/host/vm.c b/host/vm.c
 index db95c05..3fd6356 100644
 --- a/host/vm.c
@@ -6138,15 +6403,16 @@ index 29c8b3b..71cc43b 100644
      /// On an iPhone's large screen (iPhone Duo unfolded): fill it, or leave a strip at the right for the status
      /// bar and Henge's controls. Macs that never chose fill it.
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..e1397d9 100644
+index 34d6a98..770caa7 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
-@@ -23,23 +23,45 @@
+@@ -23,23 +23,55 @@
  
  #include <fcntl.h>
  #include <unistd.h>
 +#include <sys/resource.h>
 +#include <mach/mach.h>
++#include <errno.h>
 +
  
  HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
@@ -6165,6 +6431,15 @@ index 34d6a98..e1397d9 100644
  static pthread_rwlock_t api_lock = PTHREAD_RWLOCK_INITIALIZER;
 +/* A save reads VM memory, but two writers must not share .part or compression state. */
 +static pthread_mutex_t snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
++struct HengeSaveRequest {
++    uint64_t generation;
++    int background;
++    _Atomic int cancelled, phase, claimed;
++    _Atomic uint64_t scanned, total;
++};
++/* The short request lock protects only this pointer, never VM work or I/O. */
++static pthread_mutex_t snapshot_request_lock = PTHREAD_MUTEX_INITIALIZER;
++static HengeSaveRequest *active_save;
  static _Atomic uint64_t generation;
 +static uint64_t counter_epoch; /* api_lock */
  static int installer_session;
@@ -6189,7 +6464,7 @@ index 34d6a98..e1397d9 100644
      exit_reason = reason;
      int halt = hv_vm_cpu(0)->halted;
      exit_outcome = HENGE_VM_OUTCOME_ERROR;
-@@ -49,13 +71,12 @@ static void on_exit(int reason) {
+@@ -49,13 +81,12 @@ static void on_exit(int reason) {
      case HV_HALT_HOST: exit_outcome = HENGE_VM_OUTCOME_HOST_STOP; break;
      case HV_HALT_PANIC: exit_outcome = HENGE_VM_OUTCOME_PANIC; break;
      }
@@ -6206,7 +6481,19 @@ index 34d6a98..e1397d9 100644
      fprintf(stderr, "henge: the machine stopped (%s, halt reason %d); CPU threads ended, disks flushed%s\n",
              exit_description(), halt, installer_session ? "" : ", machine released");
      pthread_rwlock_unlock(&api_lock);
-@@ -75,26 +96,27 @@ static int begin_start(char *err, size_t errlen) {
+@@ -67,6 +98,11 @@ static int begin_start(char *err, size_t errlen) {
+         snprintf(err, errlen, "A Mac app ran in this launch. Quit Henge (swipe it away) and open it again to start a Mac.");
+         return -1;
+     }
++    int current = atomic_load(&state);
++    if (current == 1 || current == 3 || current == 4) {
++        snprintf(err,errlen,"The previous Mac is still running, paused or finishing its shutdown.");
++        return -1;
++    }
+     pthread_rwlock_wrlock(&api_lock);
+     if ((state != 0 && state != 2) || installer_session) {
+         snprintf(err, errlen, "%s", installer_session
+@@ -75,26 +111,27 @@ static int begin_start(char *err, size_t errlen) {
          pthread_rwlock_unlock(&api_lock);
          return -1;
      }
@@ -6238,20 +6525,35 @@ index 34d6a98..e1397d9 100644
      pthread_rwlock_unlock(&api_lock);
      return 0;
  }
-@@ -117,8 +139,10 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
+@@ -116,9 +153,25 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
+     return hv_snapshot_check(path, ident, bytes, saved_at);
  }
  
++int henge_vm_saved_info(const char *path, char *ident, size_t capacity, HengeSavedInfo *out) {
++    HvSnapshotInfo info;
++    int rc = hv_snapshot_inspect(path, ident, capacity, &info);
++    if (!rc && out) *out = (HengeSavedInfo){info.bytes, info.ram_mb, info.saved_at, info.cpus};
++    return rc;
++}
++
  int henge_vm_pause(char *err, size_t errlen) {
 -    if (state == 4) return 0;
 -    if (!lock_running()) {
++    return henge_vm_pause_generation(0, err, errlen);
++}
++int henge_vm_pause_generation(uint64_t expected, char *err, size_t errlen) {
 +    pthread_rwlock_wrlock(&api_lock);
++    if (expected && expected != atomic_load(&generation)) {
++        pthread_rwlock_unlock(&api_lock);
++        snprintf(err, errlen, "The Mac session changed."); return -1;
++    }
 +    if (state == 4) { pthread_rwlock_unlock(&api_lock); return 0; }
 +    if (state != 1) {
 +        pthread_rwlock_unlock(&api_lock);
          snprintf(err, errlen, "No Mac is running.");
          return -1;
      }
-@@ -133,21 +157,25 @@ int henge_vm_pause(char *err, size_t errlen) {
+@@ -133,21 +186,63 @@ int henge_vm_pause(char *err, size_t errlen) {
          snprintf(err, errlen, "The Mac stopped by itself.");
          return -1;
      }
@@ -6263,26 +6565,85 @@ index 34d6a98..e1397d9 100644
      return 0;
  }
  
++HengeSaveRequest *henge_vm_save_request(uint64_t expected, int background) {
++    HengeSaveRequest *r = calloc(1, sizeof *r);
++    if (r) { r->generation = expected; r->background = !!background; }
++    return r;
++}
++void henge_vm_save_cancel(HengeSaveRequest *r) { if (r) atomic_store(&r->cancelled, 1); }
++void henge_vm_save_free(HengeSaveRequest *r) { free(r); }
++void henge_vm_save_progress(HengeSaveRequest *r, HengeSaveProgress *out) {
++    if (!out) return;
++    *out = r ? (HengeSaveProgress){atomic_load(&r->scanned), atomic_load(&r->total), atomic_load(&r->phase), atomic_load(&r->cancelled)} : (HengeSaveProgress){0};
++}
++static int save_cancelled(void *context) {
++    HengeSaveRequest *r = context;
++    return atomic_load(&r->cancelled) || (r->generation && r->generation != atomic_load(&generation));
++}
++static void save_progress(uint64_t scanned, uint64_t total, void *context) {
++    HengeSaveRequest *r = context;
++    atomic_store(&r->total, total); atomic_store(&r->scanned, scanned);
++}
++static void cancel_active_save(uint64_t expected) {
++    pthread_mutex_lock(&snapshot_request_lock);
++    if (active_save && (!expected || expected == active_save->generation)) henge_vm_save_cancel(active_save);
++    pthread_mutex_unlock(&snapshot_request_lock);
++}
  int henge_vm_save(const char *path, const char *ident, char *err, size_t errlen) {
++    HengeSaveRequest *r = henge_vm_save_request(atomic_load(&generation), 0);
++    if (!r) { snprintf(err,errlen,"Out of memory creating the save request."); return -1; }
++    int rc = henge_vm_save_run(r, path, ident, err, errlen);
++    henge_vm_save_free(r); return rc;
++}
++int henge_vm_save_run(HengeSaveRequest *request, const char *path, const char *ident, char *err, size_t errlen) {
++    if (!request) { snprintf(err,errlen,"No save request."); return -1; }
++    if (atomic_exchange(&request->claimed,1)) { snprintf(err,errlen,"This save request has already been used."); return -1; }
 +    pthread_mutex_lock(&snapshot_lock);
++    pthread_mutex_lock(&snapshot_request_lock); active_save = request; pthread_mutex_unlock(&snapshot_request_lock);
      pthread_rwlock_rdlock(&api_lock);
-     if (state != 4) {
-         pthread_rwlock_unlock(&api_lock);
-+        pthread_mutex_unlock(&snapshot_lock);
-         snprintf(err, errlen, "The Mac is not paused.");
-         return -1;
+-    if (state != 4) {
+-        pthread_rwlock_unlock(&api_lock);
+-        snprintf(err, errlen, "The Mac is not paused.");
+-        return -1;
++    int r = -1;
++    if (save_cancelled(request)) snprintf(err,errlen,"Saving cancelled; the Mac session changed or is returning.");
++    else if (state != 4) snprintf(err,errlen,"The Mac is not paused.");
++    else {
++        atomic_store(&request->phase,1);
++        long active = sysconf(_SC_NPROCESSORS_ONLN);
++        HvSnapshotControl control = {.cancelled=save_cancelled, .progress=save_progress, .context=request,
++            .workers=(unsigned)(active > 0 && active < 8 ? active : 8), .background=request->background};
++        r = hv_snapshot_save_controlled(path, ident, &control, err, errlen);
      }
-     int r = hv_snapshot_save(path, ident, err, errlen);
+-    int r = hv_snapshot_save(path, ident, err, errlen);
++    atomic_store(&request->phase, !r ? 2 : save_cancelled(request) ? 3 : 4);
      pthread_rwlock_unlock(&api_lock);
++    pthread_mutex_lock(&snapshot_request_lock); active_save = NULL; pthread_mutex_unlock(&snapshot_request_lock);
 +    pthread_mutex_unlock(&snapshot_lock);
      fprintf(stderr, "henge: %s\n", r ? err : "the paused Mac is saved");
      return r;
  }
-@@ -165,19 +193,52 @@ int henge_vm_continue(void) {
+@@ -160,24 +255,73 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
+ }
+ 
+ int henge_vm_continue(void) {
++    return henge_vm_continue_generation(0, NULL, NULL, 0);
++}
++int henge_vm_continue_generation(uint64_t expected, const char *saved_path, char *err, size_t errlen) {
+     pthread_rwlock_wrlock(&api_lock);
++    if (expected && expected != atomic_load(&generation)) {
++        pthread_rwlock_unlock(&api_lock);
++        if (err && errlen) snprintf(err,errlen,"The Mac session changed."); return -1;
++    }
+     if (state != 4) {
          pthread_rwlock_unlock(&api_lock);
          return -1;
      }
 -    state = 1;
++    if (saved_path && unlink(saved_path) && errno != ENOENT) {
++        if (err && errlen) snprintf(err,errlen,"The old saved state could not be invalidated: %s. The Mac remains paused.",strerror(errno));
++        pthread_rwlock_unlock(&api_lock); return -1;
++    }
 +    set_state(1);
 +    counter_epoch++;
      int r = hv_vm_continue();
@@ -6319,9 +6680,14 @@ index 34d6a98..e1397d9 100644
 +}
 +
 +void henge_vm_foreground_graphics(void) {
++    (void)henge_vm_foreground_generation(0);
++}
++int henge_vm_foreground_generation(uint64_t expected) {
 +    pthread_rwlock_wrlock(&api_lock);
++    if (expected && expected != atomic_load(&generation)) { pthread_rwlock_unlock(&api_lock); return -1; }
 +    if ((state==1 || state==4) && hv_vm_cpu_background()) (void)hv_vm_set_cpu_background(0);
 +    pthread_rwlock_unlock(&api_lock);
++    return 0;
 +}
 +int henge_vm_cpu_background(void) {
 +    pthread_rwlock_rdlock(&api_lock);
@@ -6333,11 +6699,35 @@ index 34d6a98..e1397d9 100644
  static int boot_or_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
                            int cpus, const char *resume, const char *ident, char *err, size_t errlen) {
      { extern void hv_prof_ios_start(void); hv_prof_ios_start(); }
-@@ -293,21 +354,22 @@ static int lock_running(void) {
+@@ -194,12 +338,16 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
+     if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
+     if (resume) {
+         int restored = hv_snapshot_restore(resume, ident, err, errlen);
+-        /* Used once: from here the Mac runs on and its disk moves past what the file holds. */
+-        unlink(resume);
+         if (restored != 0) {
+             fprintf(stderr, "henge: resume failed: %s\n", err);
+             return failed_start();
+         }
++        /* Failed restoration preserves the user's recovery file. Consume it
++           only after a complete restore, before any CPU/disk can run. */
++        if (unlink(resume) && errno != ENOENT) {
++            snprintf(err,errlen,"The restored state could not be invalidated: %s. The Mac was not started.",strerror(errno));
++            return failed_start();
++        }
+     }
+     if (getenv("HV_STATS")) hv_vm_machine()->stats_interval = atoi(getenv("HV_STATS"));
+     return started(err, errlen);
+@@ -293,22 +441,29 @@ static int lock_running(void) {
      return 0;
  }
  void henge_vm_stop(void) {
++    (void)henge_vm_stop_generation(0);
++}
++int henge_vm_stop_generation(uint64_t expected) {
++    cancel_active_save(expected);
 +    pthread_rwlock_wrlock(&api_lock);
++    if (expected && expected != atomic_load(&generation)) { pthread_rwlock_unlock(&api_lock); return -1; }
      if (state == 4) { /* paused: its CPU threads have ended already, so nothing calls on_exit */
 -        pthread_rwlock_wrlock(&api_lock);
 -        if (state == 4) {
@@ -6355,18 +6745,21 @@ index 34d6a98..e1397d9 100644
 +        counter_epoch++;
 +        fprintf(stderr, "henge: the paused Mac was stopped and released\n");
          pthread_rwlock_unlock(&api_lock);
-         return;
+-        return;
++        return 0;
      }
 -    if (!lock_running()) return;
-+    if (state != 1) { pthread_rwlock_unlock(&api_lock); return; }
++    if (state != 1) { pthread_rwlock_unlock(&api_lock); return 0; }
      hv_vm_stop();
 -    state = 3;
 +    set_state(3);
 +    counter_epoch++;
      pthread_rwlock_unlock(&api_lock);
++    return 0;
  }
  
-@@ -344,13 +406,13 @@ void henge_vm_log_cache(void) {
+ long henge_vm_balloon(long target_mb) {
+@@ -344,13 +499,13 @@ void henge_vm_log_cache(void) {
  
  uint64_t henge_vm_blocks(void) {
      pthread_rwlock_rdlock(&api_lock);
@@ -6382,7 +6775,7 @@ index 34d6a98..e1397d9 100644
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
-@@ -454,11 +516,30 @@ void henge_vm_set_display_layer(void *layer) {
+@@ -454,11 +609,30 @@ void henge_vm_set_display_layer(void *layer) {
      hv_vm_set_display_layer(layer);
  }
  uint64_t henge_vm_gpu_frames(void) {
@@ -6415,7 +6808,7 @@ index 34d6a98..e1397d9 100644
  int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride) {
      if (!lock_running()) return -1;
      HvBootDisplay d;
-@@ -509,3 +590,77 @@ uint64_t henge_largest_mapping_mb(void) {
+@@ -509,3 +683,77 @@ uint64_t henge_largest_mapping_mb(void) {
      }
      return 0;
  }
@@ -6494,23 +6887,42 @@ index 34d6a98..e1397d9 100644
 +    hv_vm_release_input_source(source);pthread_rwlock_unlock(&api_lock);
 +}
 diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
-index b8c41fa..d2e80f3 100644
+index b8c41fa..d889e36 100644
 --- a/ios/Henge/Native/henge-vm.h
 +++ b/ios/Henge/Native/henge-vm.h
-@@ -34,6 +34,12 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
+@@ -32,8 +32,31 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
+ /* The two halves of henge_vm_suspend. Pausing needs the GPU (what only it holds goes back into the Mac's memory), which
+    iOS refuses an app in the background: pause when Henge stops being active, save once it is in the background. */
  int henge_vm_pause(char *err, size_t errlen);
++int henge_vm_pause_generation(uint64_t generation, char *err, size_t errlen);
  int henge_vm_save(const char *path, const char *ident, char *err, size_t errlen);
++typedef struct HengeSaveRequest HengeSaveRequest;
++/* Owned per save, never reused. Cancel/progress do not acquire the VM lock.
++   The owner must keep the request alive until run/cancel/progress calls finish. */
++HengeSaveRequest *henge_vm_save_request(uint64_t generation, int background);
++void henge_vm_save_cancel(HengeSaveRequest *request);
++void henge_vm_save_free(HengeSaveRequest *request);
++int henge_vm_save_run(HengeSaveRequest *request, const char *path, const char *ident, char *err, size_t errlen);
++typedef struct HengeSaveProgress { uint64_t scanned, total; int phase, cancelled; } HengeSaveProgress;
++/* phase: 0 pending, 1 saving, 2 committed, 3 cancelled, 4 failed. */
++void henge_vm_save_progress(HengeSaveRequest *request, HengeSaveProgress *out);
++typedef struct HengeSavedInfo { uint64_t bytes, ram_mb; int64_t saved_at; uint32_t cpus; } HengeSavedInfo;
++int henge_vm_saved_info(const char *path, char *ident, size_t capacity, HengeSavedInfo *info);
  int henge_vm_continue(void);
++/* Invalidate the saved file under the same VM lock, before guest disks can
++   change. A failed unlink leaves the Mac paused and reports an error. */
++int henge_vm_continue_generation(uint64_t generation, const char *saved_path, char *err, size_t errlen);
 +/* Foreground-only preparation pauses/drains the GPU, gates its guest rings,
 +   and continues CPU/I/O. Caller must obtain an iOS continued CPU grant before
 +   leaving the app. Return to foreground restores graphics; no PiP keepalive. */
 +int henge_vm_prepare_cpu_background(char *err, size_t errlen);
 +void henge_vm_foreground_graphics(void);
++int henge_vm_foreground_generation(uint64_t generation);
 +int henge_vm_cpu_background(void);
  int henge_vm_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
                      int cpus, const char *path, const char *ident, char *err, size_t errlen);
  int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int64_t *saved_at);
-@@ -41,6 +47,9 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
+@@ -41,6 +64,9 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
  /* 0 not started, 1 running, 2 stopped, 3 starting/stopping, 4 paused (saved, or being saved).
     Normal guests are fully released before state 2; installer sessions retain
     their restore stack and can_start stays false. */
@@ -6520,7 +6932,15 @@ index b8c41fa..d2e80f3 100644
  int henge_vm_state(void);
  /* A new generation starts with each successful boot, even in the same view. */
  uint64_t henge_vm_generation(void);
-@@ -62,6 +71,32 @@ int henge_vm_knob(const char *name, int value);
+@@ -55,6 +81,7 @@ enum HengeVmOutcome {
+ };
+ int henge_vm_exit_outcome(void);
+ void henge_vm_stop(void);
++int henge_vm_stop_generation(uint64_t generation);
+ /* Testing: sets a translation knob (core/machine.h) in the running machine; nonzero if it exists. */
+ int henge_vm_knob(const char *name, int value);
+ /* The memory balloon (only with HV_BALLOON set before boot): asks the guest to hand over target_mb (when >= 0)
+@@ -62,6 +89,32 @@ int henge_vm_knob(const char *name, int value);
  long henge_vm_balloon(long target_mb);
  
  /* Progress, for the session screen. */
@@ -8449,7 +8869,7 @@ index 0000000..3f68b13
 +                    '-fsanitize=address,undefined','-pthread',str(path/'test.c'),'-o',str(path/'check')],check=True)
 +    subprocess.run([str(path/'check')],check=True,timeout=20)
 diff --git a/tests/test_cpu_sync.c b/tests/test_cpu_sync.c
-index bd64ae5..b60f6a1 100644
+index bd64ae5..3bb545e 100644
 --- a/tests/test_cpu_sync.c
 +++ b/tests/test_cpu_sync.c
 @@ -5,10 +5,28 @@
@@ -8481,7 +8901,26 @@ index bd64ae5..b60f6a1 100644
  static void *finish_request(void *unused) {
      (void)unused;
      struct timespec delay = {0, 10000000}; nanosleep(&delay, NULL);
-@@ -55,6 +73,21 @@ int main(void) {
+@@ -26,6 +44,18 @@ int main(void) {
+     assert(!hv_machine_init(&m, 1 << 20));
+     m.fastmem_enabled = 1;
+     hv_cpu_reset_index(&cpu[0], &m, 0); hv_cpu_reset_index(&cpu[1], &m, 1);
++    /* Already-completed requests must not publish a false park or wake our
++       own waiters. Still process a pending invalidation on this CPU. */
++    __atomic_store_n(&m.percpu[0].tlb_live,1,__ATOMIC_SEQ_CST);
++    __atomic_store_n(&m.percpu[0].ack_waiters,1,__ATOMIC_SEQ_CST);
++    seq=hv_cpu_post(&cpu[1],0);hv_cpu_process_requests(&cpu[1]);
++    uint32_t event=m.percpu[0].ack_event;
++    hv_cpu_sync(&cpu[0],&cpu[1],seq);
++    assert(m.percpu[0].tlb_live && m.percpu[0].ack_event==event);
++    uint64_t own_ready=hv_cpu_post(&cpu[0],HV_REQ_TLB_ALL);
++    hv_cpu_sync(&cpu[0],&cpu[1],seq);
++    assert(m.percpu[0].ack_seq==own_ready && m.percpu[0].ack_event==event+1 && m.percpu[0].tlb_live);
++    __atomic_store_n(&m.percpu[0].ack_waiters,0,__ATOMIC_SEQ_CST);
+     for (int enabled = 0; enabled <= 1; enabled++) {
+         hv_knob[HV_K_SYNCWAIT] = enabled;
+         for (int round = 0; round < 12; round++) {
+@@ -55,6 +85,21 @@ int main(void) {
      }
      assert(m.percpu[0].sync_sleeps && m.percpu[0].sync_timeouts);
      assert(!m.percpu[0].sync_errors);
@@ -10504,19 +10943,20 @@ index 01aead4..b1daca1 100644
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..522e75b 100644
+index a13a70d..6717ec3 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
-@@ -3,6 +3,8 @@
+@@ -3,6 +3,9 @@
  #include "install.h"
  #include "jit_region.h"
  #include "vm.h"
 +#include "disk.h"
 +#include "dispatch.h"
++#include "snapshot.h"
  
  #include <fcntl.h>
  #include <mach/mach.h>
-@@ -12,13 +14,41 @@
+@@ -12,13 +15,68 @@
  #include <stdlib.h>
  #include <string.h>
  #include <unistd.h>
@@ -10527,6 +10967,33 @@ index a13a70d..522e75b 100644
  /* Real native bridge and device workers; only the debugger allocation and
     unused installer entry point are replaced. No Apple ROM or disk needed. */
 +extern void hv_snapshot_test_fail_after(int n);
++extern void hv_snapshot_test_progress(void (*hook)(uint64_t));
++static pthread_mutex_t save_gate_mu = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t save_gate_cv = PTHREAD_COND_INITIALIZER;
++static int save_gate_entered, save_gate_release;
++static HengeSaveRequest *saving_request;
++static const char *saving_path;
++static int save_result;
++static char save_error[256];
++static void save_gate(uint64_t scanned) {
++    if (scanned < (4u << 20)) return;
++    pthread_mutex_lock(&save_gate_mu);
++    save_gate_entered = 1; pthread_cond_broadcast(&save_gate_cv);
++    while (!save_gate_release) pthread_cond_wait(&save_gate_cv,&save_gate_mu);
++    pthread_mutex_unlock(&save_gate_mu);
++}
++static void *save_on_thread(void *unused) {
++    (void)unused;
++    save_result=henge_vm_save_run(saving_request,saving_path,"test",save_error,sizeof save_error);
++    return NULL;
++}
++typedef struct CancelAtProgress { _Atomic int cancelled; uint64_t scanned; } CancelAtProgress;
++static int cancel_at_progress(void *p) { return atomic_load(&((CancelAtProgress *)p)->cancelled); }
++static void cancel_after_chunk(uint64_t scanned,uint64_t total,void *p) {
++    CancelAtProgress *c=p;
++    if (scanned > c->scanned) c->scanned=scanned;
++    if (scanned >= (4u << 20) && scanned<total) atomic_store(&c->cancelled,1);
++}
  static HvJitRegion jit;
  static HengeDualMapping mapping;
  static int failures;
@@ -10558,7 +11025,7 @@ index a13a70d..522e75b 100644
  HengeDualMapping *henge_ios_jit_get_mapping(void) { return &mapping; }
  void hv_prof_ios_start(void) {}
  int hv_install_start(HvVirtioUsb *usb, const char *ipsw, const char *work, uint64_t ecid,
-@@ -58,6 +88,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
+@@ -58,6 +116,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
      if (fd < 0 || (data && write(fd, data, bytes) != (ssize_t)bytes) || ftruncate(fd, bytes)) exit(1);
      close(fd);
  }
@@ -10596,7 +11063,7 @@ index a13a70d..522e75b 100644
  static void *read_ui(void *unused) {
      (void)unused;
      while (!atomic_load(&reader_done)) {
-@@ -69,6 +130,8 @@ static void *read_ui(void *unused) {
+@@ -69,6 +158,8 @@ static void *read_ui(void *unused) {
          henge_vm_cpus_on();
          henge_vm_link_connected(0);
          henge_vm_gpu_frames();
@@ -10605,7 +11072,7 @@ index a13a70d..522e75b 100644
          henge_vm_balloon(-1);
          henge_vm_set_display_layer(NULL);
          if (!henge_vm_boot_display(&pixels, &width, &height, &stride)) henge_vm_free_display(pixels);
-@@ -76,8 +139,11 @@ static void *read_ui(void *unused) {
+@@ -76,8 +167,11 @@ static void *read_ui(void *unused) {
      }
      return NULL;
  }
@@ -10618,7 +11085,7 @@ index a13a70d..522e75b 100644
      char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
      if (!mkdtemp(dir) || hv_jit_region_open(&jit, 8 << 20)) return 1;
      snprintf(rom, sizeof rom, "%s/rom", dir);
-@@ -91,6 +157,10 @@ int main(void) {
+@@ -91,6 +185,10 @@ int main(void) {
      write_file(aux, NULL, 1 << 20);
      mapping = (HengeDualMapping){.rx_addr = (uint8_t *)jit.base,
          .rw_addr = (uint8_t *)jit.base + jit.rw_diff, .size = jit.capacity * 4};
@@ -10629,7 +11096,7 @@ index a13a70d..522e75b 100644
      pthread_t reader;
      if (pthread_create(&reader, NULL, read_ui, NULL)) return 1;
      /* Warm the process-wide pointer queue before counting worker threads. */
-@@ -102,6 +172,7 @@ int main(void) {
+@@ -102,6 +200,7 @@ int main(void) {
      /* Missing ROM fails after disks, RAM and device workers were created. */
      for (int i = 0; i < 3; i++) {
          check("failed boot reports an error", henge_vm_boot(rom, disk, aux, 1, 0, 64, 4, error, sizeof error) != 0);
@@ -10637,7 +11104,7 @@ index a13a70d..522e75b 100644
          check("failed boot allows retry", henge_vm_state() == 0 && henge_vm_can_start());
          check("failed boot closes files", fds() == initial_fds);
          check("failed boot joins workers", threads() == initial_threads);
-@@ -150,8 +221,28 @@ int main(void) {
+@@ -150,8 +249,28 @@ int main(void) {
          write_file(rom, code, sizeof code);
          int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          check("resume test boots", rc == 0);
@@ -10666,11 +11133,50 @@ index a13a70d..522e75b 100644
          henge_vm_mouse_button(1, 1);
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "suspend: %s\n", error);
-@@ -160,18 +251,54 @@ int main(void) {
+@@ -160,35 +279,105 @@ int main(void) {
              fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\n");
              return 1;
          }
 -        check("pause releases queued right-Control", !(hv_vm_board()->usb->state[0] & (1u << 4)));
++        uint64_t session_generation=henge_vm_generation();
++        struct stat original; check("saved file stats",!stat(snap,&original));
++        CancelAtProgress cancellation={0};
++        HvSnapshotControl control={.cancelled=cancel_at_progress,.progress=cancel_after_chunk,.context=&cancellation,.workers=1,.background=1};
++        check("cancel mid-save leaves the original complete file",hv_snapshot_save_controlled(snap,"test",&control,error,sizeof error)!=0 &&
++              strstr(error,"cancelled") && cancellation.scanned>0 && henge_vm_saved_ok(snap,"test",NULL,NULL)==0);
++        struct stat after_cancel;check("cancellation does not replace the previous save",!stat(snap,&after_cancel) &&
++              original.st_ino==after_cancel.st_ino && original.st_size==after_cancel.st_size);
++        char partial[320];snprintf(partial,sizeof partial,"%s.part",snap);
++        check("cancel removes only the partial file",access(partial,F_OK)!=0);
++        saving_request=henge_vm_save_request(session_generation,1);saving_path=snap;
++        if (!saving_request) return 1;
++        save_gate_entered=save_gate_release=0;hv_snapshot_test_progress(save_gate);
++        pthread_t saving_thread;if (pthread_create(&saving_thread,NULL,save_on_thread,NULL)) return 1;
++        pthread_mutex_lock(&save_gate_mu);
++        while (!save_gate_entered) pthread_cond_wait(&save_gate_cv,&save_gate_mu);
++        pthread_mutex_unlock(&save_gate_mu);
++        HengeSaveProgress saving;henge_vm_save_progress(saving_request,&saving);
++        check("progress is readable without waiting for the VM save lock",saving.phase==1 && saving.scanned>0 && saving.scanned<=saving.total);
++        henge_vm_save_cancel(saving_request);
++        henge_vm_save_progress(saving_request,&saving);
++        check("cancellation never waits for the snapshot writer",saving.cancelled);
++        pthread_mutex_lock(&save_gate_mu);save_gate_release=1;pthread_cond_broadcast(&save_gate_cv);pthread_mutex_unlock(&save_gate_mu);
++        pthread_join(saving_thread,NULL);hv_snapshot_test_progress(NULL);
++        henge_vm_save_progress(saving_request,&saving);
++        check("cancelled save returns paused without publishing partial state",save_result!=0 && saving.phase==3 &&
++              henge_vm_state()==4 && henge_vm_saved_ok(snap,"test",NULL,NULL)==0 && access(partial,F_OK)!=0);
++        check("save request is one shot",henge_vm_save_run(saving_request,snap,"test",error,sizeof error)!=0);
++        henge_vm_save_free(saving_request);saving_request=NULL;
++        char inspected_ident[1024];HengeSavedInfo saved_info;
++        check("saved configuration can be inspected without allocating a VM",!henge_vm_saved_info(snap,inspected_ident,sizeof inspected_ident,&saved_info) &&
++              !strcmp(inspected_ident,"test") && saved_info.ram_mb==64 && saved_info.cpus==2 && saved_info.bytes>0);
++        check("stale generation cannot pause, resume, restore graphics or stop this Mac",
++              henge_vm_pause_generation(session_generation+1,error,sizeof error)!=0 &&
++              henge_vm_continue_generation(session_generation+1,snap,error,sizeof error)!=0 &&
++              henge_vm_foreground_generation(session_generation+1)!=0 &&
++              henge_vm_stop_generation(session_generation+1)!=0 && henge_vm_state()==4);
++        check("failed saved-file invalidation keeps the Mac paused",henge_vm_continue_generation(session_generation,dir,error,sizeof error)!=0 &&
++              henge_vm_state()==4 && strstr(error,"invalidated"));
 +        uint8_t released[8] = {0};
 +        check("pause releases all keys/modifiers", !memcmp(hv_vm_board()->usb->state, released, sizeof released));
 +        check("pause releases touch/button", !hv_vm_board()->usb->tp_button && !hv_vm_board()->usb->tp_fingers[0].in);
@@ -10723,14 +11229,19 @@ index a13a70d..522e75b 100644
          check("a paused Mac stops", henge_vm_state() == 2 && hv_vm_board()->ram == NULL);
          uint64_t bytes = 0;
          check("the save is whole", henge_vm_saved_ok(snap, "test", &bytes, NULL) == 0 && bytes > 0);
-@@ -183,12 +310,14 @@ int main(void) {
-         rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
-         usleep(30000);
-         rc |= henge_vm_suspend(snap, "test", error, sizeof error);
-+        if (rc || henge_vm_state() != 4 || !hv_vm_board()->ram) return 1;
-         c2 = *(volatile uint64_t *)hv_vm_board()->ram;
-         henge_vm_stop();
-         rc |= henge_vm_resume(rom, disk, aux, 1, 0, 64, 2, snap, "test", error, sizeof error);
+         check("another ident is refused", henge_vm_saved_ok(snap, "other", NULL, NULL) != 0);
+         rc = henge_vm_resume(rom, disk, aux, 1, 0, 64, 2, snap, "other", error, sizeof error);
+         check("resume with another ident fails and leaves it startable", rc != 0 && henge_vm_can_start());
+-        check("a failed resume uses the file up too", access(snap, F_OK) != 0);
+-        /* Save again (the failed resume took the file), then resume it properly. */
+-        rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
+-        usleep(30000);
+-        rc |= henge_vm_suspend(snap, "test", error, sizeof error);
+-        c2 = *(volatile uint64_t *)hv_vm_board()->ram;
+-        henge_vm_stop();
+-        rc |= henge_vm_resume(rom, disk, aux, 1, 0, 64, 2, snap, "test", error, sizeof error);
++        check("failed resume preserves the complete saved state for recovery", access(snap, F_OK) == 0);
++        rc = henge_vm_resume(rom, disk, aux, 1, 0, 64, 2, snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "resume: %s\n", error);
          check("resume starts the saved Mac", rc == 0 && henge_vm_state() == 1);
          check("the file is used once", access(snap, F_OK) != 0);
@@ -10738,7 +11249,7 @@ index a13a70d..522e75b 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +338,78 @@ int main(void) {
+@@ -209,6 +398,78 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);
