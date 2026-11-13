@@ -1,0 +1,100 @@
+name: Henge desktop Retina and pointer model checks
+'on':
+  push:
+    branches:
+    - validation/desktop-retina-038
+permissions:
+  contents: read
+concurrency:
+  group: henge-desktop-retina-038
+  cancel-in-progress: true
+jobs:
+  layout:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: build-request
+        persist-credentials: false
+        ref: 2d12dd8710beb44296623df924776d74ef884d1d
+    - id: pins
+      run: "python3 - <<'PYPIN'\nimport json,os\nm=json.load(open('build-request/henge-build/manifest.json'))\nwith open(os.environ['GITHUB_OUTPUT'],'a')\
+        \ as f:\n    f.write('henge='+m['henge_sha']+'\\n')\n    f.write('preview='+str(m.get('ui_preview_requested',True)).lower()+'\\\
+        n')\nPYPIN"
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Henge
+        ref: ${{ steps.pins.outputs.henge }}
+        path: Henge
+        persist-credentials: false
+    - name: Reconstruct exact pinned and patched source
+      run: 'set -euo pipefail
+
+        python3 - <<''PYPATCH''
+
+        from pathlib import Path
+
+        import hashlib,json,subprocess
+
+        root=Path(''build-request/henge-build'');m=json.loads((root/''manifest.json'').read_text());p=root/''henge.patch''
+
+        assert hashlib.sha256(p.read_bytes()).hexdigest()==m[''patch_sha256'']
+
+        subprocess.run([''git'',''-C'',''Henge'',''apply'',''--check'',str(p.resolve())],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''apply'',str(p.resolve())],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''add'',''-A''],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''-c'',''user.name=Henge CI'',''-c'',''user.email=henge-ci@users.noreply.github.com'',''commit'',''-m'',''Apply
+        pinned custom source for controller review''],check=True)
+
+        PYPATCH
+
+        bash build-request/henge-build/integrate-upstream.sh
+
+        '
+    - name: Execute actual desktop sizing and input ownership models
+      working-directory: Henge
+      run: 'set -euo pipefail
+
+        mkdir -p build
+
+        exec > >(tee build/desktop-layout.log) 2>&1
+
+        test "$(git -C ../build-request rev-parse HEAD)" = 2d12dd8710beb44296623df924776d74ef884d1d
+
+        swiftc -parse-as-library -swift-version 5 ios/Henge/GuestScreenSize.swift tests/test_guest_screen.swift -o build/test_guest_screen
+
+        build/test_guest_screen
+
+        swiftc -parse-as-library -swift-version 5 ios/Henge/PhysicalMouseButtons.swift tests/test_physical_mouse_buttons.swift
+        -o build/test_physical_mouse_buttons
+
+        build/test_physical_mouse_buttons
+
+        python3 - <<''PROOF''
+
+        import hashlib,json
+
+        from pathlib import Path
+
+        m=json.loads(Path(''../build-request/henge-build/manifest.json'').read_text())
+
+        p=Path(''../build-request/henge-build/audit-repairs.patch'')
+
+        assert hashlib.sha256(p.read_bytes()).hexdigest()==m[''audit_repairs_sha256'']
+
+        print(''DESKTOP_SOURCE_PROOF'',json.dumps({''source'':''2d12dd8710beb44296623df924776d74ef884d1d'',''patch_sha256'':m[''audit_repairs_sha256''],''desktop_layout'':''passed'',''pointer_model'':''passed''}))
+
+        PROOF
+
+        '
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: Henge-desktop-layout-source-2d12dd87
+        path: Henge/build/*.log
+        retention-days: 7
+        if-no-files-found: error
