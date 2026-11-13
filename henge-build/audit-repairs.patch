@@ -5776,10 +5776,10 @@ index 0000000..a79226b
 +remote-server latency, guest decompression and I/O queueing are not directly timed.
 diff --git a/docs/upstream-desktop/PROGRESS.md b/docs/upstream-desktop/PROGRESS.md
 new file mode 100644
-index 0000000..ade96b4
+index 0000000..05fe76d
 --- /dev/null
 +++ b/docs/upstream-desktop/PROGRESS.md
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,172 @@
 +# Desktop integration after 0.3.5
 +
 +Base delivered commit a3fd806, patch c09b2eb. Latest upstream main e98920c.
@@ -5938,6 +5938,20 @@ index 0000000..ade96b4
 +all warm cache hits, execute both compute states, exercise fallback/pressure/stop,
 +and require cold compute hits on physical GPUs. No product fast path is disabled.
 +Real M4/Duo cold compute persistence is a hardware-only performance validation.
++
++Follow-up run43348358520: executing both compute kernels before saving made ALL
++four production PSOs reload with real cold hits in all cycles and fresh processes.
++Their numeric outputs were verified on the GPU. The production fixture now models
++real pipeline use; ALL FOUR cold-hit assertions are retained unconditionally
++(no capability/environment exception). Independent API controls still reproduce
++Paravirtual missing-function behavior for compute and occasionally the second
++render format, despite successful save; every such case must execute its ordinary
++fallback correctly. This adapter-specific public-API observation does not relax
++the actual production cache hit tests. Physical latency gains remain unmeasured.
++Added a real disposable raw-image/APFS integration test: vendor-created filesystems,
++Recovery relocation, diskutil root-container growth and mounted payload/filesystem
++verification, with strict image-to-device ownership. This tests actual APFS data
++without pretending to boot a complete Recovery OS.
 diff --git a/docs/upstream-review/2026-11-12-decisions.md b/docs/upstream-review/2026-11-12-decisions.md
 new file mode 100644
 index 0000000..6a2a3d7
@@ -13340,14 +13354,14 @@ index 34d6a98..4a2af4e 100644
 +    hv_vm_release_input_source(source);pthread_rwlock_unlock(&api_lock);
 +}
 diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
-index b8c41fa..eec2c83 100644
+index b8c41fa..fc1a20d 100644
 --- a/ios/Henge/Native/henge-vm.h
 +++ b/ios/Henge/Native/henge-vm.h
 @@ -4,6 +4,7 @@
  
  #include <stddef.h>
  #include <stdint.h>
-+#include "disk_resize.h"
++#include "../../../host/disk_resize.h"
  
  /* Builds the machine from imported files, on the JIT region the app holds
     (henge_ios_jit_prewarm), and starts it. 0, or -1 with a reason in err. */
@@ -16436,6 +16450,132 @@ index bd64ae5..3bb545e 100644
 -    puts("CPU sync: spinning/sleeping, acknowledgement, parked target, missed notification, own requests and tagged multiwindow/PAN cache clears passed");
 +    puts("CPU sync: acknowledgement, parked target, missing notifications, 64 deterministic check-to-syscall races, own requests and multiwindow/PAN clears passed");
  }
+diff --git a/tests/test_disk_recovery_macos.py b/tests/test_disk_recovery_macos.py
+new file mode 100644
+index 0000000..b7a9a21
+--- /dev/null
++++ b/tests/test_disk_recovery_macos.py
+@@ -0,0 +1,120 @@
++"""Real APFS integration on an isolated disposable raw image, never the host disk.
++The Recovery container has real APFS data but no bootable Recovery OS: boot policy
++and firmware recovery remain physical-guest validation, not claims of this test.
++"""
++from pathlib import Path
++import os
++import plistlib
++import re
++import struct
++import subprocess
++import sys
++import tempfile
++import uuid
++import zlib
++
++if sys.platform != 'darwin':
++    raise SystemExit('This real APFS integration test requires macOS')
++ROOT=Path(__file__).resolve().parents[1]
++DRIVER=ROOT/'build/disk-resize/grow'
++assert DRIVER.is_file(), 'Run test_disk_resize.py to build the production driver first'
++RECOVERY=bytes.fromhex('727663520079aa11aa1100306543ecac')
++
++def run(*args,plist=False):
++    result=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=180)
++    if result.returncode:
++        raise RuntimeError(f'{args!r}: {result.stderr.decode(errors="replace")} {result.stdout.decode(errors="replace")}')
++    return plistlib.loads(result.stdout) if plist else result.stdout.decode(errors='replace')
++
++def attach(image):
++    info=run('hdiutil','attach','-imagekey','diskimage-class=CRawDiskImage','-nomount','-plist',str(image),plist=True)
++    entities=info['system-entities']
++    devices=[v['dev-entry'] for v in entities if re.fullmatch(r'/dev/disk[0-9]+',v.get('dev-entry','')) and v.get('content-hint')=='GUID_partition_scheme']
++    if not devices:
++        # An initially blank raw image has no partition-scheme hint yet.
++        first=entities[0];assert not first.get('content-hint') and re.fullmatch(r'/dev/disk[0-9]+',first.get('dev-entry','')),info
++        devices=[first['dev-entry']]
++    assert len(devices)==1,info
++    # Bind every mutating command to the whole device returned for OUR image.
++    device=devices[0]
++    images=run('hdiutil','info','-plist',plist=True)['images']
++    owned=[v for v in images if Path(v.get('image-path','')).resolve()==image.resolve()]
++    assert len(owned)==1 and any(v.get('dev-entry')==device for v in owned[0]['system-entities'])
++    return device
++
++def containers(device):
++    prefix=device.removeprefix('/dev/')+'s'
++    return [c for c in run('diskutil','apfs','list','-plist',plist=True)['Containers']
++            if any(p.get('DeviceIdentifier','').startswith(prefix) for p in c.get('PhysicalStores',[]))]
++
++def named(device,name):
++    matches=[(c,v) for c in containers(device) for v in c.get('Volumes',[]) if v.get('Name')==name]
++    assert len(matches)==1,(name,containers(device))
++    return matches[0]
++
++def mounted(volume,name):
++    identifier=volume['DeviceIdentifier'];run('diskutil','mount',identifier)
++    info=run('diskutil','info','-plist',identifier,plist=True)
++    assert info['VolumeName']==name and info['MountPoint'].startswith('/Volumes/')
++    return Path(info['MountPoint'])
++
++def mark_recovery(image):
++    # Offline GPT-only type update models the real trailing Recovery partition.
++    # The Apple APFS filesystem itself was created by diskutil, not our fixture.
++    with image.open('r+b') as f:
++        f.seek(512);primary=bytearray(f.read(512));f.seek(image.stat().st_size-512);backup=bytearray(f.read(512))
++        count,stride=struct.unpack_from('<II',primary,80)
++        f.seek(struct.unpack_from('<Q',primary,72)[0]*512);entries=bytearray(f.read(count*stride))
++        apfs=bytes.fromhex('ef57347c0000aa11aa1100306543ecac')
++        indexes=[i for i in range(count) if entries[i*stride:i*stride+16]==apfs]
++        assert len(indexes)==2
++        index=max(indexes,key=lambda i:struct.unpack_from('<Q',entries,i*stride+40)[0])
++        entries[index*stride:index*stride+16]=RECOVERY
++        identity=bytes(entries[index*stride+16:index*stride+32])
++        for header,offset in [(primary,512),(backup,image.stat().st_size-512)]:
++            struct.pack_into('<I',header,88,zlib.crc32(entries));struct.pack_into('<I',header,16,0)
++            struct.pack_into('<I',header,16,zlib.crc32(header[:struct.unpack_from('<I',header,12)[0]]))
++            f.seek(struct.unpack_from('<Q',header,72)[0]*512);f.write(entries);f.seek(offset);f.write(header)
++        f.flush();os.fsync(f.fileno())
++    return identity
++
++with tempfile.TemporaryDirectory(prefix='henge-apfs-integration-') as directory:
++    image=Path(directory)/'test.img'
++    with image.open('wb') as f:f.truncate(1<<30)
++    device=None;tag=uuid.uuid4().hex[:10];main_name='HengeMain-'+tag;recovery_name='HengeRecovery-'+tag
++    payload=os.urandom(65536)
++    try:
++        device=attach(image)
++        run('diskutil','partitionDisk',device,'GPT','APFS',main_name,'384m','APFS',recovery_name,'R')
++        main,main_vol=named(device,main_name);recovery,recovery_vol=named(device,recovery_name)
++        original_capacity=main['CapacityCeiling'];recovery_capacity=recovery['CapacityCeiling']
++        recovery_uuid=recovery['APFSContainerUUID']
++        for volume,name in [(main_vol,main_name),(recovery_vol,recovery_name)]:
++            path=mounted(volume,name)/'henge-verification.bin'
++            with path.open('wb') as f:f.write(payload);f.flush();os.fsync(f.fileno())
++        run('hdiutil','detach',device);device=None
++        recovery_identity=mark_recovery(image)
++        run(str(DRIVER),str(image),str(2<<30))
++        inspect=list(map(int,run(str(DRIVER),str(image),'inspect').split()))
++        assert inspect[6]==1,inspect
++        run(str(DRIVER),str(image),'prepare')
++        assert Path(str(image)+'.before-expansion').exists() and Path(str(image)+'.before-apfs-expansion').exists()
++        device=attach(image)
++        main,main_vol=named(device,main_name);recovery,recovery_vol=named(device,recovery_name)
++        assert recovery['APFSContainerUUID']==recovery_uuid and recovery['CapacityCeiling']==recovery_capacity
++        run('diskutil','apfs','resizeContainer',main['ContainerReference'],'0')
++        main,main_vol=named(device,main_name);recovery,recovery_vol=named(device,recovery_name)
++        assert main['CapacityCeiling']>original_capacity+(512<<20),(original_capacity,main)
++        for volume,name in [(main_vol,main_name),(recovery_vol,recovery_name)]:
++            assert (mounted(volume,name)/'henge-verification.bin').read_bytes()==payload
++            run('diskutil','verifyVolume',volume['DeviceIdentifier'])
++        run('hdiutil','detach',device);device=None
++        with image.open('rb') as f:
++            f.seek(512);h=f.read(512);count,stride=struct.unpack_from('<II',h,80)
++            f.seek(struct.unpack_from('<Q',h,72)[0]*512);entries=f.read(count*stride)
++            recovery_entries=[entries[i*stride:(i+1)*stride] for i in range(count) if entries[i*stride:i*stride+16]==RECOVERY]
++            assert len(recovery_entries)==1 and recovery_entries[0][16:32]==recovery_identity
++        print('PASS real APFS expansion: production Recovery relocation, native diskutil container growth, both mounted payloads and filesystem verification, Recovery UUID/GPT identity preserved')
++    finally:
++        if device:
++            subprocess.run(['hdiutil','detach','-force',device],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)
 diff --git a/tests/test_disk_resize.py b/tests/test_disk_resize.py
 new file mode 100644
 index 0000000..70db131
@@ -18385,10 +18525,10 @@ index 0000000..425a58c
 +}
 diff --git a/tests/test_pipeline_archive.py b/tests/test_pipeline_archive.py
 new file mode 100644
-index 0000000..ede2f38
+index 0000000..fd66a5c
 --- /dev/null
 +++ b/tests/test_pipeline_archive.py
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,20 @@
 +"""Actual production replay across fresh native processes, not an API mock."""
 +from pathlib import Path
 +import os,subprocess,tempfile
@@ -18409,14 +18549,12 @@ index 0000000..ede2f38
 +    assert not oversized.exists() and not bad.exists() and not (Path(directory)/'v0-obsolete.bin').exists()
 +    assert sum(p.stat().st_size for p in Path(directory).glob('*.bin'))<=128<<20
 +print('PASS production persistent Metal archive: fresh-process hits, corrupt/stale rejection, bounded disk and normal compilation fallback')
-+
-+if os.environ.get("HENGE_TEST_COLD_COMPUTE_ARCHIVE_UNSUPPORTED")=="1":print("Cloud Paravirtual adapter: cold compute persistence unverified on physical GPU; independent API proved missing-function limit; both compute outputs and warm hits tested")
 diff --git a/tests/test_pipeline_archive_api.m b/tests/test_pipeline_archive_api.m
 new file mode 100644
-index 0000000..29b8129
+index 0000000..441e7e2
 --- /dev/null
 +++ b/tests/test_pipeline_archive_api.m
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,83 @@
 +/* Independent public Metal API probe: distinguishes a replay integration defect
 +   from a host adapter that cannot reopen its own binary archives. */
 +#import <Foundation/Foundation.h>
@@ -18478,9 +18616,7 @@ index 0000000..29b8129
 +  }
 +  if(write&&delayed)for(unsigned i=0;i<4;i++)assert([(id<MTLBinaryArchive>)archives[i] serializeToURL:urls[i] error:&error]);
 +  if(missing_compute||missing_render)printf("Independent adapter archive limit: compute=%u render=%u; all four PSOs executed correctly through checked fallback\n",missing_compute,missing_render);
-+  /* A render miss is not an established limitation of this adapter. */
-+  if(missing_render)return 79;
-+  return missing_compute?78:0;
++  return (missing_compute||missing_render)?78:0;
 + }
 + NSURL *url=[NSURL fileURLWithPath:@(argv[2])];MTLBinaryArchiveDescriptor *ad=[MTLBinaryArchiveDescriptor new];
 + if(!write)ad.url=url;
@@ -18562,7 +18698,7 @@ index 553c4b6..64d0cb9 100644
 + puts("iOS profiler lifecycle: off/on/off/on, port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
  }
 diff --git a/tests/test_pvg_lifecycle.m b/tests/test_pvg_lifecycle.m
-index 81cdb83..34811cd 100644
+index 81cdb83..0d93421 100644
 --- a/tests/test_pvg_lifecycle.m
 +++ b/tests/test_pvg_lifecycle.m
 @@ -1,9 +1,16 @@
@@ -18582,7 +18718,7 @@ index 81cdb83..34811cd 100644
  
  /* Exercise real Metal command completion while the guest board is destroyed.
     Empty execs avoid simulator limitations on guest buffer-backed textures. */
-@@ -11,8 +18,201 @@ static HvMachine machine;
+@@ -11,8 +18,199 @@ static HvMachine machine;
  static HvCpu cpus[2];
  static HvVmapple board;
  
@@ -18665,7 +18801,6 @@ index 81cdb83..34811cd 100644
 +        if(cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN"))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>0);
 +        assert([cache pipelineState:0xe descriptor:render error:&error] && !error);
 +        assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>0);
-+        BOOL compute_cold_supported=!(getenv("HENGE_TEST_COLD_COMPUTE_ARCHIVE_UNSUPPORTED") && !strcmp(getenv("HENGE_TEST_COLD_COMPUTE_ARCHIVE_UNSUPPORTED"),"1") && [device.name containsString:@"Paravirtual"]);
 +        void(^execute_compute)(id,uint32_t)=^(id pipeline,uint32_t expected){
 +            id<MTLBuffer> output=[device newBufferWithLength:4 options:MTLResourceStorageModeShared];assert(output);*(uint32_t *)output.contents=0;
 +            id<MTLCommandQueue> queue=[device newCommandQueue];id<MTLCommandBuffer> cb=[queue commandBuffer];id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
@@ -18674,7 +18809,7 @@ index 81cdb83..34811cd 100644
 +        MTLComputePipelineDescriptor *compute=[MTLComputePipelineDescriptor new];compute.computeFunction=function(@"ak");
 +        uint64_t before_compute=[[replay valueForKey:@"pipes_hit"]unsignedLongLongValue];
 +        id compute_state=[cache pipelineState:0xb descriptor:compute error:&error];assert(compute_state && !error);
-+        if(compute_cold_supported && (cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN")))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_compute);
++        if(cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN"))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_compute);
 +        execute_compute(compute_state,7);
 +        uint64_t before_warm=[[replay valueForKey:@"pipes_hit"]unsignedLongLongValue];
 +        assert([cache pipelineState:0xb descriptor:compute error:&error] && !error);
@@ -18688,12 +18823,11 @@ index 81cdb83..34811cd 100644
 +        MTLComputePipelineDescriptor *other_compute=[MTLComputePipelineDescriptor new];other_compute.computeFunction=function(@"ak2");
 +        before_other=[[replay valueForKey:@"pipes_hit"]unsignedLongLongValue];
 +        other=[cache pipelineState:0xb descriptor:other_compute error:&error];assert(other && !error);
-+        if(compute_cold_supported && (cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN")))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_other);
++        if(cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN"))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_other);
 +        execute_compute(other,8);
 +        before_warm=[[replay valueForKey:@"pipes_hit"]unsignedLongLongValue];
 +        assert([cache pipelineState:0xb descriptor:other_compute error:&error] && !error);
 +        assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_warm);
-+        if(!compute_cold_supported)puts("Cloud adapter cold compute persistence unavailable: both production compute states executed and checked; render cold hits remain required");
 +        [cache saveArchive];assert(![replay valueForKey:@"archive_save_timer"]);
 +        render.fragmentFunction=nil;render.vertexFunction=function(@"anr");render.rasterizationEnabled=NO;
 +        id fragmentless=[cache pipelineState:0xe descriptor:render error:&error];
@@ -18785,7 +18919,7 @@ index 81cdb83..34811cd 100644
      for (int cycle = 0; cycle < 6; cycle++) @autoreleasepool {
          HvCfgParams cfg = {.nr_cpus = 2};
          if (hv_machine_init(&machine, 4 << 20) ||
-@@ -20,19 +220,69 @@ int main(void) {
+@@ -20,19 +218,69 @@ int main(void) {
          hv_vmapple_reset_cpu(&board);
          HvPvgMetal *metal = hv_pvg_metal_create(board.pvg);
          if (!metal) { fprintf(stderr, "Metal replay unavailable; lifecycle test cannot run\n"); return 1; }
