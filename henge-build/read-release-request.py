@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 
@@ -33,8 +34,12 @@ def main():
     source=state.get('final_validation',{}).get('source_commit');answer=False
     def git(*args):return subprocess.check_output(['git','-C',str(repo),*args],text=True).strip()
     if state.get('release_requested') and source:
-        parents=git('show','-s','--format=%P','HEAD').split()
-        subprocess.run(['git','-C',str(repo),'merge-base','--is-ancestor',source,'HEAD'],check=True)
+        assert re.fullmatch(r'[0-9a-f]{40}',source), 'Invalid validation source'
+        # Pretty-format %P hides parents at a shallow boundary. Raw commit
+        # objects retain them; fetch just the validated tree for a frozen diff.
+        parents=re.findall(r'^parent ([0-9a-f]{40})$',git('cat-file','-p','HEAD'),re.M)
+        available=subprocess.run(['git','-C',str(repo),'cat-file','-e',source+'^{commit}'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
+        if not available:subprocess.run(['git','-C',str(repo),'fetch','--no-tags','--depth=1','origin',source],check=True)
         changed=git('diff','--name-only',source,'HEAD').splitlines()
         validated=json.loads(git('show',source+':henge-build/manifest.json'))
         digest=hashlib.sha256((root/'audit-repairs.patch').read_bytes()).hexdigest()
