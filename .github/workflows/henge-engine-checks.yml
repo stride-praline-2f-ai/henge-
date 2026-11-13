@@ -1,0 +1,67 @@
+name: Henge engine foundation comparisons
+'on':
+  push:
+    branches:
+    - feature/m4-ultra-efficiency
+    paths:
+    - henge-build/**
+    - .github/workflows/henge-engine-checks.yml
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: henge-engine-foundation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  engine:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: build-request
+        persist-credentials: false
+    - id: pins
+      run: "python3 - <<'PYPIN'\nimport json,os\nm=json.load(open('build-request/henge-build/manifest.json'))\nwith open(os.environ['GITHUB_OUTPUT'],'a') as f:\n    f.write('henge='+m['henge_sha']+'\\n')\n    f.write('preview='+str(m.get('ui_preview_requested',True)).lower()+'\\n')\nPYPIN"
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Henge
+        ref: ${{ steps.pins.outputs.henge }}
+        path: Henge
+        persist-credentials: false
+    - name: Reconstruct exact pinned and patched source
+      run: 'set -euo pipefail
+
+        python3 - <<''PYPATCH''
+
+        from pathlib import Path
+
+        import hashlib,json,subprocess
+
+        root=Path(''build-request/henge-build'');m=json.loads((root/''manifest.json'').read_text());p=root/''henge.patch''
+
+        assert hashlib.sha256(p.read_bytes()).hexdigest()==m[''patch_sha256'']
+
+        subprocess.run([''git'',''-C'',''Henge'',''apply'',''--check'',str(p.resolve())],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''apply'',str(p.resolve())],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''add'',''-A''],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''-c'',''user.name=Henge CI'',''-c'',''user.email=henge-ci@users.noreply.github.com'',''commit'',''-m'',''Apply pinned custom source for controller review''],check=True)
+
+        PYPATCH
+
+        bash build-request/henge-build/integrate-upstream.sh
+
+        '
+    - name: Focused JIT memory reference and selected-group checks
+      working-directory: Henge
+      run: "set -euo pipefail\nmkdir -p build\nexec > >(tee build/engine-foundation.log) 2>&1\nulimit -s 65520\nmake -j4 build/test_jit_ring build/test_register_groups build/test_mem build/test_mmu build/test_bench\nbuild/test_jit_ring\nbuild/test_register_groups\nfor mode in 0 1 2; do\n  HV_GROUPS=$mode build/test_mem\n  HV_GROUPS=$mode build/test_mmu\n  for round in 0 1 2; do\n    HV_GROUPS=$mode build/test_bench > \"build/engine-groups-$mode-$round.log\"\n    cat \"build/engine-groups-$mode-$round.log\"\n  done\ndone\n"
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: Henge-engine-foundation-${{ github.sha }}
+        path: Henge/build/*.log
+        retention-days: 7
+        if-no-files-found: error

@@ -17,8 +17,6 @@ permissions:
         default: false
 concurrency:
   group: henge-gamepad-previews-${{ github.ref }}
-  # Failure evidence from the prior run is retained in artifacts; newer source
-  # supersedes previews containing the diagnosed layout/input defect.
   cancel-in-progress: true
 jobs:
   source:
@@ -30,15 +28,7 @@ jobs:
         path: build-request
         persist-credentials: false
     - id: pins
-      run: 'python3 - <<''PYPIN''
-
-        import json,os
-
-        m=json.load(open(''build-request/henge-build/manifest.json''))
-
-        with open(os.environ[''GITHUB_OUTPUT''],''a'') as f:f.write(''henge=''+m[''henge_sha'']+''\n'')
-
-        PYPIN'
+      run: "python3 - <<'PYPIN'\nimport json,os\nm=json.load(open('build-request/henge-build/manifest.json'))\nwith open(os.environ['GITHUB_OUTPUT'],'a') as f:\n    f.write('henge='+m['henge_sha']+'\\n')\n    f.write('preview='+str(m.get('ui_preview_requested',True)).lower()+'\\n')\nPYPIN"
     - uses: actions/checkout@v4
       with:
         repository: Leviidev/Henge
@@ -64,16 +54,13 @@ jobs:
 
         subprocess.run([''git'',''-C'',''Henge'',''add'',''-A''],check=True)
 
-        subprocess.run([''git'',''-C'',''Henge'',''-c'',''user.name=Henge CI'',''-c'',''user.email=henge-ci@users.noreply.github.com'',''commit'',''-m'',''Apply
-        pinned custom source for controller review''],check=True)
+        subprocess.run([''git'',''-C'',''Henge'',''-c'',''user.name=Henge CI'',''-c'',''user.email=henge-ci@users.noreply.github.com'',''commit'',''-m'',''Apply pinned custom source for controller review''],check=True)
 
         PYPATCH
 
         bash build-request/henge-build/integrate-upstream.sh
 
-        tar -czf gamepad-source.tgz -C Henge ios/Henge/Components ios/Henge/Controls ios/Henge/Link/LinkProtocol.swift devices/gamepad.h
-        devices/gamepad_ds4.h tests/test_gamepad.c tests/test_gamepad_tuning.swift tests/gamepad-preview tools/preview_gamepad.py
-        ios/Henge/ResumeCoordinator.swift ios/Henge/ResumeIdentity.swift tests/test_session_resume.py tests/test_resume_coordinator.swift
+        tar -czf gamepad-source.tgz -C Henge ios/Henge/Components ios/Henge/Controls ios/Henge/Link/LinkProtocol.swift devices/gamepad.h devices/gamepad_ds4.h tests/test_gamepad.c tests/test_gamepad_tuning.swift tests/gamepad-preview tools/preview_gamepad.py ios/Henge/ResumeCoordinator.swift ios/Henge/ResumeIdentity.swift tests/test_session_resume.py tests/test_resume_coordinator.swift
 
         '
     - uses: actions/upload-artifact@v4
@@ -82,6 +69,8 @@ jobs:
         path: gamepad-source.tgz
         retention-days: 3
         overwrite: true
+    outputs:
+      preview: ${{ steps.pins.outputs.preview }}
   native:
     needs: source
     runs-on: xcode-27
@@ -95,12 +84,7 @@ jobs:
       run: tar -xzf gamepad-source.tgz
     - &id003
       name: Select latest installed Xcode
-      run: "python3 - <<'PYXCODE'\nimport glob,os,re,subprocess\nchoices=[]\nfor app in glob.glob('/Applications/Xcode*.app'):\n\
-        \ dev=app+'/Contents/Developer'\n try:\n  version=subprocess.check_output(['xcodebuild','-version'],env={**os.environ,'DEVELOPER_DIR':dev},text=True)\n\
-        \  match=re.search(r'Xcode (\\d+(?:\\.\\d+)*)',version)\n  if match:choices.append((tuple(map(int,match[1].split('.'))),dev,version))\n\
-        \ except subprocess.CalledProcessError:pass\nif not choices:raise SystemExit('No Xcode installed')\nversion,dev,description=max(choices)\n\
-        if version<(27,1):raise SystemExit('Unfolded Duo review requires Xcode 27.1 or newer')\nprint(description+dev)\n\
-        with open(os.environ['GITHUB_ENV'],'a') as f:f.write('DEVELOPER_DIR='+dev+'\\n')\nPYXCODE"
+      run: "python3 - <<'PYXCODE'\nimport glob,os,re,subprocess\nchoices=[]\nfor app in glob.glob('/Applications/Xcode*.app'):\n dev=app+'/Contents/Developer'\n try:\n  version=subprocess.check_output(['xcodebuild','-version'],env={**os.environ,'DEVELOPER_DIR':dev},text=True)\n  match=re.search(r'Xcode (\\d+(?:\\.\\d+)*)',version)\n  if match:choices.append((tuple(map(int,match[1].split('.'))),dev,version))\n except subprocess.CalledProcessError:pass\nif not choices:raise SystemExit('No Xcode installed')\nversion,dev,description=max(choices)\nif version<(27,1):raise SystemExit('Unfolded Duo review requires Xcode 27.1 or newer')\nprint(description+dev)\nwith open(os.environ['GITHUB_ENV'],'a') as f:f.write('DEVELOPER_DIR='+dev+'\\n')\nPYXCODE"
     - name: Production Instant Resume coordinator and recovery tests
       run: python3 tests/test_session_resume.py
     - name: Controller packets and pure input model
@@ -108,15 +92,11 @@ jobs:
 
         mkdir -p preview-artifacts
 
-        xcrun --sdk macosx clang -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -Idevices tests/test_gamepad.c
-        -o preview-artifacts/test_gamepad
+        xcrun --sdk macosx clang -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -Idevices tests/test_gamepad.c -o preview-artifacts/test_gamepad
 
         preview-artifacts/test_gamepad
 
-        swiftc -parse-as-library -swift-version 5 ios/Henge/Controls/GamepadState.swift ios/Henge/Controls/GamepadTuning.swift
-        ios/Henge/Controls/GamepadLayout.swift ios/Henge/Controls/PadInput.swift ios/Henge/Controls/TouchpadTuning.swift
-        ios/Henge/Controls/ControllerPostureLayout.swift ios/Henge/Controls/GyroSteeringMath.swift tests/test_gamepad_tuning.swift
-        -o preview-artifacts/test_gamepad_tuning
+        swiftc -parse-as-library -swift-version 5 ios/Henge/Controls/GamepadState.swift ios/Henge/Controls/GamepadTuning.swift ios/Henge/Controls/GamepadLayout.swift ios/Henge/Controls/PadInput.swift ios/Henge/Controls/TouchpadTuning.swift ios/Henge/Controls/ControllerPostureLayout.swift ios/Henge/Controls/GyroSteeringMath.swift tests/test_gamepad_tuning.swift -o preview-artifacts/test_gamepad_tuning
 
         preview-artifacts/test_gamepad_tuning
 
@@ -149,14 +129,7 @@ jobs:
       env:
         PROFILE: ${{ matrix.profile }}
         NATIVE_DUO: ${{ inputs.native_duo && '1' || '0' }}
-      run: |
-        args=(--profile "$PROFILE")
-        if [[ "$PROFILE" == duo-unfolded && "$NATIVE_DUO" != 1 ]]; then
-          # Full production UI at 951x669; native runtime failure is retained in
-          # run 43158389557, job 130983663525, artifact 13917861161.
-          args+=(--duo-layout-canvas)
-        fi
-        python3 tools/preview_gamepad.py "${args[@]}"
+      run: "args=(--profile \"$PROFILE\")\nif [[ \"$PROFILE\" == duo-unfolded && \"$NATIVE_DUO\" != 1 ]]; then\n  # Full production UI at 951x669; native runtime failure is retained in\n  # run 43158389557, job 130983663525, artifact 13917861161.\n  args+=(--duo-layout-canvas)\nfi\npython3 tools/preview_gamepad.py \"${args[@]}\"\n"
     - uses: actions/upload-artifact@v4
       if: always()
       with:
@@ -164,3 +137,4 @@ jobs:
         path: preview-artifacts
         retention-days: 7
         if-no-files-found: error
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.source.outputs.preview == 'true' }}
