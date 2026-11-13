@@ -138,6 +138,42 @@ if manifest.get('upstream_desktop'):
         assert marker in executable,'Missing desktop optimisation runtime: '+repr(marker)
     data['upstream_desktop']=dict(manifest['upstream_desktop'],runtime_markers_verified=True,
         source_validation=desktop['source_commit'],physical_performance_verified=False)
+# The final diagnostic archive must contain this review, not an earlier IPA.
+review=state.get('project_review',{})
+assert review.get('complete') and review.get('source_commit')==state['final_validation']['source_commit']
+markers=(b'Process headroom when opened',b'hengevm.network-events',b'jit-publication:',
+         b'native-touch-metrics:',b'hvprof-jit-word:',b'Continuous test diagnostics: entire visible session',
+         b'cumulative measured I/O; worker durations can overlap',b'setupHeartbeat')
+missing=[repr(marker) for marker in markers if marker not in app_executable]
+assert not missing,'Missing review runtime markers: '+', '.join(missing)
+hooks=(b'_hv_vm_test_network_token',b'_hv_vm_test_network_apply')
+assert all(hook not in app_executable for hook in hooks),'Network test hooks leaked into production'
+assert plist.get('HengeTestDiagnostics') is manifest.get('test_diagnostics') is True
+for marker in review['required_markers']:
+    assert any(marker in line for line in review['native_check_lines']),marker
+# Keep the actual iOS image's symbols outside the distributable IPA. They turn
+# ASLR-independent profiler offsets into exact functions for this source build.
+product=Path('Henge/ios/build/DerivedData/Build/Products/Release-iphoneos')
+image=product/'Henge.app/Henge'
+import re
+image_uuid=subprocess.check_output(['xcrun','dwarfdump','--uuid',str(image)],text=True)
+image_ids=re.findall(r'UUID: ([0-9A-Fa-f-]+) \(arm64\)',image_uuid)
+with tempfile.TemporaryDirectory(prefix='henge-symbols-') as directory:
+    packaged=Path(directory)/'Henge'
+    packaged.write_bytes(app_executable)
+    packaged_uuid=subprocess.check_output(['xcrun','dwarfdump','--uuid',str(packaged)],text=True)
+    packaged_ids=re.findall(r'UUID: ([0-9A-Fa-f-]+) \(arm64\)',packaged_uuid)
+    assert image_ids and image_ids==packaged_ids,'Packaged image differs from compiled image'
+    # This build retains the native symbol table. Read directly from the
+    # archived executable so code offsets cannot refer to a stale dSYM.
+    symbols=subprocess.check_output(['xcrun','nm','-arch','arm64','-n',str(packaged)],text=True)
+assert len(symbols.splitlines())>100 and '_hv_helper' in symbols,'No actionable native symbols'
+symbol_file=ipa.parent/'Henge-symbols.txt'
+symbol_file.write_text('Source '+os.environ['GITHUB_SHA']+'\n'+image_uuid+'\n'+symbols)
+data['diagnostic_symbols']={'uuid_matched':True,'uuid':image_ids[0],
+    'file':symbol_file.name,'sha256':hashlib.sha256(symbol_file.read_bytes()).hexdigest()}
+data['project_review']=dict(review,runtime_markers_verified=True,test_hooks_absent=True,
+    physical_touch_fps_energy_verified=False)
 data["audit_repairs"]={"sha256":manifest["audit_repairs_sha256"],"snapshot_schema":3,"test_allocation_hook_absent":True}
 data["upstream_integration"]={
   **integration,

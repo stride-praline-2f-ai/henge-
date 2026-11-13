@@ -10,6 +10,7 @@ import subprocess
 ALLOWED={
     'henge-build/manifest.json','henge-build/optimization-state.json',
     'docs/m4-optimisation/PROGRESS.md','docs/m4-optimisation/VALIDATION.md',
+    'docs/project-review/REVIEW.md','docs/project-review/VALIDATION.md',
     'docs/m4-optimisation/CONTROLS-ADVANCED.md','docs/low-power-controls.md',
     'henge-build/verify-integrated-ipa.py','henge-build/read-release-request.py',
     'henge-build/test-release-request.py','henge-build/test-pairing-metadata.py','henge-build/integrate-upstream.sh',

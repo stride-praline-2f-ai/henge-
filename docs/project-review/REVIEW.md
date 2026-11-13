@@ -94,3 +94,7 @@ branch repair remain substantial; host presentation has long gaps.
 
 Physical touch, Pencil, FPS and thermal gains still require device verification.
 No claim that logging alone identifies every possible bottleneck with certainty.
+
+## Final integrated cloud gate
+
+Current source `ed4693c827c671efbf124b68c9d0161fe73ff778`, patch `20225ad181270cb36ff6b6e5b5fc860e046006eb863248db1525541da1cff8b7` passed https://github.com/stride-praline-2f-ai/henge-/actions/runs/43461735695, plus engine run `43461735627`. Includes the eight original review corrections and the desktop diagnostic/touch/JIT follow-up. This supersedes earlier pending-validation statements above. Final IPA inspection remains pending; physical performance is unmeasured.

@@ -14,14 +14,4 @@ App Runner mode has been removed, including continued VM background execution. U
 
 For loading: Automatic scheduling,4guest CPUs as the baseline, kernel read cache on (TLB-first), and diagnostics off. Explicit saved cache-off choices remain off; enable Kernel read cache to use the new path. Keep chosen Retina and60/120Hz preferences. Low Power Mode still applies OS limits. Native microbenchmarks are not measured app-launch or game FPS gains.
 
-
-For the reference desktop layout, choose Mac settings → Screen → Desktop Retina
-before a cold start. M4 uses2560×1920 with2x macOS UI; Duo fits its current inner
-screen. Native Retina on iPad keeps all panel pixels. Existing saved machines
-retain their selected mode and completed snapshots retain their saved geometry.
-After upgrading, update the guest sharing companion from session Details for
-direct host USB encoding and confirmed clipboard paste. Hardware input does not
-require changing modes or restarting the companion when alternating devices.
-Snapshots are build/layout-specific: shut down before upgrading; incompatible
-old states are rejected and the Mac disk is preserved. iOS still bounds automatic
-background save time and controls Low Power performance/refresh behaviour.
+This0.3.9(110) test build enables continuous Session Diagnostics once on first launch, for the entire visible session. Settings → Performance → Session Diagnostics can disable it. It adds counters and50Hz sampling; compare release speed with diagnostics disabled. Ordinary logs include hot instruction words, disk queue/flush timing and touch setup metrics. Old guest touch helpers should be updated from Details → Sharing to use setup progress heartbeats.
