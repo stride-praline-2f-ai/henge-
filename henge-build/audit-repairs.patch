@@ -752,7 +752,7 @@ index a41d6d2..fa6964e 100644
              m->fastmem_enabled ? "on" : "off", m->fastmem_diagnostics ? "on" : "off");
      if (m->fastmem_enabled) fprintf(out, "fastmem-layout: tagged-multiwindow entries=262144 per-PAN bytes-per-CPU=10485760 (bounded allocation; exact VA tags; all kernel windows)\n");
 diff --git a/core/machine.c b/core/machine.c
-index 7a01fdc..b2d9ae1 100644
+index 7a01fdc..a26a6c0 100644
 --- a/core/machine.c
 +++ b/core/machine.c
 @@ -23,7 +23,7 @@ extern void hv_xjump_thunk(void);
@@ -764,11 +764,14 @@ index 7a01fdc..b2d9ae1 100644
  
  static void knobs_init(void) {
      for (int i = 0; i < HV_K_COUNT; i++)
-@@ -84,11 +84,15 @@ static int init_rest(HvMachine *m) {
+@@ -84,11 +84,18 @@ static int init_rest(HvMachine *m) {
      const char *tail = getenv("HV_JIT_TAIL");
      m->jit_tail_enabled = !tail || strcmp(tail, "0");
      m->fastmem_enabled = getenv("HV_FASTMEM") && atoi(getenv("HV_FASTMEM")) == 1;
-+    m->fastmem_tlb_first = getenv("HV_FASTMEM_ORDER") && !strcmp(getenv("HV_FASTMEM_ORDER"), "tlb-first");
++    /* Paired native ARM64 tests retain the collision benefit without the
++       cache-first hit-path tax. Expert A/B can still request lut-first. */
++    const char *fm_order = getenv("HV_FASTMEM_ORDER");
++    m->fastmem_tlb_first = !fm_order || strcmp(fm_order, "lut-first");
      m->fastmem_diagnostics = getenv("HV_FASTMEM_STATS") && atoi(getenv("HV_FASTMEM_STATS")) == 1;
      /* Native A/B was mixed, including split-alias regressions. Keep this
         correct but unproven scheduling experiment opt-in. */
@@ -780,7 +783,7 @@ index 7a01fdc..b2d9ae1 100644
      fprintf(stderr, "henge: kernel read cache requested=%s diagnostics=%s%s\n",
              m->fastmem_enabled ? "on" : "off", m->fastmem_diagnostics ? "on" : "off",
              m->fastmem_enabled && m->fastmem_diagnostics ? " (counting adds overhead; disable diagnostics for timing)" : "");
-@@ -110,6 +114,7 @@ static int init_rest(HvMachine *m) {
+@@ -110,6 +117,7 @@ static int init_rest(HvMachine *m) {
      /* So the tests can run the translator these ways too (the iOS and --phone paths read them in knobs_init). */
      hv_knob[HV_K_SUPERBLOCKS] = getenv("HV_SUPERBLOCKS") ? atoi(getenv("HV_SUPERBLOCKS")) : 0;
      fprintf(stderr, "efficiency-v3: superblocks=%d (experimental) wait-probes=%d jit-finish=batched branch-patch=full-barrier (relaxed request falls back safely); indexed chain repair and full invalidation barriers retained\n", hv_knob[HV_K_SUPERBLOCKS] != 0, m->wait_stats);
@@ -788,7 +791,7 @@ index 7a01fdc..b2d9ae1 100644
      /* The exact check for an access in a page's last 15 bytes, in the access's out-of-line path (code size only):
         on the phone, Golden Gate's boot and login send 80-240K such accesses a second to the helper without it. It
         costs ~13% of the code (Mac 2026-11-09: 296-300 against 259-261 bytes a block), and the phone's code cache
-@@ -139,6 +144,9 @@ static int init_rest(HvMachine *m) {
+@@ -139,6 +147,9 @@ static int init_rest(HvMachine *m) {
      m->quiesce_initialized=hv_quiesce_init(&m->quiesce)==0;
      m->quiesce_enabled=m->quiesce_initialized && (!getenv("HV_STW_WAIT") || strcmp(getenv("HV_STW_WAIT"),"0"));
      fprintf(stderr,"henge: flush-wait: mode=%s; short spin then event wake, own requests serviced, 100us missed-wake fallback; guest WFE/timers unchanged\n",m->quiesce_enabled?"event":"legacy-yield");
@@ -798,7 +801,7 @@ index 7a01fdc..b2d9ae1 100644
      for (int i = 0; i < HV_MAX_CPUS; i++) { /* untouched pages cost nothing, so every CPU gets its tables now */
          HvPerCpu *p = &m->percpu[i];
          p->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
-@@ -219,10 +227,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+@@ -219,10 +230,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
  #define HV_ULF_WAKE_ALL 0x100u
  #define HV_ULF_NO_ERRNO 0x1000000u
  
@@ -816,7 +819,7 @@ index 7a01fdc..b2d9ae1 100644
  }
  
  void hv_cpu_ack_wake(HvCpu *cpu) {
-@@ -262,6 +274,13 @@ void hv_cpu_process_requests(HvCpu *cpu) {
+@@ -262,6 +277,13 @@ void hv_cpu_process_requests(HvCpu *cpu) {
  
  void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
      HvPerCpu *t = target->pc_state, *s = self ? self->pc_state : NULL;
@@ -830,7 +833,7 @@ index 7a01fdc..b2d9ae1 100644
      HvMachine *mm = target->m;
      uint64_t t0 = mm->stats_interval ? mach_absolute_time() : 0;
      if (s) {
-@@ -271,6 +290,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -271,6 +293,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
      int sleep = hv_knob[HV_K_SYNCWAIT], probed = !t0 || !mm->wait_stats, probed_long = !t0 || !mm->wait_stats;
      if (s && mm->wait_stats) __atomic_store_n(&s->phase, HV_PHASE_SYNC, __ATOMIC_RELAXED);
      for (uint32_t spins = 0;; spins++) {
@@ -838,7 +841,7 @@ index 7a01fdc..b2d9ae1 100644
          uint64_t ack = __atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE);
          if (ack >= seq) break;
          if (!probed && !(spins & 63) && mach_absolute_time() - t0 >= 2400) { /* 100 us: what is it doing? */
-@@ -295,10 +315,12 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -295,10 +318,12 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
          if (self) hv_cpu_process_requests(self);
          if (sleep && spins >= 64) {
              __atomic_add_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
@@ -853,7 +856,7 @@ index 7a01fdc..b2d9ae1 100644
                  if (rc == -ETIMEDOUT && s) __atomic_add_fetch(&s->sync_timeouts, 1, __ATOMIC_RELAXED);
                  if (rc < 0 && rc != -ETIMEDOUT && rc != -EINTR) {
                      if (s) __atomic_add_fetch(&s->sync_errors, 1, __ATOMIC_RELAXED);
-@@ -396,18 +418,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
+@@ -396,18 +421,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
      return marked;
  }
  
@@ -882,7 +885,7 @@ index 7a01fdc..b2d9ae1 100644
      if (marked) __asm__ volatile("sev" ::: "memory");
      return marked;
  }
-@@ -467,6 +496,8 @@ void hv_machine_free(HvMachine *m) {
+@@ -467,6 +499,8 @@ void hv_machine_free(HvMachine *m) {
      free(m->slot_xa);
      free(m->slot_xpa);
      free(m->xchained);
@@ -891,7 +894,7 @@ index 7a01fdc..b2d9ae1 100644
      if (m->locks_initialized) {
          pthread_mutex_destroy(&m->big_mu);
          pthread_cond_destroy(&m->big_cv);
-@@ -514,6 +545,26 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
+@@ -514,6 +548,26 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
      return NULL;
  }
  
@@ -918,7 +921,7 @@ index 7a01fdc..b2d9ae1 100644
  uint32_t *hv_smc_counts;
  uint64_t *hv_smc_last;
  uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
-@@ -622,6 +673,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
+@@ -622,6 +676,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
  
  /* MMIO is accessed in naturally sized pieces of at most 8 bytes. */
  int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
@@ -926,7 +929,7 @@ index 7a01fdc..b2d9ae1 100644
      void *p = hv_phys_ptr(m, pa, len);
      if (p) {
          memcpy(buf, p, len);
-@@ -640,8 +692,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
+@@ -640,8 +695,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
  }
  
  int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
@@ -2167,7 +2170,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..4fc5f6c 100644
+index 9073d22..aa69bb9 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -3130,7 +3133,7 @@ index 9073d22..4fc5f6c 100644
                  library_load_seconds * 1000, library_load_worst * 1000);
          fprintf(stderr, "hengevm: gpu-pipelines: builds=%llu total_ms=%.2f worst_ms=%.2f (cumulative host pipeline creation, including failures)\n",
                  (unsigned long long)pipeline_builds, pipeline_seconds * 1000, pipeline_worst_seconds * 1000);
-+        fprintf(stderr, "hengevm: gpu-pipeline-archives: hits=%llu compiled=%llu pending=%lu bypass=%llu hit_ms=%.2f compile_ms=%.2f pressure_suspended=%d (session totals; disk cache survives launches, unsaved batches bounded to 8s)\n",
++        fprintf(stderr, "hengevm: gpu-pipeline-archives: hits=%llu compiled=%llu pending=%lu bypass=%llu hit_ms=%.2f compile_ms=%.2f pressure_suspended=%d (session totals; disk cache survives launches, save scheduled 8s from first pending PSO)\n",
 +                (unsigned long long)pipes_hit,(unsigned long long)pipes_compiled,(unsigned long)archive_pending.count,
 +                (unsigned long long)pipes_unsaveable,hit_ms,compile_ms,archive_pressure_suspended);
 +        fprintf(stderr, "hengevm: gpu-function-reuse: hits=%llu builds=%llu memory_warnings=%llu (exact binary, unspecialized first function; worker-owned LRU)\n",
@@ -5103,10 +5106,10 @@ index 0000000..1d6c0b5
 +performance, P/E placement, watts or thermals.
 diff --git a/docs/m4-optimisation/LOADING-0.3.7.md b/docs/m4-optimisation/LOADING-0.3.7.md
 new file mode 100644
-index 0000000..2bbbb10
+index 0000000..a464f06
 --- /dev/null
 +++ b/docs/m4-optimisation/LOADING-0.3.7.md
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,44 @@
 +Loading follow-up, 2026-11-13 (implementation; IPA gate closed)
 +
 +Latest supplied fd3681d/0.3.6 Duo log contains TWO sessions: 4 CPUs/8GB each;
@@ -5138,9 +5141,19 @@ index 0000000..2bbbb10
 +  physical mouse toggle removed; meaningful settings retain explanations.
 +
 +Verification: Linux ASan/UBSan RAM/fastmem/disk/descriptor and4096 raced block
-+completions pass. ARM64 Unicorn2088+ cases pass; native macOS/Metal/Swift/app
-+validation and same-source off/LUT-first/TLB-first benchmark pending.
++completions pass. ARM64 Unicorn2088+ cases pass; native macOS/Metal/Swift/lifecycle/ASan checks passed in run43389387394,
++job131765399602 through native stages (full iOS build still running at checkpoint).
++Paired7-round current-engine benchmark, flat: warmed cache-on/off ratios
++0.996/1.005/1.007 (single/two-window/user) vs old1.368/1.267/1.384;
++collision-heavy ratio0.036 (~28x faster than cache off). Split-layout collision
++ratio0.034; ordinary-hit ratios0.936/0.969/0.882 reflect host drift/layout,
++not a claimed physical speedup. Choose TLB-first default for the existing cache.
++Fresh preferences enable it; saved off choices remain off. Explicit M4 Automatic
++selects this cache and disables periodic diagnostics. Full final-source build
++and release gate must still pass before packaging.
 +Do not publish an IPA until those actual checks and final gate pass.
++
++Safety decisions: persistent archive hints select candidate files; Metal itself validates the complete descriptor. They are not proof of exact PSO identity, so no unsafe direct pipeline-state reuse is added from those partial keys. Guest-visible CPUs remain static and user selectable; OS scheduling is not physical core pinning. No guest translation persistence across app/JIT launches is claimed.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
 index 0000000..df77a2d
@@ -7495,7 +7508,7 @@ index 0000000..c2a9184
 +  "notes": "Inventory of all PRs; not a claim every diff was runtime-tested. Current focus: shared controller UI and entitlement-free USB touchscreen. No blanket upstream merge."
 +}
 diff --git a/host/audio_mac.c b/host/audio_mac.c
-index 4e016ae..762d692 100644
+index 4e016ae..062e285 100644
 --- a/host/audio_mac.c
 +++ b/host/audio_mac.c
 @@ -20,7 +20,7 @@
@@ -7538,7 +7551,7 @@ index 4e016ae..762d692 100644
 +}
 +void hv_audio_pause(HvVirtioSnd *d) {
 +    dispose_output(); /* Preserve guest running/prepared state for snapshots. */
-+    if(d)d->backend.start=NULL; /* CPU-only background mode drains by guest clock. */
++    if(d)d->backend.start=NULL; /* Detached audio must not restart while the VM is paused. */
 +}
 +void hv_audio_detach(HvVirtioSnd *d) {
 +    dispose_output();if(d)d->running=0;
@@ -11081,7 +11094,7 @@ index 47b0ced..f6edeb5 100644
              sendTarget()
          }
 diff --git a/ios/Henge/EngineTuning.swift b/ios/Henge/EngineTuning.swift
-index e579188..f941a32 100644
+index e579188..40964d0 100644
 --- a/ios/Henge/EngineTuning.swift
 +++ b/ios/Henge/EngineTuning.swift
 @@ -4,38 +4,65 @@ import Foundation
@@ -11125,7 +11138,8 @@ index e579188..f941a32 100644
      static func apply() {
 +        applyLock.lock(); defer { applyLock.unlock() }
          var env = defaults
-         env["HV_FASTMEM"] = UserDefaults.standard.bool(forKey: fastmemKey) ? "1" : "0"
+-        env["HV_FASTMEM"] = UserDefaults.standard.bool(forKey: fastmemKey) ? "1" : "0"
++        env["HV_FASTMEM"] = (UserDefaults.standard.object(forKey:fastmemKey) as? Bool ?? true) ? "1" : "0"
          let d = UserDefaults.standard
 -        if let policy = d.string(forKey: cpuPolicyKey), ["auto", "legacy", "mixed"].contains(policy) {
 -            env["HV_CPU_POLICY"] = policy
@@ -12552,10 +12566,10 @@ index 1bc238f..ccdbb33 100644
  }
 diff --git a/ios/Henge/M4Performance.swift b/ios/Henge/M4Performance.swift
 new file mode 100644
-index 0000000..28b982d
+index 0000000..6b959ab
 --- /dev/null
 +++ b/ios/Henge/M4Performance.swift
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,33 @@
 +import Foundation
 +
 +/// Hardware selection is authoritative in the native topology detector. These
@@ -12580,7 +12594,8 @@ index 0000000..28b982d
 +    static func applyAutomaticDefaults() {
 +        guard enabled else { return }
 +        let defaults = UserDefaults.standard
-+        for key in [statisticsKey, EngineTuning.fastmemKey] { defaults.set(false,forKey:key) }
++        defaults.set(false,forKey:statisticsKey)
++        defaults.set(true,forKey:EngineTuning.fastmemKey)
 +
 +    }
 +    static func logProfile() {
@@ -14669,7 +14684,7 @@ index 0000000..75768bd
 +    }
 +}
 diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
-index e1693b0..44085b8 100644
+index e1693b0..4fdc76a 100644
 --- a/ios/Henge/SettingsView.swift
 +++ b/ios/Henge/SettingsView.swift
 @@ -9,16 +9,13 @@ struct SettingsView: View {
@@ -14677,8 +14692,9 @@ index e1693b0..44085b8 100644
      @AppStorage(Trackpad.scrollSpeedKey) private var trackpadScroll = Trackpad.defaultScrollSpeed
      @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = HardwareScroll.defaultSpeed
 -    @AppStorage(EngineTuning.diagnosticsKey) private var cacheDiagnostics = false
+-    @AppStorage(EngineTuning.fastmemKey) private var fastmem = false
 +    @AppStorage(M4Performance.statisticsKey) private var sessionDiagnostics = M4Performance.statisticsEnabled
-     @AppStorage(EngineTuning.fastmemKey) private var fastmem = false
++    @AppStorage(EngineTuning.fastmemKey) private var fastmem = true
      @AppStorage(VolumeClicks.inputModeKey) private var inputMode = VolumeClicks.InputMode.touchscreen
      @AppStorage(VolumeClicks.modeKey) private var volumeMode = VolumeClicks.Mode.delayHold
      @AppStorage(VolumeClicks.swapKey) private var swapButtons = false
@@ -14742,7 +14758,7 @@ index e1693b0..44085b8 100644
                      Picker("Mac refresh rate", selection: $refreshRate) {
                          Text("30 Hz").tag(30)
                          Text("60 Hz").tag(60)
-@@ -150,39 +143,33 @@ struct SettingsView: View {
+@@ -150,57 +143,51 @@ struct SettingsView: View {
                      }
                      .pickerStyle(.segmented)
                      Toggle("Thermal display protection", isOn: $thermalProtection)
@@ -14773,7 +14789,7 @@ index e1693b0..44085b8 100644
 -                    Toggle("Superblocks (experimental)", isOn: $superblocks)
 -                    Text("Continues translated code through conditional branches within the same page, bounded to 48 instructions at a conditional exit. May reduce dispatch work but increase code-cache pressure. Off by default; performance on your device is unverified. Applies to a new Mac session.")
 +                    Toggle("Kernel read cache", isOn: $fastmem)
-+                    Text("Adds a larger permission-checked cache for kernel reads. It can help when translations collide, but costs memory and may slow other workloads. Applies to the next Mac session; detailed per-access counting stays off.")
++                    Text("Checks a larger permission-validated cache only when the normal translation cache misses. Helps repeated kernel reads when translations collide; uses additional memory. Existing on/off choices are kept. Applies to the next Mac session; per-access counting stays off.")
                          .font(.footnote).foregroundStyle(.secondary)
                      Picker("Code cache", selection: $codeCacheMB) {
                          Text("512 MB").tag(512)
@@ -14795,7 +14811,12 @@ index e1693b0..44085b8 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  .listRowBackground(Desk.card)
-@@ -194,13 +181,13 @@ struct SettingsView: View {
+                 Section("Guest sharing") {
+                     Toggle("Shared folder and automatic clipboard", isOn: $guestSharing)
+-                    Text("Allows the Mac to access Henge's Shared folder and send its clipboard to the iPad. Turn off to keep them separate. Quit and reopen Henge to apply. Explicit Paste still types the text you choose.")
++                    Text("Allows the Mac to access Henge's Shared folder and send its clipboard to the iPad. Turn off to keep them separate. Quit and reopen Henge to apply. Explicit Paste still types the text you choose. Update an older Mac sharing companion from Details → Sharing to remove its obsolete Runner worker.")
+                         .font(.footnote).foregroundStyle(.secondary)
+                 }
                  .listRowBackground(Desk.card)
                  Section("Instant Resume") {
                      Toggle("Resume where you left off", isOn: $instantResume)
@@ -16769,10 +16790,10 @@ index 0000000..7b09ed0
 +print('Display snapshot parser: two ports, all header mutations and truncations passed ASan/UBSan')
 diff --git a/tests/test_engine_tuning.swift b/tests/test_engine_tuning.swift
 new file mode 100644
-index 0000000..a1f0d03
+index 0000000..1cb8fbf
 --- /dev/null
 +++ b/tests/test_engine_tuning.swift
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,61 @@
 +import Foundation
 +
 +// Redirect only this fixture's Documents lookup; never alter HOME or app data.
@@ -16789,6 +16810,8 @@ index 0000000..a1f0d03
 +    static func main() throws {
 +        try Foundation.FileManager.default.createDirectory(at: fixtureDocuments, withIntermediateDirectories: true)
 +        defer { try? Foundation.FileManager.default.removeItem(at: fixtureDocuments) }
++        let savedFastmem = UserDefaults.standard.object(forKey:EngineTuning.fastmemKey)
++        UserDefaults.standard.removeObject(forKey:EngineTuning.fastmemKey)
 +        let savedGroups = UserDefaults.standard.object(forKey: "henge.perf.groupedMemory")
 +        let savedSpin = UserDefaults.standard.object(forKey: "henge.perf.wfiSpin")
 +        let savedDiagnostics = UserDefaults.standard.object(forKey: "henge.perf.cacheDiagnostics")
@@ -16799,6 +16822,7 @@ index 0000000..a1f0d03
 +        UserDefaults.standard.set(true,forKey:"henge.perf.wfiSpin")
 +        UserDefaults.standard.set(true,forKey:"henge.perf.groupedMemory")
 +        defer {
++            if let savedFastmem { UserDefaults.standard.set(savedFastmem,forKey:EngineTuning.fastmemKey) } else { UserDefaults.standard.removeObject(forKey:EngineTuning.fastmemKey) }
 +            if let oldMigration { UserDefaults.standard.set(oldMigration,forKey:migrationKey) } else { UserDefaults.standard.removeObject(forKey:migrationKey) }
 +            for (key, value) in [("henge.perf.groupedMemory", savedGroups), ("henge.perf.wfiSpin", savedSpin), ("henge.perf.cacheDiagnostics", savedDiagnostics)] {
 +                if let value { UserDefaults.standard.set(value, forKey:key) }
@@ -16810,6 +16834,10 @@ index 0000000..a1f0d03
 +        try "HV_FIXTURE_OVERRIDE=1\nHV_WFI_SPIN=50\nHV_GROUPS=1\n".write(to:url,atomically:true,encoding:.utf8)
 +        EngineTuning.apply()
 +        precondition(value("HV_STATS") == "0" && value("HV_FASTMEM_STATS") == "0")
++        precondition(value("HV_FASTMEM")=="1")
++        UserDefaults.standard.set(false,forKey:EngineTuning.fastmemKey)
++        EngineTuning.apply()
++        precondition(value("HV_FASTMEM")=="0", "Explicit cache-off choice must survive migration")
 +        let previous=UserDefaults.standard.dictionary(forKey:migrationKey)!
 +        precondition(previous["henge.perf.groupedMemory"] as? Bool == true)
 +        precondition(UserDefaults.standard.object(forKey:"henge.perf.groupedMemory")==nil)
@@ -18034,10 +18062,10 @@ index 0000000..624db4e
 +}
 diff --git a/tests/test_m4_defaults.swift b/tests/test_m4_defaults.swift
 new file mode 100644
-index 0000000..2027dbc
+index 0000000..348e938
 --- /dev/null
 +++ b/tests/test_m4_defaults.swift
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,42 @@
 +import Foundation
 +var fixtureM4: Int32 = 1
 +func hv_host_is_m4_16gb() -> Int32 { fixtureM4 }
@@ -18063,7 +18091,8 @@ index 0000000..2027dbc
 +        fixtureM4=0;M4Performance.applyAutomaticDefaults()
 +        precondition(d.bool(forKey:EngineTuning.fastmemKey))
 +        fixtureM4=1;M4Performance.applyAutomaticDefaults()
-+        for key in keys where key != EngineTuning.refreshKey && key != "henge.perf.codeCacheMB" {
++        precondition(d.bool(forKey:EngineTuning.fastmemKey))
++        for key in keys where key != EngineTuning.fastmemKey && key != EngineTuning.refreshKey && key != "henge.perf.codeCacheMB" {
 +            precondition(!d.bool(forKey:key))
 +        }
 +        precondition(d.integer(forKey:EngineTuning.refreshKey)==120)

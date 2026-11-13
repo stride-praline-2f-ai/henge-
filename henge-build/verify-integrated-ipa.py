@@ -38,6 +38,10 @@ if manifest.get('controls_power'):
     assert b'runner CPU background=%d; GPU rings retained' not in binary, 'Removed Runner gate remains linked'
     permitted=plist.get('BGTaskSchedulerPermittedIdentifiers', [])
     assert permitted == [plist['CFBundleIdentifier']+'.pairing.*'], 'Only JIT pairing background tasks are permitted'
+if manifest.get('loading_followup'):
+    for marker in (b'kernel read cache order=', b'gpu-pipeline-archives:',
+                   b'Removed Runner mode and retired experimental UI overrides'):
+        assert marker in binary, 'Missing loading follow-up: '+repr(marker)
 if manifest.get('controller_posture'):
     assert plist.get('NSMotionUsageDescription'), 'Motion usage description missing'
     # Swift strings of <=15 UTF-8 bytes can be encoded in ARM64 immediates.

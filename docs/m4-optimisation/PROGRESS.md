@@ -52,3 +52,12 @@ not the full VM. Conflicting single-monitor mode/built-in UUID changes were not
 blindly merged into the two-port/snapshot/touchscreen implementation.
 
 Loading follow-up0.3.7: TLB-first secondary LUT, adjacent disk segment coalescing, warning-safe shader persistence, app Runner removal/settings migration. In development; native/SDK/UI validation pending and IPA gate closed. Details: runtime docs/m4-optimisation/LOADING-0.3.7.md.
+
+Loading checkpoint: source0defd6 native run43389387394 passed full regressions,
+sanitizers, Metal persistence/lifecycle, input/Link/Instant Resume, SDK and iOS
+Release application compilation. Artifact14020257710 retains paired native
+cache-order measurements. Select TLB-first; fresh kernel-cache default on,
+explicit saved off preserved. Local6a126d7 exports patch47321e5c844cd68a891694c2d81dcd9394d4bddba605a2d604be6184e41415c7.
+M4 UI passed in43389387513. Duo viewport job131765457694 was cancelled by
+GitHub before a result; artifact14020174245 retains logs. It is not a pass.
+Run final-default native/app checks and retry Duo viewport before opening IPA gate.
