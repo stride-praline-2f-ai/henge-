@@ -19,6 +19,7 @@ assert ipa.is_file(), "IPA was not produced"
 with zipfile.ZipFile(ipa) as z:
     assert z.testzip() is None, "Corrupt IPA archive"
     plist=plistlib.loads(z.read("Payload/Henge.app/Info.plist"))
+    app_executable=z.read("Payload/Henge.app/"+plist["CFBundleExecutable"])
 assert plist.get("HengeAuditRepairsSHA256")==manifest["audit_repairs_sha256"], "Incorrect audit repairs"
 assert plist.get("HengeSnapshotSchema")==3, "Incorrect snapshot schema"
 assert plist['CFBundleShortVersionString'] == manifest['app_version'], 'Unexpected app version'
@@ -113,8 +114,8 @@ if manifest.get('controls_power'):
 if manifest.get('upstream_desktop'):
     desktop=state['upstream_desktop']
     assert desktop.get('complete') and desktop.get('source_commit')==state['final_validation']['source_commit']
-    executable=(app/'Henge').read_bytes()
-    for marker in (b'jit-ring:',b'saved pipelines:',b'v3-pipelines-',b'henge.planar.owner',b'pipeline archive bypass'):
+    executable=app_executable
+    for marker in (b'jit-ring:',b'saved pipelines:',b'v3-pipelines-',b'henge.planar.owner',b'pipeline archive bypass',b'Recovery copy verification failed; original disk preserved',b'Finish macOS volume expansion'):
         assert marker in executable,'Missing desktop optimisation runtime: '+repr(marker)
     data['upstream_desktop']=dict(manifest['upstream_desktop'],runtime_markers_verified=True,
         source_validation=desktop['source_commit'],physical_performance_verified=False)
