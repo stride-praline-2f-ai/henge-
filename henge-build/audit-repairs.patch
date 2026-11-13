@@ -5397,10 +5397,10 @@ index 0000000..a464f06
 +Safety decisions: persistent archive hints select candidate files; Metal itself validates the complete descriptor. They are not proof of exact PSO identity, so no unsafe direct pipeline-state reuse is added from those partial keys. Guest-visible CPUs remain static and user selectable; OS scheduling is not physical core pinning. No guest translation persistence across app/JIT launches is claimed.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
-index 0000000..3a7bca5
+index 0000000..a55c4c4
 --- /dev/null
 +++ b/docs/m4-optimisation/PROGRESS.md
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,169 @@
 +# Current checkpoint
 +
 +- Reconstructed source inherited at wrapper commit 343d2d84, patch 9ee35476;
@@ -5567,6 +5567,9 @@ index 0000000..3a7bca5
 +reapplied at start/continue/pause, so a deferred stop cannot leave GPU/disk timing
 +on after a lifecycle transition. Real native lifecycle test calls these APIs
 +while holding the writer lock; no sleeps or ignored test failures.
++
++Pointer capture and loss cleanup are scoped to the active application scene;
++external-display scene notifications cannot reset the primary Magic Keyboard.
 diff --git a/docs/m4-optimisation/SPEC.md b/docs/m4-optimisation/SPEC.md
 new file mode 100644
 index 0000000..87f0a22
@@ -12223,7 +12226,7 @@ index a0a1e92..6a36fce 100644
          if let selected { return selected }
          // Older Fit profiles only stored this size convention. Explicit new
 diff --git a/ios/Henge/Hardware.swift b/ios/Henge/Hardware.swift
-index af0bc1b..b95f92e 100644
+index af0bc1b..8e8b4eb 100644
 --- a/ios/Henge/Hardware.swift
 +++ b/ios/Henge/Hardware.swift
 @@ -123,7 +123,11 @@ enum HardwareKeys {
@@ -12248,7 +12251,7 @@ index af0bc1b..b95f92e 100644
          held.removeAll()
      }
  }
-@@ -147,7 +151,7 @@ enum HardwareKeys {
+@@ -147,17 +151,23 @@ enum HardwareKeys {
  /// that only for an app filling the screen. SwiftUI has no way to ask, so the answer is added to the
  /// class of the window's root view controller, which is who iPadOS asks.
  enum PointerLock {
@@ -12257,7 +12260,25 @@ index af0bc1b..b95f92e 100644
      private static var patched: Set<ObjectIdentifier> = []
  
      static func set(_ on: Bool) {
-@@ -195,11 +199,16 @@ final class HardwareMouse {
+         wanted = on
+-        let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows)
++        let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
++            .filter { $0.session.role == .windowApplication }.flatMap(\.windows)
+         for window in windows {
+             guard let root = window.rootViewController else { continue }
+             let kind: AnyClass = type(of: root)
+             if patched.insert(ObjectIdentifier(kind)).inserted {
+-                let answer: @convention(block) (UIViewController) -> Bool = { _ in wanted }
++                let answer: @convention(block) (UIViewController) -> Bool = { controller in
++                    MainActor.assumeIsolated {
++                        guard wanted, let scene = controller.viewIfLoaded?.window?.windowScene else { return false }
++                        return scene.session.role == .windowApplication && scene.activationState == .foregroundActive
++                    }
++                }
+                 class_replaceMethod(kind, #selector(getter: UIViewController.prefersPointerLocked), imp_implementationWithBlock(answer), "B@:")
+             }
+             root.setNeedsUpdateOfPrefersPointerLocked()
+@@ -195,11 +205,16 @@ final class HardwareMouse {
      private var acceptsInput = false
      private var scrollCallbacks: UInt64 = 0, scrollFrames: UInt64 = 0
      private var largestScroll: Int32 = 0
@@ -12274,7 +12295,7 @@ index af0bc1b..b95f92e 100644
              releaseButtons()
              scrollTimer?.invalidate(); scrollTimer = nil
              scrollState = HardwareScroll()
-@@ -208,10 +217,13 @@ final class HardwareMouse {
+@@ -208,10 +223,13 @@ final class HardwareMouse {
      }
  
      var scrollDiagnostics: String {
@@ -12289,7 +12310,7 @@ index af0bc1b..b95f92e 100644
          acceptsInput = true
          scrollCallbacks = 0; scrollFrames = 0; largestScroll = 0
          let defaults = UserDefaults.standard
-@@ -243,13 +255,19 @@ final class HardwareMouse {
+@@ -243,13 +261,20 @@ final class HardwareMouse {
              self.scrollTimer = nil
              self.mice.removeAll { $0 === mouse }
          })
@@ -12297,6 +12318,7 @@ index af0bc1b..b95f92e 100644
 +        observers.append(NotificationCenter.default.addObserver(forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main) { [weak self] note in
              // The scene comes in the user info: the notification's object isn't it.
              let scene = note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene
++            guard scene?.session.role == .windowApplication else { return }
              let locked = scene?.pointerLockState?.isLocked ?? false
              HengeLog.log("input", "pointer lock: \(locked ? "on" : "off")")
 +            if !locked && PointerLock.wanted {
@@ -12311,7 +12333,7 @@ index af0bc1b..b95f92e 100644
      }
  
      func stop() {
-@@ -275,7 +293,16 @@ final class HardwareMouse {
+@@ -275,7 +300,16 @@ final class HardwareMouse {
      }
  
      func releaseButtons() {
@@ -12329,7 +12351,7 @@ index af0bc1b..b95f92e 100644
      }
  
      private func attach(_ mouse: GCMouse) {
-@@ -283,18 +310,38 @@ final class HardwareMouse {
+@@ -283,18 +317,38 @@ final class HardwareMouse {
          mice.append(mouse)
          mouse.handlerQueue = .main
          HengeLog.log("input", "mouse: \(mouse.vendorName ?? "?"), right button \(input.rightButton != nil), middle \(input.middleButton != nil)")
@@ -12374,7 +12396,7 @@ index af0bc1b..b95f92e 100644
          restX += min(max(dx * speed, -32767), 32767)
          restY -= min(max(dy * speed, -32767), 32767)
          let x = restX.rounded(), y = restY.rounded()
-@@ -305,8 +352,11 @@ final class HardwareMouse {
+@@ -305,8 +359,11 @@ final class HardwareMouse {
      }
  
      private func button(_ physicalButton: Int32, _ pressed: Bool) {
@@ -12388,7 +12410,7 @@ index af0bc1b..b95f92e 100644
          if !pressed { StickyKeys.shared.releaseAll() }
      }
  
-@@ -314,7 +364,8 @@ final class HardwareMouse {
+@@ -314,7 +371,8 @@ final class HardwareMouse {
      /// macOS accelerates wheel units roughly quadratically, so use a tunable square root
      /// and cap each event to keep a small pad gesture from jumping across a page.
      private func scrolled(_ first: Float, _ second: Float) {
@@ -12398,7 +12420,7 @@ index af0bc1b..b95f92e 100644
          scrollCallbacks &+= 1
          scrollState.push(first: Double(first), second: Double(second), scale: scrollScale, reversed: reverse)
          scheduleScrollIfNeeded()
-@@ -344,3 +395,35 @@ final class HardwareMouse {
+@@ -344,3 +402,35 @@ final class HardwareMouse {
          henge_vm_mouse_scroll(event.x, event.y)
      }
  }
