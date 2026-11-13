@@ -38,3 +38,23 @@ Neither result is a measured app-launch, Roblox FPS, temperature or watt gain.
 No forced Retina reduction or permanent60Hz restriction was added. Instant
 Resume, storage expansion, touch/gamepad/Link/audio/native Metal paths passed.
 One metadata-only child opens final IPA packaging after this complete gate.
+
+Delivered0.3.7(108), source5c3a565e4f93dd0198f7aafe28a897ac981dc444:
+https://github.com/stride-praline-2f-ai/henge-/actions/runs/43397695154
+Job131792570458 passed native/ASan/UBSan, actual JIT metadata writer, frozen retry
+guard, full iOS app, IPA signing/framework/entitlement/runtime-marker checks.
+Independent archive inspection also passed, including processing for JIT pairing,
+pairing-only BG IDs, Runner absence in app AND sharing companion, and preserved
+controller/Link/Instant Resume/audio/disk expansion paths. Previousfaed artifact
+was rejected before delivery; it was never uploaded to Drive.
+
+Artifact14023504290; IPA10091659bytes; SHA-256:
+e4b055e694aff98f4106ff669fcf6e37e1fbf502987ff8758aaf4ddd595d5ebb
+Drive (new file, previous0.3.6 retained):
+https://drive.google.com/file/d/1Y9HO6D-b8bVBLWB-Y95mF9ECu6-yDNMQ/view?usp=drivesdk
+Drive metadata and full byte-download SHA roundtrip verified. Ad hoc archive
+requires the installation tool's supported signing/provisioning as usual.
+Runtime source3e5b8a and patch47321e5... are unchanged in the metadata-only release
+children.15controller captures inspected; physical Duo/M4 FPS, app-launch latency,
+power and cooling gains remain unmeasured. Source engineering and artifact
+production/delivery are complete; these hardware measurements are a separate gate.
