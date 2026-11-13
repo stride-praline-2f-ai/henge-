@@ -32,3 +32,13 @@ Neither result is a measured app-launch, Roblox FPS, temperature or watt gain.
 No forced Retina reduction or permanent60Hz restriction was added. Instant
 Resume, storage expansion, touch/gamepad/Link/audio/native Metal paths passed.
 One metadata-only child opens final IPA packaging after this complete gate.
+
+Final artifact inspection correction: run43394749303 was green in CI, but its
+IPA was rejected locally before Drive upload because Runner cleanup had also
+removed UIBackgroundModes=processing needed by existing JIT pairing. Restore
+only that plist declaration in the authoritative integration writer. Execute
+that actual writer against absent/partial/duplicate modes; preserve audio,
+pairing-only identifiers, versions and unrelated keys. The package verifier
+now also requires this declaration. Retry guard permits only this exact two-line
+metadata insertion; engine, runtime patch, pins and app version remain frozen.
+No Runner UI, guest worker or CPU/GPU background machinery is restored.

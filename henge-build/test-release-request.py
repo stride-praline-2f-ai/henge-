@@ -17,7 +17,16 @@ for path in ['henge-build/audit-repairs.patch','henge-build/henge.patch','ios/He
 for key in m.FROZEN:
     changed=copy.deepcopy(manifest);changed[key]='changed';assert not m.requested(retry,[failed],[],changed,manifest,digest)
 assert not m.requested(retry,[failed],[],manifest,manifest,'wrong')
+assert m.requested(retry,[failed],['henge-build/integrate-upstream.sh'],manifest,manifest,digest,metadata_safe=True)
+assert not m.requested(retry,[failed],['henge-build/integrate-upstream.sh'],manifest,manifest,digest)
 retry['release_requested']=False;assert not m.requested(retry,[failed],[],manifest,manifest,digest)
+anchor='p["BGTaskSchedulerPermittedIdentifiers"]=["$(PRODUCT_BUNDLE_IDENTIFIER).pairing.*"]\n'
+repair='modes=list(p.get("UIBackgroundModes", []))\np["UIBackgroundModes"]=list(dict.fromkeys([*modes,"processing"]))\n'
+before='unchanged merger\n'+anchor+'unchanged rest of source'
+after=before.replace(anchor,anchor+repair)
+assert m.pairing_metadata_only(before,after)
+assert not m.pairing_metadata_only(before,after+'\n# other mutation')
+assert not m.pairing_metadata_only(before,after.replace('processing','audio'))
 print('PASS release request: one-shot parent, explicit failed packaging retry, frozen source/pins/version/patch and permitted paths')
 
 # Reproduce the real Actions depth-1 checkout. Ancestor pretty-printing and
@@ -35,6 +44,7 @@ with tempfile.TemporaryDirectory(prefix='henge-release-git-') as folder:
     import hashlib
     code=b'unchanged verified runtime patch';(build/'audit-repairs.patch').write_bytes(code)
     frozen=copy.deepcopy(manifest);frozen['audit_repairs_sha256']=hashlib.sha256(code).hexdigest()
+    (build/'integrate-upstream.sh').write_text(before)
     (build/'manifest.json').write_text(__import__('json').dumps(frozen));(origin/'engine.c').write_text('unchanged runtime')
     git(origin,'add','.');git(origin,'commit','-m','validated source');source_sha=git(origin,'rev-parse','HEAD')
     request=dict(release_requested=True,final_reconciliation_complete=True,integrated_patch_sha256=frozen['audit_repairs_sha256'],final_validation={'source_commit':source_sha})
@@ -46,6 +56,14 @@ with tempfile.TemporaryDirectory(prefix='henge-release-git-') as folder:
     subprocess.run(['python3',str(clone/'henge-build/read-release-request.py')],check=True,env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     assert output.read_text().strip()=='requested=true'
     git(clone,'config','user.name','Henge test');git(clone,'config','user.email','test@example.invalid')
+    # The sole approved integration-script repair is tested through the real
+    # shallow checkout/main path, not just the pure allow-list predicate.
+    request['release_retry']['parent_commit']=git(clone,'rev-parse','HEAD')
+    (clone/'henge-build/optimization-state.json').write_text(__import__('json').dumps(request))
+    (clone/'henge-build/integrate-upstream.sh').write_text(after)
+    git(clone,'add','.');git(clone,'commit','-m','pairing metadata only');output.write_text('')
+    subprocess.run(['python3',str(clone/'henge-build/read-release-request.py')],check=True,env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    assert output.read_text().strip()=='requested=true'
     (clone/'docs').mkdir();(clone/'docs/low-power-controls.md').write_text('Later documentation must not package again')
     git(clone,'add','.');git(clone,'commit','-m','later documentation');output.write_text('')
     subprocess.run(['python3',str(clone/'henge-build/read-release-request.py')],check=True,env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

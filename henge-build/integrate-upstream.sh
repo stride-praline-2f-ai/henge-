@@ -99,6 +99,8 @@ p["NSMotionUsageDescription"]="Use optional motion controls to steer racing game
 # Continued processing is retained only for the existing JIT pairing flow.
 # VM Runner background task registration has been removed.
 p["BGTaskSchedulerPermittedIdentifiers"]=["$(PRODUCT_BUNDLE_IDENTIFIER).pairing.*"]
+modes=list(p.get("UIBackgroundModes", []))
+p["UIBackgroundModes"]=list(dict.fromkeys([*modes,"processing"]))
 with path.open("wb") as f: plistlib.dump(p,f)
 helper=path.parent.parent / "HengeJITHelper" / "Info.plist"
 with helper.open("rb") as f: helper_info=plistlib.load(f)

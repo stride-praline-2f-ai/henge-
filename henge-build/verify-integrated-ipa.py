@@ -36,6 +36,7 @@ if manifest.get('controls_power'):
                    b'BEGIN 30s; aggregate process CPU', b'invalid store action tag %u (%u bytes)'):
         assert marker in binary, 'Missing controls/power runtime marker: '+repr(marker)
     assert b'runner CPU background=%d; GPU rings retained' not in binary, 'Removed Runner gate remains linked'
+    assert 'processing' in plist.get('UIBackgroundModes', []), 'Existing JIT pairing requires processing capability'
     permitted=plist.get('BGTaskSchedulerPermittedIdentifiers', [])
     assert permitted == [plist['CFBundleIdentifier']+'.pairing.*'], 'Only JIT pairing background tasks are permitted'
 if manifest.get('loading_followup'):
