@@ -5159,10 +5159,10 @@ index 0000000..a464f06
 +Safety decisions: persistent archive hints select candidate files; Metal itself validates the complete descriptor. They are not proof of exact PSO identity, so no unsafe direct pipeline-state reuse is added from those partial keys. Guest-visible CPUs remain static and user selectable; OS scheduling is not physical core pinning. No guest translation persistence across app/JIT launches is claimed.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
-index 0000000..df77a2d
+index 0000000..960e8ef
 --- /dev/null
 +++ b/docs/m4-optimisation/PROGRESS.md
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,103 @@
 +# Current checkpoint
 +
 +- Reconstructed source inherited at wrapper commit 343d2d84, patch 9ee35476;
@@ -5253,6 +5253,19 @@ index 0000000..df77a2d
 +
 +Next: run exact-source macOS native/sanitizer/lifecycle/Metal and full iOS Release
 +checks, then the existing M4 and unfolded-Duo UI gates. No partial IPA requested.
++
++## Opening UI / automatic save / clipboard follow-up
++
++Production dashboard and controller components are shared with Simulator UI tests.
++Automatic saving defaults on only when no preference exists; explicit off is kept.
++Repeated inactive notifications retain the same save; foreground and stop still cancel.
++Dense snapshot chunks borrow quiesced RAM without changing schema3. Save and restore
++share memory-budgeted allocation/retry. Essential/persistent failures preserve the
++previous committed snapshot. Private GPU texture copy-back has an actual Metal regression.
++Clipboard paste uses companion acknowledgement, session guards and complete HTTP
++framing. Guest copies use a single ordered retry queue. Universal Clipboard is
++explicitly allowed via UIPasteboard; no automatic device clipboard reads.
++Pending: exact-source macOS/SDK and UI checks; no IPA before they pass.
 diff --git a/docs/m4-optimisation/SPEC.md b/docs/m4-optimisation/SPEC.md
 new file mode 100644
 index 0000000..87f0a22
@@ -5346,10 +5359,10 @@ index 0000000..98fbd1b
 +Physical Duo/M4 desktop warmup and game performance still require comparison.
 diff --git a/docs/m4-optimisation/VALIDATION.md b/docs/m4-optimisation/VALIDATION.md
 new file mode 100644
-index 0000000..a61d132
+index 0000000..033a5b5
 --- /dev/null
 +++ b/docs/m4-optimisation/VALIDATION.md
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,79 @@
 +# Validation
 +
 +Passed locally: production scheduling policy/detection regression compiled with
@@ -5415,6 +5428,20 @@ index 0000000..a61d132
 +as the asset bottleneck, or stable60FPS. Keep4CPU/8GiB as the reference, preserve
 +user choices and Retina/60/120Hz options. New bounded existing-worker reports
 +make disk, shader/pipeline reuse and per-vCPU work visible in the next capture.
++
++## Resume/clipboard follow-up validation boundary
++
++Local ASan/UBSan clipboard bridge test passes with4000 concurrent updates, acknowledgement
++validation and old-companion negotiation. First cloud checkpoint passed actual snapshot
++chunk round-trips, companion UTF-8/framing/retry, bounded Swift delivery, coordinator and
++full application SDK typecheck. Its lifecycle allocation assertions expected even transient
++packing failures to abort; tests now distinguish recoverable packing failures from essential
++and persistent failures. Final exact-source results are required.
++
++Not yet device-proven: multi-GB save duration within iOS background allowance, Roblox/Safari
++resume on physical hardware, remote game-server session retention, Apple Universal Clipboard
++transport/account/radio availability. iOS can suspend/kill the app; only completed compatible
++snapshots survive termination. No JIT pointers or host Metal objects are persisted.
 diff --git a/docs/m4-optimisation/WARMUP.md b/docs/m4-optimisation/WARMUP.md
 new file mode 100644
 index 0000000..091a0de
@@ -8500,7 +8527,7 @@ index 083d66e..d51f8b2 100644
  
  typedef struct {
 diff --git a/host/share.c b/host/share.c
-index 9c7244a..fd5395a 100644
+index 9c7244a..a0bc668 100644
 --- a/host/share.c
 +++ b/host/share.c
 @@ -44,17 +44,44 @@ static char agent_path[PATH_MAX];
@@ -8611,7 +8638,12 @@ index 9c7244a..fd5395a 100644
      pthread_mutex_unlock(&clip_mu);
      char headers[64];
      snprintf(headers, sizeof headers, "X-Henge-Seq: %lu\r\n", seq);
-@@ -662,18 +709,72 @@ static int clipboard_put(Conn *c, Request *r) {
+@@ -658,22 +705,77 @@ static int clipboard_put(Conn *c, Request *r) {
+     size_t len = 0;
+     char *text = body_small(c, r, &len);
+     if (!text) return -1;
++    if (memchr(text, 0, len)) { free(text); return respond_empty(c, r, 400, "Bad Request"); }
+     pthread_mutex_lock(&clip_mu);
      free(guest_clip);
      guest_clip = text;
      agent_seen = time(NULL);
@@ -8684,7 +8716,7 @@ index 9c7244a..fd5395a 100644
      if (!strcmp(what, "native-touch") && !strcmp(r->method, "GET")) {
          if (body_discard(c, r) != 0) return -1;
          char json[1024]; size_t n = hv_native_touch_next(json, sizeof json);
-@@ -691,6 +792,7 @@ static int serve_henge(Conn *c, Request *r) {
+@@ -691,6 +793,7 @@ static int serve_henge(Conn *c, Request *r) {
          hv_native_touch_report(generation, state);
          return respond_empty(c, r, 204, "No Content");
      }
@@ -8713,11 +8745,17 @@ index 37b2313..0036e5b 100644
  long hv_share_agent_seen(void);
  
 diff --git a/host/snapshot.c b/host/snapshot.c
-index 383ae01..470ae8c 100644
+index 383ae01..2e6f140 100644
 --- a/host/snapshot.c
 +++ b/host/snapshot.c
-@@ -27,11 +27,26 @@
+@@ -25,13 +25,37 @@
+ #include <sys/uio.h>
+ #include <time.h>
  #include <unistd.h>
++#include <TargetConditionals.h>
++#if TARGET_OS_IOS
++#include <os/proc.h>
++#endif
  
  #include "pvg_lite.h"
 +#include "surface_hash.h"
@@ -8727,12 +8765,17 @@ index 383ae01..470ae8c 100644
 +/* Native regression builds inject one allocation failure at a time. Release
 +   binaries have neither this hook nor a per-allocation diagnostic branch. */
 +#ifdef HV_SNAPSHOT_TESTING
-+static int snapshot_fail_after = -1;
-+void hv_snapshot_test_fail_after(int n) { snapshot_fail_after = n; }
++static int snapshot_fail_after = -1, snapshot_fail_persistent, snapshot_packing_retries;
++void hv_snapshot_test_fail_after(int n) { snapshot_fail_after = n; snapshot_fail_persistent = 0; if(n>=0)snapshot_packing_retries=0; }
++int hv_snapshot_test_packing_retries(void) { return snapshot_packing_retries; }
++void hv_snapshot_test_fail_persistently(int n) { snapshot_fail_after = n; snapshot_fail_persistent = 1; }
 +static void (*snapshot_progress_hook)(uint64_t);
 +void hv_snapshot_test_progress(void (*hook)(uint64_t)) { snapshot_progress_hook = hook; }
 +static void *snapshot_malloc(size_t n) {
-+    if (snapshot_fail_after >= 0 && snapshot_fail_after-- == 0) return NULL;
++    if (snapshot_fail_after >= 0) {
++        if (!snapshot_fail_after) { if (!snapshot_fail_persistent) snapshot_fail_after = -1; return NULL; }
++        snapshot_fail_after--;
++    }
 +    return malloc(n);
 +}
 +#define malloc snapshot_malloc
@@ -8744,7 +8787,7 @@ index 383ae01..470ae8c 100644
  #define PAGE 0x4000ull
  #define CHUNK_PAGES 256u
  #define CHUNK_BYTES ((uint64_t)CHUNK_PAGES * PAGE)
-@@ -50,10 +65,11 @@ typedef struct SnapHeader {
+@@ -50,10 +74,11 @@ typedef struct SnapHeader {
      uint32_t ncpus, nram;
      uint64_t ram_size;
      char disk[256];         /* hv_vm_disk_identity when saved: the disk has to be exactly that again */
@@ -8757,7 +8800,7 @@ index 383ae01..470ae8c 100644
      uint64_t len;
  } SecHdr;
  
-@@ -72,6 +88,7 @@ typedef struct ChunkHdr {
+@@ -72,6 +97,7 @@ typedef struct ChunkHdr {
      uint32_t bytes;         /* what follows */
      uint32_t raw;           /* 1: the pages as they are (LZ4 did not make them smaller) */
      uint8_t bitmap[CHUNK_PAGES / 8];
@@ -8765,7 +8808,7 @@ index 383ae01..470ae8c 100644
  } ChunkHdr;
  
  /* A CPU's architectural state: everything but its caches, which a new machine starts empty. */
-@@ -119,11 +136,25 @@ typedef struct W {
+@@ -119,11 +145,25 @@ typedef struct W {
      uint8_t *buf;
      size_t n, cap;
      uint64_t total;
@@ -8792,7 +8835,7 @@ index 383ae01..470ae8c 100644
          ssize_t k = write(w->fd, w->buf + off, w->n - off);
          if (k < 0 && errno == EINTR) continue;
          if (k <= 0) w->err = errno ? errno : EIO;
-@@ -134,7 +165,7 @@ static void w_flush(W *w) {
+@@ -134,7 +174,7 @@ static void w_flush(W *w) {
  
  static void w_raw(W *w, const void *d, uint64_t len) {
      const uint8_t *p = d;
@@ -8801,7 +8844,7 @@ index 383ae01..470ae8c 100644
          size_t room = w->cap - w->n, k = len < room ? (size_t)len : room;
          memcpy(w->buf + w->n, p, k);
          w->n += k, p += k, len -= k, w->total += k;
-@@ -143,7 +174,9 @@ static void w_raw(W *w, const void *d, uint64_t len) {
+@@ -143,7 +183,9 @@ static void w_raw(W *w, const void *d, uint64_t len) {
  }
  
  static void w_section(W *w, uint32_t tag, const void *d, uint64_t len) {
@@ -8812,7 +8855,7 @@ index 383ae01..470ae8c 100644
      w_raw(w, &h, sizeof h);
      w_raw(w, d, len);
  }
-@@ -180,7 +213,9 @@ static int r_raw(R *r, void *d, uint64_t len) {
+@@ -180,7 +222,9 @@ static int r_raw(R *r, void *d, uint64_t len) {
  static int r_section(R *r, uint32_t tag, void *d, uint64_t len) {
      SecHdr h;
      if (r_raw(r, &h, sizeof h) || h.tag != tag || h.len != len) return r->err = r->err ? r->err : EINVAL, -1;
@@ -8823,7 +8866,7 @@ index 383ae01..470ae8c 100644
  }
  
  /* A section of any length (up to max), in memory the caller frees. */
-@@ -191,7 +226,9 @@ static int r_section_any(R *r, uint32_t tag, void **d, uint64_t *len, uint64_t m
+@@ -191,7 +235,9 @@ static int r_section_any(R *r, uint32_t tag, void **d, uint64_t *len, uint64_t m
      *d = malloc(h.len ? h.len : 1);
      if (!*d) return r->err = ENOMEM, -1;
      *len = h.len;
@@ -8834,7 +8877,7 @@ index 383ae01..470ae8c 100644
  }
  
  #define R_RANGE(r, tag, p, from, to) r_section(r, tag, (uint8_t *)(p) + offsetof(__typeof__(*(p)), from), \
-@@ -251,6 +288,7 @@ typedef struct Slot {
+@@ -251,6 +297,7 @@ typedef struct Slot {
      ChunkHdr h;
      uint8_t *stage; /* the chunk's stored pages, one after another */
      uint8_t *out;   /* compressed */
@@ -8842,10 +8885,29 @@ index 383ae01..470ae8c 100644
      void *scratch;
  } Slot;
  
-@@ -271,11 +309,19 @@ static void slots_free(Slot *s, int n) {
+@@ -271,11 +318,38 @@ static void slots_free(Slot *s, int n) {
      for (int i = 0; i < n; i++) free(s[i].stage), free(s[i].out), free(s[i].scratch);
  }
  
++/* Both directions share one bounded allocation/retry policy. No pages are
++   discarded; a smaller batch changes concurrency, never the snapshot format. */
++static unsigned slots_prepare(Slot set[2][BATCH], unsigned batch) {
++    if (!batch || batch > BATCH) batch = BATCH;
++    memset(set, 0, sizeof(Slot) * 2 * BATCH);
++    while (slots_alloc(set[0], batch) || slots_alloc(set[1], batch)) {
++        slots_free(set[0], BATCH); slots_free(set[1], BATCH);
++        memset(set, 0, sizeof(Slot) * 2 * BATCH);
++        if (batch == 1) return 0;
++#ifdef HV_SNAPSHOT_TESTING
++        snapshot_packing_retries++;
++#endif
++        unsigned previous = batch;
++        batch = batch > 2 ? batch / 2 : 1;
++        fprintf(stderr,"hengevm: snapshot: memory allocation reduced workers %u -> %u\n",previous,batch);
++    }
++    return batch;
++}
++
 +static uint64_t chunk_checksum(const ChunkHdr *header, const uint8_t *raw, size_t n) {
 +    ChunkHdr h = *header;
 +    h.checksum = 0;
@@ -8863,7 +8925,7 @@ index 383ae01..470ae8c 100644
      s->h.index = index;
      size_t host_page = (size_t)getpagesize();
      size_t vec_n = (size_t)(pages * PAGE + host_page - 1) / host_page;
-@@ -284,6 +330,7 @@ static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t ind
+@@ -284,6 +358,7 @@ static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t ind
         then looks the same while it holds data: file-backed RAM is read whole. */
      int have_vec = use_mincore && mincore((void *)(base + from), (size_t)pages * PAGE, vec) == 0;
      for (uint32_t i = 0; i < pages; i++) {
@@ -8871,7 +8933,7 @@ index 383ae01..470ae8c 100644
          const uint8_t *pg = base + from + (uint64_t)i * PAGE;
          if (have_vec) {
              int touched = 0;
-@@ -293,15 +340,26 @@ static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t ind
+@@ -293,15 +368,26 @@ static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t ind
              if (!touched) continue;
          }
          if (page_zero(pg)) continue;
@@ -8901,7 +8963,7 @@ index 383ae01..470ae8c 100644
  }
  
  static double pack_secs, write_secs, wait_secs; /* for the log: compressing, writing, and waiting for a batch to be compressed */
-@@ -314,16 +372,24 @@ static double mono(void) {
+@@ -314,16 +400,19 @@ static double mono(void) {
  
  /* Chunks are compressed a batch at a time on every core, the next batch while the last one is written. */
  static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
@@ -8915,23 +8977,20 @@ index 383ae01..470ae8c 100644
 -    w_raw(w, &rh, sizeof rh);
 +    w_section(w, TAG('R', 'A', 'M', ' '), &rh, sizeof rh);
      Slot set[2][BATCH];
-     memset(set, 0, sizeof set);
+-    memset(set, 0, sizeof set);
 -    if (slots_alloc(set[0], BATCH) || slots_alloc(set[1], BATCH)) {
 -        slots_free(set[0], BATCH), slots_free(set[1], BATCH);
 -        return w->err = ENOMEM, -1;
-+    while (slots_alloc(set[0], batch) || slots_alloc(set[1], batch)) {
-+        slots_free(set[0], BATCH); slots_free(set[1], BATCH);
-+        memset(set, 0, sizeof set);
-+        if (batch == 1) return w->err = ENOMEM, -1;
-+        batch = batch > 2 ? batch / 2 : 1;
-     }
+-    }
++    batch = slots_prepare(set, batch);
++    if (!batch) return w->err = ENOMEM, -1;
 +    /* A bounded, explicitly enabled automatic save must finish before iOS
 +       expires its assertion. It is user-requested work, not deferrable upkeep.
 +       Guest CPUs remain paused; this does not change their scheduling policy. */
      dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
      dispatch_group_t packing = dispatch_group_create();
      const uint8_t *base = ram->host;
-@@ -332,24 +398,26 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
+@@ -332,24 +421,26 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
      void (^pack)(Slot *, uint32_t, uint32_t) = ^(Slot *sl, uint32_t first, uint32_t n) {
          dispatch_group_async(packing, q, ^{
              double t0 = mono();
@@ -8964,7 +9023,7 @@ index 383ae01..470ae8c 100644
          uint64_t at[BATCH], pos = w->total;
          for (uint32_t k = 0; k < n; k++) {
              at[k] = pos;
-@@ -360,9 +428,10 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
+@@ -360,9 +451,10 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
          int fd = w->fd;
          const uint64_t *atp = at;
          dispatch_apply(n, q, ^(size_t k) {
@@ -8976,7 +9035,7 @@ index 383ae01..470ae8c 100644
                  ssize_t got = pwritev(fd, v, v[1].iov_len ? 2 : 1, (off_t)(atp[k] + done));
                  if (got < 0 && errno == EINTR) continue;
                  if (got <= 0) {
-@@ -381,10 +450,16 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
+@@ -381,10 +473,16 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
          if (lseek(fd, (off_t)pos, SEEK_SET) != (off_t)pos && !w->err) w->err = errno;
          write_secs += mono() - t1;
          wait_secs += t1 - t0;
@@ -8993,7 +9052,7 @@ index 383ae01..470ae8c 100644
      return w->err ? -1 : 0;
  }
  
-@@ -392,12 +467,19 @@ static int chunk_unpack(Slot *s, uint8_t *base, uint64_t size) {
+@@ -392,12 +490,19 @@ static int chunk_unpack(Slot *s, uint8_t *base, uint64_t size) {
      uint64_t from = (uint64_t)s->h.index * CHUNK_BYTES;
      if (from >= size) return -1;
      uint32_t pages = (uint32_t)((size - from < CHUNK_BYTES ? size - from : CHUNK_BYTES) / PAGE);
@@ -9013,7 +9072,38 @@ index 383ae01..470ae8c 100644
      uint32_t k = 0;
      for (uint32_t i = 0; i < pages && k < s->h.stored; i++)
          if (s->h.bitmap[i / 8] & (1u << (i % 8))) memcpy(base + from + (uint64_t)i * PAGE, src + (uint64_t)k++ * PAGE, PAGE);
-@@ -442,7 +524,7 @@ static int load_ram(R *r, HvRam *ram) {
+@@ -412,12 +517,14 @@ static int load_ram(R *r, HvRam *ram) {
+     if (r_section(r, TAG('R', 'A', 'M', ' '), &rh, sizeof rh)) return -1;
+     uint32_t nchunks = (uint32_t)((ram->size + CHUNK_BYTES - 1) / CHUNK_BYTES);
+     if (rh.pa != ram->pa || rh.size != ram->size || rh.chunk_pages != CHUNK_PAGES || rh.nchunks != nchunks) return r->err = EINVAL, -1;
++    unsigned batch = BATCH;
++#if TARGET_OS_IOS
++    long active = sysconf(_SC_NPROCESSORS_ONLN);
++    batch = hv_snapshot_workers(active > 0 ? (unsigned)active : 1, os_proc_available_memory());
++#endif
+     Slot set[2][BATCH];
+-    memset(set, 0, sizeof set);
+-    if (slots_alloc(set[0], BATCH) || slots_alloc(set[1], BATCH)) {
+-        slots_free(set[0], BATCH), slots_free(set[1], BATCH);
+-        return r->err = ENOMEM, -1;
+-    }
++    batch = slots_prepare(set, batch);
++    if (!batch) return r->err = ENOMEM, -1;
+     dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+     dispatch_group_t unpacking = dispatch_group_create();
+     __block _Atomic int bad = 0;
+@@ -425,8 +532,8 @@ static int load_ram(R *r, HvRam *ram) {
+     uint8_t *base = ram->host;
+     uint64_t size = ram->size;
+     int cur = 0;
+-    for (uint32_t first = 0; first < nchunks && !bad; first += BATCH, cur ^= 1) {
+-        uint32_t n = nchunks - first < BATCH ? nchunks - first : BATCH;
++    for (uint32_t first = 0; first < nchunks && !bad; first += batch, cur ^= 1) {
++        uint32_t n = nchunks - first < batch ? nchunks - first : batch;
+         Slot *sl = set[cur];
+         double t0 = mono();
+         for (uint32_t k = 0; k < n; k++) {
+@@ -442,7 +549,7 @@ static int load_ram(R *r, HvRam *ram) {
          dispatch_group_async(unpacking, q, ^{
              double t1 = mono();
              dispatch_apply(n, q, ^(size_t k) {
@@ -9022,7 +9112,7 @@ index 383ae01..470ae8c 100644
              });
              unpacked += mono() - t1;
          });
-@@ -529,12 +611,16 @@ static void save_devices(W *w, HvVmapple *b) {
+@@ -529,12 +636,16 @@ static void save_devices(W *w, HvVmapple *b) {
      }
      size_t pn = hv_pvg_lite_state(b->pvg, NULL, 0);
      uint8_t *pb = malloc(pn);
@@ -9040,7 +9130,7 @@ index 383ae01..470ae8c 100644
      w_section(w, TAG('P', 'V', 'G', 'D'), db, db ? dn : 0);
      free(db);
  }
-@@ -577,6 +663,13 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
+@@ -577,6 +688,13 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
              r_section(r, XHCI, (uint8_t *)x + offsetof(HvXhci, usbcmd), offsetof(HvXhci, mu) - offsetof(HvXhci, usbcmd)) ||
              r_section(r, XHCI, (uint8_t *)x + offsetof(HvXhci, reports), sizeof(HvXhci) - offsetof(HvXhci, reports)))
              return -1;
@@ -9054,7 +9144,7 @@ index 383ae01..470ae8c 100644
      }
      void *blob;
      uint64_t len;
-@@ -592,12 +685,22 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
+@@ -592,12 +710,22 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
  /* ---- the file ---- */
  
  int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errlen) {
@@ -9078,7 +9168,7 @@ index 383ae01..470ae8c 100644
      struct timespec t0, t1;
      clock_gettime(CLOCK_MONOTONIC, &t0);
      char tmp[1100];
-@@ -605,7 +708,9 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+@@ -605,7 +733,9 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
      int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
      if (fd < 0) return fail(err, errlen, "Cannot write %s: %s", tmp, strerror(errno));
      fcntl(fd, F_NOCACHE, 1);
@@ -9089,7 +9179,7 @@ index 383ae01..470ae8c 100644
      w.buf = malloc(w.cap);
      if (!w.buf) {
          close(fd);
-@@ -624,6 +729,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+@@ -624,6 +754,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
          unlink(tmp);
          return fail(err, errlen, "Cannot read the disk's details.");
      }
@@ -9097,7 +9187,7 @@ index 383ae01..470ae8c 100644
      w_raw(&w, &h, sizeof h);
      for (int i = 0; i < ncpus; i++) {
          CpuState s;
-@@ -641,10 +747,12 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+@@ -641,10 +772,12 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
      free(w.buf);
      int bad = w.err;
      if (!bad && fsync(fd) != 0) bad = errno;
@@ -9110,7 +9200,7 @@ index 383ae01..470ae8c 100644
          return fail(err, errlen, "Cannot write the saved Mac: %s", strerror(bad));
      }
      clock_gettime(CLOCK_MONOTONIC, &t1);
-@@ -659,11 +767,11 @@ static int read_header(int fd, SnapHeader *h, const char *ident, uint64_t *bytes
+@@ -659,11 +792,11 @@ static int read_header(int fd, SnapHeader *h, const char *ident, uint64_t *bytes
      struct stat st;
      Trailer t;
      if (fstat(fd, &st) != 0 || (uint64_t)st.st_size < sizeof *h + sizeof t) return -1;
@@ -9126,7 +9216,7 @@ index 383ae01..470ae8c 100644
      if (pread(fd, &t, sizeof t, st.st_size - (off_t)sizeof t) != (ssize_t)sizeof t || t.tag != TAG('E', 'N', 'D', ' ') ||
          t.total != (uint64_t)st.st_size)
          return -1;
-@@ -675,12 +783,26 @@ int hv_snapshot_check(const char *path, const char *ident, uint64_t *bytes, int6
+@@ -675,12 +808,26 @@ int hv_snapshot_check(const char *path, const char *ident, uint64_t *bytes, int6
      int fd = open(path, O_RDONLY);
      if (fd < 0) return -1;
      SnapHeader h;
@@ -9154,7 +9244,7 @@ index 383ae01..470ae8c 100644
  int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t errlen) {
      HvMachine *m = hv_vm_machine();
      HvVmapple *b = hv_vm_board();
-@@ -692,10 +814,11 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
+@@ -692,10 +839,11 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
      if (fd < 0) return fail(err, errlen, "No saved Mac: %s", strerror(errno));
      fcntl(fd, F_NOCACHE, 1);
      SnapHeader h;
@@ -9168,7 +9258,7 @@ index 383ae01..470ae8c 100644
      }
      char disk_now[256];
      h.disk[sizeof h.disk - 1] = 0;
-@@ -728,7 +851,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
+@@ -728,7 +876,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
      if (!bad) bad = r_raw(&r, &t, sizeof t) || t.tag != TAG('E', 'N', 'D', ' ');
      free(r.buf);
      close(fd);
@@ -9821,10 +9911,10 @@ index 0000000..c6cb225
 +}
 diff --git a/ios/Henge/Components/OpeningDashboard.swift b/ios/Henge/Components/OpeningDashboard.swift
 new file mode 100644
-index 0000000..af7116d
+index 0000000..254ebed
 --- /dev/null
 +++ b/ios/Henge/Components/OpeningDashboard.swift
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,154 @@
 +import SwiftUI
 +
 +/// Presentation only: callers retain machine, JIT and connection ownership.
@@ -9863,6 +9953,7 @@ index 0000000..af7116d
 +    let summary: String
 +    let ready: Bool
 +    let saved: Bool
++    var inMemory = false
 +    var preview: UIImage?
 +    var setupNote: String?
 +    let start: () -> Void
@@ -9894,8 +9985,8 @@ index 0000000..af7116d
 +            }
 +            Button(action: ready ? start : setup) {
 +                HStack {
-+                    Image(systemName: ready ? (saved ? "arrow.clockwise" : "play.fill") : "bolt.fill")
-+                    Text(ready ? (saved ? "Resume Mac" : "Start Mac") : "Enable JIT")
++                    Image(systemName: ready ? (inMemory ? "play.fill" : (saved ? "arrow.clockwise" : "play.fill")) : "bolt.fill")
++                    Text(ready ? (inMemory ? "Continue Mac" : (saved ? "Resume Mac" : "Start Mac")) : "Enable JIT")
 +                    Spacer()
 +                    Image(systemName: "arrow.right")
 +                }.font(.headline).padding(.horizontal, 20).frame(minHeight: 54)
@@ -9918,7 +10009,7 @@ index 0000000..af7116d
 +        }
 +    }
 +    private var status: some View {
-+        Label(ready ? (saved ? "Saved session" : "Ready") : "Setup needed",
++        Label(ready ? (saved ? "Saved session" : (inMemory ? "Paused in memory" : "Ready")) : "Setup needed",
 +              systemImage: ready ? (saved ? "pause.circle.fill" : "checkmark.circle.fill") : "bolt.circle")
 +            .font(.caption.weight(.semibold)).foregroundStyle(ready ? Desk.good : Desk.warn)
 +            .padding(.horizontal, 10).padding(.vertical, 7)
@@ -10350,10 +10441,10 @@ index 0000000..58c1aae
 +
 diff --git a/ios/Henge/Controls/GamepadSettingsPanel.swift b/ios/Henge/Controls/GamepadSettingsPanel.swift
 new file mode 100644
-index 0000000..5f4ecb5
+index 0000000..0d25155
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadSettingsPanel.swift
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,73 @@
 +import SwiftUI
 +
 +struct GamepadSettingsPanel: View {
@@ -10383,16 +10474,16 @@ index 0000000..5f4ecb5
 +                Section("Stick response") {
 +                    adjustment("Movement sensitivity",value:$preferences.value.moveSensitivity,range:0.35...2)
 +                    adjustment("Look sensitivity",value:$preferences.value.lookSensitivity,range:0.25...3)
-+                    adjustment("Dead zone",value:$preferences.value.deadZone,range:0...0.35)
-+                    adjustment("Response curve",value:$preferences.value.responseCurve,range:1...2.5)
++                    adjustment("Dead zone",value:$preferences.value.deadZone,range:0...0.35, format:"%.0f%%", multiplier:100)
++                    adjustment("Response curve",value:$preferences.value.responseCurve,range:1...2.5, format:"%.2f")
 +                    Toggle("Invert look Y",isOn:$preferences.value.invertLookY)
 +                    if mapping {
-+                        adjustment("Mouse look speed",value:$preferences.value.mouseLookSpeed,range:300...2400)
++                        adjustment("Mouse look speed",value:$preferences.value.mouseLookSpeed,range:300...2400, format:"%.0f px/s")
 +                    }
 +                }
 +                Section("Racing · gyro steering") {
 +                    Toggle("Tilt to steer",isOn:$gyro.enabled).disabled(!gyro.available)
-+                    adjustment("Full steering angle",value:$gyro.fullLockDegrees,range:15...70)
++                    adjustment("Full steering angle",value:$gyro.fullLockDegrees,range:15...70, format:"%.0f°")
 +                    Toggle("Invert steering",isOn:$gyro.inverted)
 +                    Text(gyro.available ? "Tilt controls horizontal steering. The joystick still controls acceleration/braking and all buttons remain available. Keyboard mapping translates steering to A/D. Recenter while holding the device comfortably." : "This device does not report a motion sensor. Joystick controls remain available.")
 +                        .font(.footnote).foregroundStyle(.secondary)
@@ -10405,27 +10496,28 @@ index 0000000..5f4ecb5
 +                    Button("Reset touchpad sensitivity") { touchpad.value=TouchpadTuning() }
 +                }
 +                Section("Overlay") {
-+                    adjustment("Control size",value:$preferences.value.scale,range:0.8...1.15)
-+                    adjustment("Opacity",value:$preferences.value.opacity,range:0.25...0.85)
++                    adjustment("Control size",value:$preferences.value.scale,range:0.8...1.15, format:"%.0f%%", multiplier:100)
++                    adjustment("Opacity",value:$preferences.value.opacity,range:0.25...0.85, format:"%.0f%%", multiplier:100)
 +                    Text("Drag a trigger down to reduce its analog pressure. L3 and R3 press the sticks. Use the three-finger menu to show or hide the overlay.")
 +                        .font(.footnote).foregroundStyle(.secondary)
 +                }
 +                Button("Reset gamepad tuning") { preferences.value = GamepadTuning() }
 +            }
++            .tint(Desk.accentLight)
++            .scrollContentBackground(.hidden).background(Desk.page)
 +            .navigationTitle("Gamepad settings")
 +            .onAppear { gyro.setConfigurationVisible(true) }
 +            .onDisappear { gyro.setConfigurationVisible(false) }
 +            .toolbar { ToolbarItem(placement:.confirmationAction) { Button("Done") { dismiss() } } }
 +        }
 +    }
-+    private func adjustment(_ name: String, value: Binding<Double>, range: ClosedRange<Double>) -> some View {
++    private func adjustment(_ name: String, value: Binding<Double>, range: ClosedRange<Double>, format: String = "%.2f×", multiplier: Double = 1) -> some View {
 +        VStack(alignment:.leading) {
-+            HStack { Text(name); Spacer(); Text(value.wrappedValue,format:.number.precision(.fractionLength(2))).monospacedDigit().foregroundStyle(.secondary) }
-+            Slider(value:value,in:range).accessibilityLabel(name)
++            HStack { Text(name); Spacer(); Text(String(format:format,value.wrappedValue*multiplier)).monospacedDigit().foregroundStyle(.secondary) }
++            Slider(value:value,in:range).accessibilityLabel(name).accessibilityValue(Text(String(format:format,value.wrappedValue*multiplier)))
 +        }
 +    }
 +}
-+
 diff --git a/ios/Henge/Controls/GamepadState.swift b/ios/Henge/Controls/GamepadState.swift
 new file mode 100644
 index 0000000..77e4f94
@@ -10908,7 +11000,7 @@ index 0000000..f4bf2f7
 +}
 diff --git a/ios/Henge/Controls/WirelessControlsPanel.swift b/ios/Henge/Controls/WirelessControlsPanel.swift
 new file mode 100644
-index 0000000..24520e6
+index 0000000..4dc41a1
 --- /dev/null
 +++ b/ios/Henge/Controls/WirelessControlsPanel.swift
 @@ -0,0 +1,174 @@
@@ -10949,8 +11041,8 @@ index 0000000..24520e6
 +                             short:geometry.size.height<450,portrait:layout.style == .portrait)
 +                }
 +            }
-+            .background(LinearGradient(colors:[Color(red:0.08,green:0.1,blue:0.16),.black],startPoint:.topLeading,endPoint:.bottomTrailing))
-+            .foregroundStyle(.white)
++            .background(Desk.page)
++            .foregroundStyle(Desk.text)
 +            .onChange(of:layout.style) { _,_ in releaseInput() }
 +            .onChange(of:layoutChoice) { _,_ in releaseInput() }
 +        }
@@ -11630,7 +11722,7 @@ index 037685f..bbea374 100644
          log("boot", "cache lifecycle: JIT translations and kernel read lookups are RAM-only; no cross-launch executable cache")
          if let source = info["HengeCustomSourceCommit"] as? String {
 diff --git a/ios/Henge/HomeView.swift b/ios/Henge/HomeView.swift
-index 2c11af9..089af4b 100644
+index 2c11af9..46f9888 100644
 --- a/ios/Henge/HomeView.swift
 +++ b/ios/Henge/HomeView.swift
 @@ -1,4 +1,5 @@
@@ -11749,7 +11841,7 @@ index 2c11af9..089af4b 100644
      @ViewBuilder private var notices: some View {
          if Device.chipTooOld {
              NoticeRow(symbol: "exclamationmark.triangle.fill", text: Device.chipTooOldText, tint: Desk.bad)
-@@ -174,77 +191,19 @@ private struct MacHero: View {
+@@ -174,77 +191,23 @@ private struct MacHero: View {
      let jitReady: Bool
      let start: () -> Void
      let turnOnJIT: () -> Void
@@ -11757,8 +11849,7 @@ index 2c11af9..089af4b 100644
      let jitNote: String?
      @AppStorage("henge.cpus") private var cpus = 4
 -
-+    @State private var previewImage: UIImage?
-     var body: some View {
+-    var body: some View {
 -        VStack(spacing: 0) {
 -            NavigationLink(value: mac) {
 -                VStack(spacing: 0) {
@@ -11809,7 +11900,11 @@ index 2c11af9..089af4b 100644
 -        }
 -        .padding(14)
 -        .deskCard(radius: 30)
--    }
++    @ObservedObject private var resumeStatus = InstantResumeStatus.shared
++    @State private var previewImage: UIImage?
++    private var inMemory: Bool {
++        InstantResume.runtime.configuration(macID:mac.id,generation:henge_vm_generation(),state:henge_vm_state()) != nil
+     }
 -
 -    @ViewBuilder private var preview: some View {
 -        ZStack {
@@ -11821,8 +11916,9 @@ index 2c11af9..089af4b 100644
 -                    .font(.system(size: 46, weight: .light))
 -                    .foregroundStyle(Desk.faint)
 -            }
++    var body: some View {
 +        MacLaunchCard(name: mac.name, summary: "\(mac.summary) · \(cpus) CPUs",
-+            ready: jitReady, saved: InstantResume.hasSave(for: mac), preview: previewImage,
++            ready: jitReady || inMemory, saved: InstantResume.hasSave(for: mac), inMemory: inMemory, preview: previewImage,
 +            setupNote: jitNote, start: start, setup: turnOnJIT, configure: configure)
 +        .task(id: mac.lastUsed) {
 +            let path = MacPreview.file(for: mac).path
@@ -13322,7 +13418,7 @@ index 29c8b3b..00f528f 100644
          all.removeAll { $0.id == id }
          save()
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..5d05fc1 100644
+index 34d6a98..bac3e55 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
 @@ -3,6 +3,7 @@
@@ -13485,7 +13581,7 @@ index 34d6a98..5d05fc1 100644
          snprintf(err, errlen, "No Mac is running.");
          return -1;
      }
-@@ -133,21 +191,70 @@ int henge_vm_pause(char *err, size_t errlen) {
+@@ -133,21 +191,73 @@ int henge_vm_pause(char *err, size_t errlen) {
          snprintf(err, errlen, "The Mac stopped by itself.");
          return -1;
      }
@@ -13548,8 +13644,11 @@ index 34d6a98..5d05fc1 100644
 +        headroom = os_proc_available_memory();
 +#endif
 +        unsigned workers = hv_snapshot_workers(active > 0 ? (unsigned)active : 1, headroom);
-+        fprintf(stderr, "henge: save policy: workers=%u available=%lluMB background=%d; bounded user-initiated compression\n",
-+                workers, (unsigned long long)(headroom >> 20), request->background);
++        char available[40];
++        if (headroom == UINT64_MAX) snprintf(available,sizeof available,"not reported");
++        else snprintf(available,sizeof available,"%llu MiB",(unsigned long long)(headroom >> 20));
++        fprintf(stderr, "henge: save policy: workers=%u available=%s background=%d; bounded user-initiated compression\n",
++                workers, available, request->background);
 +        HvSnapshotControl control = {.cancelled=save_cancelled, .progress=save_progress, .context=request,
 +            .workers=workers, .background=request->background};
 +        r = hv_snapshot_save_controlled(path, ident, &control, err, errlen);
@@ -13562,7 +13661,7 @@ index 34d6a98..5d05fc1 100644
      fprintf(stderr, "henge: %s\n", r ? err : "the paused Mac is saved");
      return r;
  }
-@@ -160,18 +267,39 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
+@@ -160,18 +270,39 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
  }
  
  int henge_vm_continue(void) {
@@ -13605,7 +13704,7 @@ index 34d6a98..5d05fc1 100644
      }
      pthread_rwlock_unlock(&api_lock);
      fprintf(stderr, "henge: the Mac runs on%s\n", r ? " -- no, its CPU threads could not start" : "");
-@@ -192,17 +320,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
+@@ -192,17 +323,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
      fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
              jit->size >> 20);
      if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
@@ -13634,7 +13733,7 @@ index 34d6a98..5d05fc1 100644
  }
  
  static volatile int install_step = -1;
-@@ -239,7 +375,7 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
+@@ -239,7 +378,7 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
          snprintf(err, errlen, "The installer could not start.");
          return failed_start();
      }
@@ -13643,7 +13742,7 @@ index 34d6a98..5d05fc1 100644
  }
  
  int henge_install_step(void) { return install_step; }
-@@ -293,22 +429,29 @@ static int lock_running(void) {
+@@ -293,22 +432,29 @@ static int lock_running(void) {
      return 0;
  }
  void henge_vm_stop(void) {
@@ -13684,7 +13783,7 @@ index 34d6a98..5d05fc1 100644
  }
  
  long henge_vm_balloon(long target_mb) {
-@@ -344,13 +487,13 @@ void henge_vm_log_cache(void) {
+@@ -344,13 +490,13 @@ void henge_vm_log_cache(void) {
  
  uint64_t henge_vm_blocks(void) {
      pthread_rwlock_rdlock(&api_lock);
@@ -13700,7 +13799,7 @@ index 34d6a98..5d05fc1 100644
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
-@@ -375,9 +518,35 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
+@@ -375,9 +521,35 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
      if (hv_share_start(folder, socket_path, agent) == 0) hv_net_set_share_socket(socket_path);
  }
  void henge_share_set_clipboard(const char *text) { hv_share_set_clipboard(text); }
@@ -13736,7 +13835,7 @@ index 34d6a98..5d05fc1 100644
  void henge_vm_set_display(uint32_t width, uint32_t height) { hv_pvg_lite_set_mode(width, height); }
  void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm) { hv_pvg_lite_set_size_mm(width_mm, height_mm); }
  int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,uint32_t height_mm,uint32_t hz) {
-@@ -388,6 +557,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
+@@ -388,6 +560,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
@@ -13763,7 +13862,7 @@ index 34d6a98..5d05fc1 100644
  void henge_vm_link_connected(int connected) {
      if (!lock_running()) return;
      HvVmapple *b = hv_vm_board();
-@@ -454,13 +643,51 @@ void henge_vm_set_display_layer(void *layer) {
+@@ -454,13 +646,51 @@ void henge_vm_set_display_layer(void *layer) {
      hv_vm_set_display_layer(layer);
  }
  uint64_t henge_vm_gpu_frames(void) {
@@ -13818,7 +13917,7 @@ index 34d6a98..5d05fc1 100644
      HvBootDisplay d;
      int result = -1;
      if (hv_vm_boot_display(&d) == 0) {
-@@ -509,3 +736,81 @@ uint64_t henge_largest_mapping_mb(void) {
+@@ -509,3 +739,81 @@ uint64_t henge_largest_mapping_mb(void) {
      }
      return 0;
  }
@@ -15509,7 +15608,7 @@ index e1693b0..269386b 100644
 +
  }
 diff --git a/ios/Henge/Sharing.swift b/ios/Henge/Sharing.swift
-index eb316cc..752dc6d 100644
+index eb316cc..0d7bf6a 100644
 --- a/ios/Henge/Sharing.swift
 +++ b/ios/Henge/Sharing.swift
 @@ -1,11 +1,29 @@
@@ -15555,7 +15654,7 @@ index eb316cc..752dc6d 100644
          HengeLog.log("sharing", enabledForSession
                       ? "guest folder and clipboard bridge enabled (local virtual address 10.0.2.4)"
                       : "guest folder and automatic clipboard bridge disabled for this launch")
-@@ -34,25 +58,66 @@ enum Sharing {
+@@ -34,25 +58,70 @@ enum Sharing {
  
      /// What is copied on the Mac is copied here too. The other way needs the system's paste button: iOS
      /// asks for permission whenever an app reads the clipboard on its own.
@@ -15602,6 +15701,10 @@ index eb316cc..752dc6d 100644
 +    @MainActor static func paste(_ text: String) {
 +        guard !ClipboardStatus.shared.busy, UIApplication.shared.applicationState == .active,
 +              henge_vm_state() == 1 else { return }
++        guard !text.utf8.contains(0) else {
++            ClipboardStatus.shared.message = "This text contains a null character and cannot be shared safely."
++            return
++        }
 +        let generation = henge_vm_generation()
 +        let status = ClipboardStatus.shared
 +        pasteRevision &+= 1
@@ -15970,7 +16073,7 @@ index 0000000..5435674
 +HengeGamepadPreview.xcodeproj/
 diff --git a/tests/gamepad-preview/App.swift b/tests/gamepad-preview/App.swift
 new file mode 100644
-index 0000000..65606de
+index 0000000..1b4c950
 --- /dev/null
 +++ b/tests/gamepad-preview/App.swift
 @@ -0,0 +1,120 @@
@@ -16039,7 +16142,7 @@ index 0000000..65606de
 +                    Spacer()
 +                    Button(opening ? "Controls" : "Home") { opening.toggle() }.accessibilityIdentifier("show-home")
 +                    if opening {
-+                        Button("State") { homeState=(homeState+1)%3 }.accessibilityIdentifier("home-state")
++                        Button("State") { homeState=(homeState+1)%4 }.accessibilityIdentifier("home-state")
 +                        Button(homeDark ? "Light" : "Dark") { homeDark.toggle() }.accessibilityIdentifier("home-theme")
 +                    }
 +                    Button(wireless ? "Local" : "Wireless") { last = .off;wireless.toggle() }.accessibilityIdentifier("switch-layout")
@@ -16063,7 +16166,7 @@ index 0000000..65606de
 +                    if opening {
 +                        ScrollView {
 +                            OpeningDashboard(wide:width>=900) {
-+                                MacLaunchCard(name:"Macintosh",summary:"macOS · 8 GB · 4 CPUs",ready:homeState != 2,saved:homeState == 1,
++                                MacLaunchCard(name:"Macintosh",summary:"macOS · 8 GB · 4 CPUs",ready:homeState != 2,saved:homeState == 1,inMemory:homeState == 3,
 +                                    setupNote:"Enable JIT to start your Mac",start:{homeActions+=1},setup:{homeActions+=1},configure:{homeActions+=1})
 +                            } connections: {
 +                                VStack(spacing:20) {
@@ -16096,10 +16199,10 @@ index 0000000..65606de
 +}
 diff --git a/tests/gamepad-preview/GamepadPreviewUITests.swift b/tests/gamepad-preview/GamepadPreviewUITests.swift
 new file mode 100644
-index 0000000..64908b5
+index 0000000..8b1511f
 --- /dev/null
 +++ b/tests/gamepad-preview/GamepadPreviewUITests.swift
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,147 @@
 +import XCTest
 +import CoreGraphics
 +
@@ -16158,6 +16261,9 @@ index 0000000..64908b5
 +        launch.tap()
 +        XCTAssertEqual(app.staticTexts["home-actions"].label,"Actions: 2")
 +        capture("\(PreviewFixture.profile)-home-setup")
++        app.buttons["home-state"].tap()
++        XCTAssertTrue(app.staticTexts["Continue Mac"].exists || launch.label.contains("Continue Mac"))
++        capture("\(PreviewFixture.profile)-home-paused")
 +        app.buttons["show-home"].tap()
 +        XCTAssertTrue(surface.waitForExistence(timeout:5))
 +        capture("\(PreviewFixture.profile)-local-default")
@@ -19496,7 +19602,7 @@ index 553c4b6..64d0cb9 100644
 + puts("iOS profiler lifecycle: off/on/off/on, port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
  }
 diff --git a/tests/test_pvg_lifecycle.m b/tests/test_pvg_lifecycle.m
-index 81cdb83..64fe0d1 100644
+index 81cdb83..e75cbc5 100644
 --- a/tests/test_pvg_lifecycle.m
 +++ b/tests/test_pvg_lifecycle.m
 @@ -1,9 +1,16 @@
@@ -19516,7 +19622,7 @@ index 81cdb83..64fe0d1 100644
  
  /* Exercise real Metal command completion while the guest board is destroyed.
     Empty execs avoid simulator limitations on guest buffer-backed textures. */
-@@ -11,8 +18,209 @@ static HvMachine machine;
+@@ -11,8 +18,268 @@ static HvMachine machine;
  static HvCpu cpus[2];
  static HvVmapple board;
  
@@ -19698,7 +19804,7 @@ index 81cdb83..64fe0d1 100644
 +    [surface setValue:@YES forKey:@"mapping_in_buffer"];
 +    [surface setValue:@4 forKey:@"surface_w"]; [surface setValue:@4 forKey:@"surface_h"];
 +    [surface setValue:@256 forKey:@"row"]; [surface setValue:@0 forKey:@"first"];
-+    [surface setValue:@('BGRA') forKey:@"fourcc"];
++    [surface setValue:@((uint32_t)'BGRA') forKey:@"fourcc"];
 +    Ivar mapped = class_getInstanceVariable([surface class], "mapped"); assert(mapped);
 +    *(const uint8_t **)((uint8_t *)(__bridge void *)surface + ivar_getOffset(mapped)) = buffer.contents;
 +    NSMutableDictionary *surfaces = [replay valueForKey:@"surfaces"];
@@ -19718,6 +19824,65 @@ index 81cdb83..64fe0d1 100644
 +    }
 +}
 +
++@protocol ResumeGpuTesting
++- (void)commit:(id<MTLCommandBuffer>)buffer channel:(uint32_t)channel stamp:(uint64_t)stamp complete:(BOOL)complete;
++@end
++static void pointerIvar(id object,const char *name,void *value) {
++    Ivar field=class_getInstanceVariable([object class],name);assert(field);
++    *(void **)((uint8_t *)(__bridge void *)object+ivar_getOffset(field))=value;
++}
++/* A private game/browser render target must survive pause, and an unsupported
++   resource must refuse the save instead of silently losing its pixels. */
++static void privateTextureResume(HvPvgMetal *metal) {
++    id replay=(__bridge id)metal;
++    dispatch_queue_t worker=[replay valueForKey:@"worker"];
++    __block id object=nil;__block id<MTLBuffer> bytes=nil;
++    __block BOOL oldCache=NO;__block uint64_t oldEpoch=0;
++    dispatch_sync(worker,^{
++        id<MTLDevice> device=[replay valueForKey:@"device"];
++        bytes=[device newBufferWithLength:16384 options:MTLResourceStorageModeShared];assert(bytes);
++        MTLTextureDescriptor *descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:4 height:4 mipmapped:NO];
++        descriptor.storageMode=MTLStorageModePrivate;descriptor.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
++        id<MTLTexture> texture=[device newTextureWithDescriptor:descriptor];assert(texture);
++        object=[NSClassFromString(@"HvObject")new];
++        [object setValue:texture forKey:@"object"];[object setValue:bytes forKey:@"guest_copy"];
++        for(NSString *flag in @[@"mapping_in_buffer",@"guest_backed",@"host_valid",@"guest_stale"]) [object setValue:@YES forKey:flag];
++        [object setValue:@16384 forKey:@"length"];[object setValue:@1 forKey:@"vpage"];
++        [object setValue:@1 forKey:@"tex_mips"];[object setValue:@1 forKey:@"tex_slices"];
++        uint32_t *pages=calloc(1,4);assert(pages);pages[0]=1;pointerIvar(object,"pages",pages);pointerIvar(object,"mapped",bytes.contents);
++        uint8_t *layout=calloc(1,36);assert(layout);
++        uint64_t row=256;uint32_t width=4,height=4,depth=1;
++        memcpy(layout+16,&row,8);memcpy(layout+24,&width,4);memcpy(layout+28,&height,4);memcpy(layout+32,&depth,4);
++        pointerIvar(object,"tex_layout",layout);
++        // This fixture owns an immutable mapping; use the existing exact epoch
++        // cache rather than constructing an unrelated guest page-table driver.
++        oldCache=[[replay valueForKey:@"batch_cache"]boolValue];oldEpoch=[[replay valueForKey:@"current_epoch"]unsignedLongLongValue];
++        [replay setValue:@YES forKey:@"batch_cache"];[replay setValue:@123 forKey:@"current_epoch"];
++        [object setValue:@123 forKey:@"refresh_epoch"];[object setValue:@77 forKey:@"refresh_task"];
++        NSMutableDictionary *tasks=[replay valueForKey:@"tasks"];tasks[@77]=[NSMutableDictionary dictionaryWithObject:object forKey:@1];
++        id<MTLCommandQueue> queue=[replay valueForKey:@"queue"];id<MTLCommandBuffer> cb=[queue commandBuffer];
++        MTLRenderPassDescriptor *pass=[MTLRenderPassDescriptor renderPassDescriptor];
++        pass.colorAttachments[0].texture=texture;pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
++        pass.colorAttachments[0].clearColor=MTLClearColorMake(1,0,0,1);
++        id<MTLRenderCommandEncoder> encoder=[cb renderCommandEncoderWithDescriptor:pass];assert(encoder);[encoder endEncoding];
++        [(id<ResumeGpuTesting>)replay commit:cb channel:0 stamp:0 complete:NO];
++    });
++    assert(!hv_pvg_metal_quiesce(metal));
++    assert(![[object valueForKey:@"guest_stale"]boolValue]);
++    for(unsigned y=0;y<4;y++)for(unsigned x=0;x<4;x++) {
++        uint8_t *pixel=(uint8_t *)bytes.contents+y*256+x*4;assert(!pixel[0]&&!pixel[1]&&pixel[2]==255&&pixel[3]==255);
++    }
++    dispatch_sync(worker,^{[object setValue:@YES forKey:@"guest_stale"];[object setValue:@2 forKey:@"tex_mips"];});
++    assert(hv_pvg_metal_quiesce(metal)!=0 && [[object valueForKey:@"guest_stale"]boolValue]);
++    dispatch_sync(worker,^{[object setValue:@1 forKey:@"tex_mips"];});
++    assert(!hv_pvg_metal_quiesce(metal));
++    dispatch_sync(worker,^{
++        [[replay valueForKey:@"tasks"]removeObjectForKey:@77];
++        [replay setValue:@(oldCache) forKey:@"batch_cache"];[replay setValue:@(oldEpoch) forKey:@"current_epoch"];
++    });
++    puts("GPU resume: queued private render target preserved; invalid layout refuses save; recovery passed");
++}
++
  int main(void) {
 -    alarm(30);
 +    alarm(60);
@@ -19727,7 +19892,7 @@ index 81cdb83..64fe0d1 100644
      for (int cycle = 0; cycle < 6; cycle++) @autoreleasepool {
          HvCfgParams cfg = {.nr_cpus = 2};
          if (hv_machine_init(&machine, 4 << 20) ||
-@@ -20,19 +228,64 @@ int main(void) {
+@@ -20,19 +287,65 @@ int main(void) {
          hv_vmapple_reset_cpu(&board);
          HvPvgMetal *metal = hv_pvg_metal_create(board.pvg);
          if (!metal) { fprintf(stderr, "Metal replay unavailable; lifecycle test cannot run\n"); return 1; }
@@ -19750,6 +19915,7 @@ index 81cdb83..64fe0d1 100644
 +               ![(__bridge id)metal valueForKey:@"archive_save_timer"]);
 +        assert(![[(__bridge id)metal valueForKey:@"archive_pressure_suspended"]boolValue]);
 +        (void)hv_pvg_metal_capture_timing(metal,0,NULL);
++        privateTextureResume(metal);
 +        detachedPresentation(metal);
 +        hv_pvg_metal_set_display_paused(metal, 1);
 +        assert([[(__bridge id)metal valueForKey:@"display_quiesced"] boolValue]);
@@ -20476,11 +20642,12 @@ index 0000000..c0d70a9
 +print('Simulator selection: dedicated Duo runtime before fallback, latest compatible M4, unavailable runtime and missing-model fallback passed')
 diff --git a/tests/test_snapshot_pack.c b/tests/test_snapshot_pack.c
 new file mode 100644
-index 0000000..11c21fc
+index 0000000..2fe081e
 --- /dev/null
 +++ b/tests/test_snapshot_pack.c
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,58 @@
 +/* Actual schema3 chunk encoder/decoder. Link dead-strips unrelated VM entrypoints. */
++#define HV_SNAPSHOT_TESTING 1
 +#include "../host/snapshot.c"
 +#include <assert.h>
 +
@@ -20519,6 +20686,20 @@ index 0000000..11c21fc
 +    roundtrip(&slot,ram,copy,size,0,0); /* sparse compaction, unchanged disk schema */
 +    HvSnapshotControl control={.cancelled=cancelled_always};
 +    chunk_pack(&slot,ram,size,0,0,&control);assert(!slot.h.stored&&!slot.h.bytes);
++    FILE *file=tmpfile();assert(file);
++    uint64_t stored=0;
++    HvSnapshotControl limited={.workers=2};
++    W writer={.fd=fileno(file),.buf=malloc(CHUNK_BYTES),.cap=CHUNK_BYTES,.control=&limited};assert(writer.buf);
++    HvRam source={.pa=0x100000,.size=size,.host=ram};
++    assert(!save_ram(&writer,&source,&stored,1));w_flush(&writer);assert(!writer.err);free(writer.buf);
++    assert(lseek(fileno(file),0,SEEK_SET)==0);memset(copy,0,size);
++    R reader={.fd=fileno(file),.buf=malloc(CHUNK_BYTES),.cap=CHUNK_BYTES};assert(reader.buf);
++    HvRam destination={.pa=source.pa,.size=size,.host=copy};
++    hv_snapshot_test_fail_after(0);
++    assert(!load_ram(&reader,&destination));
++    assert(hv_snapshot_test_packing_retries()>0);
++    hv_snapshot_test_fail_after(-1);
++    assert(!memcmp(ram,copy,size));free(reader.buf);fclose(file);
 +    slots_free(&slot,1);free(ram);free(copy);
 +    puts("Snapshot chunks: dense/sparse/zero/raw/partial, corruption, cancellation and memory budgets passed");
 +    return 0;
@@ -20825,7 +21006,7 @@ index 0000000..f2c797b
 +    return 0;
 +}
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..ae111c9 100644
+index a13a70d..6cd37c1 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
 @@ -3,6 +3,9 @@
@@ -20838,7 +21019,7 @@ index a13a70d..ae111c9 100644
  
  #include <fcntl.h>
  #include <mach/mach.h>
-@@ -12,13 +15,69 @@
+@@ -12,13 +15,71 @@
  #include <stdlib.h>
  #include <string.h>
  #include <unistd.h>
@@ -20849,6 +21030,8 @@ index a13a70d..ae111c9 100644
  /* Real native bridge and device workers; only the debugger allocation and
     unused installer entry point are replaced. No Apple ROM or disk needed. */
 +extern void hv_snapshot_test_fail_after(int n);
++extern void hv_snapshot_test_fail_persistently(int n);
++extern int hv_snapshot_test_packing_retries(void);
 +extern void henge_vm_test_write_lock(int held);
 +extern void hv_snapshot_test_progress(void (*hook)(uint64_t));
 +static pthread_mutex_t save_gate_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -20908,7 +21091,7 @@ index a13a70d..ae111c9 100644
  HengeDualMapping *henge_ios_jit_get_mapping(void) { return &mapping; }
  void hv_prof_ios_start(void) {}
  int hv_install_start(HvVirtioUsb *usb, const char *ipsw, const char *work, uint64_t ecid,
-@@ -29,6 +88,16 @@ int hv_install_start(HvVirtioUsb *usb, const char *ipsw, const char *work, uint6
+@@ -29,6 +90,16 @@ int hv_install_start(HvVirtioUsb *usb, const char *ipsw, const char *work, uint6
  static void check(const char *what, int ok) {
      if (!ok) { fprintf(stderr, "FAIL: %s\n", what); failures++; }
  }
@@ -20925,7 +21108,7 @@ index a13a70d..ae111c9 100644
  static int fds(void) {
      int n = 0;
      for (int i = 0; i < 2048; i++) if (fcntl(i, F_GETFD) != -1) n++;
-@@ -58,6 +127,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
+@@ -58,6 +129,37 @@ static void write_file(const char *path, const void *data, size_t bytes) {
      if (fd < 0 || (data && write(fd, data, bytes) != (ssize_t)bytes) || ftruncate(fd, bytes)) exit(1);
      close(fd);
  }
@@ -20963,7 +21146,7 @@ index a13a70d..ae111c9 100644
  static void *read_ui(void *unused) {
      (void)unused;
      while (!atomic_load(&reader_done)) {
-@@ -69,6 +169,8 @@ static void *read_ui(void *unused) {
+@@ -69,6 +171,8 @@ static void *read_ui(void *unused) {
          henge_vm_cpus_on();
          henge_vm_link_connected(0);
          henge_vm_gpu_frames();
@@ -20972,7 +21155,7 @@ index a13a70d..ae111c9 100644
          henge_vm_balloon(-1);
          henge_vm_set_display_layer(NULL);
          if (!henge_vm_boot_display(&pixels, &width, &height, &stride)) henge_vm_free_display(pixels);
-@@ -76,8 +178,22 @@ static void *read_ui(void *unused) {
+@@ -76,8 +180,22 @@ static void *read_ui(void *unused) {
      }
      return NULL;
  }
@@ -20996,7 +21179,7 @@ index a13a70d..ae111c9 100644
      char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
      if (!mkdtemp(dir) || hv_jit_region_open(&jit, 8 << 20)) return 1;
      snprintf(rom, sizeof rom, "%s/rom", dir);
-@@ -91,6 +207,10 @@ int main(void) {
+@@ -91,6 +209,10 @@ int main(void) {
      write_file(aux, NULL, 1 << 20);
      mapping = (HengeDualMapping){.rx_addr = (uint8_t *)jit.base,
          .rw_addr = (uint8_t *)jit.base + jit.rw_diff, .size = jit.capacity * 4};
@@ -21007,7 +21190,7 @@ index a13a70d..ae111c9 100644
      pthread_t reader;
      if (pthread_create(&reader, NULL, read_ui, NULL)) return 1;
      /* Warm the process-wide pointer queue before counting worker threads. */
-@@ -102,6 +222,7 @@ int main(void) {
+@@ -102,6 +224,7 @@ int main(void) {
      /* Missing ROM fails after disks, RAM and device workers were created. */
      for (int i = 0; i < 3; i++) {
          check("failed boot reports an error", henge_vm_boot(rom, disk, aux, 1, 0, 64, 4, error, sizeof error) != 0);
@@ -21015,7 +21198,7 @@ index a13a70d..ae111c9 100644
          check("failed boot allows retry", henge_vm_state() == 0 && henge_vm_can_start());
          check("failed boot closes files", fds() == initial_fds);
          check("failed boot joins workers", threads() == initial_threads);
-@@ -150,9 +271,35 @@ int main(void) {
+@@ -150,9 +273,35 @@ int main(void) {
          write_file(rom, code, sizeof code);
          int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          check("resume test boots", rc == 0);
@@ -21051,7 +21234,7 @@ index a13a70d..ae111c9 100644
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "suspend: %s\n", error);
          check("suspend saves", rc == 0 && henge_vm_state() == 4 && access(snap, F_OK) == 0);
-@@ -160,35 +307,98 @@ int main(void) {
+@@ -160,35 +309,98 @@ int main(void) {
              fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\n");
              return 1;
          }
@@ -21160,7 +21343,7 @@ index a13a70d..ae111c9 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +419,78 @@ int main(void) {
+@@ -209,6 +421,97 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);
@@ -21203,13 +21386,32 @@ index a13a70d..ae111c9 100644
 +        check("concurrent saves serialize", !attempts[0].result && !attempts[1].result &&
 +              henge_vm_saved_ok(snap, "test", NULL, NULL) == 0);
 +        for (int allocation = 0; allocation < 7; allocation++) {
-+            hv_snapshot_test_fail_after(allocation);
++            hv_snapshot_test_fail_persistently(allocation);
 +            rc = henge_vm_save(snap, "test", error, sizeof error);
 +            hv_snapshot_test_fail_after(-1);
 +            check("allocation failure reported and stays paused", rc != 0 && henge_vm_state() == 4);
 +            check("allocation failure preserves good save", henge_vm_saved_ok(snap, "test", NULL, NULL) == 0);
 +            check("allocation failure removes partial save", access(blocked, F_OK) != 0);
 +        }
++        /* A transient packing allocation failure retries with fewer workers;
++           persistent failures above must still refuse and preserve the save. */
++        unsigned recovered_allocations = 0, essential_failures = 0;
++        for (int allocation = 0; allocation < 9; allocation++) {
++            hv_snapshot_test_fail_after(allocation);
++            rc = henge_vm_save(snap, "test", error, sizeof error);
++            int retried = hv_snapshot_test_packing_retries();
++            hv_snapshot_test_fail_after(-1);
++            if (retried) {
++                recovered_allocations++;
++                check("transient packing allocation recovers with smaller batch", rc == 0 && henge_vm_state() == 4);
++            } else {
++                essential_failures++;
++                check("essential allocation failure refuses save", rc != 0 && henge_vm_state() == 4);
++            }
++            check("allocation outcome retains a complete compatible save", henge_vm_saved_ok(snap,"test",NULL,NULL) == 0);
++            check("allocation outcome removes partial save", access(blocked,F_OK) != 0);
++        }
++        check("both essential and recoverable allocations exercised", recovered_allocations && essential_failures);
 +        if (henge_vm_continue() || henge_vm_suspend(snap, "test", error, sizeof error)) return 1;
 +        henge_vm_stop();
 +        /* A payload byte changed without changing file length or trailer. */
