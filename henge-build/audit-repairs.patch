@@ -1844,10 +1844,10 @@ index 0000000..803678a
 +}
 +#endif
 diff --git a/devices/metal_library_cache.h b/devices/metal_library_cache.h
-index 30699bd..6ea7d06 100644
+index 30699bd..28122bd 100644
 --- a/devices/metal_library_cache.h
 +++ b/devices/metal_library_cache.h
-@@ -2,17 +2,30 @@
+@@ -2,17 +2,32 @@
  #import <Metal/Metal.h>
  #import <Foundation/Foundation.h>
  
@@ -1868,6 +1868,8 @@ index 30699bd..6ea7d06 100644
  }
  @property(nonatomic, readonly) NSUInteger retainedBytes;
  @property(nonatomic, readonly) NSUInteger count;
++@property(nonatomic, readonly) NSUInteger admissionBytes;
++@property(nonatomic, readonly) NSUInteger admissionEntries;
  @property(nonatomic, readonly) uint64_t hits;
  @property(nonatomic, readonly) uint64_t loads;
 +@property(nonatomic, readonly) uint64_t functionHits;
@@ -1880,13 +1882,15 @@ index 30699bd..6ea7d06 100644
  @end
  
  @implementation HvMetalLibraryCache
-@@ -24,19 +37,50 @@
+@@ -24,19 +39,52 @@
      return self;
  }
  - (NSUInteger)count { return _libraries.count; }
 -- (id<MTLLibrary>)libraryForData:(NSData *)data loader:(id<MTLLibrary>(^)(void))loader {
 -    id<MTLLibrary> cached = _libraries[data];
 -    if (cached) { _hits++; return cached; }
++- (NSUInteger)admissionBytes { return _maxBytes; }
++- (NSUInteger)admissionEntries { return _maxEntries; }
 +- (void)trim { [_libraries removeAllObjects]; [_order removeAllObjects]; _retainedBytes = 0; }
 +- (void)setAdmissionBytes:(NSUInteger)bytes entries:(NSUInteger)entries {
 +    _maxBytes = bytes; _maxEntries = entries;
@@ -2293,7 +2297,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..aa69bb9 100644
+index 9073d22..50d0273 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -2579,7 +2583,7 @@ index 9073d22..aa69bb9 100644
 +        }
 +    }
 +    archive_budget_pressure=pressure;
-+    HvResourceBudget budget = hv_resource_budget(available, pressure);
++    HvResourceBudget budget = hv_resource_budget_profile(available, pressure, hv_host_is_m4_16gb());
 +    [library_cache setAdmissionBytes:getenv("HV_GPU_LIBRARY_CACHE_OFF") ? 0 : (NSUInteger)budget.library_bytes
 +                            entries:budget.library_entries];
 +    cache_budget_deadline = now_seconds() + 1;
@@ -3252,8 +3256,17 @@ index 9073d22..aa69bb9 100644
                  atomic_load_explicit(&gpu_duration_ns, memory_order_relaxed) / 1e6,
                  atomic_load_explicit(&gpu_max_ns, memory_order_relaxed) / 1e6,
                  (unsigned long long)atomic_load_explicit(&gpu_timing_missing, memory_order_relaxed));
-@@ -2287,6 +2691,22 @@ typedef struct {
-                 library_load_seconds * 1000, library_load_worst * 1000);
+@@ -2281,12 +2685,29 @@ typedef struct {
+             (unsigned long long)planar_creations,(unsigned long long)planar_reuses);
+         fprintf(stderr, "hengevm: gpu-surface-checks: performed=%llu duplicate_scans_avoided=%llu (exact surface identity; one check per command batch)\n",
+                 (unsigned long long)surface_checks, (unsigned long long)surface_checks_avoided);
+-        fprintf(stderr, "hengevm: gpu-libraries: hits=%llu loads=%llu retained=%lu bytes=%lu load_ms=%.2f worst_ms=%.2f (exact bytes; session-only; limits 32 libraries/8MiB binary keys)\n",
++        fprintf(stderr, "hengevm: gpu-libraries: hits=%llu loads=%llu retained=%lu bytes=%lu load_ms=%.2f worst_ms=%.2f (exact bytes; session-only; limits %lu libraries/%.1fMiB binary keys)\n",
+                 (unsigned long long)library_cache.hits, (unsigned long long)library_cache.loads,
+                 (unsigned long)library_cache.count, (unsigned long)library_cache.retainedBytes,
+-                library_load_seconds * 1000, library_load_worst * 1000);
++                library_load_seconds * 1000, library_load_worst * 1000,
++                (unsigned long)library_cache.admissionEntries, library_cache.admissionBytes/1048576.0);
          fprintf(stderr, "hengevm: gpu-pipelines: builds=%llu total_ms=%.2f worst_ms=%.2f (cumulative host pipeline creation, including failures)\n",
                  (unsigned long long)pipeline_builds, pipeline_seconds * 1000, pipeline_worst_seconds * 1000);
 +        fprintf(stderr, "hengevm: gpu-pipeline-archives: hits=%llu compiled=%llu pending=%lu bypass=%llu hit_ms=%.2f compile_ms=%.2f pressure_suspended=%d (session totals; disk cache survives launches, save scheduled 8s from first pending PSO)\n",
@@ -3275,7 +3288,7 @@ index 9073d22..aa69bb9 100644
      }
      return YES;
  }
-@@ -2319,14 +2739,27 @@ static const uint8_t *half_to_byte(void) {
+@@ -2319,14 +2740,27 @@ static const uint8_t *half_to_byte(void) {
      memcpy(&hx, (const uint8_t *)a + 0x24, 2), memcpy(&hy, (const uint8_t *)a + 0x26, 2);
      if (!w || !h || w > 512 || h > 512 || stride < (uint64_t)w * 4 || stride > 8192) return;
      uint8_t *bits = malloc((size_t)stride * h);
@@ -3303,7 +3316,7 @@ index 9073d22..aa69bb9 100644
      [glyph replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
      if (a[0] == 1) {
          link_cursor=glyph;link_cw=w;link_ch=h;link_hx=hx;link_hy=hy;
-@@ -2336,21 +2769,22 @@ static const uint8_t *half_to_byte(void) {
+@@ -2336,21 +2770,22 @@ static const uint8_t *half_to_byte(void) {
      os_unfair_lock_lock(&screen_lock);
      cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
      cursor_tex = glyph;
@@ -3329,7 +3342,7 @@ index 9073d22..aa69bb9 100644
          [self screenChanged];
          return;
      }
-@@ -2368,7 +2802,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2368,7 +2803,7 @@ static const uint8_t *half_to_byte(void) {
      }
      if (where == 0xffffffff) return;
      /* Bigger than the guest draws it. The hot spot stays where it points. */
@@ -3338,7 +3351,7 @@ index 9073d22..aa69bb9 100644
      /* The pointer's place is in the display mode's pixels; a scaled resolution's frame is smaller than the mode. */
      uint32_t mw = w, mh = h;
      hv_pvg_lite_mode(&mw, &mh);
-@@ -2439,26 +2873,110 @@ static const uint8_t *half_to_byte(void) {
+@@ -2439,26 +2874,110 @@ static const uint8_t *half_to_byte(void) {
     refresh, so that happens on a thread of its own and never holds up the guest's GPU work:
     this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
  - (void)updatePacingPolicy {
@@ -3459,7 +3472,7 @@ index 9073d22..aa69bb9 100644
      if (presenter_running || !layer || !screen_tex || drawable_retry_pending || pacing_pending) return;
      [self updatePacingPolicy];
      double now = now_seconds();
-@@ -2520,12 +3038,35 @@ static const uint8_t *half_to_byte(void) {
+@@ -2520,12 +3039,35 @@ static const uint8_t *half_to_byte(void) {
      const uint8_t *page=hv_pvg_lite_display_page_for_port(lite,1);
      uint32_t at=page ? __atomic_load_n((const uint32_t *)(page+0xe00),__ATOMIC_ACQUIRE) : UINT32_MAX;
      BOOL shown=page && at!=UINT32_MAX && (link_cursor_shown || page[0xe04]);
@@ -3496,7 +3509,7 @@ index 9073d22..aa69bb9 100644
  - (void)showOnLayer:(uint64_t)mapping {
      HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]); /* not met yet: a resumed machine's screen */
      if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
-@@ -2547,28 +3088,49 @@ static const uint8_t *half_to_byte(void) {
+@@ -2547,28 +3089,49 @@ static const uint8_t *half_to_byte(void) {
      screen_dirty = YES;
      [self kickPresenter:YES];
      os_unfair_lock_unlock(&screen_lock);
@@ -3549,7 +3562,7 @@ index 9073d22..aa69bb9 100644
              presenter_running = NO;
              [self kickPresenter:NO];
              os_unfair_lock_unlock(&screen_lock);
-@@ -2597,7 +3159,12 @@ static const uint8_t *half_to_byte(void) {
+@@ -2597,7 +3160,12 @@ static const uint8_t *half_to_byte(void) {
              target.drawableSize = want;
              [CATransaction commit];
          }
@@ -3563,7 +3576,7 @@ index 9073d22..aa69bb9 100644
          if (!drawable) {
              os_unfair_lock_lock(&screen_lock);
              screen_dirty = YES;
-@@ -2636,6 +3203,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2636,6 +3204,7 @@ static const uint8_t *half_to_byte(void) {
          cw0 = cursor_w, ch0 = cursor_h, hx = cursor_hot_x, hy = cursor_hot_y;
          BOOL same_target = layer_generation == generation && layer == target;
          BOOL same_size = screen_w == W && screen_h == H;
@@ -3571,7 +3584,7 @@ index 9073d22..aa69bb9 100644
          if (same_target && same_size) {
              screen_dirty = NO;
              drawable_retry_deadline = 0;
-@@ -2671,8 +3239,8 @@ static const uint8_t *half_to_byte(void) {
+@@ -2671,8 +3240,8 @@ static const uint8_t *half_to_byte(void) {
          const uint8_t *page = hv_pvg_lite_display_page(lite);
          uint32_t where = page ? __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE) : 0xffffffff;
          if (ctex && where != 0xffffffff && (shown || page[0xe04])) {
@@ -3582,7 +3595,7 @@ index 9073d22..aa69bb9 100644
              float x = (float)(where & 0xffff) - hx * scale, y = (float)(where >> 16) - hy * scale;
              float cw = cw0 * scale, ch = ch0 * scale;
              /* The pointer's place is in the display mode's pixels, not the surface's: with a scaled resolution
-@@ -2717,11 +3285,13 @@ static const uint8_t *half_to_byte(void) {
+@@ -2717,11 +3286,13 @@ static const uint8_t *half_to_byte(void) {
          // Serialize the final check and commit with set_layer: a switch that has
          // returned must not be followed by a commit to its old target.
          os_unfair_lock_lock(&screen_lock);
@@ -3599,7 +3612,7 @@ index 9073d22..aa69bb9 100644
                      os_unfair_lock_unlock(&self->frame_metrics_lock);
                  }];
              }
-@@ -2741,7 +3311,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2741,7 +3312,7 @@ static const uint8_t *half_to_byte(void) {
      if (atomic_load(&stopping)) return;
      double now = now_seconds();
      on_screen = mapping;
@@ -3608,7 +3621,7 @@ index 9073d22..aa69bb9 100644
          late = NO;
          [self showOnLayer:mapping];
          return;
-@@ -2834,13 +3404,20 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2834,13 +3405,20 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->completions = dispatch_group_create();
          r->device = dev;
          r->queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
@@ -3631,7 +3644,7 @@ index 9073d22..aa69bb9 100644
          r->resource_tally = getenv("HV_PVG_TALLY") != NULL;
          r->batch_cache = getenv("HV_GPU_BATCH_CACHE") && !strcmp(getenv("HV_GPU_BATCH_CACHE"), "1");
          r->tasks = [NSMutableDictionary new];
-@@ -2848,6 +3425,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2848,6 +3426,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->surfaces = [NSMutableDictionary new];
          r->planar = [NSMutableDictionary new];
          r->complaints = [NSMutableSet new];
@@ -3656,7 +3669,7 @@ index 9073d22..aa69bb9 100644
          r->shot = getenv("HV_PVG_SHOT");
          cp_start(r);
  #if !TARGET_OS_IPHONE
-@@ -2864,6 +3459,32 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2864,6 +3460,32 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
              r->shot_timer = timer;
          }
  #endif
@@ -3689,7 +3702,7 @@ index 9073d22..aa69bb9 100644
          fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
          return (HvPvgMetal *)CFBridgingRetain(r);
      }
-@@ -2874,23 +3495,40 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
+@@ -2874,23 +3496,40 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
      @autoreleasepool {
          HvReplay *r = CFBridgingRelease(m);
          atomic_store(&r->stopping, 1);
@@ -3733,7 +3746,7 @@ index 9073d22..aa69bb9 100644
              r->lite = NULL;
              r->tasks = nil;
              r->surfaces = nil;
-@@ -2951,7 +3589,8 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
+@@ -2951,7 +3590,8 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                      /* "May be thrown away": Apple's host only marks it purgeable, and the bytes stay
                         until the system needs the memory. Here they just stay. */
                  } else if (op == 0x20 && n >= 4) {
@@ -3743,7 +3756,7 @@ index 9073d22..aa69bb9 100644
                  } else {
                      hv_pvg_lite_command(lite, cmd, len);
                      if (op == 8 && n >= 16) {
-@@ -2998,24 +3637,78 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
+@@ -2998,24 +3638,78 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
      }
      r->pacing_pending = NO; r->frame_pacing.next = 0; /* reattaching the same layer also wakes a stopped presenter */
      r->layer = l;
@@ -3823,7 +3836,7 @@ index 9073d22..aa69bb9 100644
          [r screenChanged];
          return;
      }
-@@ -3030,8 +3723,8 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
+@@ -3030,8 +3724,8 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
  void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
      HvReplay *r = (__bridge HvReplay *)m;
      dispatch_async(r->worker, ^{
@@ -3834,7 +3847,7 @@ index 9073d22..aa69bb9 100644
          HvObject *s = r->surfaces[@(mapping)];
          if(s && s->planar_entry){
              hv_planar_release_mapping(r->planar,s->planar_key,s->planar_entry);
-@@ -3104,6 +3797,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
+@@ -3104,6 +3798,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
          (unsigned long long)m.overflow,(unsigned long long)m.invalid);
  }
  
@@ -3844,7 +3857,7 @@ index 9073d22..aa69bb9 100644
  void hv_pvg_metal_link_connected(HvPvgMetal *m,int connected){
      if(!m)return;HvReplay *r=(__bridge HvReplay *)m;
      dispatch_async(r->worker,^{
-@@ -3117,25 +3813,46 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+@@ -3117,25 +3814,46 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
      if(atomic_exchange(&r->link_cursor_queued,1))return;
      dispatch_async(r->worker,^{atomic_store(&r->link_cursor_queued,0);if (!atomic_load(&r->stopping)) [r sendLinkMapping:r->link_mapping];});
  }
@@ -3895,7 +3908,7 @@ index 9073d22..aa69bb9 100644
              for (NSNumber *task in r->tasks) {
                  NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
                  for (NSNumber *ref in objs) {
-@@ -3143,79 +3860,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -3143,79 +3861,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
                      if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
                      if (o->parent && o->parent->heap_whole) continue;
                      if (!cb) cb = [r->queue commandBuffer];
@@ -8555,10 +8568,10 @@ index 0000000..ef1d8a6
 +#endif
 diff --git a/host/resource_policy.h b/host/resource_policy.h
 new file mode 100644
-index 0000000..5f8b972
+index 0000000..2467c4a
 --- /dev/null
 +++ b/host/resource_policy.h
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,25 @@
 +#ifndef HENGE_RESOURCE_POLICY_H
 +#define HENGE_RESOURCE_POLICY_H
 +#include <stdint.h>
@@ -8572,6 +8585,16 @@ index 0000000..5f8b972
 +    if (pressure > 2) pressure = 2;
 +    return (HvResourceBudget){pressure == 2 ? 0 : (pressure == 1 ? 2ull : 8ull) << 20,
 +                             pressure == 2 ? 0u : pressure == 1 ? 8u : 32u, pressure};
++}
++/* Only the verified ten-core/16GB M4 profile may expand discretionary cache
++   ownership, and only with known dynamic headroom. Pressure always wins. */
++static inline HvResourceBudget hv_resource_budget_profile(uint64_t available,int pressure,int m4_16gb) {
++    HvResourceBudget budget=hv_resource_budget(available,pressure);
++    if (m4_16gb && !budget.pressure && available!=UINT64_MAX && available>=(2ull<<30)) {
++        budget.library_bytes=16ull<<20;
++        budget.library_entries=128;
++    }
++    return budget;
 +}
 +#endif
 diff --git a/host/scheduling.c b/host/scheduling.c
@@ -14266,7 +14289,7 @@ index 25e7bad..246a6f8 100644
      init(defaults: UserDefaults = .standard,
           now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
 diff --git a/ios/Henge/NativeTouchSurface.swift b/ios/Henge/NativeTouchSurface.swift
-index b89dc8a..01ac5b7 100644
+index b89dc8a..28f07f9 100644
 --- a/ios/Henge/NativeTouchSurface.swift
 +++ b/ios/Henge/NativeTouchSurface.swift
 @@ -29,7 +29,7 @@ struct NativeTouchSurface: UIViewRepresentable {
@@ -14278,6 +14301,18 @@ index b89dc8a..01ac5b7 100644
              controlsTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
              controlsTap.cancelsTouchesInView = true
              controlsTap.isEnabled = false
+@@ -74,7 +74,10 @@ struct NativeTouchSurface: UIViewRepresentable {
+         }
+ 
+         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+-            let direct = touches.filter { $0.type == .direct }
++            // Apple Pencil touches are stylus events, not .direct. Send their
++            // absolute tip position through the same entitlement-free USB path.
++            // Indirect pointer events remain owned by HardwareMouse.
++            let direct = touches.filter { $0.type == .direct || $0.type == .pencil }
+             held.formUnion(direct)
+             guard !waitForLift, hv_native_touch_status() == 2 else { waitForLift = true; return }
+             for touch in direct where fingers.count < 5 {
 diff --git a/ios/Henge/ResumeCoordinator.swift b/ios/Henge/ResumeCoordinator.swift
 new file mode 100644
 index 0000000..f1f24fa
@@ -16036,7 +16071,7 @@ index 091433d..d5481c3 100644
  typedef int32_t OSStatus;
  typedef uint32_t UInt32, AudioUnitRenderActionFlags;
 diff --git a/tests/bench_programs.S b/tests/bench_programs.S
-index b4f57c2..fa638ef 100644
+index b4f57c2..6f3d076 100644
 --- a/tests/bench_programs.S
 +++ b/tests/bench_programs.S
 @@ -48,6 +48,51 @@ PROGRAM bench_mem
@@ -16074,7 +16109,7 @@ index b4f57c2..fa638ef 100644
 +    stp x4, x4, [x23]
 +    stp x4, x4, [x23, #16]
 +    mov x0, #0
-+    movz x2, #0x4, lsl #16
++    movz x2, #0x100, lsl #16
 +1:  ldr x4, [x23]
 +    add x0, x0, x4
 +    ldr x5, [x23, #8]
@@ -16203,6 +16238,28 @@ index 0000000..74083bb
 + if(rc)fprintf(stderr,"%s\n",error);
 + return rc?1:0;
 +}
+diff --git a/tests/exc_programs.S b/tests/exc_programs.S
+index e164bea..e93760a 100644
+--- a/tests/exc_programs.S
++++ b/tests/exc_programs.S
+@@ -108,6 +108,17 @@ PROGRAM p_dabt
+     mov x10, x8
+ END p_dabt
+ 
++// A grouped range must preserve completed loads and the exact first fault PC.
++PROGRAM p_group_fault
++    SETUP
++    ldr x15, [x9] // warm the ordinary RAM page without a candidate group
++1:  ldr x1, [x9]
++    ldr x2, [x9, #8]
++2:  ldr x3, [x9, #16] // first byte beyond the mapped RAM region
++    str x1, [x9]
++    adr x4, 2b
++END p_group_fault
++
+ // Down to EL0 and back up through SVC and an undefined MRS.
+ PROGRAM p_el0
+     SETUP
 diff --git a/tests/gamepad-preview/.gitignore b/tests/gamepad-preview/.gitignore
 new file mode 100644
 index 0000000..5435674
@@ -18009,6 +18066,35 @@ index 0000000..1cb8fbf
 +        print("PASS engine tuning: actual defaults, explicit overrides, removed overrides, foreign environment and grouped-path activation")
 +    }
 +}
+diff --git a/tests/test_exc.c b/tests/test_exc.c
+index 52bf4de..4b14c8c 100644
+--- a/tests/test_exc.c
++++ b/tests/test_exc.c
+@@ -6,6 +6,7 @@
+ DECLARE_PROGRAM(p_svc);
+ DECLARE_PROGRAM(p_brk_undef);
+ DECLARE_PROGRAM(p_dabt);
++DECLARE_PROGRAM(p_group_fault);
+ DECLARE_PROGRAM(p_el0);
+ DECLARE_PROGRAM(p_sysregs);
+ DECLARE_PROGRAM(p_irq);
+@@ -86,6 +87,16 @@ int main(void) {
+         check("dabt", "no writeback on a fault", c.x[10], 0x10000);
+     }
+ 
++    static const TestProgram grouped_fault = TEST_PROGRAM(p_group_fault);
++    *(uint64_t *)(stack+65536-16)=7;*(uint64_t *)(stack+65536-8)=11;
++    if (!run(&grouped_fault,&c,ADDR(stack)+65536-16)) {
++        check("grouped fault","first completed load",c.x[1],7);
++        check("grouped fault","second completed load",c.x[2],11);
++        check("grouped fault","exact fault PC",c.x[22],c.x[4]);
++        check("grouped fault","exact fault address",c.x[21],ADDR(stack)+65536);
++        check("grouped fault","single exception",c.x[24],1);
++    }
++
+     static const TestProgram el0 = TEST_PROGRAM(p_el0);
+     uint64_t sp0 = ADDR(stack) + 8192;
+     uint64_t sp1 = ADDR(stack) + 32768;
 diff --git a/tests/test_fastmem_bench.c b/tests/test_fastmem_bench.c
 index a801c82..ce611b7 100644
 --- a/tests/test_fastmem_bench.c
@@ -19285,10 +19371,18 @@ index 35ecb46..25cc62c 100644
  
  #define DATA_SIZE 65536
 diff --git a/tests/test_metal_library_cache.m b/tests/test_metal_library_cache.m
-index 3462d79..4252493 100644
+index 3462d79..685c177 100644
 --- a/tests/test_metal_library_cache.m
 +++ b/tests/test_metal_library_cache.m
-@@ -39,6 +39,45 @@ int main(int argc, const char **argv) { @autoreleasepool {
+@@ -1,6 +1,7 @@
+ #import "metal_library_cache.h"
+ #include <assert.h>
+ #include <stdio.h>
++#include "../host/resource_policy.h"
+ 
+ int main(int argc, const char **argv) { @autoreleasepool {
+     assert(argc == 2);
+@@ -39,6 +40,57 @@ int main(int argc, const char **argv) { @autoreleasepool {
      assert(![small libraryForData:k loader:failure]);assert(![small libraryForData:k loader:failure]);
      assert(failed==2 && !small.count); // errors retry rather than poisoning cache
      assert([first newFunctionWithName:@"screen_v"]); // evicted libraries held by users stay alive
@@ -19332,6 +19426,18 @@ index 3462d79..4252493 100644
 +    assert(![functions firstFunctionForData:binary loader:failure]);
 +    assert(![functions firstFunctionForData:binary loader:failure]);
 +    assert(failed==4 && !functions.count); // library failures retry through the function path too
++    HvResourceBudget roomy=hv_resource_budget_profile(4ull<<30,0,1);
++    HvMetalLibraryCache *working=[[HvMetalLibraryCache alloc]initWithMaxBytes:roomy.library_bytes entries:roomy.library_entries];
++    unsigned before=calls;
++    for(unsigned pass=0;pass<2;pass++)for(uint32_t i=0;i<96;i++) {
++        NSData *identity=[NSData dataWithBytes:&i length:sizeof i];
++        assert([working libraryForData:identity loader:loader]);
++    }
++    assert(calls==before+96 && working.count==96);
++    HvResourceBudget warned=hv_resource_budget_profile(4ull<<30,1,1);
++    [working setAdmissionBytes:warned.library_bytes entries:warned.library_entries];
++    assert(working.count==8 && first.functionNames.count); // live retained library remains valid
++    puts("M4 library cache:96 exact keys/96 loads over192 requests; pressure returns to8 hot entries");
 +    puts("Metal library cache: exact-byte LRU, immutable keys, hot-budget retention, 100 function reuses/one build, bounded bypass, failed retry and live-owner safety passed");
      return 0;
  } }
@@ -20315,10 +20421,10 @@ index 0000000..0bc09ee
 +}
 diff --git a/tests/test_resource_policy.c b/tests/test_resource_policy.c
 new file mode 100644
-index 0000000..30d5be7
+index 0000000..be71a93
 --- /dev/null
 +++ b/tests/test_resource_policy.c
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,22 @@
 +#include "resource_policy.h"
 +#include <assert.h>
 +#include <stdio.h>
@@ -20332,6 +20438,13 @@ index 0000000..30d5be7
 +    b=hv_resource_budget(4ull<<30,0);assert(b.pressure==0 && b.library_entries==32);
 +    b=hv_resource_budget(128ull<<20,0);assert(b.pressure==1);
 +    b=hv_resource_budget(512ull<<20,0);assert(b.pressure==0);
++    b=hv_resource_budget_profile(4ull<<30,0,1);assert(b.library_entries==128 && b.library_bytes==16ull<<20);
++    b=hv_resource_budget_profile(4ull<<30,0,0);assert(b.library_entries==32);
++    b=hv_resource_budget_profile(UINT64_MAX,0,1);assert(b.library_entries==32);
++    b=hv_resource_budget_profile((2ull<<30)-1,0,1);assert(b.library_entries==32);
++    b=hv_resource_budget_profile(2ull<<30,0,1);assert(b.library_entries==128);
++    b=hv_resource_budget_profile(4ull<<30,1,1);assert(b.library_entries==8 && b.library_bytes==2ull<<20);
++    b=hv_resource_budget_profile(64ull<<20,0,1);assert(!b.library_entries);
 +    puts("resource budget: dynamic headroom, pressure precedence, boundaries and recovery passed");
 +}
 diff --git a/tests/test_restore_archive.py b/tests/test_restore_archive.py
