@@ -1,6 +1,6 @@
 # Controls and new release features
 
-Validated source `1336e6c5da6a4b5498b0705e77c4f6f8bfd11404`: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43308744375; https://github.com/stride-praline-2f-ai/henge-/actions/runs/43308744339.
+Validated source `7c308dbeeb70834359eb31dba62e3cf38511e150`: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43349164304; https://github.com/stride-praline-2f-ai/henge-/actions/runs/43349164315.
 
 Three-finger controls → virtual gamepad. Shared pointer touchpad supports movement
 and scroll sensitivity. Wireless keyboard already includes its own touchpad.
@@ -35,11 +35,16 @@ manual Recover Sound action remains available.
 Fully shut down the Mac and resolve/discard a saved session before disk expansion.
 Storage → Expand Disk offers128/256/512GiB and custom up to2048GiB, grow only.
 The original remains as disk.img.before-expansion. GPT tables are validated and
-repaired for the new capacity atomically; no APFS/recovery contents are moved.
-After a cold boot enlarge APFS using the displayed macOS command or Disk Utility.
-A following recovery partition may require manual layout work; extra raw capacity
-is not automatically usable filesystem capacity. Export/remove the prior backup
-before another expansion; retain enough space for copy-on-write growth.
+repaired for the new capacity atomically. Reopen storage settings to Finish macOS
+volume expansion, including disks enlarged in an older release. The layout checker
+can prepare a recognised trailing Recovery container on a clone: checksummed NXSB,
+nonoverlapping aligned destination, verified copy, preserved UUID and both GPT CRCs.
+The pre-preparation image remains as disk.img.before-apfs-expansion. Start macOS
+and run the displayed diskutil command to grow the APFS container; unrecognised
+layouts stay unchanged. Real disposable APFS filesystems, data preservation and
+vendor container growth pass the cloud integration test. Booting a full Recovery
+OS on a user's image remains physical validation. Export/remove the prior backup
+before another capacity expansion; retain enough space for copy-on-write growth.
 
 Use60Hz for a controlled smoothness baseline;120Hz remains available. The primary
 presenter uses one display-link cadence while dirty and pauses when unchanged.
@@ -52,3 +57,30 @@ use Save Mac & Leave and keep Henge visible until complete. Old native-layout
 snapshots are clearly rejected with disks retained. iOS may deny background time
 or terminate the process. CPU-only runner remains opt-in; GPU jobs can require
 foreground. No entitlement bypass or unlimited background execution is claimed.
+
+Desktop upstream integration: PR132/145 segmented JIT eviction preserves the
+fork's physical-page chain indexes, full live-branch barriers and event-driven
+quiescence. PR152 adds lazy, disposable OS/GPU-keyed persistent Metal archives,
+bounded128MiB/2048single-PSO files,16lazy handles,64pending additions and4opaque
+variants per stable hint. One save timer and pressure release retain one manager;
+ordinary compilation remains the fallback.
+PR133 fixes GPU task retirement and invalid pipeline/function records; PR137
+accepts the final visible texture row with overflow-safe bounds. PR136 Auto
+cursor density retains explicit fixed preferences. PR143 Safari b3a8 views choose
+one immutable backend after Apple9/runtime format checks; texture ownership
+preserves exact page identity. Other video formats retain IOSurface.
+
+All four production PSOs reload cold after actual GPU use and their compute
+outputs are checked; warm hits, corrupt/stale files and fragmentless fallback pass.
+Independent public API controls record Paravirtual missing-function behavior and
+execute the ordinary fallback; production cold-hit assertions remain required.
+Archive reload/corruption/fragmentless, four-vCPU eviction/poison/split mapping,
+real chain repairs, texture bounds, planar ownership and cached cursor settings
+have exact-source cloud regressions. The cloud Metal adapter may use the Safari
+reference branch; Apple9 shared-page performance and physical app launch,
+Safari/Roblox frame-time and cooling comparisons remain unmeasured.
+
+No forced lower resolution, QoS escalation, extra vCPUs or speculative direct
+fault window is included. Latest main's AppKit additions concern Mac Apps mode,
+not the full VM. Conflicting single-monitor mode/built-in UUID changes were not
+blindly merged into the two-port/snapshot/touchscreen implementation.
