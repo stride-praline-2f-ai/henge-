@@ -110,6 +110,14 @@ if manifest.get('m4_optimisation'):
         physical_gaming_verified=False, implementation=state['m4_implementation'])
 if manifest.get('controls_power'):
     data['controls_power']=dict(manifest['controls_power'], runtime_markers_verified=True, background_metadata_verified=True, physical_controller_verified=False, physical_cpu_background_verified=False)
+if manifest.get('upstream_desktop'):
+    desktop=state['upstream_desktop']
+    assert desktop.get('complete') and desktop.get('source_commit')==state['final_validation']['source_commit']
+    executable=(app/'Henge').read_bytes()
+    for marker in (b'jit-ring:',b'saved pipelines:',b'v1-pipelines-',b'henge.planar.owner',b'pipeline archive bypass'):
+        assert marker in executable,'Missing desktop optimisation runtime: '+repr(marker)
+    data['upstream_desktop']=dict(manifest['upstream_desktop'],runtime_markers_verified=True,
+        source_validation=desktop['source_commit'],physical_performance_verified=False)
 data["audit_repairs"]={"sha256":manifest["audit_repairs_sha256"],"snapshot_schema":3,"test_allocation_hook_absent":True}
 data["upstream_integration"]={
   **integration,
