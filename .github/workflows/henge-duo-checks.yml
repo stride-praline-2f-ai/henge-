@@ -99,6 +99,32 @@ jobs:
         pkg-config --cflags --libs slirp
 
         '
+    - name: Probe public Metal archive reopening independently
+      working-directory: Henge
+      run: |
+        mkdir -p build
+        xcrun -sdk macosx metal -c tests/archive_fixture.metal -o build/archive_fixture.air
+        xcrun -sdk macosx metallib build/archive_fixture.air -o build/archive_fixture.metallib
+        xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror tests/test_pipeline_archive_api.m -framework Foundation -framework Metal -o build/test_pipeline_archive_api
+        set +e
+        failed=0
+        for kind in basic mixed; do
+          extra=()
+          if [[ "$kind" == mixed ]]; then extra=(mixed); fi
+          build/test_pipeline_archive_api build/archive_fixture.metallib "build/archive-api-$kind.bin" write "${extra[@]}" 2>&1 | tee -a build/archive-api.log
+          if [[ ${PIPESTATUS[0]} != 0 ]]; then failed=$((failed+1)); fi
+          build/test_pipeline_archive_api build/archive_fixture.metallib "build/archive-api-$kind.bin" read 2>&1 | tee -a build/archive-api.log
+          if [[ ${PIPESTATUS[0]} != 0 ]]; then failed=$((failed+1)); fi
+        done
+        exit $((failed > 0))
+    - name: Retain independent Metal API result
+      if: ${{ always() && !cancelled() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: metal-api-${{ github.run_id }}
+        path: Henge/build/archive-api.log
+        if-no-files-found: ignore
+        retention-days: 7
     - name: Compile engine regression checks
       id: native_compile
       working-directory: Henge

@@ -18088,6 +18088,41 @@ index 0000000..0dc6f5d
 +    assert not bad.exists() and not (Path(directory)/'v0-obsolete.bin').exists()
 +    assert sum(p.stat().st_size for p in Path(directory).glob('*.bin'))<=128<<20
 +print('PASS production persistent Metal archive: fresh-process hits, corrupt/stale rejection, bounded disk and normal compilation fallback')
+diff --git a/tests/test_pipeline_archive_api.m b/tests/test_pipeline_archive_api.m
+new file mode 100644
+index 0000000..1a96b66
+--- /dev/null
++++ b/tests/test_pipeline_archive_api.m
+@@ -0,0 +1,29 @@
++/* Independent public Metal API probe: distinguishes a replay integration defect
++   from a host adapter that cannot reopen its own binary archives. */
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++int main(int argc,const char **argv){@autoreleasepool{
++ assert(argc==4 || argc==5);BOOL write=!strcmp(argv[3],"write");BOOL mixed=argc==5;id<MTLDevice>d=MTLCreateSystemDefaultDevice();assert(d);
++ NSData *bytes=[NSData dataWithContentsOfFile:@(argv[1])];assert(bytes.length);
++ dispatch_data_t data=dispatch_data_create(bytes.bytes,bytes.length,NULL,DISPATCH_DATA_DESTRUCTOR_DEFAULT);
++ NSError *error=nil;id<MTLLibrary> lib=[d newLibraryWithData:data error:&error];assert(lib);
++ MTLRenderPipelineDescriptor *p=[MTLRenderPipelineDescriptor new];p.vertexFunction=[lib newFunctionWithName:@"av"];p.fragmentFunction=[lib newFunctionWithName:@"af"];p.colorAttachments[0].pixelFormat=MTLPixelFormatBGRA8Unorm;
++ NSURL *url=[NSURL fileURLWithPath:@(argv[2])];MTLBinaryArchiveDescriptor *ad=[MTLBinaryArchiveDescriptor new];
++ if(!write)ad.url=url;
++ id<MTLBinaryArchive>a=[d newBinaryArchiveWithDescriptor:ad error:&error];assert(a);
++ if(write){
++  assert([a addRenderPipelineFunctionsWithDescriptor:p error:&error]);p.binaryArchives=@[a];
++  id<MTLRenderPipelineState>live=[d newRenderPipelineStateWithDescriptor:p options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&error];assert(live);
++  if(mixed){MTLComputePipelineDescriptor *cp=[MTLComputePipelineDescriptor new];cp.computeFunction=[lib newFunctionWithName:@"ak"];assert([a addComputePipelineFunctionsWithDescriptor:cp error:&error]);cp.binaryArchives=@[a];assert([d newComputePipelineStateWithDescriptor:cp options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&error]);}
++  assert([a serializeToURL:url error:&error]);
++  printf("Independent Metal archive API: wrote %s mode=%s\n",url.lastPathComponent.UTF8String,mixed?"render+compute":"render");return 0;
++ }
++ p.binaryArchives=@[a];error=nil;
++ id<MTLRenderPipelineState>state=[d newRenderPipelineStateWithDescriptor:p options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&error];
++ printf("Independent Metal archive API: device=%s library_bytes=%lu archive_bytes=%llu reopened_hit=%d error=%s\n",d.name.UTF8String,(unsigned long)bytes.length,[[NSFileManager.defaultManager attributesOfItemAtPath:url.path error:nil]fileSize],state!=nil,error.localizedDescription.UTF8String ?: "none");
++ if(!state){p.binaryArchives=@[];error=nil;state=[d newRenderPipelineStateWithDescriptor:p error:&error];assert(state);puts("Independent Metal archive API: ordinary compilation fallback succeeded");return 78;}
++ return 0;
++}}
 diff --git a/tests/test_planar_registry.m b/tests/test_planar_registry.m
 index 942c4d7..ed28519 100644
 --- a/tests/test_planar_registry.m
