@@ -107,6 +107,20 @@ data['packaging_validation'] = dict(architectures=architectures, ios_device_plat
     distribution_signing='ad hoc; installation tool must sign with its own supported profile')
 state=json.loads(Path('build-request/henge-build/optimization-state.json').read_text())
 data['optimization_validation'] = state.get('final_validation')
+# New engine/input code must be present in the actual device archive, beyond
+# the native source test receipt. Keep physical-device claims separate.
+for feature in ('engine_foundation_followup','input_resilience_followup'):
+    proof=state.get(feature,{})
+    assert proof.get('complete') and proof.get('source_commit')==state['final_validation']['source_commit'], feature+' is not validated'
+    data[feature]=dict(proof,runtime_markers_verified=True,physical_performance_verified=False)
+for marker in (b'hostEncoding',b'ignored_button_edges=',b'mouse_delivered=',b'Apply M4 Automatic (Desktop Retina)',b'Touchscreen connecting'):
+    assert marker in app_executable, 'Missing engine/input/layout runtime: '+repr(marker)
+followup=state['ui_resume_clipboard_followup']
+assert followup['complete'] and followup['source_commit']==state['final_validation']['source_commit']
+assert followup['ui_previews'] in ('passed','waived_by_user')
+for marker in (b'A Mac when you need it. Your devices, connected.',b'Universal Clipboard also works',b'not confirmed the clipboard',b'snapshot: memory allocation reduced workers'):
+    assert marker in app_executable, 'Missing resume/clipboard runtime: '+repr(marker)
+data['ui_resume_clipboard_followup']=dict(followup,runtime_markers_verified=True)
 if manifest.get('m4_optimisation'):
     data['m4_optimisation'] = dict(manifest['m4_optimisation'],
         runtime_markers_verified=True, physical_energy_verified=False,

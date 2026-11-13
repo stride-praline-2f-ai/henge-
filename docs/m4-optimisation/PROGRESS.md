@@ -1,44 +1,24 @@
 # Integrated source release gate
 
-Validated source: `3e5b8a725885d7131bfc7c247a644e9173f3e74f`. Patch: `47321e5c844cd68a891694c2d81dcd9394d4bddba605a2d604be6184e41415c7`.
-Cloud run: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43392018361.
+Validated source: `2d12dd8710beb44296623df924776d74ef884d1d`. Patch: `e37d3d951c7249215736aad03ccd2f0c511b7f92de7892a93e0158c2f535851d`.
+Cloud run: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43421862115.
 
-M4 workstreams, shared Duo improvements, controls, Low Power policy and CPU-only runner source are integrated. Native regressions, sanitizers, actual Link host/client TLS negotiation, production Swift/Metal SDK checks, real Metal store-action tests and the complete iOS Release application compile passed.
+M4 workstreams, shared Duo improvements, controls, Low Power policy and resilient local input are integrated; app Runner remains removed. Native regressions, sanitizers, actual Link host/client TLS negotiation, production Swift/Metal SDK checks, real Metal store-action tests and the complete iOS Release application compile passed.
 
 The next metadata-only child requests one final IPA. Archive production and verification remain pending. Physical-device limitations are recorded in optimization-state.json; no measured cooling, core residency or Roblox-recognition claim.
 
-Final loading/cleanup release gate,0.3.7(108):
-Validated source3e5b8a725885d7131bfc7c247a644e9173f3e74f,
-patch47321e5c844cd68a891694c2d81dcd9394d4bddba605a2d604be6184e41415c7.
-Native/ASan/UBSan/Swift/Metal/full iOS Release app: run43392018361,job131773967687.
-Production controller UI/native input/Resume: run43392018314; all four jobs passed.
-Inspected10Duo+5M4 direct UIKit captures. Duo is an explicit951x669 unfolded
-viewport on an M4 Simulator canvas, not A20/chip/fold hardware emulation.
-Previous canceled Duo job retained separately; the final-source retry passed.
 
-Implemented: TLB-first kernel secondary cache (no extra hot-hit instructions),
-zero-copy contiguous block segment coalescing, moderate-warning shader archive
-retention and first-pending save deadline, useful archive diagnostics. App Runner
-UI, guest launcher/downloader, command queues and CPU/GPU background gates removed.
-Settings simplified with explanations; retired experimental preferences backed
-up once, environment overrides remain authoritative, explicit cache-off retained.
-Update an old Mac sharing companion from Details → Sharing to retire its old
-Runner worker. Cloud GitHub Actions builders remain available.
+The new source also includes restricted three/four-field register reuse,
+independent groups after memory barriers, one-pass ring descriptor reclamation,
+and headroom-gated M4 library reuse. Cloud warm-loop medians:35.05→24.465ms
+(four fields) and26.541→18.628ms (three fields), three interleaved rounds.
+Exact fallback is retained; total allocated code increases slightly. These
+measurements are not app-loading, Roblox FPS, watts or physical thermal tests.
 
-Cloud measurements: seven paired rounds show ordinary warmed TLB-hit overhead
-removed vs cache-first, while a collision-heavy kernel loop retains~28x vs cache
-off. Four contiguous disk pages use1I/O vs4 in the production descriptor fixture.
-Neither result is a measured app-launch, Roblox FPS, temperature or watt gain.
-No forced Retina reduction or permanent60Hz restriction was added. Instant
-Resume, storage expansion, touch/gamepad/Link/audio/native Metal paths passed.
-One metadata-only child opens final IPA packaging after this complete gate.
-
-Final artifact inspection correction: run43394749303 was green in CI, but its
-IPA was rejected locally before Drive upload because Runner cleanup had also
-removed UIBackgroundModes=processing needed by existing JIT pairing. Restore
-only that plist declaration in the authoritative integration writer. Execute
-that actual writer against absent/partial/duplicate modes; preserve audio,
-pairing-only identifiers, versions and unrelated keys. The package verifier
-now also requires this declaration. Retry guard permits only this exact two-line
-metadata insertion; engine, runtime patch, pins and app version remain frozen.
-No Runner UI, guest worker or CPU/GPU background machinery is restored.
+Local input has distinct physical/virtual owners, nonblocking diagnostics,
+primary-scene pointer recovery and direct host USB touch encoding. Touch mode
+stays selected during Duo reconnection; Pencil tip/palm priority and Magic
+Keyboard coexistence are integrated. Guest companion update is required for
+the negotiated host encoding path; no special virtual-HID entitlement is used.
+Desktop Retina is1280 logical points at2x:2560×1920 on iPad, aspect-fitted Duo.
+Native Retina remains available on iPad; saved display choices are not rewritten.

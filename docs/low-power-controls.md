@@ -2,7 +2,7 @@
 
 Use4 guest CPUs as the baseline. Six guests do not select efficiency cores; iOS controls physical placement. Compare4 and6 only with the same workload, OS Low Power Mode and display choices.
 
-Enable OS Low Power Mode. With the Low Power guest-refresh setting enabled, a cold start requesting120Hz uses60Hz while OS LPM is active. The saved preference remains120Hz; leave LPM off and cold-start to restore it. Existing resumed machines retain their saved display state. Retina resolution stays unchanged. Expert henge-env overrides remain authoritative.
+Enable OS Low Power Mode. With the Low Power guest-refresh setting enabled, a cold start requesting120Hz uses60Hz while OS LPM is active. The saved preference remains120Hz; leave LPM off and cold-start to restore it. Existing resumed machines retain their saved display state. Low Power Mode does not change Retina resolution. Desktop Retina is an explicit 1280-logical-point, 2x screen choice; Native Retina keeps every panel pixel. Expert henge-env overrides remain authoritative.
 
 Three-finger controls → gamecontroller menu → Show Virtual Gamepad. Select native HID or the explicitly labelled keyboard mapping. Mapping provides WASD, Space, auxiliary keys and pointer look/trigger clicks. Native game recognition and camera behaviour require device checks. Hide releases the local controller; pause neutralizes/disconnects it.
 
@@ -13,3 +13,15 @@ For a useful log: choose Capture Diagnostics (30 seconds) from the same menu; re
 App Runner mode has been removed, including continued VM background execution. Update an old Mac sharing companion from Details → Sharing to retire its old worker. Existing GitHub credentials and user repositories are not deleted. Instant Resume and its bounded iOS save assertion remain; completed compatible saves survive app closure. Cloud GitHub Actions builders are separate and remain supported.
 
 For loading: Automatic scheduling,4guest CPUs as the baseline, kernel read cache on (TLB-first), and diagnostics off. Explicit saved cache-off choices remain off; enable Kernel read cache to use the new path. Keep chosen Retina and60/120Hz preferences. Low Power Mode still applies OS limits. Native microbenchmarks are not measured app-launch or game FPS gains.
+
+
+For the reference desktop layout, choose Mac settings → Screen → Desktop Retina
+before a cold start. M4 uses2560×1920 with2x macOS UI; Duo fits its current inner
+screen. Native Retina on iPad keeps all panel pixels. Existing saved machines
+retain their selected mode and completed snapshots retain their saved geometry.
+After upgrading, update the guest sharing companion from session Details for
+direct host USB encoding and confirmed clipboard paste. Hardware input does not
+require changing modes or restarting the companion when alternating devices.
+Snapshots are build/layout-specific: shut down before upgrading; incompatible
+old states are rejected and the Mac disk is preserved. iOS still bounds automatic
+background save time and controls Low Power performance/refresh behaviour.
