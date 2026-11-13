@@ -96,12 +96,9 @@ version_manifest=json.loads(Path(sys.argv[2]).read_text())
 p["CFBundleShortVersionString"]=version_manifest.get("app_version", p["CFBundleShortVersionString"])
 p["CFBundleVersion"]=version_manifest.get("app_build", p["CFBundleVersion"])
 p["NSMotionUsageDescription"]="Use optional motion controls to steer racing games while this controller is visible."
-if version_manifest.get("controls_power"):
-    # BGContinuedProcessingTask (including CPU-only requests) needs the
-    # processing background mode. Retain existing audio/pairing capabilities.
-    modes=list(p.get("UIBackgroundModes", []))
-    if "processing" not in modes: modes.append("processing")
-    p["UIBackgroundModes"]=modes
+# Continued processing is retained only for the existing JIT pairing flow.
+# VM Runner background task registration has been removed.
+p["BGTaskSchedulerPermittedIdentifiers"]=["$(PRODUCT_BUNDLE_IDENTIFIER).pairing.*"]
 with path.open("wb") as f: plistlib.dump(p,f)
 helper=path.parent.parent / "HengeJITHelper" / "Info.plist"
 with helper.open("rb") as f: helper_info=plistlib.load(f)

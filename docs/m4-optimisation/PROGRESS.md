@@ -50,3 +50,5 @@ No forced lower resolution, QoS escalation, extra vCPUs or speculative direct
 fault window is included. Latest main's AppKit additions concern Mac Apps mode,
 not the full VM. Conflicting single-monitor mode/built-in UUID changes were not
 blindly merged into the two-port/snapshot/touchscreen implementation.
+
+Loading follow-up0.3.7: TLB-first secondary LUT, adjacent disk segment coalescing, warning-safe shader persistence, app Runner removal/settings migration. In development; native/SDK/UI validation pending and IPA gate closed. Details: runtime docs/m4-optimisation/LOADING-0.3.7.md.

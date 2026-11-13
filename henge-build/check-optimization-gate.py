@@ -24,7 +24,7 @@ assert validation.get('native_regressions') == 'passed' and validation.get('sani
 assert validation.get('ios_app_compile') == 'passed', 'Full iOS app compilation incomplete'
 assert isinstance(validation.get('run_id'), int) and len(validation.get('source_commit', '')) == 40, 'Missing traceable validation source'
 runner = state.get('runner_mode', {})
-assert runner.get('state') == 'verified' and runner.get('evidence'), 'Runner-mode validation incomplete'
+assert runner.get('state') == 'removed_verified' and runner.get('evidence'), 'Runner removal needs executed migration/lifecycle proof'
 m4 = state.get('m4_implementation')
 if m4 is not None:
     assert m4.get('complete') is True and all(x.get('state') in ('verified', 'verified_with_safe_alternative') and x.get('evidence') for x in m4['workstreams']), 'M4 engineering gate incomplete'
@@ -62,4 +62,6 @@ if core:
 desktop=state.get('upstream_desktop')
 if desktop:
     assert desktop.get('complete') and desktop.get('source_commit')==validation.get('source_commit'), 'Desktop PR integration requires exact-source native and graphics proof'
+loading=state.get('loading_followup',{})
+assert loading.get('complete') and loading.get('source_commit')==validation.get('source_commit'), 'Loading/Runner cleanup needs exact-source regression proof'
 print('PASS complete implementation gate:'  ,  manifest['audit_repairs_sha256'])

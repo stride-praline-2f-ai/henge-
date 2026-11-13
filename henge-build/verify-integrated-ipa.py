@@ -32,15 +32,12 @@ if manifest.get('m4_optimisation'):
 if manifest.get('controls_power'):
     with zipfile.ZipFile(ipa) as archive:
         binary=archive.read('Payload/Henge.app/Henge')
-    for marker in (b'runner CPU background=%d; GPU rings retained',
-                   b'controls-only peer authenticated; no encoder, decoder or second display',
+    for marker in (b'controls-only peer authenticated; no encoder, decoder or second display',
                    b'BEGIN 30s; aggregate process CPU', b'invalid store action tag %u (%u bytes)'):
         assert marker in binary, 'Missing controls/power runtime marker: '+repr(marker)
-    assert 'processing' in plist.get('UIBackgroundModes', []), 'CPU continued-processing background mode missing'
+    assert b'runner CPU background=%d; GPU rings retained' not in binary, 'Removed Runner gate remains linked'
     permitted=plist.get('BGTaskSchedulerPermittedIdentifiers', [])
-    bundle=plist['CFBundleIdentifier']
-    for suffix in ('.runner.cpu','.runner.session'):
-        assert any(value==bundle+suffix or (value.endswith('.*') and (bundle+suffix).startswith(value[:-1])) for value in permitted), 'Runner task ID not permitted: '+suffix
+    assert permitted == [plist['CFBundleIdentifier']+'.pairing.*'], 'Only JIT pairing background tasks are permitted'
 if manifest.get('controller_posture'):
     assert plist.get('NSMotionUsageDescription'), 'Motion usage description missing'
     # Swift strings of <=15 UTF-8 bytes can be encoded in ARM64 immediates.
@@ -110,7 +107,7 @@ if manifest.get('m4_optimisation'):
         runtime_markers_verified=True, physical_energy_verified=False,
         physical_gaming_verified=False, implementation=state['m4_implementation'])
 if manifest.get('controls_power'):
-    data['controls_power']=dict(manifest['controls_power'], runtime_markers_verified=True, background_metadata_verified=True, physical_controller_verified=False, physical_cpu_background_verified=False)
+    data['controls_power']=dict(manifest['controls_power'], runtime_markers_verified=True, background_metadata_verified=True, physical_controller_verified=False, app_runner_removed=True)
 if manifest.get('upstream_desktop'):
     desktop=state['upstream_desktop']
     assert desktop.get('complete') and desktop.get('source_commit')==state['final_validation']['source_commit']
