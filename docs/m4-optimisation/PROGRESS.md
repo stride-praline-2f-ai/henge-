@@ -1,63 +1,34 @@
-# Henge 0.3.6 (107) integrated source gate
+# Integrated source release gate
 
-Source `7c308dbeeb70834359eb31dba62e3cf38511e150`, patch `65f08466111d7130c76e7c82bd541519fe56cd0069a6eb6de54c1d9826a6105a`.
-Native and complete iOS Release compilation: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43349164304.
-Production controller UI: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43349164315.
+Validated source: `3e5b8a725885d7131bfc7c247a644e9173f3e74f`. Patch: `47321e5c844cd68a891694c2d81dcd9394d4bddba605a2d604be6184e41415c7`.
+Cloud run: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43392018361.
 
-Shared M4/Duo source now includes demand-driven primary display cadence without
-the commit-clock double gate, bounded existing frame-time capture, optional main
-screen wireless video, portrait/tabletop controls, pointer pad and sensitivity,
-opt-in gyro steering, automatic approved-pair reconnect, audio interruption
-recovery, entitlement-free USB guest touchscreen and offline GPT disk expansion.
-Existing Retina, ProMotion choices, MMU/JIT work, Instant Resume and CPU-only
-runner integration remain. Experimental controls stay explicit.
+M4 workstreams, shared Duo improvements, controls, Low Power policy and CPU-only runner source are integrated. Native regressions, sanitizers, actual Link host/client TLS negotiation, production Swift/Metal SDK checks, real Metal store-action tests and the complete iOS Release application compile passed.
 
-The latest M4/Duo follow-up batches completed disk requests into one CPU0 wake,
-skips outstanding DMA scans when nothing completed, and restores per-vCPU
-identity reporting with regular statistics off. Existing disk/GPU worker reports
-are available during explicit bounded captures; no new background timer.
-Production concurrency regression:64 ready requests used1 wake versus64 on the
-previous source.4096 raced completions, ring wrap, read/write, flush/barrier and
-worker restart passed sanitizers. This is a wake-count result, not device FPS.
+The next metadata-only child requests one final IPA. Archive production and verification remain pending. Physical-device limitations are recorded in optimization-state.json; no measured cooling, core residency or Roblox-recognition claim.
 
-All required exact-source cloud checks passed. A metadata-only child requests
-one final IPA; archive production, nested signatures and delivery are separate
-gates. Physical limitations remain below; no interim IPA was packaged.
+Final loading/cleanup release gate,0.3.7(108):
+Validated source3e5b8a725885d7131bfc7c247a644e9173f3e74f,
+patch47321e5c844cd68a891694c2d81dcd9394d4bddba605a2d604be6184e41415c7.
+Native/ASan/UBSan/Swift/Metal/full iOS Release app: run43392018361,job131773967687.
+Production controller UI/native input/Resume: run43392018314; all four jobs passed.
+Inspected10Duo+5M4 direct UIKit captures. Duo is an explicit951x669 unfolded
+viewport on an M4 Simulator canvas, not A20/chip/fold hardware emulation.
+Previous canceled Duo job retained separately; the final-source retry passed.
 
-Desktop upstream integration: PR132/145 segmented JIT eviction preserves the
-fork's physical-page chain indexes, full live-branch barriers and event-driven
-quiescence. PR152 adds lazy, disposable OS/GPU-keyed persistent Metal archives,
-bounded128MiB/2048single-PSO files,16lazy handles,64pending additions and4opaque
-variants per stable hint. One save timer and pressure release retain one manager;
-ordinary compilation remains the fallback.
-PR133 fixes GPU task retirement and invalid pipeline/function records; PR137
-accepts the final visible texture row with overflow-safe bounds. PR136 Auto
-cursor density retains explicit fixed preferences. PR143 Safari b3a8 views choose
-one immutable backend after Apple9/runtime format checks; texture ownership
-preserves exact page identity. Other video formats retain IOSurface.
+Implemented: TLB-first kernel secondary cache (no extra hot-hit instructions),
+zero-copy contiguous block segment coalescing, moderate-warning shader archive
+retention and first-pending save deadline, useful archive diagnostics. App Runner
+UI, guest launcher/downloader, command queues and CPU/GPU background gates removed.
+Settings simplified with explanations; retired experimental preferences backed
+up once, environment overrides remain authoritative, explicit cache-off retained.
+Update an old Mac sharing companion from Details → Sharing to retire its old
+Runner worker. Cloud GitHub Actions builders remain available.
 
-All four production PSOs reload cold after actual GPU use and their compute
-outputs are checked; warm hits, corrupt/stale files and fragmentless fallback pass.
-Independent public API controls record Paravirtual missing-function behavior and
-execute the ordinary fallback; production cold-hit assertions remain required.
-Archive reload/corruption/fragmentless, four-vCPU eviction/poison/split mapping,
-real chain repairs, texture bounds, planar ownership and cached cursor settings
-have exact-source cloud regressions. The cloud Metal adapter may use the Safari
-reference branch; Apple9 shared-page performance and physical app launch,
-Safari/Roblox frame-time and cooling comparisons remain unmeasured.
-
-No forced lower resolution, QoS escalation, extra vCPUs or speculative direct
-fault window is included. Latest main's AppKit additions concern Mac Apps mode,
-not the full VM. Conflicting single-monitor mode/built-in UUID changes were not
-blindly merged into the two-port/snapshot/touchscreen implementation.
-
-Loading follow-up0.3.7: TLB-first secondary LUT, adjacent disk segment coalescing, warning-safe shader persistence, app Runner removal/settings migration. In development; native/SDK/UI validation pending and IPA gate closed. Details: runtime docs/m4-optimisation/LOADING-0.3.7.md.
-
-Loading checkpoint: source0defd6 native run43389387394 passed full regressions,
-sanitizers, Metal persistence/lifecycle, input/Link/Instant Resume, SDK and iOS
-Release application compilation. Artifact14020257710 retains paired native
-cache-order measurements. Select TLB-first; fresh kernel-cache default on,
-explicit saved off preserved. Local6a126d7 exports patch47321e5c844cd68a891694c2d81dcd9394d4bddba605a2d604be6184e41415c7.
-M4 UI passed in43389387513. Duo viewport job131765457694 was cancelled by
-GitHub before a result; artifact14020174245 retains logs. It is not a pass.
-Run final-default native/app checks and retry Duo viewport before opening IPA gate.
+Cloud measurements: seven paired rounds show ordinary warmed TLB-hit overhead
+removed vs cache-first, while a collision-heavy kernel loop retains~28x vs cache
+off. Four contiguous disk pages use1I/O vs4 in the production descriptor fixture.
+Neither result is a measured app-launch, Roblox FPS, temperature or watt gain.
+No forced Retina reduction or permanent60Hz restriction was added. Instant
+Resume, storage expansion, touch/gamepad/Link/audio/native Metal paths passed.
+One metadata-only child opens final IPA packaging after this complete gate.

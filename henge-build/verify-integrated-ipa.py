@@ -41,7 +41,7 @@ if manifest.get('controls_power'):
 if manifest.get('loading_followup'):
     for marker in (b'kernel read cache order=', b'gpu-pipeline-archives:',
                    b'Removed Runner mode and retired experimental UI overrides'):
-        assert marker in binary, 'Missing loading follow-up: '+repr(marker)
+        assert marker in app_executable, 'Missing loading follow-up: '+repr(marker)
 if manifest.get('controller_posture'):
     assert plist.get('NSMotionUsageDescription'), 'Motion usage description missing'
     # Swift strings of <=15 UTF-8 bytes can be encoded in ARM64 immediates.
@@ -112,6 +112,9 @@ if manifest.get('m4_optimisation'):
         physical_gaming_verified=False, implementation=state['m4_implementation'])
 if manifest.get('controls_power'):
     data['controls_power']=dict(manifest['controls_power'], runtime_markers_verified=True, background_metadata_verified=True, physical_controller_verified=False, app_runner_removed=True)
+if manifest.get('loading_followup'):
+    data['loading_followup']=dict(manifest['loading_followup'],runtime_markers_verified=True,
+        source_validation=state['final_validation']['source_commit'],physical_performance_verified=False)
 if manifest.get('upstream_desktop'):
     desktop=state['upstream_desktop']
     assert desktop.get('complete') and desktop.get('source_commit')==state['final_validation']['source_commit']
