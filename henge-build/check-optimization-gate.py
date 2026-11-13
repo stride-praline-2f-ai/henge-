@@ -64,4 +64,10 @@ if desktop:
     assert desktop.get('complete') and desktop.get('source_commit')==validation.get('source_commit'), 'Desktop PR integration requires exact-source native and graphics proof'
 loading=state.get('loading_followup',{})
 assert loading.get('complete') and loading.get('source_commit')==validation.get('source_commit'), 'Loading/Runner cleanup needs exact-source regression proof'
+followup=state.get('ui_resume_clipboard_followup')
+if followup:
+    assert followup.get('complete') is True and followup.get('source_commit')==validation.get('source_commit'), 'UI/resume/clipboard follow-up needs exact-source proof'
+    checks=('snapshot_pack','gpu_resource_copyback','clipboard_bridge','clipboard_companion','clipboard_delivery','coordinator','ios_integration','ui_previews')
+    assert all(followup.get(k)=='passed' for k in checks), 'UI/resume/clipboard regression checks incomplete'
+    assert followup.get('evidence'), 'UI/resume/clipboard evidence missing'
 print('PASS complete implementation gate:'  ,  manifest['audit_repairs_sha256'])
