@@ -68,3 +68,29 @@ RAM mode is shown by the added status API after installing a future build; a 6 G
 headroom value alone neither proves nor disproves footprint exclusion. File-backed
 or excluded pages still consume physical memory; neither is unlimited RAM.
 No new physical FPS, energy, startup-time or cooling result is claimed.
+
+## Desktop diagnostic follow-up (0.3.9 / 110, validation pending)
+
+Latest M4 run: 4 vCPUs, 12 GiB guest RAM, 2560×1920 Retina/60Hz;
+normal thermal state and substantial process headroom. These logs do not prove
+that memory pressure or overheating explains the lag. JIT segment eviction and
+branch repair remain substantial; host presentation has long gaps.
+
+- Large quiescent exit-repair batches now publish each modified RX cache line
+  once with bounded bitmap scratch and the original barriers/fallback. Tests
+  execute modified code through MAP_JIT and split aliases. No MMU shortcuts.
+- Direct input preserves the initial contact location, rotates contact IDs,
+  drains eligible reports together and ignores incidental trackpad motion during
+  a stroke. Explicit clicks/scroll still transfer ownership. Replaced views cannot
+  cancel the current surface. Finger/Pencil tip contacts share the USB path.
+- Negotiated setup progress refreshes the helper watchdog without falsely declaring
+  readiness. Each phase is bounded, with a 30s overall ceiling and legacy fallback.
+- This diagnostic build enables Session Diagnostics once on first launch. It runs
+  throughout the visible session, can be disabled in Settings, and uses the existing
+  maintenance waiter. Logs include native phase timings, disk queue/service/flush
+  totals, JIT publication work, presentation timing, input stages and 50Hz sampled
+  hot host/JIT code. Top instruction words are included in ordinary logs even
+  when the separate bounded word file is full. Instrumentation adds overhead.
+
+Physical touch, Pencil, FPS and thermal gains still require device verification.
+No claim that logging alone identifies every possible bottleneck with certainty.

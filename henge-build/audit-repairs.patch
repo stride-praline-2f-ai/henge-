@@ -727,7 +727,7 @@ index c341d16..3d49220 100644
  void hv_enter(HvCpu *cpu, void *block);
  /* While hv_run runs, the host FPCR/FPSR hold the guest's; these move them in and out. */
 diff --git a/core/fastmem_log.c b/core/fastmem_log.c
-index a41d6d2..fa6964e 100644
+index a41d6d2..9ff30e2 100644
 --- a/core/fastmem_log.c
 +++ b/core/fastmem_log.c
 @@ -21,13 +21,14 @@ void hv_fastmem_log(HvMachine *m, FILE *out) {
@@ -748,7 +748,7 @@ index a41d6d2..fa6964e 100644
  #ifdef __APPLE__
      if (getenv("HV_TASK_STATS") && !strcmp(getenv("HV_TASK_STATS"), "1")) {
          task_power_info_data_t power = {0};
-@@ -58,13 +59,15 @@ void hv_fastmem_log(HvMachine *m, FILE *out) {
+@@ -58,13 +59,19 @@ void hv_fastmem_log(HvMachine *m, FILE *out) {
              (unsigned long long)__atomic_load_n(&m->stats.duplicate_place_avoided, __ATOMIC_RELAXED),
              (unsigned long long)__atomic_load_n(&m->stats.duplicate_bytes_avoided, __ATOMIC_RELAXED),
              (unsigned long long)__atomic_load_n(&m->stats.duplicate_place_late, __ATOMIC_RELAXED));
@@ -760,6 +760,10 @@ index a41d6d2..fa6964e 100644
              capacity ? 100.0 * (double)words / (double)capacity : 0.0, m->nblocks,
              (unsigned long long)__atomic_load_n(&m->stats.flush_full, __ATOMIC_RELAXED),
              (unsigned long long)__atomic_load_n(&m->stats.block_flushes, __ATOMIC_RELAXED));
++    fprintf(out,"jit-publication: rewritten_words=%llu invalidated_lines=%llu bitmap_batches=%llu (cumulative; complete publication barriers retained)\n",
++            (unsigned long long)__atomic_load_n(&m->jit.publication_words,__ATOMIC_RELAXED),
++            (unsigned long long)__atomic_load_n(&m->jit.publication_lines,__ATOMIC_RELAXED),
++            (unsigned long long)__atomic_load_n(&m->jit.publication_bitmap_batches,__ATOMIC_RELAXED));
 +    fprintf(out,"jit-ring: segments=%u evictions=%llu blocks_dropped=%llu exits_repaired=%llu (quiescent oldest-segment reuse; full flush fallback retained)\n",
 +        m->jit.nseg,(unsigned long long)m->stats.evictions,(unsigned long long)m->stats.evict_blocks,(unsigned long long)m->stats.evict_unchained);
      fprintf(out, "fastmem: mode=%s counters=%s (cumulative; diagnostic counting adds overhead)\n",
@@ -4259,7 +4263,7 @@ index 0000000..c550603
 +}
 +#endif
 diff --git a/devices/virtio_blk.c b/devices/virtio_blk.c
-index 873ab5e..9d86fc3 100644
+index 873ab5e..5f043c6 100644
 --- a/devices/virtio_blk.c
 +++ b/devices/virtio_blk.c
 @@ -34,10 +34,24 @@ static int seg_io(HvVirtioBlk *b, const HvVirtqElem *e, int writable, uint32_t o
@@ -4299,7 +4303,7 @@ index 873ab5e..9d86fc3 100644
      for (;;) {
          pthread_mutex_lock(&b->mu);
          while (b->fence || b->claimed == __atomic_load_n(&b->submitted, __ATOMIC_ACQUIRE)) {
-@@ -137,29 +152,45 @@ static void *worker(void *opaque) {
+@@ -137,29 +152,51 @@ static void *worker(void *opaque) {
          b->inflight++;
          pthread_mutex_unlock(&b->mu);
  
@@ -4314,8 +4318,9 @@ index 873ab5e..9d86fc3 100644
 +        uint64_t t0 = measuring ? now_us() : 0;
          if (handle(b, &r->e, &r->written) != 0) r->written = 0;
 -        if (stats) {
+-            uint64_t t1 = now_us();
++        uint64_t t1=measuring?now_us():0;
 +        if (measuring) {
-             uint64_t t1 = now_us();
              busy += t1 - t0, reqs++, bytes += r->written > 1 ? r->written : readable(&r->e);
 +            if (t1 - t0 > max_us) max_us = t1 - t0;
              if (type == T_FLUSH) flushes++, flush_us += t1 - t0;
@@ -4334,6 +4339,12 @@ index 873ab5e..9d86fc3 100644
          }
  
          pthread_mutex_lock(&b->mu);
++        if(measuring && (stats || capture==__atomic_load_n(&b->capture_epoch,__ATOMIC_RELAXED))) {
++            b->timing[0]++;b->timing[1]+=t1-t0;
++            if(r->queued_us && t0>=r->queued_us)b->timing[2]+=t0-r->queued_us;
++            if(type==T_FLUSH){b->timing[3]+=t1-t0;b->timing[5]++;}
++            if(t1-t0>b->timing[4])b->timing[4]=t1-t0;
++        }
          __atomic_store_n(&r->done, 1, __ATOMIC_RELEASE);
 +        /* Must precede completed: drain acquiring the last completion must
 +           also observe the publication that makes its final poll effective. */
@@ -4353,7 +4364,15 @@ index 873ab5e..9d86fc3 100644
      }
      return NULL;
  }
-@@ -197,6 +228,13 @@ void hv_virtio_blk_drain(HvVirtioBlk *b) {
+@@ -184,6 +221,7 @@ static void notify(HvVirtio *v, int q) {
+         }
+         if (got == 0) break;
+         r->q = q;
++        r->queued_us=(b->log_stats || (__atomic_load_n(&b->capture_epoch,__ATOMIC_RELAXED)&1))?now_us():0;
+         pthread_mutex_lock(&b->mu);
+         __atomic_store_n(&b->submitted, b->submitted + 1, __ATOMIC_RELEASE);
+         pthread_mutex_unlock(&b->mu);
+@@ -197,6 +235,18 @@ void hv_virtio_blk_drain(HvVirtioBlk *b) {
      hv_virtio_blk_poll(b);
  }
  
@@ -4363,11 +4382,16 @@ index 873ab5e..9d86fc3 100644
 +    while ((old & 1) != !!enabled &&
 +           !__atomic_compare_exchange_n(&b->capture_epoch, &old, old + 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
 +}
++int hv_virtio_blk_read_timing(HvVirtioBlk *b,uint64_t out[6]) {
++    memset(out,0,6*sizeof *out);if(!b)return 0;
++    pthread_mutex_lock(&b->mu);memcpy(out,b->timing,sizeof b->timing);pthread_mutex_unlock(&b->mu);
++    return b->log_stats || (__atomic_load_n(&b->capture_epoch,__ATOMIC_RELAXED)&1);
++}
 +
  void hv_virtio_blk_stop(HvVirtioBlk *b) {
      if (!b) return;
      pthread_mutex_lock(&b->mu);
-@@ -241,6 +279,9 @@ void hv_virtio_blk_destroy(HvVirtioBlk *b) {
+@@ -241,6 +291,9 @@ void hv_virtio_blk_destroy(HvVirtioBlk *b) {
     a slot is reused once it and every slot before it are back. */
  void hv_virtio_blk_poll(HvVirtioBlk *b) {
      if (!b) return;
@@ -4377,25 +4401,44 @@ index 873ab5e..9d86fc3 100644
      int q = -1;
      for (uint32_t i = b->published; i != b->submitted; i++) {
          HvVblkReq *r = &b->ring[i % HV_VBLK_RING];
+@@ -269,6 +322,7 @@ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int a
+     v->dev = b;
+     v->notify = notify;
+     b->disk = disk;
++    b->log_stats=getenv("HV_BLK_STATS")!=NULL;
+     b->ring = calloc(HV_VBLK_RING, sizeof *b->ring);
+     pthread_mutex_init(&b->mu, NULL);
+     pthread_cond_init(&b->cv, NULL);
 diff --git a/devices/virtio_blk.h b/devices/virtio_blk.h
-index e48d5b6..164f44b 100644
+index e48d5b6..7be1322 100644
 --- a/devices/virtio_blk.h
 +++ b/devices/virtio_blk.h
-@@ -34,6 +34,8 @@ typedef struct HvVirtioBlk {
+@@ -23,6 +23,7 @@ typedef struct HvVblkReq {
+     uint32_t written;
+     int done;            /* a worker finished it (CPU thread pushes it) */
+     int pushed;          /* in the used ring (the slot is free once all before it are too) */
++    uint64_t queued_us;
+ } HvVblkReq;
+ 
+ #define HV_VBLK_WORKERS 4 /* requests in flight at once: the guest queues many, and each waits on the host disk */
+@@ -34,6 +35,10 @@ typedef struct HvVirtioBlk {
      HvVblkReq *ring;
      uint32_t submitted;  /* CPU thread: requests handed to the worker */
      uint32_t completed;  /* workers: requests done (in any order) */
 +    int completion_pending; /* atomic: ready completions not yet claimed by a CPU poll */
 +    unsigned capture_epoch; /* atomic: odd while an explicit bounded capture is active */
++    int log_stats;
++    uint64_t timing[6]; /* mu: completed requests, service us, queued us, flush us, max service us, flush count */
      uint32_t claimed;    /* workers: requests taken (under mu) */
      int inflight;        /* taken, not done */
      int fence;           /* a flush or barrier waits for everything before it: nothing else is taken meanwhile */
-@@ -48,6 +50,8 @@ typedef struct HvVirtioBlk {
+@@ -48,6 +53,9 @@ typedef struct HvVirtioBlk {
  HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int apple_variant);
  /* CPU thread: publish finished requests and raise the interrupt. */
  void hv_virtio_blk_poll(HvVirtioBlk *b);
 +/* Reuse worker-owned I/O statistics during a bounded capture; no polling timer. */
 +void hv_virtio_blk_capture_timing(HvVirtioBlk *b, int enabled);
++int hv_virtio_blk_read_timing(HvVirtioBlk *b,uint64_t out[6]);
  /* Tests: wait for the worker to finish everything submitted, then publish it. */
  void hv_virtio_blk_drain(HvVirtioBlk *b);
  /* After CPUs stop: finish submitted DMA and join workers before disk flush/free. */
@@ -8207,6 +8250,37 @@ index 4919f5d..5a6c506 100644
 +int hv_audio_recover(HvVirtioSnd *d);
  
  #endif
+diff --git a/host/cache_line_set.h b/host/cache_line_set.h
+new file mode 100644
+index 0000000..a8c0504
+--- /dev/null
++++ b/host/cache_line_set.h
+@@ -0,0 +1,25 @@
++#ifndef HENGE_CACHE_LINE_SET_H
++#define HENGE_CACHE_LINE_SET_H
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++/* A quiescent publication batch, indexed by 64-byte RX cache line. Storage
++   is bounded separately by the caller; no guest access-path state is cached. */
++static inline size_t hv_cache_line_bitmap_words(size_t bytes) {
++    if (!bytes || bytes > SIZE_MAX-4095) return 0;
++    return (bytes+4095)/4096;
++}
++static inline int hv_cache_line_mark(uint64_t *bits,size_t count,uintptr_t base,size_t bytes,
++                                     uint32_t *const *sites,size_t n) {
++    size_t need=hv_cache_line_bitmap_words(bytes);
++    if(!bits || !need || count<need || (base&63) || !sites || bytes>UINTPTR_MAX-base)return 0;
++    memset(bits,0,need*sizeof *bits);
++    for(size_t i=0;i<n;i++) {
++        uintptr_t site=(uintptr_t)sites[i];
++        if(site<base || site-base>=bytes || (site&3))return 0;
++        size_t line=(site-base)>>6;
++        bits[line>>6]|=1ull<<(line&63);
++    }
++    return 1;
++}
++#endif
 diff --git a/host/disk.c b/host/disk.c
 index ecb059f..f36fffc 100644
 --- a/host/disk.c
@@ -8513,28 +8587,57 @@ index 0000000..e42b4b0
 +static inline int hv_env_flag(const char *name) { return hv_env_flag_value(getenv(name)); }
 +#endif
 diff --git a/host/jit_region.c b/host/jit_region.c
-index e1e8e9d..c52522a 100644
+index e1e8e9d..8b47615 100644
 --- a/host/jit_region.c
 +++ b/host/jit_region.c
-@@ -92,6 +92,31 @@ void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words) {
+@@ -1,4 +1,5 @@
+ #include "jit_region.h"
++#include "cache_line_set.h"
+ 
+ #include <TargetConditionals.h>
+ #include <libkern/OSCacheControl.h>
+@@ -92,6 +93,54 @@ void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words) {
      if (start && words) sys_icache_invalidate(start, words * sizeof(uint32_t));
  }
  
 +void hv_jit_finish_words(HvJitRegion *region, uint32_t *const *words, size_t n) {
-+    (void)region;
 +#if TARGET_OS_OSX
 +    if (!region->rw_diff) pthread_jit_write_protect_np(1);
 +#endif
++    size_t bytes=region->capacity<=SIZE_MAX/4?region->capacity*4:0;
++    size_t bitmap_words=hv_cache_line_bitmap_words(bytes);
++    // Large eviction batches can revisit a line many times in slot order.
++    // At most8MiB scratch; allocation/range failures retain full publication.
++    uint64_t *bitmap=n>=65536 && bitmap_words && bitmap_words<=(1u<<20) ? calloc(bitmap_words,sizeof *bitmap) : NULL;
++    int grouped=bitmap && hv_cache_line_mark(bitmap,bitmap_words,(uintptr_t)region->base,bytes,words,n);
 +    __asm__ volatile("dsb ish" ::: "memory");
++    size_t lines=0;
++    if(grouped) {
++        for(size_t i=0;i<bitmap_words;i++) {
++            uint64_t pending=bitmap[i];
++            while(pending) {
++                unsigned bit=(unsigned)__builtin_ctzll(pending);pending&=pending-1;
++                uintptr_t address=(uintptr_t)region->base+((i*64+bit)<<6);
++                __asm__ volatile("ic ivau, %0" ::"r"(address):"memory");
++                if(++lines%20==0)__asm__ volatile("dsb ish" ::: "memory");
++            }
++        }
++    } else {
 +    uintptr_t last = 0;
 +    for (size_t k = 0; k < n; k++) {
 +        uintptr_t a = (uintptr_t)words[k] & ~(uintptr_t)63;
 +        if (a == last) continue;
 +        last = a;
 +        __asm__ volatile("ic ivau, %0" ::"r"(a) : "memory");
++        lines++;
 +        if (k % 20 == 19) __asm__ volatile("dsb ish" ::: "memory"); /* as sys_icache_invalidate does, for the CPUs that need it */
 +    }
++    }
 +    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
++    free(bitmap);
++    __atomic_fetch_add(&region->publication_words,n,__ATOMIC_RELAXED);
++    __atomic_fetch_add(&region->publication_lines,lines,__ATOMIC_RELAXED);
++    __atomic_fetch_add(&region->publication_bitmap_batches,grouped,__ATOMIC_RELAXED);
 +}
 +
 +void hv_jit_poison(HvJitRegion *region, uint32_t *start, size_t words) {
@@ -8548,7 +8651,7 @@ index e1e8e9d..c52522a 100644
  /* As sys_icache_invalidate does it (libsystem_platform: DSB, IC IVAU per 64-byte line with a DSB after every 20 for
     the CPUs that need one, DSB, ISB), over both ranges. */
  static void ic_lines(uint32_t *start, size_t words, int *n) {
-@@ -128,19 +153,83 @@ void hv_jit_finish_branch(HvJitRegion *region, uint32_t *word) {
+@@ -128,19 +177,83 @@ void hv_jit_finish_branch(HvJitRegion *region, uint32_t *word) {
      hv_jit_finish(region, word, 1);
  }
  
@@ -8640,7 +8743,7 @@ index e1e8e9d..c52522a 100644
 +    return used<cap ? used : cap;
  }
 diff --git a/host/jit_region.h b/host/jit_region.h
-index a2f5a0d..733ac92 100644
+index a2f5a0d..ece2419 100644
 --- a/host/jit_region.h
 +++ b/host/jit_region.h
 @@ -4,8 +4,13 @@
@@ -8658,7 +8761,7 @@ index a2f5a0d..733ac92 100644
  
     Two shapes. macOS: one MAP_JIT mapping, made writable per thread while code
     is copied in (rw_diff is 0). iOS: an executable mapping a debugger granted
-@@ -21,6 +26,14 @@ typedef struct HvJitRegion {
+@@ -21,6 +26,15 @@ typedef struct HvJitRegion {
      size_t used;        /* in instructions */
      size_t limit;       /* in instructions; 0: all of it (HV_JIT_CAP: a smaller cache in the same region, to compare) */
      int owned;          /* mapped here (closed here) rather than handed in */
@@ -8670,10 +8773,11 @@ index a2f5a0d..733ac92 100644
 +    int wrapped;        /* written all the way round since the last reset: every segment may hold code */
 +    int too_big;        /* a reservation larger than a segment failed: only a reset makes room for it */
 +    uint32_t seg_epoch[HV_JIT_MAX_SEGS]; /* bumped as each segment is taken back: space reserved in it before is gone */
++    uint64_t publication_words, publication_lines, publication_bitmap_batches;
  } HvJitRegion;
  
  int hv_jit_region_open(HvJitRegion *region, size_t bytes);
-@@ -37,8 +50,23 @@ void hv_jit_finish2(HvJitRegion *region, uint32_t *a, size_t na, uint32_t *b, si
+@@ -37,8 +51,23 @@ void hv_jit_finish2(HvJitRegion *region, uint32_t *a, size_t na, uint32_t *b, si
     synchronization. The former relaxed option falls back to this safe path. */
  void hv_jit_finish_branch(HvJitRegion *region, uint32_t *word);
  
@@ -8838,7 +8942,7 @@ index eeabe42..7035b1a 100644
            uint32_t seen = 0; uint64_t distinct = 0; (void)seen;
            uint64_t best[4] = {0}; uint32_t bestn[4] = {0};
 diff --git a/host/native_touch.c b/host/native_touch.c
-index 504e669..49faeb9 100644
+index 504e669..584885b 100644
 --- a/host/native_touch.c
 +++ b/host/native_touch.c
 @@ -1,4 +1,5 @@
@@ -8847,7 +8951,7 @@ index 504e669..49faeb9 100644
  #include <math.h>
  #include <pthread.h>
  #include <stdio.h>
-@@ -7,29 +8,70 @@
+@@ -7,29 +8,83 @@
  
  #define QUEUE_SIZE 64
  #define MAX_CONTACTS 5
@@ -8863,12 +8967,19 @@ index 504e669..49faeb9 100644
 +static HvTouchEncoder encoder;
  static double last_sender, last_helper, started;
 +static HvNativeTouchUSB usb;
++static uint64_t accepted_frames,rejected_frames,usb_reports,usb_failures,cancellations;
++static size_t peak_queued;
++static int setup_phase;
++static int same_contacts(const Frame *a, const Frame *b) {
++    return a->count == b->count && !memcmp(a->ids,b->ids,a->count);
++}
  static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
  static void reset_locked(void) {
 +    if (usb.connect) usb.connect(usb.context, 0);
      if (++epoch == 0) epoch = 1;
      queued = 0; memset(&current, 0, sizeof current);
 +    host_encoded = cancel_pending = sender_expired = 0; memset(&encoder,0,sizeof encoder);
++    setup_phase=0;
      started = last_sender = now(); last_helper = 0;
      status = enabled ? HV_TOUCH_WAITING : HV_TOUCH_OFF;
      pthread_cond_broadcast(&changed);
@@ -8876,15 +8987,18 @@ index 504e669..49faeb9 100644
  static void expire_locked(void) {
      double t = now();
 -    if (enabled && ((status == HV_TOUCH_READY && (t-last_helper > 0.7 || t-last_sender > 0.7)) ||
+-                    (status == HV_TOUCH_WAITING && t-started > 5))) {
 +    if(enabled && host_encoded && status==HV_TOUCH_READY && t-last_sender>.7 && !sender_expired) {
 +        // A UI stall releases contacts, not the mapped USB display. The UIKit
 +        // surface fences resting contacts when its heartbeat resumes.
 +        sender_expired=1;cancel_pending=1;queued=0;memset(&current,0,sizeof current);
++        fprintf(stderr,"native-touch-state: epoch=%u UI sender stalled; cancelling contacts, mapping retained\n",epoch);
 +        pthread_cond_broadcast(&changed);
 +    }
 +    double helper_timeout=host_encoded?2.5:.7;
 +    if (enabled && ((status == HV_TOUCH_READY && (t-last_helper > helper_timeout || (!host_encoded && t-last_sender > .7))) ||
-                     (status == HV_TOUCH_WAITING && t-started > 5))) {
++                    (status == HV_TOUCH_WAITING && (t-(last_helper>started?last_helper:started)>5 || t-started>30)))) {
++        fprintf(stderr,"native-touch-state: epoch=%u timeout status=%d setup_phase=%d helper_age_ms=%.0f sender_age_ms=%.0f\n",epoch,status,setup_phase,last_helper?(t-last_helper)*1000:-1,(t-last_sender)*1000);
          enabled = 0; reset_locked(); status = HV_TOUCH_TIMEOUT;
      }
  }
@@ -8896,19 +9010,23 @@ index 504e669..49faeb9 100644
 +    if(cancel_pending && t>=encoder.deadline) {
 +        hv_touch_encoder_cancel(&encoder);cancel_pending=0;
 +    }
-+    if(!cancel_pending) {
++    for(unsigned step=0; !cancel_pending && step<=QUEUE_SIZE; step++) {
 +        uint8_t report[32];int consumed=0;
 +        int emitted=hv_touch_encoder_step(&encoder,queued?&queue[0]:NULL,t,&consumed,report);
 +        if(consumed){current=queue[0];memmove(queue,queue+1,(--queued)*sizeof(Frame));}
++        if(emitted)usb_reports++;
 +        if(emitted && (!usb.report || !usb.report(usb.context,report))) {
++            usb_failures++;
 +            enabled=0;reset_locked();status=HV_TOUCH_TIMEOUT;return 0;
 +        }
++        if(!consumed || !queued)break;
 +    }
 +    return cancel_pending?encoder.deadline:hv_touch_encoder_due(&encoder,queued!=0,t);
 +}
 +void hv_native_touch_cancel(uint32_t generation) {
 +    pthread_mutex_lock(&mutex);expire_locked();
 +    if(!enabled || generation!=epoch){pthread_mutex_unlock(&mutex);return;}
++    cancellations++;
 +    queued=0;memset(&current,0,sizeof current);
 +    if(host_encoded) {
 +        cancel_pending=1;encode_locked();
@@ -8921,26 +9039,41 @@ index 504e669..49faeb9 100644
  uint32_t hv_native_touch_enable(int on) {
      pthread_mutex_lock(&mutex);
      if (enabled != !!on || (!on && status != HV_TOUCH_OFF)) { enabled = !!on; reset_locked(); }
-@@ -55,7 +97,8 @@ int hv_native_touch_submit(uint32_t generation, const uint8_t *ids, const double
+@@ -54,40 +109,125 @@ int hv_native_touch_submit(uint32_t generation, const uint8_t *ids, const double
+         frame.ids[i] = ids[i]; frame.x[i] = x[i]; frame.y[i] = y[i];
      }
      pthread_mutex_lock(&mutex); expire_locked();
-     if (!enabled || status != HV_TOUCH_READY || generation != epoch) { pthread_mutex_unlock(&mutex); return 0; }
+-    if (!enabled || status != HV_TOUCH_READY || generation != epoch) { pthread_mutex_unlock(&mutex); return 0; }
 -    last_sender = now();
++    if (!enabled || status != HV_TOUCH_READY || generation != epoch) { rejected_frames++;pthread_mutex_unlock(&mutex); return 0; }
++    accepted_frames++;
 +    last_sender = now();sender_expired=0;
 +    if(host_encoded && usb.keepalive)usb.keepalive(usb.context);
      // Keep the sender watchdog alive without waking the helper for an unchanged idle frame.
      if (!count && !queued && !current.count) {
          pthread_mutex_unlock(&mutex);
-@@ -65,29 +108,88 @@ int hv_native_touch_submit(uint32_t generation, const uint8_t *ids, const double
-     if (queued && queue[queued-1].count == count && !memcmp(queue[queued-1].ids, frame.ids, count)) queue[queued-1] = frame;
+         return 1;
+     }
+     /* Only coalesce motion: preserve every change in contact membership, including short taps. */
+-    if (queued && queue[queued-1].count == count && !memcmp(queue[queued-1].ids, frame.ids, count)) queue[queued-1] = frame;
++    const Frame *before=queued>1?&queue[queued-2]:&current;
++    if (queued && same_contacts(&queue[queued-1],&frame) && same_contacts(before,&queue[queued-1])) queue[queued-1] = frame;
      else if (queued < QUEUE_SIZE) queue[queued++] = frame;
      else { enabled = 0; reset_locked(); status = HV_TOUCH_DEVICE; pthread_mutex_unlock(&mutex); return 0; }
++    if(queued>peak_queued)peak_queued=queued;
 +    encode_locked();
      pthread_cond_signal(&changed); pthread_mutex_unlock(&mutex); return 1;
  }
  void hv_native_touch_report(uint32_t generation, int value) {
      pthread_mutex_lock(&mutex); expire_locked();
++    // Setup progress does not declare readiness, disconnect USB or downgrade
++    // an already-ready service. A bounded slow IOKit attach can stay alive.
++    if(enabled && generation==epoch && value==HV_TOUCH_WAITING) {
++        if(status==HV_TOUCH_WAITING)last_helper=now();
++        pthread_mutex_unlock(&mutex);return;
++    }
      if (enabled && generation == epoch && value >= HV_TOUCH_READY && value <= HV_TOUCH_DEVICE) {
++        if(status!=value)fprintf(stderr,"native-touch-state: epoch=%u status=%d->%d setup_phase=%d direct_usb=%d\n",epoch,status,value,setup_phase,host_encoded);
          last_helper = now(); if (status == HV_TOUCH_WAITING) last_sender = last_helper; status = value;
 -        if (value != HV_TOUCH_READY) { enabled = 0; queued = 0; memset(&current, 0, sizeof current); }
 +        if (value != HV_TOUCH_READY) {
@@ -8950,6 +9083,21 @@ index 504e669..49faeb9 100644
      }
      pthread_mutex_unlock(&mutex);
  }
++void hv_native_touch_progress(uint32_t generation,int phase) {
++    pthread_mutex_lock(&mutex);expire_locked();
++    if(enabled && generation==epoch && status==HV_TOUCH_WAITING && phase>=0 && phase<=6) {
++        last_helper=now();
++        if(setup_phase!=phase)fprintf(stderr,"native-touch-setup: epoch=%u phase=%d (1 detach,2 attach,3 IOHID mapping,4 event association,5 screen discovery,6 direct USB)\n",epoch,phase);
++        setup_phase=phase;
++    }
++    pthread_mutex_unlock(&mutex);
++}
++void hv_native_touch_log(void) {
++    pthread_mutex_lock(&mutex);
++    double t=now();
++    fprintf(stderr,"native-touch-metrics: epoch=%u enabled=%d status=%d direct_usb=%d setup_phase=%d queued=%zu peak=%zu frames=%llu rejected=%llu reports=%llu failed=%llu cancels=%llu helper_age_ms=%.0f sender_age_ms=%.0f\n",epoch,enabled,status,host_encoded,setup_phase,queued,peak_queued,(unsigned long long)accepted_frames,(unsigned long long)rejected_frames,(unsigned long long)usb_reports,(unsigned long long)usb_failures,(unsigned long long)cancellations,last_helper?(t-last_helper)*1000:-1,(t-last_sender)*1000);
++    pthread_mutex_unlock(&mutex);
++}
  size_t hv_native_touch_next(char *json, size_t capacity) {
      if (capacity < 1024) return 0;
      pthread_mutex_lock(&mutex); expire_locked();
@@ -8986,7 +9134,7 @@ index 504e669..49faeb9 100644
 +size_t hv_native_touch_usb_state(char *json, size_t capacity) {
 +    pthread_mutex_lock(&mutex); expire_locked();
 +    int connected = usb.connected && usb.connected(usb.context);
-+    int n = snprintf(json, capacity, "{\"version\":1,\"epoch\":%u,\"available\":%s,\"connected\":%s,\"hostEncoding\":true}",
++    int n = snprintf(json, capacity, "{\"version\":1,\"epoch\":%u,\"available\":%s,\"connected\":%s,\"hostEncoding\":true,\"setupHeartbeat\":true}",
 +                     epoch, usb.connect ? "true" : "false", connected ? "true" : "false");
 +    pthread_mutex_unlock(&mutex);
 +    return n >= 0 && (size_t)n < capacity ? (size_t)n : 0;
@@ -9028,10 +9176,10 @@ index 504e669..49faeb9 100644
 +    pthread_mutex_unlock(&mutex);return accepted;
 +}
 diff --git a/host/native_touch.h b/host/native_touch.h
-index 4072159..922ecae 100644
+index 4072159..edff5d4 100644
 --- a/host/native_touch.h
 +++ b/host/native_touch.h
-@@ -9,8 +9,26 @@ uint32_t hv_native_touch_enable(int enabled);
+@@ -9,8 +9,28 @@ uint32_t hv_native_touch_enable(int enabled);
  uint32_t hv_native_touch_epoch(void);
  uint32_t hv_native_touch_reset(void);
  int hv_native_touch_status(void);
@@ -9042,6 +9190,8 @@ index 4072159..922ecae 100644
  /* Guest helper transport. next waits at most 250 ms; new input wakes it immediately. */
  size_t hv_native_touch_next(char *json, size_t capacity);
  void hv_native_touch_report(uint32_t epoch, int status);
++void hv_native_touch_progress(uint32_t epoch,int phase);
++void hv_native_touch_log(void);
 +/* The emulator supplies this transport; the guest only associates the USB
 +   device with its display and encodes reports. No virtual-HID grant is needed. */
 +typedef struct HvNativeTouchUSB {
@@ -9175,7 +9325,7 @@ index 0000000..ad71d74
 +}
 +#endif
 diff --git a/host/prof_ios.c b/host/prof_ios.c
-index b7ff92a..9a9648c 100644
+index b7ff92a..82300e4 100644
 --- a/host/prof_ios.c
 +++ b/host/prof_ios.c
 @@ -27,7 +27,12 @@ static struct { uintptr_t off; uint32_t n; } slots[SLOTS];
@@ -9192,7 +9342,28 @@ index b7ff92a..9a9648c 100644
  
  /* HV_PROF_IOS=2: the translated instruction under each JIT sample, by its encoding */
  #define WORD_SLOTS 16384
-@@ -51,7 +56,7 @@ static void dump_words(void) {
+@@ -43,7 +48,20 @@ static void count_word(uint32_t w) {
+     words_lost++;
+ }
+ 
++static int by_word_count(const void *a,const void *b) {
++    const __typeof__(words[0]) *x=a,*y=b;
++    return x->n<y->n ? 1 : x->n>y->n ? -1 : 0;
++}
++
+ static void dump_words(void) {
++    // Keep actionable instruction samples in the two ordinary shared logs,
++    // even when the separate bounded word file has filled. No raw user data.
++    static __typeof__(words[0]) sorted_words[WORD_SLOTS];
++    memcpy(sorted_words,words,sizeof words);
++    qsort(sorted_words,WORD_SLOTS,sizeof sorted_words[0],by_word_count);
++    for(int i=0;i<20 && sorted_words[i].n;i++)
++        fprintf(stderr,"hvprof-jit-word: word=%08x samples=%u jit_share_pct=%.2f lost=%llu\n",
++            sorted_words[i].w,sorted_words[i].n,jit?100.0*sorted_words[i].n/jit:0,(unsigned long long)words_lost);
+     const char *home = getenv("HOME");
+     char path[1024];
+     snprintf(path, sizeof path, "%s/Documents/hvprof-words.txt", home ? home : ".");
+@@ -51,7 +69,7 @@ static void dump_words(void) {
      if (f) fseek(f, 0, SEEK_END);
      if (f && ftell(f) >= (8 << 20)) { fclose(f); f = NULL; } /* bounded opt-in diagnostic file */
      if (f) {
@@ -9201,7 +9372,7 @@ index b7ff92a..9a9648c 100644
          for (int i = 0; i < WORD_SLOTS; i++)
              if (words[i].n) fprintf(f, "p %u 0 %08x\n", words[i].n, words[i].w);
          fclose(f);
-@@ -79,6 +84,7 @@ static void unregister_thread(void *value) {
+@@ -79,6 +97,7 @@ static void unregister_thread(void *value) {
      if(port)mach_port_deallocate(mach_task_self(),port);
  }
  static void reg(void) {
@@ -9209,7 +9380,7 @@ index b7ff92a..9a9648c 100644
      if(pthread_getspecific(thread_key))return;
      thread_act_t port=mach_thread_self();
      pthread_mutex_lock(&registry_mu);
-@@ -95,7 +101,10 @@ static void leave(void) {
+@@ -95,7 +114,10 @@ static void leave(void) {
      unregister_thread(value);
  }
  static void session(int on) {
@@ -9220,7 +9391,7 @@ index b7ff92a..9a9648c 100644
      pthread_cond_broadcast(&registry_cv);
      while (!on && sampling) pthread_cond_wait(&registry_cv, &registry_mu);
      pthread_mutex_unlock(&registry_mu);
-@@ -183,15 +192,25 @@ static void *sampler(void *unused) {
+@@ -183,15 +205,25 @@ static void *sampler(void *unused) {
      }
      return NULL;
  }
@@ -9388,7 +9559,7 @@ index 083d66e..d51f8b2 100644
  
  typedef struct {
 diff --git a/host/share.c b/host/share.c
-index 9c7244a..a79205d 100644
+index 9c7244a..ccdb148 100644
 --- a/host/share.c
 +++ b/host/share.c
 @@ -44,17 +44,44 @@ static char agent_path[PATH_MAX];
@@ -9578,8 +9749,22 @@ index 9c7244a..a79205d 100644
      if (!strcmp(what, "native-touch") && !strcmp(r->method, "GET")) {
          if (body_discard(c, r) != 0) return -1;
          char json[1024]; size_t n = hv_native_touch_next(json, sizeof json);
-@@ -691,6 +794,7 @@ static int serve_henge(Conn *c, Request *r) {
-         hv_native_touch_report(generation, state);
+@@ -682,15 +785,17 @@ static int serve_henge(Conn *c, Request *r) {
+     if (!strcmp(what, "native-touch") && !strcmp(r->method, "PUT")) {
+         if (r->chunked || r->length < 0 || r->length > 64) { r->close = 1; return respond_empty(c, r, 400, "Bad Request"); }
+         size_t length; char *body = body_small(c, r, &length);
+-        unsigned generation; int state; char extra;
++        unsigned generation; int state,phase=0; char extra;
+         if (!body) return -1;
+-        int valid = sscanf(body, "%u %d %c", &generation, &state, &extra) == 2 &&
+-                    state >= HV_TOUCH_READY && state <= HV_TOUCH_DEVICE;
++        int plain=sscanf(body,"%u %d %c",&generation,&state,&extra)==2;
++        int progress=sscanf(body,"%u %d %d %c",&generation,&state,&phase,&extra)==3 && state==HV_TOUCH_WAITING && phase>=0 && phase<=6;
++        int valid = (plain || progress) && state >= HV_TOUCH_WAITING && state <= HV_TOUCH_DEVICE;
+         free(body);
+         if (!valid) return respond_empty(c, r, 400, "Bad Request");
+-        hv_native_touch_report(generation, state);
++        if(progress)hv_native_touch_progress(generation,phase);else hv_native_touch_report(generation,state);
          return respond_empty(c, r, 204, "No Content");
      }
 +    if (!strcmp(what, "clipboard-ack") && !strcmp(r->method, "POST")) return clipboard_ack(c, r);
@@ -12516,11 +12701,15 @@ index 47b0ced..f6edeb5 100644
              sendTarget()
          }
 diff --git a/ios/Henge/EngineTuning.swift b/ios/Henge/EngineTuning.swift
-index e579188..da1e2f1 100644
+index e579188..50cd563 100644
 --- a/ios/Henge/EngineTuning.swift
 +++ b/ios/Henge/EngineTuning.swift
-@@ -4,38 +4,65 @@ import Foundation
- /// then Documents/henge-env.txt (KEY=VALUE per line, # comments; {Documents} in a value is that folder) overrides them all.
+@@ -1,41 +1,68 @@
+ import Foundation
+ 
+ /// Engine settings, without a rebuild. Defaults below, then the Performance settings,
+-/// then Documents/henge-env.txt (KEY=VALUE per line, # comments; {Documents} in a value is that folder) overrides them all.
++/// then Documents/henge-env.txt overrides performance settings. Enabled session diagnostics owns instrumentation flags.
  /// Applied at launch and again before each Mac starts, so changes need no relaunch.
  enum EngineTuning {
 -    static let diagnosticsKey = "henge.perf.cacheDiagnostics"
@@ -12583,7 +12772,7 @@ index e579188..da1e2f1 100644
 +            HengeLog.log("tuning","Removed Runner mode and retired experimental UI overrides; Automatic restored. Explicit henge-env.txt overrides remain available.")
          }
 -        env["HV_FASTMEM_STATS"] = (d.object(forKey: diagnosticsKey) as? Bool ?? false) ? "1" : "0"
-+        env["HV_FASTMEM_STATS"] = "0"
++        env["HV_FASTMEM_STATS"] = M4Performance.statisticsEnabled ? "1" : "0"
          if [30, 60, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
 -        env["HV_SUPERBLOCKS"] = d.bool(forKey: superblocksKey) ? "1" : "0"
 -        if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
@@ -12598,10 +12787,20 @@ index e579188..da1e2f1 100644
          if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
          let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
          // GPU command trace: checks Documents/trace-on at most once per second while commands arrive.
-@@ -51,6 +78,11 @@ enum EngineTuning {
+@@ -51,6 +78,21 @@ enum EngineTuning {
                      .trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "{Documents}", with: docs.path)
              }
          }
++        // An enabled diagnostic switch must actually instrument the session,
++        // even if an old experiment file left diagnostic flags at zero.
++        // CPU/memory/display/performance overrides retain their normal priority.
++        if M4Performance.statisticsEnabled {
++            env.merge(["HV_STATS":"10","HV_STATS_HASH":"0","HV_FASTMEM_STATS":"1",
++                       "HV_GPU_TIMING":"1","HV_FRAME_STATS":"1","HV_BLK_STATS":"10",
++                       "HV_PROF_IOS":"2","HV_PROF_IOS_HZ":"50","HV_PROF_IOS_SECS":"30",
++                       "HV_PROF_IOS_DURATION":"0"],uniquingKeysWith:{ _, profile in profile })
++            HengeLog.log("diagnostics","Session diagnostics owns instrumentation flags for this run; active for the full session,50Hz hot-code samples,10s engine/I/O reports. Generated counters and sampling add overhead. Performance/display overrides remain unchanged.")
++        }
 +        for key in appliedKeys.subtracting(env.keys) {
 +            unsetenv(key)
 +            HengeLog.log("tuning", "\(key)=<removed override>")
@@ -12649,7 +12848,7 @@ index a0a1e92..6a36fce 100644
          if let selected { return selected }
          // Older Fit profiles only stored this size convention. Explicit new
 diff --git a/ios/Henge/Hardware.swift b/ios/Henge/Hardware.swift
-index af0bc1b..3308856 100644
+index af0bc1b..c4205d4 100644
 --- a/ios/Henge/Hardware.swift
 +++ b/ios/Henge/Hardware.swift
 @@ -123,7 +123,11 @@ enum HardwareKeys {
@@ -12826,7 +13025,7 @@ index af0bc1b..3308856 100644
      private func moved(_ dx: Float, _ dy: Float) {
          guard acceptsInput, dx.isFinite, dy.isFinite, speed.isFinite else { return }
 +        guard dx != 0 || dy != 0 else { return }
-+        LocalPointerInput.hardware()
++        guard LocalPointerInput.hardware(.motion) else { return }
          restX += min(max(dx * speed, -32767), 32767)
          restY -= min(max(dy * speed, -32767), 32767)
          let x = restX.rounded(), y = restY.rounded()
@@ -12839,7 +13038,7 @@ index af0bc1b..3308856 100644
 -        henge_vm_mouse_button(button, pressed ? 1 : 0)
 +    private func button(_ physicalButton: Int32, _ pressed: Bool, device: ObjectIdentifier) {
 +        guard acceptsInput else { ignoredButtonEdges &+= 1; return }
-+        if pressed { LocalPointerInput.hardware() }
++        if pressed { guard LocalPointerInput.hardware(.button) else { return } }
 +        guard let button = buttons.event(physicalButton, pressed: pressed, device: device) else { return }
 +        buttonEdges &+= 1
 +        henge_vm_input_button(4, button, pressed ? 1 : 0)
@@ -12852,11 +13051,11 @@ index af0bc1b..3308856 100644
      private func scrolled(_ first: Float, _ second: Float) {
 -        guard acceptsInput else { return }
 +        guard acceptsInput, first.isFinite, second.isFinite, first != 0 || second != 0 else { return }
-+        LocalPointerInput.hardware()
++        guard LocalPointerInput.hardware(.scroll) else { return }
          scrollCallbacks &+= 1
          scrollState.push(first: Double(first), second: Double(second), scale: scrollScale, reversed: reverse)
          scheduleScrollIfNeeded()
-@@ -344,3 +406,35 @@ final class HardwareMouse {
+@@ -344,3 +406,40 @@ final class HardwareMouse {
          henge_vm_mouse_scroll(event.x, event.y)
      }
  }
@@ -12869,7 +13068,9 @@ index af0bc1b..3308856 100644
 +    static var ownership = LocalPointerOwnership()
 +    static var surfaceID: ObjectIdentifier?
 +    static var cancelSurface: (() -> Void)?
++    static func owns(_ view: UIView) -> Bool { surfaceID == ObjectIdentifier(view) }
 +    static func install(_ view: UIView, cancel: @escaping () -> Void) {
++        if surfaceID != ObjectIdentifier(view) { cancelSurface?(); ownership.reset() }
 +        surfaceID = ObjectIdentifier(view); cancelSurface = cancel
 +    }
 +    static func uninstall(_ view: UIView) {
@@ -12882,23 +13083,28 @@ index af0bc1b..3308856 100644
 +        PointerLock.set(false)
 +        NotificationCenter.default.post(name: changed, object: nil)
 +    }
-+    static func hardware() {
-+        guard ownership.claim(.hardware) else { return }
++    static func setDirectContacts(_ count: Int) { ownership.setDirectContacts(count) }
++    @discardableResult static func hardware(_ intent: LocalPointerOwnership.HardwareIntent = .motion) -> Bool {
++        guard ownership.permitsHardware(intent) else { return false }
++        guard ownership.claim(.hardware) else { return true }
 +        cancelSurface?()
 +        PointerLock.set(true)
 +        NotificationCenter.default.post(name: changed, object: nil)
++        return true
 +    }
 +    static func cancel() {
 +        ownership.reset(); cancelSurface?()
 +    }
 +}
 diff --git a/ios/Henge/HengeApp.swift b/ios/Henge/HengeApp.swift
-index 04b1a49..6afb5c6 100644
+index 04b1a49..e613b17 100644
 --- a/ios/Henge/HengeApp.swift
 +++ b/ios/Henge/HengeApp.swift
-@@ -13,13 +13,13 @@ struct HengeApp: App {
+@@ -12,14 +12,15 @@ struct HengeApp: App {
+         // allocator's first lines land in Documents/henge.log too.
          HengeLog.start()
          HengeLog.log("boot", "address space: \(henge_largest_reservation_gb()) GB can be reserved in one piece")
++        M4Performance.prepareDiagnosticBuild()
          EngineTuning.apply()
 -        BackgroundExecutionStatus.log()
 +        M4Performance.logProfile()
@@ -14514,10 +14720,10 @@ index 1bc238f..ccdbb33 100644
  }
 diff --git a/ios/Henge/M4Performance.swift b/ios/Henge/M4Performance.swift
 new file mode 100644
-index 0000000..5be105a
+index 0000000..721e4bd
 --- /dev/null
 +++ b/ios/Henge/M4Performance.swift
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,47 @@
 +import Foundation
 +
 +/// Hardware selection is authoritative in the native topology detector. These
@@ -14525,6 +14731,15 @@ index 0000000..5be105a
 +enum M4Performance {
 +    static var enabled: Bool { hv_host_is_m4_16gb() != 0 }
 +    static let statisticsKey = "henge.perf.sessionDiagnostics"
++    /// A user-authorized diagnostic IPA starts logging once on first launch.
++    /// Later explicit Off choices remain respected; normal releases stay quiet.
++    static func prepareDiagnosticBuild(defaults: UserDefaults = .standard,
++                                       enabled: Bool = Bundle.main.object(forInfoDictionaryKey:"HengeTestDiagnostics") as? Bool ?? false,
++                                       build: String = Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String ?? "unknown") {
++        let key="henge.diagnostics.initialized.\(build)"
++        guard enabled,defaults.object(forKey:key)==nil else { return }
++        defaults.set(true,forKey:statisticsKey);defaults.set(true,forKey:key)
++    }
 +    static var statisticsEnabled: Bool {
 +        (UserDefaults.standard.object(forKey: statisticsKey) as? Bool) ?? false
 +    }
@@ -14544,7 +14759,10 @@ index 0000000..5be105a
 +    static func applyAutomaticDefaults() {
 +        guard enabled else { return }
 +        let defaults = UserDefaults.standard
-+        defaults.set(false,forKey:statisticsKey)
++        // A test build keeps the explicitly enabled diagnostics across presets.
++        if Bundle.main.object(forInfoDictionaryKey:"HengeTestDiagnostics") as? Bool != true {
++            defaults.set(false,forKey:statisticsKey)
++        }
 +        defaults.set(true,forKey:EngineTuning.fastmemKey)
 +
 +    }
@@ -14797,18 +15015,20 @@ index 29c8b3b..28300a1 100644
          all.removeAll { $0.id == id }
          save()
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..c4dbe71 100644
+index 34d6a98..9a9f5cd 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
-@@ -3,6 +3,7 @@
+@@ -3,7 +3,9 @@
  #include "net_slirp.h"
  #include <sys/mman.h>
  #include "henge-vm.h"
 +#include "disk_resize.h"
  #include "fastmem.h"
++#include "native_touch.h"
  
  #include <os/proc.h>
-@@ -23,23 +24,58 @@
+ #include <TargetConditionals.h>
+@@ -23,23 +25,58 @@
  
  #include <fcntl.h>
  #include <unistd.h>
@@ -14869,7 +15089,7 @@ index 34d6a98..c4dbe71 100644
      exit_reason = reason;
      int halt = hv_vm_cpu(0)->halted;
      exit_outcome = HENGE_VM_OUTCOME_ERROR;
-@@ -49,13 +85,12 @@ static void on_exit(int reason) {
+@@ -49,13 +86,12 @@ static void on_exit(int reason) {
      case HV_HALT_HOST: exit_outcome = HENGE_VM_OUTCOME_HOST_STOP; break;
      case HV_HALT_PANIC: exit_outcome = HENGE_VM_OUTCOME_PANIC; break;
      }
@@ -14886,7 +15106,7 @@ index 34d6a98..c4dbe71 100644
      fprintf(stderr, "henge: the machine stopped (%s, halt reason %d); CPU threads ended, disks flushed%s\n",
              exit_description(), halt, installer_session ? "" : ", machine released");
      pthread_rwlock_unlock(&api_lock);
-@@ -67,6 +102,11 @@ static int begin_start(char *err, size_t errlen) {
+@@ -67,6 +103,11 @@ static int begin_start(char *err, size_t errlen) {
          snprintf(err, errlen, "A Mac app ran in this launch. Quit Henge (swipe it away) and open it again to start a Mac.");
          return -1;
      }
@@ -14898,7 +15118,7 @@ index 34d6a98..c4dbe71 100644
      pthread_rwlock_wrlock(&api_lock);
      if ((state != 0 && state != 2) || installer_session) {
          snprintf(err, errlen, "%s", installer_session
-@@ -75,26 +115,31 @@ static int begin_start(char *err, size_t errlen) {
+@@ -75,26 +116,31 @@ static int begin_start(char *err, size_t errlen) {
          pthread_rwlock_unlock(&api_lock);
          return -1;
      }
@@ -14935,7 +15155,7 @@ index 34d6a98..c4dbe71 100644
      pthread_rwlock_unlock(&api_lock);
      return 0;
  }
-@@ -116,9 +161,25 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
+@@ -116,9 +162,25 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
      return hv_snapshot_check(path, ident, bytes, saved_at);
  }
  
@@ -14963,7 +15183,7 @@ index 34d6a98..c4dbe71 100644
          snprintf(err, errlen, "No Mac is running.");
          return -1;
      }
-@@ -133,21 +194,73 @@ int henge_vm_pause(char *err, size_t errlen) {
+@@ -133,21 +195,73 @@ int henge_vm_pause(char *err, size_t errlen) {
          snprintf(err, errlen, "The Mac stopped by itself.");
          return -1;
      }
@@ -15043,7 +15263,7 @@ index 34d6a98..c4dbe71 100644
      fprintf(stderr, "henge: %s\n", r ? err : "the paused Mac is saved");
      return r;
  }
-@@ -160,18 +273,39 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
+@@ -160,18 +274,39 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
  }
  
  int henge_vm_continue(void) {
@@ -15086,7 +15306,7 @@ index 34d6a98..c4dbe71 100644
      }
      pthread_rwlock_unlock(&api_lock);
      fprintf(stderr, "henge: the Mac runs on%s\n", r ? " -- no, its CPU threads could not start" : "");
-@@ -192,17 +326,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
+@@ -192,17 +327,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
      fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
              jit->size >> 20);
      if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
@@ -15115,7 +15335,7 @@ index 34d6a98..c4dbe71 100644
  }
  
  static volatile int install_step = -1;
-@@ -239,7 +381,7 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
+@@ -239,7 +382,7 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
          snprintf(err, errlen, "The installer could not start.");
          return failed_start();
      }
@@ -15124,7 +15344,7 @@ index 34d6a98..c4dbe71 100644
  }
  
  int henge_install_step(void) { return install_step; }
-@@ -293,22 +435,29 @@ static int lock_running(void) {
+@@ -293,22 +436,29 @@ static int lock_running(void) {
      return 0;
  }
  void henge_vm_stop(void) {
@@ -15165,7 +15385,7 @@ index 34d6a98..c4dbe71 100644
  }
  
  long henge_vm_balloon(long target_mb) {
-@@ -336,7 +485,8 @@ int henge_vm_knob(const char *name, int value) {
+@@ -336,21 +486,23 @@ int henge_vm_knob(const char *name, int value) {
      return result;
  }
  void henge_vm_log_cache(void) {
@@ -15174,8 +15394,9 @@ index 34d6a98..c4dbe71 100644
 +    if(state!=1){pthread_rwlock_unlock(&api_lock);return;}
      hv_fastmem_log(hv_vm_machine(), stderr);
      hv_vm_log_ticker();
++    hv_native_touch_log();
      pthread_rwlock_unlock(&api_lock);
-@@ -344,13 +494,13 @@ void henge_vm_log_cache(void) {
+ }
  
  uint64_t henge_vm_blocks(void) {
      pthread_rwlock_rdlock(&api_lock);
@@ -15191,7 +15412,7 @@ index 34d6a98..c4dbe71 100644
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
-@@ -375,9 +525,35 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
+@@ -375,9 +527,35 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
      if (hv_share_start(folder, socket_path, agent) == 0) hv_net_set_share_socket(socket_path);
  }
  void henge_share_set_clipboard(const char *text) { hv_share_set_clipboard(text); }
@@ -15227,7 +15448,7 @@ index 34d6a98..c4dbe71 100644
  void henge_vm_set_display(uint32_t width, uint32_t height) { hv_pvg_lite_set_mode(width, height); }
  void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm) { hv_pvg_lite_set_size_mm(width_mm, height_mm); }
  int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,uint32_t height_mm,uint32_t hz) {
-@@ -388,6 +564,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
+@@ -388,6 +566,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
@@ -15254,7 +15475,7 @@ index 34d6a98..c4dbe71 100644
  void henge_vm_link_connected(int connected) {
      if (!lock_running()) return;
      HvVmapple *b = hv_vm_board();
-@@ -454,13 +650,51 @@ void henge_vm_set_display_layer(void *layer) {
+@@ -454,13 +652,51 @@ void henge_vm_set_display_layer(void *layer) {
      hv_vm_set_display_layer(layer);
  }
  uint64_t henge_vm_gpu_frames(void) {
@@ -15309,7 +15530,7 @@ index 34d6a98..c4dbe71 100644
      HvBootDisplay d;
      int result = -1;
      if (hv_vm_boot_display(&d) == 0) {
-@@ -509,3 +743,110 @@ uint64_t henge_largest_mapping_mb(void) {
+@@ -509,3 +745,112 @@ uint64_t henge_largest_mapping_mb(void) {
      }
      return 0;
  }
@@ -15378,6 +15599,8 @@ index 34d6a98..c4dbe71 100644
 +        out->translations=__atomic_load_n(&m->stats.translations,__ATOMIC_RELAXED);
 +        out->full_flushes=__atomic_load_n(&m->stats.flush_full,__ATOMIC_RELAXED);
 +        out->detailed_counters=m->stats_interval!=0;
++        out->disk_timing_enabled[0]=hv_virtio_blk_read_timing(hv_vm_board()->root_blk,out->disk[0]);
++        out->disk_timing_enabled[1]=hv_virtio_blk_read_timing(hv_vm_board()->aux_blk,out->disk[1]);
 +        uint64_t gpu[4]={0};
 +        if (hv_pvg_lite_capture_timing(hv_vm_board()->pvg,-1,gpu)==2) out->available|=16;
 +        out->replay_gpu_completed=gpu[0];out->replay_gpu_ns=gpu[1];
@@ -15421,7 +15644,7 @@ index 34d6a98..c4dbe71 100644
 +    hv_vm_release_input_source(source);pthread_rwlock_unlock(&api_lock);
 +}
 diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
-index b8c41fa..eae366a 100644
+index b8c41fa..5dbe293 100644
 --- a/ios/Henge/Native/henge-vm.h
 +++ b/ios/Henge/Native/henge-vm.h
 @@ -4,6 +4,7 @@
@@ -15482,7 +15705,7 @@ index b8c41fa..eae366a 100644
  /* Testing: sets a translation knob (core/machine.h) in the running machine; nonzero if it exists. */
  int henge_vm_knob(const char *name, int value);
  /* The memory balloon (only with HV_BALLOON set before boot): asks the guest to hand over target_mb (when >= 0)
-@@ -62,6 +86,41 @@ int henge_vm_knob(const char *name, int value);
+@@ -62,6 +86,43 @@ int henge_vm_knob(const char *name, int value);
  long henge_vm_balloon(long target_mb);
  
  /* Progress, for the session screen. */
@@ -15503,6 +15726,8 @@ index b8c41fa..eae366a 100644
 +    uint64_t gamepad_delivered, gamepad_coalesced, gamepad_overflow;
 +    uint64_t mouse_delivered, mouse_dropped, mouse_queued;
 +    uint64_t replay_gpu_completed, replay_gpu_ns, replay_gpu_max_ns, replay_gpu_unavailable;
++    uint64_t disk[2][6];
++    int disk_timing_enabled[2];
 +    int detailed_counters;
 +    unsigned available; /* bits: 0 CPU, 1 memory, 2 headroom, 3 VM, 4 replay GPU timing */
 +    uint64_t generation, epoch;
@@ -15524,7 +15749,7 @@ index b8c41fa..eae366a 100644
  void henge_vm_log_cache(void);           /* optional per-CPU cache-use diagnostics */
  uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
  uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
-@@ -74,6 +133,9 @@ int henge_vm_guest_el0(void);              /* any CPU running user code right no
+@@ -74,6 +135,9 @@ int henge_vm_guest_el0(void);              /* any CPU running user code right no
     henge_share_take_clipboard returns what the guest copied, once: a malloc'd string, or NULL. */
  void henge_vm_share(const char *folder, const char *socket_path, const char *agent);
  void henge_share_set_clipboard(const char *text);
@@ -15534,7 +15759,7 @@ index b8c41fa..eae366a 100644
  char *henge_share_take_clipboard(void);
  long henge_share_agent_seen(void);
  
-@@ -82,7 +144,12 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
+@@ -82,7 +146,12 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
  /* The panel's physical size; 0, 0 for the default (a ~122 ppi, 1x screen). Before boot. */
  void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm);
  int henge_vm_set_link_display(uint32_t width, uint32_t height, uint32_t width_mm, uint32_t height_mm, uint32_t hz);
@@ -15585,14 +15810,15 @@ index 25e7bad..1d63f5d 100644
  
      func stop() {
 diff --git a/ios/Henge/NativeTouchSurface.swift b/ios/Henge/NativeTouchSurface.swift
-index b89dc8a..76bba68 100644
+index b89dc8a..78b246c 100644
 --- a/ios/Henge/NativeTouchSurface.swift
 +++ b/ios/Henge/NativeTouchSurface.swift
-@@ -6,10 +6,11 @@ import UIKit
+@@ -6,10 +6,12 @@ import UIKit
  struct NativeTouchSurface: UIViewRepresentable {
      let imageRect: CGRect
      let revealsControls: Bool
 +    var acceptsInput = true
++    @MainActor static var diagnostics: String { Surface.diagnostics }
  
      func makeUIView(context: Context) -> Surface { Surface() }
 -    func updateUIView(_ view: Surface, context: Context) { view.configure(imageRect, revealsControls: revealsControls) }
@@ -15602,16 +15828,22 @@ index b89dc8a..76bba68 100644
  
      final class Surface: UIView {
          private struct Finger {
-@@ -22,6 +23,8 @@ struct NativeTouchSurface: UIViewRepresentable {
+@@ -22,14 +24,22 @@ struct NativeTouchSurface: UIViewRepresentable {
          private var generation: UInt32 = 0
          private var heartbeat: Timer?
          private var waitForLift = false
 +        private var acceptsInput = true
 +        private var lastSend = ProcessInfo.processInfo.systemUptime
          private var held = Set<UITouch>()
++        private var nextContact: UInt8 = 1
++        private static var fingerBegins: UInt64 = 0, pencilBegins: UInt64 = 0
++        private static var accepted: UInt64 = 0, rejected: UInt64 = 0
++        static var diagnostics: String {
++            "native-touch: finger_begins=\(fingerBegins) pencil_begins=\(pencilBegins) accepted=\(accepted) rejected=\(rejected) status=\(hv_native_touch_status()) (no coordinates or input contents)"
++        }
          private let controlsTap = UITapGestureRecognizer()
  
-@@ -29,7 +32,7 @@ struct NativeTouchSurface: UIViewRepresentable {
+         override init(frame: CGRect) {
              super.init(frame: frame)
              isMultipleTouchEnabled = true
              backgroundColor = .clear
@@ -15620,7 +15852,7 @@ index b89dc8a..76bba68 100644
              controlsTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
              controlsTap.cancelsTouchesInView = true
              controlsTap.isEnabled = false
-@@ -38,13 +41,18 @@ struct NativeTouchSurface: UIViewRepresentable {
+@@ -38,13 +48,18 @@ struct NativeTouchSurface: UIViewRepresentable {
          }
          required init?(coder: NSCoder) { fatalError("made in code") }
  
@@ -15641,13 +15873,14 @@ index b89dc8a..76bba68 100644
                  imageRect = rect
                  generation = hv_native_touch_epoch()
                  waitForLift = !held.isEmpty
-@@ -64,19 +72,37 @@ struct NativeTouchSurface: UIViewRepresentable {
+@@ -64,32 +79,67 @@ struct NativeTouchSurface: UIViewRepresentable {
  
          override func didMoveToWindow() {
              super.didMoveToWindow()
 -            if window == nil { cancel(); heartbeat?.invalidate(); heartbeat = nil }
 +            if window == nil {
 +                cancel(); heartbeat?.invalidate(); heartbeat = nil
++                held.removeAll(); waitForLift = false
 +                LocalPointerInput.uninstall(self)
 +            } else {
 +                LocalPointerInput.install(self) { [weak self] in self?.cancel() }
@@ -15657,12 +15890,19 @@ index b89dc8a..76bba68 100644
          func cancel() {
              fingers.removeAll()
 -            _ = hv_native_touch_submit(generation, nil, nil, nil, 0)
-+            hv_native_touch_cancel(generation)
++            if LocalPointerInput.owns(self) {
++                LocalPointerInput.setDirectContacts(0)
++                hv_native_touch_cancel(generation)
++            }
              waitForLift = !held.isEmpty
          }
  
          override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
 -            let direct = touches.filter { $0.type == .direct }
++            // UIKit can omit an end callback across window/focus transitions.
++            // Never let a retained, already-ended UITouch block all future taps.
++            held = held.filter { $0.phase != .ended && $0.phase != .cancelled }
++            if held.isEmpty { waitForLift = false }
 +            // Apple Pencil touches are stylus events, not .direct. Send their
 +            // absolute tip position through the same entitlement-free USB path.
 +            // Indirect pointer events remain owned by HardwareMouse.
@@ -15671,6 +15911,8 @@ index b89dc8a..76bba68 100644
 +            let hasPencil = !stylus.isEmpty || fingers.contains { $0.touch.type == .pencil }
 +            let direct = hasPencil ? stylus : touches.filter { $0.type == .direct }
 +            guard !direct.isEmpty else { return }
++            Self.pencilBegins &+= UInt64(stylus.count)
++            Self.fingerBegins &+= UInt64(direct.count - stylus.count)
 +            if !stylus.isEmpty && fingers.contains(where: { $0.touch.type != .pencil }) {
 +                fingers.removeAll()
 +                hv_native_touch_cancel(generation)
@@ -15683,30 +15925,62 @@ index b89dc8a..76bba68 100644
              for touch in direct where fingers.count < 5 {
                  let point = touch.location(in: self)
                  guard imageRect.contains(point) else { continue }
-@@ -87,7 +113,7 @@ struct NativeTouchSurface: UIViewRepresentable {
+-                let id = (UInt8(1)...UInt8(127)).first { candidate in !fingers.contains { $0.id == candidate } }!
++                // Do not reuse contact1 for every quick Pencil stroke while
++                // its prior USB slot is still delivering a lift.
++                while fingers.contains(where: { $0.id == nextContact }) { nextContact = nextContact == 127 ? 1 : nextContact + 1 }
++                let id = nextContact
++                nextContact = nextContact == 127 ? 1 : nextContact + 1
+                 fingers.append(Finger(touch: touch, id: id, point: point))
+             }
++            LocalPointerInput.setDirectContacts(fingers.count)
+             send()
          }
  
          override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
 -            guard !waitForLift else { return }
 +            guard acceptsInput, !waitForLift else { return }
              for index in fingers.indices where touches.contains(fingers[index].touch) {
-                 fingers[index].point = fingers[index].touch.location(in: self)
+-                fingers[index].point = fingers[index].touch.location(in: self)
++                let touch = fingers[index].touch
++                let latest = touch.type == .pencil ? (event?.coalescedTouches(for: touch)?.last ?? touch) : touch
++                fingers[index].point = latest.location(in: self)
              }
-@@ -102,6 +128,9 @@ struct NativeTouchSurface: UIViewRepresentable {
+             send()
+         }
+@@ -98,19 +148,26 @@ struct NativeTouchSurface: UIViewRepresentable {
+         private func lift(_ touches: Set<UITouch>) {
+             held.subtract(touches)
+             fingers.removeAll { touches.contains($0.touch) }
++            LocalPointerInput.setDirectContacts(fingers.count)
+             if held.isEmpty { waitForLift = false }
              send()
          }
          private func send() {
++            guard window != nil, LocalPointerInput.owns(self) else { return }
 +            let now = ProcessInfo.processInfo.systemUptime
 +            if now - lastSend > 0.65 { cancel() }
 +            lastSend = now
              guard imageRect.width > 0, imageRect.height > 0 else { return }
              if generation != hv_native_touch_epoch() {
                  fingers.removeAll(); waitForLift = !held.isEmpty
++                LocalPointerInput.setDirectContacts(0)
+                 generation = hv_native_touch_epoch()
+             }
+             let ids = fingers.map(\.id)
+             let x = fingers.map { min(1, max(0, Double(($0.point.x-imageRect.minX)/imageRect.width))) }
+             let y = fingers.map { min(1, max(0, Double(($0.point.y-imageRect.minY)/imageRect.height))) }
+-            _ = hv_native_touch_submit(generation, ids, x, y, ids.count)
++            if hv_native_touch_submit(generation, ids, x, y, ids.count) != 0 { Self.accepted &+= 1 }
++            else { Self.rejected &+= 1 }
+         }
+     }
+ }
 diff --git a/ios/Henge/PhysicalMouseButtons.swift b/ios/Henge/PhysicalMouseButtons.swift
-index 9a5c260..a433a97 100644
+index 9a5c260..83191ad 100644
 --- a/ios/Henge/PhysicalMouseButtons.swift
 +++ b/ios/Henge/PhysicalMouseButtons.swift
-@@ -7,23 +7,52 @@ struct PhysicalMouseButtons {
+@@ -7,23 +7,60 @@ struct PhysicalMouseButtons {
  
      /// Captured when the VM session starts, so a held button's release uses the same mapping.
      let swapsRightAndMiddle: Bool
@@ -15756,13 +16030,21 @@ index 9a5c260..a433a97 100644
 +/// One local pointer owner; keyboard and remote sources remain independent.
 +struct LocalPointerOwnership {
 +    enum Owner: Equatable { case none, hardware, direct }
++    enum HardwareIntent: Equatable { case motion, button, scroll }
 +    private(set) var owner: Owner = .none
++    private(set) var directContacts = 0
++    mutating func setDirectContacts(_ count: Int) { directContacts = max(0,count) }
++    func permitsHardware(_ intent: HardwareIntent) -> Bool {
++        // Palm movement on an attached trackpad must not tear a Pencil stroke.
++        // An explicit click or scroll still performs a deliberate handoff.
++        intent != .motion || directContacts == 0
++    }
 +    mutating func claim(_ next: Owner) -> Bool {
 +        guard owner != next else { return false }
 +        owner = next
 +        return true
 +    }
-+    mutating func reset() { owner = .none }
++    mutating func reset() { owner = .none; directContacts = 0 }
 +}
 diff --git a/ios/Henge/ResumeCoordinator.swift b/ios/Henge/ResumeCoordinator.swift
 new file mode 100644
@@ -16142,31 +16424,39 @@ index 0000000..3bc275d
 +}
 diff --git a/ios/Henge/SessionDiagnosticCapture.swift b/ios/Henge/SessionDiagnosticCapture.swift
 new file mode 100644
-index 0000000..36cc045
+index 0000000..161231c
 --- /dev/null
 +++ b/ios/Henge/SessionDiagnosticCapture.swift
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,99 @@
 +import Foundation
 +import Combine
 +
-+/// A bounded consumer of SessionView's existing maintenance waiter. No new
-+/// sampling timer, per-access instrumentation, key text or pairing secrets.
++/// Consumes SessionView's existing maintenance waiter for a bounded capture
++/// or an explicitly enabled test session. No extra timer or input contents.
 +@MainActor
 +final class SessionDiagnosticCapture: ObservableObject {
 +    @Published private(set) var active = false
 +    private var end = 0.0
 +    private(set) var nextDeadline: Double?
 +    private var previous: (Double,HengeVmCounters,HengeVmResources)?
-+    func begin() {
-+        guard !active else { return }
++    private(set) var continuous = false
++    private let reportQueue=DispatchQueue(label:"henge.diagnostics.reports",qos:.utility)
++    private var reportPending=false
++    func begin(continuous: Bool = false) {
++        if active {
++            if continuous { self.continuous=true;end = .infinity }
++            return
++        }
 +        let now = ProcessInfo.processInfo.systemUptime
-+        active = true; end = now+30; nextDeadline = now; previous = nil
++        self.continuous=continuous
++        active = true; end = continuous ? .infinity : now+30; nextDeadline = now; previous = nil
 +        henge_vm_capture_timing(1)
-+        HengeLog.log("capture","BEGIN 30s; aggregate process CPU, VM/JIT/memory/network/presentation; replay GPU buffer durations may overlap and exclude other GPU users; no per-access counters enabled")
++        HengeLog.log("capture", continuous ? "BEGIN continuous; aggregate process CPU, VM/JIT/memory/network/presentation; instrumentation overhead enabled for testing" : "BEGIN 30s; aggregate process CPU, VM/JIT/memory/network/presentation; replay GPU buffer durations may overlap and exclude other GPU users; no per-access counters enabled")
++        if continuous { HengeLog.log("capture","Continuous test diagnostics: entire visible session; stage timings and 50Hz hot-code sampling; instrumentation affects timing; pause/background boundaries are recorded") }
 +    }
 +    func stop() {
 +        guard active else { return }
-+        active = false; nextDeadline = nil; previous = nil
++        active = false; continuous = false; nextDeadline = nil; previous = nil
 +        henge_vm_capture_timing(0)
 +        HengeLog.log("capture","END; share henge.log and henge-native.log; host presentation is not game FPS; no temperature/watts measurement")
 +    }
@@ -16196,7 +16486,7 @@ index 0000000..36cc045
 +            return
 +        }
 +        var rates = "baseline"
-+        if let (time,oldVM,old) = previous, now>time {
++        if let (time,oldVM,old) = previous, now-time>=0.25 {
 +            let seconds = now-time
 +            if old.available & 1 != 0, resources.available & 1 != 0, resources.process_cpu_us >= old.process_cpu_us {
 +                rates = String(format:"cpu_core_equivalents=%.3f interval_s=%.3f",Double(resources.process_cpu_us-old.process_cpu_us)/1_000_000/seconds,seconds)
@@ -16210,21 +16500,30 @@ index 0000000..36cc045
 +                } else { rates += " replay_gpu_timing=unavailable_or_new_baseline" }
 +            } else { rates += " vm_rates=new_epoch" }
 +        }
-+        previous = (now,vm,resources)
++        if previous == nil || now-(previous?.0 ?? now)>=0.25 { previous = (now,vm,resources) }
 +        let power = ProcessInfo.processInfo.isLowPowerModeEnabled
 +        let thermal = ProcessInfo.processInfo.thermalState.rawValue
 +        let hz = getenv("HV_HZ").map { String(cString:$0) } ?? "unknown"
 +        let policy = getenv("HV_CPU_POLICY").map { String(cString:$0) } ?? "unknown"
 +        HengeLog.log("capture", "\(rates) state=\(vm.state) generation=\(vm.generation) epoch=\(vm.epoch) lpm=\(power) thermal=\(thermal) guest_hz=\(hz) cpu_policy=\(policy) available_bits=\(resources.available) footprint=\(resources.footprint) resident=\(resources.resident) headroom=\(resources.headroom) jit_used=\(resources.jit_used) jit_capacity=\(resources.jit_capacity) translations=\(resources.translations) resets=\(resources.full_flushes) pad_delivered=\(resources.gamepad_delivered) pad_coalesced=\(resources.gamepad_coalesced) pad_overflow=\(resources.gamepad_overflow) detailed_counters=\(resources.detailed_counters)")
 +        HengeLog.log("capture-input", "\(HardwareMouse.shared.scrollDiagnostics) mouse_delivered=\(resources.mouse_delivered) mouse_dropped=\(resources.mouse_dropped) mouse_queued=\(resources.mouse_queued) pointer_wanted=\(PointerLock.wanted) owner=\(LocalPointerInput.ownership.owner)")
++        HengeLog.log("capture-touch", NativeTouchSurface.diagnostics)
++        let root=resources.disk.0,aux=resources.disk.1
++        HengeLog.log("capture-io","root_enabled=\(resources.disk_timing_enabled.0) requests=\(root.0) service_us=\(root.1) queue_us=\(root.2) flush_us=\(root.3) max_service_us=\(root.4) flush_count=\(root.5) aux_enabled=\(resources.disk_timing_enabled.1) requests=\(aux.0) service_us=\(aux.1) queue_us=\(aux.2) flush_us=\(aux.3) max_service_us=\(aux.4) flush_count=\(aux.5) flush_mode=\(getenv("HV_FLUSH").map { String(cString:$0) } ?? "unknown") (cumulative measured I/O; worker durations can overlap)")
 +        let preferences = UserDefaults.standard
 +        HengeLog.log("capture-policy","requested_hz=\(preferences.integer(forKey:EngineTuning.refreshKey)) presentation_cap=\(preferences.integer(forKey:"henge.perf.presentationCap")) power_aware=\(preferences.object(forKey:"henge.perf.lowPowerAware") as? Bool ?? true) link_connected=\(LinkHostService.shared.connected) controls_only=\(LinkHostService.shared.controlOnly) grouped=\(getenv("HV_GROUPS").map { String(cString:$0) } ?? "0") superblocks=\(getenv("HV_SUPERBLOCKS").map { String(cString:$0) } ?? "0")")
 +        // Presented-time histogram is enabled by this same bounded capture:
 +        // frame-presented p95/p99 include cursor and idle intervals, not game FPS.
 +        // Existing cumulative wait/idle/cache reports, only during this capture.
 +        // Disabled per-access diagnostics remain explicitly unavailable.
-+        henge_vm_log_cache()
-+        nextDeadline = min(end,now+5)
++        if !reportPending {
++            reportPending=true
++            reportQueue.async { [weak self] in
++                henge_vm_log_cache()
++                Task { @MainActor in self?.reportPending=false }
++            }
++        }
++        nextDeadline = min(end,now+(continuous ? 10 : 5))
 +        if now>=end { stop() }
 +    }
 +}
@@ -16305,10 +16604,10 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..c5eafb8 100644
+index f84465e..8a5e923 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
-@@ -9,6 +9,17 @@ struct SessionView: View {
+@@ -9,6 +9,18 @@ struct SessionView: View {
      let close: () -> Void
  
      @StateObject private var display = DisplayRouter()
@@ -16316,6 +16615,7 @@ index f84465e..c5eafb8 100644
 +    @State private var showGamepadSettings = false
 +    @State private var showWirelessControls = false
 +    @StateObject private var diagnosticCapture = SessionDiagnosticCapture()
++    @AppStorage(M4Performance.statisticsKey) private var sessionDiagnostics = M4Performance.statisticsEnabled
 +    @ObservedObject private var clipboardStatus = ClipboardStatus.shared
 +    @ObservedObject private var resumeStatus = InstantResumeStatus.shared
 +    @State private var bootConfiguration: ResumeConfiguration?
@@ -16326,7 +16626,7 @@ index f84465e..c5eafb8 100644
      @State private var error: String?
      @State private var state: Int32 = 0
      @State private var bootAttempt = 0
-@@ -22,11 +33,11 @@ struct SessionView: View {
+@@ -22,11 +34,11 @@ struct SessionView: View {
      @State private var started = Date()
      @State private var runningScreen: GuestScreenSize?
      @State private var thermalState = ProcessInfo.processInfo.thermalState
@@ -16340,7 +16640,7 @@ index f84465e..c5eafb8 100644
      @AppStorage("henge.cursor.sharp") private var sharpCursor = true
      @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = HardwareScroll.defaultSpeed
  
-@@ -45,6 +56,8 @@ struct SessionView: View {
+@@ -45,6 +57,8 @@ struct SessionView: View {
      @AppStorage("henge.tips.stillWallpaperShown") private var stillWallpaperTipShown = false
      @State private var showWallpaperTip = false
      @State private var confirmStop = false
@@ -16349,7 +16649,7 @@ index f84465e..c5eafb8 100644
      @State private var zoomCentre = CGPoint(x: 0.5, y: 0.5) // where the zoomed view is, 0...1 of the Mac's screen
      @State private var map: UIImage?
      @State private var zoomFollowing: Task<Void, Never>?
-@@ -53,7 +66,6 @@ struct SessionView: View {
+@@ -53,7 +67,6 @@ struct SessionView: View {
      @State private var shown = CGSize(width: 0.5, height: 0.5) // how much of the Mac's screen the zoomed view shows
      @Environment(\.scenePhase) private var scenePhase
  
@@ -16357,7 +16657,7 @@ index f84465e..c5eafb8 100644
      var body: some View {
          GeometryReader { geo in
              let insets = geo.safeAreaInsets
-@@ -91,9 +103,16 @@ struct SessionView: View {
+@@ -91,9 +104,16 @@ struct SessionView: View {
                      .position(x: layout.screen.midX, y: layout.screen.midY)
                  if state != 2 {
                  Group {
@@ -16376,7 +16676,7 @@ index f84465e..c5eafb8 100644
                      } else {
                          Trackpad()
                      }
-@@ -190,20 +209,32 @@ struct SessionView: View {
+@@ -190,20 +210,32 @@ struct SessionView: View {
          } message: {
              Text("This turns the Mac off at once. Anything not saved on it is lost.")
          }
@@ -16414,7 +16714,7 @@ index f84465e..c5eafb8 100644
              HardwareMouse.shared.setAcceptsInput(phase == .active && !pointerNeeded)
              guard phase != .active else {
                  display.refresh()
-@@ -211,13 +242,75 @@ struct SessionView: View {
+@@ -211,13 +243,75 @@ struct SessionView: View {
                  return
              }
              nativeTouch.stop()
@@ -16492,14 +16792,20 @@ index f84465e..c5eafb8 100644
              if showing {
                  refreshDetails()
                  HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll()
-@@ -228,35 +321,39 @@ struct SessionView: View {
+@@ -228,35 +322,45 @@ struct SessionView: View {
          }
          .onAppear {
              UIApplication.shared.isIdleTimerDisabled = true
++            if sessionDiagnostics { diagnosticCapture.begin(continuous:true) }
 +            Sharing.startFollowingClipboard()
              HardwareMouse.shared.start()
              VolumeClicks.shared.start()
          }
++        .onChange(of: sessionDiagnostics) { _, enabled in
++            if enabled { diagnosticCapture.begin(continuous:true) }
++            else if diagnosticCapture.continuous { diagnosticCapture.stop() }
++            wakeups.signal()
++        }
          .onDisappear {
 -            LinkHostService.shared.stop()
 -            nativeTouch.stop()
@@ -16548,7 +16854,7 @@ index f84465e..c5eafb8 100644
  
      // A fold/rotation after boot must fit the mode the guest actually received,
      // rather than stretch it by recalculating only the host view's aspect.
-@@ -411,6 +508,9 @@ struct SessionView: View {
+@@ -411,6 +515,9 @@ struct SessionView: View {
          .labelStyle(.iconOnly)
          .buttonBorderShape(.circle)
          .tint(Desk.raised)
@@ -16558,7 +16864,7 @@ index f84465e..c5eafb8 100644
      }
  
      /// An iPhone's large screen: an iPhone Duo unfolded, regular both ways.
-@@ -485,6 +585,29 @@ struct SessionView: View {
+@@ -485,6 +592,32 @@ struct SessionView: View {
      /// The controls a column has too.
      @ViewBuilder private var floatingTools: some View {
          tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
@@ -16576,7 +16882,10 @@ index f84465e..c5eafb8 100644
 +            }
 +            Section("Diagnostics") {
 +                Button(diagnosticCapture.active ? "Stop Diagnostic Capture" : "Capture Diagnostics (30 seconds)",systemImage:"waveform.path.ecg") {
-+                    if diagnosticCapture.active { diagnosticCapture.stop() } else { diagnosticCapture.begin() }
++                    if diagnosticCapture.active {
++                        if diagnosticCapture.continuous { sessionDiagnostics=false }
++                        diagnosticCapture.stop()
++                    } else { diagnosticCapture.begin() }
 +                    wakeups.signal()
 +                }
 +            }
@@ -16588,7 +16897,7 @@ index f84465e..c5eafb8 100644
          pasteTool
          tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
          tool("info.circle", "Details", tint: .white) { showDetails = true }
-@@ -513,12 +636,19 @@ struct SessionView: View {
+@@ -513,12 +646,19 @@ struct SessionView: View {
      }
  
      /// Keeps the pointer in view: the view moves when the pointer nears its edge.
@@ -16609,7 +16918,7 @@ index f84465e..c5eafb8 100644
              }
              if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / displayAspect)) { map = UIImage(cgImage: image) }
              tick += 1
-@@ -541,10 +671,70 @@ struct SessionView: View {
+@@ -541,10 +681,70 @@ struct SessionView: View {
  
      // MARK: Status
  
@@ -16680,7 +16989,7 @@ index f84465e..c5eafb8 100644
              Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
          }
          .padding(18)
-@@ -577,12 +767,13 @@ struct SessionView: View {
+@@ -577,12 +777,13 @@ struct SessionView: View {
          NavigationStack {
              List {
                  Section(phase) {
@@ -16695,7 +17004,7 @@ index f84465e..c5eafb8 100644
                  Section("Display") {
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
-@@ -599,6 +790,7 @@ struct SessionView: View {
+@@ -599,6 +800,7 @@ struct SessionView: View {
                  }
                  Section("Pointer") {
                      Picker("Size", selection: $cursorScale) {
@@ -16703,7 +17012,7 @@ index f84465e..c5eafb8 100644
                          Text("1×").tag(1)
                          Text("2×").tag(2)
                          Text("3×").tag(3)
-@@ -608,7 +800,7 @@ struct SessionView: View {
+@@ -608,7 +810,7 @@ struct SessionView: View {
                      LabeledContent("Magic Keyboard / mouse scroll speed", value: String(format: "%.2f×", scrollSpeed))
                      Slider(value: $scrollSpeed, in: HardwareScroll.minimumSpeed...HardwareScroll.maximumSpeed)
                      Button("Reset hardware scroll speed") { scrollSpeed = HardwareScroll.defaultSpeed }
@@ -16712,7 +17021,7 @@ index f84465e..c5eafb8 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  Section("Touch input") {
-@@ -618,16 +810,16 @@ struct SessionView: View {
+@@ -618,16 +820,16 @@ struct SessionView: View {
                          Text("Enable Guest sharing in Henge Settings and reopen Henge to use native touch.")
                              .font(.footnote).foregroundStyle(.secondary)
                      }
@@ -16736,7 +17045,7 @@ index f84465e..c5eafb8 100644
                      }
                      Button("Type the Helper Update Command") {
                          showDetails = false
-@@ -640,8 +832,11 @@ struct SessionView: View {
+@@ -640,8 +842,11 @@ struct SessionView: View {
                  }
                  Section("Sharing") {
                      LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
@@ -16750,7 +17059,7 @@ index f84465e..c5eafb8 100644
                              showDetails = false
                              Task {
                                  try? await Task.sleep(nanoseconds: 600_000_000)
-@@ -680,6 +875,8 @@ struct SessionView: View {
+@@ -680,6 +885,8 @@ struct SessionView: View {
      }
  
      private func run(viewport: CGSize) async {
@@ -16759,7 +17068,7 @@ index f84465e..c5eafb8 100644
          error = nil
          state = 0
          userCode = false
-@@ -693,65 +890,109 @@ struct SessionView: View {
+@@ -693,65 +900,109 @@ struct SessionView: View {
          zoomCentre = CGPoint(x: 0.5, y: 0.5)
          map = nil
          showWallpaperTip = false
@@ -16914,7 +17223,7 @@ index f84465e..c5eafb8 100644
              if state == 2 {
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
-@@ -769,38 +1010,58 @@ struct SessionView: View {
+@@ -769,38 +1020,58 @@ struct SessionView: View {
                  }
                  break
              }
@@ -17047,7 +17356,7 @@ index 0000000..75768bd
 +    }
 +}
 diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
-index e1693b0..9c64c2c 100644
+index e1693b0..d7d2ed4 100644
 --- a/ios/Henge/SettingsView.swift
 +++ b/ios/Henge/SettingsView.swift
 @@ -9,19 +9,16 @@ struct SettingsView: View {
@@ -17140,7 +17449,7 @@ index e1693b0..9c64c2c 100644
 +                            .font(.footnote).foregroundStyle(.secondary)
 +                    }
 +                    Toggle("Session diagnostics", isOn: $sessionDiagnostics)
-+                    Text("Periodic CPU, JIT and resource reports for troubleshooting. Adds overhead; turn off for speed comparisons. Applies to the next Mac session. The in-session capture button records a bounded detailed sample.")
++                    Text("Logs the entire session: CPU hot-code samples, translation/fastmem counters, JIT recycling, disk waits, GPU timing, frame pacing and touch/Pencil delivery. Adds overhead. Restart the Mac after changing this to apply engine instrumentation. The test build enables it once; you can turn it off. The capture button remains available for a short sample.")
 +                        .font(.footnote).foregroundStyle(.secondary)
                      LabeledContent("Host chip", value: HostScheduling.chip)
                      LabeledContent("Host CPU layout", value: HostScheduling.layout)
@@ -18724,10 +19033,10 @@ index b3af248..8d325db 100644
  /* EL0, so the indirect-branch cache takes these low (user) addresses. */
 diff --git a/tests/test_blk_completion.c b/tests/test_blk_completion.c
 new file mode 100644
-index 0000000..a238290
+index 0000000..ee7562a
 --- /dev/null
 +++ b/tests/test_blk_completion.c
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,90 @@
 +/* Production virtio queue, block workers and file I/O. Only RAM/PCI/CPU-wake
 +   boundaries are supplied here so the same concurrency test runs on Linux. */
 +#define _DEFAULT_SOURCE 1
@@ -18791,6 +19100,7 @@ index 0000000..a238290
 +    hv_virtio_blk_capture_timing(b,1);unsigned epoch=b->capture_epoch;assert(epoch&1);
 +    hv_virtio_blk_capture_timing(b,1);assert(b->capture_epoch==epoch);
 +    hv_virtio_blk_capture_timing(b,0);assert(b->capture_epoch==epoch+1);
++    uint64_t measured[6];assert(!hv_virtio_blk_read_timing(b,measured)&&measured[0]==0);
 +    submit(b,64,1);wait_done(b);
 +    assert(atomic_load(&wakes)==1 && b->completion_pending);
 +    hv_virtio_blk_poll(b);assert(used()==64 && !b->completion_pending);
@@ -18810,7 +19120,9 @@ index 0000000..a238290
 +        }
 +        wait_done(b);hv_virtio_blk_poll(b);assert(b->published==b->submitted);
 +    }
++    hv_virtio_blk_capture_timing(b,1);
 +    assert(!hv_virtio_blk_start(b));submit(b,1,4);hv_virtio_blk_drain(b);assert(ram[0x50000]==0);
++    assert(hv_virtio_blk_read_timing(b,measured) && measured[0]>=1 && measured[5]>=1);
 +    submit(b,1,0x10000);hv_virtio_blk_drain(b);assert(ram[0x50000]==0);
 +    hv_virtio_blk_stop(b);assert(hv_virtio_blk_idle(b));hv_virtio_blk_destroy(b);close(fd);
 +    puts("block completion: 64 ready requests / 1 wake; 4096 raced completions, ring wrap, read/write, flush, barrier and restart passed");
@@ -18867,6 +19179,33 @@ index 0000000..ee09756
 +    e.seg[0].addr=4096;invalidations=0;
 +    assert(seg_io(&b,&e,1,0,sizeof disk,4096)==-1 && !invalidations);
 +    puts("block segments: 4 adjacent pages / 1 I/O, status exclusion, header, region/gap/direction, bounds and errors passed");
++}
+diff --git a/tests/test_cache_line_set.c b/tests/test_cache_line_set.c
+new file mode 100644
+index 0000000..5bb7c2c
+--- /dev/null
++++ b/tests/test_cache_line_set.c
+@@ -0,0 +1,21 @@
++#include "cache_line_set.h"
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++int main(void) {
++    uintptr_t base=0x100000;size_t bytes=1<<20,words=hv_cache_line_bitmap_words(bytes);
++    uint64_t *bits=malloc(words*sizeof *bits);uint32_t **sites=malloc(65536*sizeof *sites);assert(bits&&sites);
++    for(size_t i=0;i<65536;i++)sites[i]=(uint32_t *)(base+((i*17)%256)*4);
++    assert(hv_cache_line_mark(bits,words,base,bytes,sites,65536));
++    unsigned total=0;for(size_t i=0;i<words;i++)total+=(unsigned)__builtin_popcountll(bits[i]);
++    assert(total==16);
++    sites[2]=(uint32_t *)(base+bytes-4);
++    assert(hv_cache_line_mark(bits,words,base,bytes,sites,65536)&&bits[words-1]>>63);
++    sites[2]=(uint32_t *)(base+bytes);assert(!hv_cache_line_mark(bits,words,base,bytes,sites,65536));
++    sites[2]=(uint32_t *)(base-4);assert(!hv_cache_line_mark(bits,words,base,bytes,sites,65536));
++    assert(!hv_cache_line_mark(NULL,words,base,bytes,sites,65536));
++    assert(!hv_cache_line_mark(bits,words,UINTPTR_MAX-63,4096,sites,65536));
++    assert(!hv_cache_line_bitmap_words(SIZE_MAX));
++    free(bits);free(sites);
++    puts("PASS JIT dirty lines:65536 unordered writes ->16 exact lines; final word, outside range, allocation fallback and overflow bounds");
 +}
 diff --git a/tests/test_chain_index.py b/tests/test_chain_index.py
 index 88db6e8..569ea23 100644
@@ -19696,10 +20035,10 @@ index 0000000..7b09ed0
 +print('Display snapshot parser: two ports, all header mutations and truncations passed ASan/UBSan')
 diff --git a/tests/test_engine_tuning.swift b/tests/test_engine_tuning.swift
 new file mode 100644
-index 0000000..b2cd270
+index 0000000..a5ed764
 --- /dev/null
 +++ b/tests/test_engine_tuning.swift
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,71 @@
 +import Foundation
 +
 +// Redirect only this fixture's Documents lookup; never alter HOME or app data.
@@ -19756,6 +20095,16 @@ index 0000000..b2cd270
 +        precondition(value("HV_FIXTURE_OVERRIDE") == nil)
 +        precondition(value("HV_FIXTURE_FOREIGN") == "kept")
 +        precondition(value("HV_WFI_SPIN") == "0" && value("HV_GROUPS") == "2")
++        M4Performance.statisticsEnabled=true
++        try "HV_STATS=0\nHV_PROF_IOS=0\nHV_FASTMEM=0\n".write(to:url,atomically:true,encoding:.utf8)
++        EngineTuning.apply()
++        precondition(value("HV_STATS")=="10" && value("HV_PROF_IOS")=="2" && value("HV_FASTMEM_STATS")=="1")
++        precondition(value("HV_FASTMEM")=="0", "Diagnostics do not change the chosen cache path")
++        precondition(value("HV_PROF_IOS_HZ")=="50" && value("HV_BLK_STATS")=="10")
++        M4Performance.statisticsEnabled=false
++        try "".write(to:url,atomically:true,encoding:.utf8)
++        EngineTuning.apply()
++        precondition(value("HV_STATS")=="0" && value("HV_PROF_IOS")==nil && value("HV_BLK_STATS")==nil)
 +        UserDefaults.standard.removeObject(forKey:"henge.perf.groupedMemory")
 +        UserDefaults.standard.removeObject(forKey:"henge.perf.wfiSpin")
 +        print("PASS engine tuning: actual defaults, explicit overrides, removed overrides, foreign environment and grouped-path activation")
@@ -20742,6 +21091,31 @@ index 060441b..566fa59 100644
  }
  '''
  b=r/'build';b.mkdir(exist_ok=True);p=b/'test_jit_allocation.c';p.write_text(s)
+diff --git a/tests/test_jit_region.c b/tests/test_jit_region.c
+index 7013cf9..5c10de9 100644
+--- a/tests/test_jit_region.c
++++ b/tests/test_jit_region.c
+@@ -34,6 +34,20 @@ static int one(const char *what) {
+     hv_jit_write(&region, site, &branch, 4); hv_jit_finish_branch(&region, site);
+     __asm__ volatile("isb" ::: "memory");
+     bad |= jump() != 43;
++    uint32_t **patches=malloc(65536*sizeof *patches);
++    if(!patches) return 1;
++    for(size_t i=0;i<65536;i++)patches[i]=i&1?a:b;
++    hv_jit_write(&region,a,second,sizeof second);hv_jit_write(&region,b,body,sizeof body);
++    hv_jit_finish_words(&region,patches,65536);
++    __asm__ volatile("isb" ::: "memory");
++    bad |= ((long(*)(void))a)()!=43 || ((long(*)(void))b)()!=42 || region.publication_bitmap_batches!=1;
++    free(patches);
++    uint32_t *small[2]={a,b};
++    hv_jit_write(&region,a,body,sizeof body);hv_jit_write(&region,b,second,sizeof second);
++    hv_jit_finish_words(&region,small,2);
++    __asm__ volatile("isb" ::: "memory");
++    bad |= ((long(*)(void))a)()!=42 || ((long(*)(void))b)()!=43 || region.publication_bitmap_batches!=1;
++    printf("%s: bitmap publication65536 writes / %llu exact RX lines %s\n",what,(unsigned long long)region.publication_lines,bad?"FAIL":"passed");
+     printf("%s: two-range publication and B-to-B patch %s\n", what, bad ? "FAIL" : "passed");
+     hv_jit_region_close(&region);
+     return bad;
 diff --git a/tests/test_jit_ring.c b/tests/test_jit_ring.c
 new file mode 100644
 index 0000000..9650b71
@@ -21089,10 +21463,10 @@ index 0000000..624db4e
 +}
 diff --git a/tests/test_m4_defaults.swift b/tests/test_m4_defaults.swift
 new file mode 100644
-index 0000000..669e95b
+index 0000000..c8dc9dd
 --- /dev/null
 +++ b/tests/test_m4_defaults.swift
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,50 @@
 +import Foundation
 +var fixtureM4: Int32 = 1
 +func hv_host_is_m4_16gb() -> Int32 { fixtureM4 }
@@ -21109,6 +21483,14 @@ index 0000000..669e95b
 +        let saved = keys.map { ($0, d.object(forKey: $0)) }
 +        defer { for (key, value) in saved { if let value { d.set(value, forKey:key) } else { d.removeObject(forKey:key) } } }
 +        d.removeObject(forKey:M4Performance.statisticsKey)
++        let suite=UserDefaults(suiteName:"DiagnosticBuildFixture")!
++        suite.removePersistentDomain(forName:"DiagnosticBuildFixture")
++        M4Performance.prepareDiagnosticBuild(defaults:suite,enabled:true,build:"test")
++        precondition(suite.bool(forKey:M4Performance.statisticsKey))
++        suite.set(false,forKey:M4Performance.statisticsKey)
++        M4Performance.prepareDiagnosticBuild(defaults:suite,enabled:true,build:"test")
++        precondition(!suite.bool(forKey:M4Performance.statisticsKey),"Explicit stop after first launch is preserved")
++        suite.removePersistentDomain(forName:"DiagnosticBuildFixture")
 +        fixtureM4=0;precondition(!M4Performance.statisticsEnabled)
 +        fixtureM4=1;precondition(!M4Performance.statisticsEnabled)
 +        d.set(true,forKey:M4Performance.statisticsKey)
@@ -21136,7 +21518,7 @@ index 0000000..669e95b
 +    }
 +}
 diff --git a/tests/test_mem.c b/tests/test_mem.c
-index 35ecb46..25cc62c 100644
+index 35ecb46..0281f8e 100644
 --- a/tests/test_mem.c
 +++ b/tests/test_mem.c
 @@ -16,13 +16,16 @@ DECLARE_PROGRAM(epilogue);
@@ -21157,6 +21539,15 @@ index 35ecb46..25cc62c 100644
  };
  
  #define DATA_SIZE 65536
+@@ -164,6 +167,8 @@ int main(void) {
+     setvbuf(stdout, NULL, _IONBF, 0);
+     static HvMachine m;
+     if (hv_machine_init(&m, 8 << 20) != 0) return 1;
++    /* Exercise the actual generated diagnostic counters as well as production mode. */
++    m.stats_interval = getenv("HV_STATS") ? atoi(getenv("HV_STATS")) : 0;
+     data = aligned_alloc(16384, DATA_SIZE);
+     stack = aligned_alloc(16384, STACK_SIZE);
+     pt = aligned_alloc(16384, PT_SIZE);
 diff --git a/tests/test_metal_library_cache.m b/tests/test_metal_library_cache.m
 index 3462d79..685c177 100644
 --- a/tests/test_metal_library_cache.m
@@ -21284,7 +21675,7 @@ index 3f46cf5..d231f2a 100644
      pt_next = 2 * 65536;
      uint64_t r4 = alloc_table();
 diff --git a/tests/test_native_touch.c b/tests/test_native_touch.c
-index 1766e60..2ba0d15 100644
+index 1766e60..d3a5e41 100644
 --- a/tests/test_native_touch.c
 +++ b/tests/test_native_touch.c
 @@ -40,20 +40,34 @@ static void *delayed_contact(void *generation) {
@@ -21325,7 +21716,17 @@ index 1766e60..2ba0d15 100644
  int main(void) {
      assert(hv_native_touch_status() == HV_TOUCH_OFF);
      uint32_t e = hv_native_touch_enable(1);
-@@ -121,8 +135,18 @@ int main(void) {
+@@ -67,7 +81,8 @@ int main(void) {
+     xy[0] = NAN; assert(!hv_native_touch_submit(e, duplicate, xy, xy, 1));
+     xy[0] = 1.1; assert(!hv_native_touch_submit(e, duplicate, xy, xy, 1));
+     submit(e, 1, 0.2); submit(e, 1, 0.8); submit(e, 0, 0);
+-    next(); assert(strstr(json, "0.800000000")); assert(strstr(json, "\"id\":1"));
++    next(); assert(strstr(json, "0.200000000")); assert(strstr(json, "\"id\":1"));
++    next(); assert(strstr(json, "0.800000000"));
+     next(); assert(strstr(json, "\"contacts\":[]"));
+     submit(e, 1, 0.3);
+     uint32_t fresh = hv_native_touch_reset(); assert(fresh != e);
+@@ -121,8 +136,18 @@ int main(void) {
      // Exercise the real guest HTTP endpoints and their status validation.
      char directory[] = "/tmp/henge-touch-test-XXXXXX"; assert(mkdtemp(directory));
      char socket_path[108]; snprintf(socket_path, sizeof socket_path, "%s/s", directory);
@@ -21345,7 +21746,7 @@ index 1766e60..2ba0d15 100644
      e = hv_native_touch_enable(1);
      http("/.henge/native-touch", NULL, response, sizeof response, socket_path);
      assert(strstr(response, "200 OK") && strstr(response, "\"version\":1"));
-@@ -137,6 +161,43 @@ int main(void) {
+@@ -137,6 +162,43 @@ int main(void) {
      hv_native_touch_enable(0);
      http("/.henge/native-touch", NULL, response, sizeof response, socket_path);
      assert(strstr(response, "\"enabled\":false") && strstr(response, "\"contacts\":[]"));
@@ -21437,29 +21838,33 @@ index 0000000..a0458d7
 +}
 diff --git a/tests/test_native_touch_host.c b/tests/test_native_touch_host.c
 new file mode 100644
-index 0000000..81c30b7
+index 0000000..e975d65
 --- /dev/null
 +++ b/tests/test_native_touch_host.c
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,75 @@
 +#include "native_touch.h"
 +#include <assert.h>
 +#include <stdint.h>
 +#include <stdio.h>
 +#include <string.h>
 +#include <time.h>
-+typedef struct { int connected,reports,mapped,fail_report;uint8_t last[32]; } USB;
++typedef struct { int connected,reports,mapped,fail_report;uint8_t last[32],history[256][32]; } USB;
 +static int connect_usb(void *c,int v){((USB*)c)->connected=v;return 1;}
 +static int connected(void *c){return ((USB*)c)->connected;}
 +static int mapped(void *c){((USB*)c)->mapped++;return 1;}
-+static int report(void *c,const uint8_t *v){USB *u=c;assert(u->connected);if(u->fail_report)return 0;u->reports++;memcpy(u->last,v,32);return 1;}
++static int report(void *c,const uint8_t *v){USB *u=c;assert(u->connected);if(u->fail_report)return 0;assert(u->reports<256);memcpy(u->history[u->reports++],v,32);memcpy(u->last,v,32);return 1;}
 +static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
 +int main(void){
 +    USB u={0};HvNativeTouchUSB usb={.context=&u,.connect=connect_usb,.connected=connected,.report=report,.mapped=mapped};
 +    hv_native_touch_set_usb(&usb);uint32_t e=hv_native_touch_enable(1);
++    hv_native_touch_progress(e-1,4);assert(hv_native_touch_status()==HV_TOUCH_WAITING);
++    hv_native_touch_progress(e,3);assert(hv_native_touch_status()==HV_TOUCH_WAITING);
 +    assert(!hv_native_touch_usb_host_encoding(e));
 +    assert(hv_native_touch_usb_connect(e,1));assert(hv_native_touch_usb_mapped(e));
 +    assert(!hv_native_touch_usb_host_encoding(e-1));assert(hv_native_touch_usb_host_encoding(e));
 +    hv_native_touch_report(e,HV_TOUCH_READY);
++    hv_native_touch_report(e,HV_TOUCH_WAITING);
++    assert(hv_native_touch_status()==HV_TOUCH_READY); // late setup progress cannot downgrade readiness
 +    uint8_t id=7;double x=.25,y=.5;double start=now();
 +    assert(hv_native_touch_submit(e,&id,&x,&y,1));
 +    assert(now()-start<.05 && u.last[1]==3 && u.last[31]==1);
@@ -21473,6 +21878,25 @@ index 0000000..81c30b7
 +    while(u.last[31] && now()-start<.5){hv_native_touch_report(e,HV_TOUCH_READY);assert(hv_native_touch_next(json,sizeof json));assert(strstr(json,"\"contacts\":[]"));}
 +    assert(u.last[31]==0 && u.connected && hv_native_touch_status()==HV_TOUCH_READY);
 +    assert(hv_native_touch_epoch()==e); // handoff must not remap USB or restart helper
++    // A new Pencil stroke during a prior lift keeps its initial hit position,
++    // even when movement and lift arrive before the settling interval ends.
++    assert(hv_native_touch_submit(e,&id,&x,&y,1));
++    hv_native_touch_cancel(e);
++    int from=u.reports;id=8;x=.2;assert(hv_native_touch_submit(e,&id,&x,&y,1));
++    x=.8;assert(hv_native_touch_submit(e,&id,&x,&y,1));
++    assert(hv_native_touch_submit(e,NULL,NULL,NULL,0));
++    double finish=now()+1;
++    int saw_first=0,saw_motion=0;
++    while(now()<finish) {
++        hv_native_touch_report(e,HV_TOUCH_READY);assert(hv_native_touch_next(json,sizeof json));
++        for(int j=from;j<u.reports;j++)for(int k=0;k<u.history[j][31];k++) {
++            const uint8_t *f=u.history[j]+1+6*k;
++            if(f[0]==3 && (f[2]|f[3]<<8)==6553)saw_first=1;
++            if(f[0]==3 && (f[2]|f[3]<<8)==26214) { assert(saw_first);saw_motion=1; }
++        }
++        if(saw_motion && !u.last[31])break;
++    }
++    assert(saw_first && saw_motion && !u.last[31] && u.connected);
 +    n=u.reports;
 +    assert(hv_native_touch_submit(e,NULL,NULL,NULL,0));
 +    hv_native_touch_report(e,HV_TOUCH_READY);assert(hv_native_touch_next(json,sizeof json));
@@ -21606,10 +22030,10 @@ index 0000000..425a58c
 +    puts("PASS TLB span permissions/bounds, exact cursor damage, retired-page boundaries and reuse");
 +}
 diff --git a/tests/test_physical_mouse_buttons.swift b/tests/test_physical_mouse_buttons.swift
-index d0f1589..8ee0fe3 100644
+index d0f1589..b089e1f 100644
 --- a/tests/test_physical_mouse_buttons.swift
 +++ b/tests/test_physical_mouse_buttons.swift
-@@ -28,13 +28,33 @@ struct PhysicalMouseButtonTests {
+@@ -28,13 +28,41 @@ struct PhysicalMouseButtonTests {
          // Concurrent presses and disconnect cleanup must release their mapped IDs.
          check(swapped.event(1, pressed: true) == 2, "right hold must use middle")
          check(swapped.event(2, pressed: true) == 1, "middle hold must use right")
@@ -21641,6 +22065,14 @@ index d0f1589..8ee0fe3 100644
 +        check(ownership.claim(.hardware), "pointer preempts held touch")
 +        ownership.reset()
 +        check(ownership.claim(.hardware), "focus recovery must reestablish pointer ownership")
++        check(ownership.claim(.direct), "Pencil claims the display")
++        ownership.setDirectContacts(1)
++        check(!ownership.permitsHardware(.motion), "incidental trackpad motion cannot cancel an active stroke")
++        check(ownership.permitsHardware(.button) && ownership.permitsHardware(.scroll), "deliberate hardware actions can hand off")
++        ownership.setDirectContacts(0)
++        check(ownership.permitsHardware(.motion), "lifting restores immediate pointer movement")
++        ownership.setDirectContacts(1);ownership.reset()
++        check(ownership.directContacts == 0 && ownership.permitsHardware(.motion), "focus cleanup cannot retain a stale stroke")
          print("PASS: standard mapping, right/middle swap, left drag, releases and disconnect cleanup")
      }
  }
@@ -23930,14 +24362,14 @@ index 70d7ccb..e4f9089 100755
 +test -s "$BUILD/libhengerestore.a"
  ls -la "$BUILD/libhengerestore.a"
 diff --git a/tools/check_host_scheduling.sh b/tools/check_host_scheduling.sh
-index 509bce1..8d57ebc 100755
+index 509bce1..b185628 100755
 --- a/tools/check_host_scheduling.sh
 +++ b/tools/check_host_scheduling.sh
 @@ -2,6 +2,24 @@
  # Native tests + iPhoneOS SDK type checking. Does not build an app or IPA.
  set -euo pipefail
  cd "$(dirname "$0")/.."
-+for test in input_ring native_touch_encoder env_flag; do
++for test in input_ring native_touch_encoder env_flag cache_line_set; do
 +    cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ihost -Idevices "tests/test_$test.c" -o "/tmp/henge-$test"
 +    "/tmp/henge-$test"
 +done
@@ -24798,10 +25230,10 @@ index 7f9c3b6..69a6d26 100644
          bytes.append(UInt8(occupied.count))
 diff --git a/tools/native-touch/USBTouchTransport.swift b/tools/native-touch/USBTouchTransport.swift
 new file mode 100644
-index 0000000..0508937
+index 0000000..49c5483
 --- /dev/null
 +++ b/tools/native-touch/USBTouchTransport.swift
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,218 @@
 +import AppKit
 +import Foundation
 +import IOKit
@@ -24899,6 +25331,7 @@ index 0000000..0508937
 +        let available: Bool
 +        let connected: Bool
 +        let hostEncoding: Bool?
++        let setupHeartbeat: Bool?
 +    }
 +    private let connection: GuestConnection
 +    private let epoch: UInt32
@@ -24906,6 +25339,7 @@ index 0000000..0508937
 +    private let base = URL(string: "http://10.0.2.4/.henge/native-touch-usb")!
 +    private(set) var active = false
 +    private(set) var hostEncoded = false
++    private var setupPhase = 0
 +
 +    init(connection: GuestConnection, epoch: UInt32) { self.connection = connection; self.epoch = epoch }
 +
@@ -24935,18 +25369,32 @@ index 0000000..0508937
 +            throw CocoaError(.featureUnsupported)
 +        }
 +        let displayUUID = CFUUIDCreateString(nil, uuid) as String
++        let reportsProgress = try await state().setupHeartbeat == true
++        setupPhase=1
++        let progress: Task<Void, Never>? = reportsProgress ? Task { [connection, epoch] in
++            while !Task.isCancelled {
++                var request=URLRequest(url:URL(string:"http://10.0.2.4/.henge/native-touch")!)
++                request.httpMethod="PUT";request.httpBody=Data("\(epoch) 1 \(self.setupPhase)".utf8)
++                _ = try? await connection.data(for:request)
++                do { try await Task.sleep(for:.milliseconds(500)) } catch { return }
++            }
++        } : nil
++        defer { progress?.cancel() }
 +        try mapper.start(displayUUID: displayUUID)
 +        do {
 +            // A prior session can leave a service with a cached display identity.
 +            // Wait for its actual removal before attaching the replacement.
 +            try await setConnected(false)
-+            let deadline = ProcessInfo.processInfo.systemUptime + 4
++            var deadline = ProcessInfo.processInfo.systemUptime + (reportsProgress ? 5 : 4)
 +            while try await state().connected || mapper.devicePresent {
 +                guard ProcessInfo.processInfo.systemUptime < deadline else { throw URLError(.timedOut) }
 +                try await Task.sleep(for: .milliseconds(25))
 +            }
 +            mapper.prepareAttachment()
++            setupPhase=2
 +            try await setConnected(true)
++            setupPhase=3
++            if reportsProgress { deadline=ProcessInfo.processInfo.systemUptime+5 }
 +            while !mapper.mapped {
 +                guard ProcessInfo.processInfo.systemUptime < deadline else { throw URLError(.timedOut) }
 +                try await Task.sleep(for: .milliseconds(10))
@@ -24954,12 +25402,16 @@ index 0000000..0508937
 +            // The Report Rate feature query holds event-driver initialization
 +            // until this acknowledgement, closing the publication/cache race.
 +            try await control(2)
++            setupPhase=4
++            if reportsProgress { deadline=ProcessInfo.processInfo.systemUptime+5 }
 +            while !mapper.isAssociated() {
 +                guard ProcessInfo.processInfo.systemUptime < deadline else { throw URLError(.timedOut) }
 +                try Task.checkCancellation()
 +                try await Task.sleep(for: .milliseconds(25))
 +            }
 +            // The desktop also has to discover the newly associated service.
++            setupPhase=5
++            if reportsProgress { deadline=ProcessInfo.processInfo.systemUptime+5 }
 +            while !NSScreen.screens.contains(where: {
 +                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == displayID &&
 +                    $0.touchCapabilities.contains(.multiTouch)
@@ -24970,6 +25422,7 @@ index 0000000..0508937
 +            // New hosts encode UIKit contacts directly into their emulated USB
 +            // endpoint. The companion still owns display association/liveness.
 +            if try await state().hostEncoding == true {
++                setupPhase=6
 +                try await control(3)
 +                hostEncoded = true
 +            }

@@ -93,6 +93,7 @@ p["HengeMergedUpstreamCommit"]=i["main_sha"]
 p["HengeIntegratedPullRequests"]=[int(x["number"]) for x in i["pull_requests"]]
 p["HengeIntegratedPullRequestHeads"]=[str(x["sha"]) for x in i["pull_requests"]]
 version_manifest=json.loads(Path(sys.argv[2]).read_text())
+p["HengeTestDiagnostics"]=bool(version_manifest.get("test_diagnostics",False))
 p["CFBundleShortVersionString"]=version_manifest.get("app_version", p["CFBundleShortVersionString"])
 p["CFBundleVersion"]=version_manifest.get("app_build", p["CFBundleVersion"])
 p["NSMotionUsageDescription"]="Use optional motion controls to steer racing games while this controller is visible."
