@@ -5776,10 +5776,10 @@ index 0000000..a79226b
 +remote-server latency, guest decompression and I/O queueing are not directly timed.
 diff --git a/docs/upstream-desktop/PROGRESS.md b/docs/upstream-desktop/PROGRESS.md
 new file mode 100644
-index 0000000..5a67161
+index 0000000..ade96b4
 --- /dev/null
 +++ b/docs/upstream-desktop/PROGRESS.md
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,158 @@
 +# Desktop integration after 0.3.5
 +
 +Base delivered commit a3fd806, patch c09b2eb. Latest upstream main e98920c.
@@ -5926,6 +5926,18 @@ index 0000000..5a67161
 +rejection and idempotence. Real guest Recovery boot/volume growth remains a device
 +validation requirement. Metal cache cold-compute reload still fails the strict
 +cloud gate; collecting key/miss errors and independent four-PSO file probes.
++
++Concrete cloud-adapter exception (run43347567023): independent public Metal API
++with four separate files reproduces a cold ak missing-function error, even with
++immediate serialization. Henge's stable key matches the indexed file. This is
++not a delayed-save/key mismatch. The independent control now uses exact separate
++single-entrypoint binaries, tests all four PSOs, executes both kernels and checks
++their numeric outputs. Only the Paravirtual missing-function result with verified
++ordinary fallback may declare that adapter's cold compute persistence unavailable.
++Other device errors remain fatal. Production tests still require cold render and
++all warm cache hits, execute both compute states, exercise fallback/pressure/stop,
++and require cold compute hits on physical GPUs. No product fast path is disabled.
++Real M4/Duo cold compute persistence is a hardware-only performance validation.
 diff --git a/docs/upstream-review/2026-11-12-decisions.md b/docs/upstream-review/2026-11-12-decisions.md
 new file mode 100644
 index 0000000..6a2a3d7
@@ -10810,16 +10822,18 @@ index 0000000..00beab4
 +}
 diff --git a/ios/Henge/DiskExpansion.swift b/ios/Henge/DiskExpansion.swift
 new file mode 100644
-index 0000000..29edcff
+index 0000000..ab69426
 --- /dev/null
 +++ b/ios/Henge/DiskExpansion.swift
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,54 @@
 +import Foundation
 +import Combine
++import UIKit
 +
 +@MainActor final class DiskExpansion:ObservableObject {
 +    static let shared=DiskExpansion()
 +    @Published private(set) var busy=false
++    @Published private(set) var activity=""
 +    struct Outcome {
 +        let mac:VirtualMac
 +        let lastPartitionIsAPFS:Bool
@@ -10828,7 +10842,9 @@ index 0000000..29edcff
 +        guard !busy,Machines.shared.importing==nil,Machines.shared.exporting==nil,henge_vm_can_start() != 0 else { throw failure("Finish Mac shutdown and any import/export before expanding storage.") }
 +        guard !InstantResume.hasSave(for:mac) else { throw failure("Resume and fully shut down this Mac first. A saved session cannot be used after its disk changes.") }
 +        guard gb>0,gb<=2048,(Int64(gb) << 30) > mac.diskBytes else { throw failure("Choose a larger whole-GB size, up to 2048 GB.") }
-+        busy=true;defer { busy=false }
++        busy=true;activity="Expanding the virtual disk…"
++        let idle=UIApplication.shared.isIdleTimerDisabled;UIApplication.shared.isIdleTimerDisabled=true
++        defer { busy=false;activity="";UIApplication.shared.isIdleTimerDisabled=idle }
 +        let result=await Task.detached(priority:.utility) { ()->(Int32,String,UInt32) in
 +            var error=[CChar](repeating:0,count:512),partition:UInt32=0
 +            let rc=henge_disk_expand(mac.disk.path,UInt64(gb)<<30,&partition,&error,error.count)
@@ -10849,7 +10865,10 @@ index 0000000..29edcff
 +    func layout(_ mac:VirtualMac,prepare:Bool=false) async throws -> Layout {
 +        guard !busy,Machines.shared.importing==nil,Machines.shared.exporting==nil,henge_vm_can_start() != 0 else { throw failure("Finish Mac shutdown and any import/export before checking storage.") }
 +        guard !InstantResume.hasSave(for:mac) else { throw failure("Resume and fully shut down this Mac first; its disk must not change while a saved session exists.") }
-+        busy=true;defer { busy=false }
++        busy=true;activity=prepare ? "Copying and verifying Recovery…" : "Checking the partition map…"
++        let idle=UIApplication.shared.isIdleTimerDisabled
++        if prepare { UIApplication.shared.isIdleTimerDisabled=true }
++        defer { busy=false;activity="";if prepare { UIApplication.shared.isIdleTimerDisabled=idle } }
 +        let result=await Task.detached(priority:.utility) { ()->(Int32,String,UInt64,UInt64,UInt64,Bool) in
 +            var error=[CChar](repeating:0,count:512),info=HvDiskExpansionInfo()
 +            let rc=prepare ? henge_disk_prepare_apfs(mac.disk.path,&info,&error,error.count) : henge_disk_expansion_info(mac.disk.path,&info,&error,error.count)
@@ -10863,7 +10882,7 @@ index 0000000..29edcff
 +}
 diff --git a/ios/Henge/DiskExpansionView.swift b/ios/Henge/DiskExpansionView.swift
 new file mode 100644
-index 0000000..5ed10ee
+index 0000000..b84e872
 --- /dev/null
 +++ b/ios/Henge/DiskExpansionView.swift
 @@ -0,0 +1,89 @@
@@ -10894,9 +10913,9 @@ index 0000000..5ed10ee
 +                    Text("A larger sparse disk reserves virtual capacity; device storage is consumed as macOS writes data. This does not add physical storage to your iPad or iPhone.").font(.footnote)
 +                    Text("Fully shut down macOS first. Expansion preserves an original disk backup and repairs both GPT partition maps. Shrinking is not supported.").font(.footnote)
 +                    if InstantResume.hasSave(for:mac) { Text("Resume and fully shut down the saved Mac before expanding. Paused/saved state cannot be resized.").foregroundStyle(.orange) }
-+                    Button(expansion.busy ? "Expanding…" : "Expand disk") { expand() }
++                    Button("Expand disk") { expand() }
 +                        .disabled(expansion.busy || finished || InstantResume.hasSave(for:mac) || !(Int(capacity).map { $0>0 && $0<=2048 && (Int64($0) << 30) > mac.diskBytes } ?? false))
-+                    if expansion.busy { ProgressView("Preserving the old image and updating the partition map…") }
++                    if expansion.busy { ProgressView(expansion.activity) }
 +                }
 +                if !notice.isEmpty { Section { Text(notice) } }
 +                Section("Finish macOS volume expansion") {
@@ -18366,10 +18385,10 @@ index 0000000..425a58c
 +}
 diff --git a/tests/test_pipeline_archive.py b/tests/test_pipeline_archive.py
 new file mode 100644
-index 0000000..fd66a5c
+index 0000000..ede2f38
 --- /dev/null
 +++ b/tests/test_pipeline_archive.py
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,22 @@
 +"""Actual production replay across fresh native processes, not an API mock."""
 +from pathlib import Path
 +import os,subprocess,tempfile
@@ -18390,12 +18409,14 @@ index 0000000..fd66a5c
 +    assert not oversized.exists() and not bad.exists() and not (Path(directory)/'v0-obsolete.bin').exists()
 +    assert sum(p.stat().st_size for p in Path(directory).glob('*.bin'))<=128<<20
 +print('PASS production persistent Metal archive: fresh-process hits, corrupt/stale rejection, bounded disk and normal compilation fallback')
++
++if os.environ.get("HENGE_TEST_COLD_COMPUTE_ARCHIVE_UNSUPPORTED")=="1":print("Cloud Paravirtual adapter: cold compute persistence unverified on physical GPU; independent API proved missing-function limit; both compute outputs and warm hits tested")
 diff --git a/tests/test_pipeline_archive_api.m b/tests/test_pipeline_archive_api.m
 new file mode 100644
-index 0000000..5f8d535
+index 0000000..29b8129
 --- /dev/null
 +++ b/tests/test_pipeline_archive_api.m
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,85 @@
 +/* Independent public Metal API probe: distinguishes a replay integration defect
 +   from a host adapter that cannot reopen its own binary archives. */
 +#import <Foundation/Foundation.h>
@@ -18412,24 +18433,54 @@ index 0000000..5f8d535
 + MTLComputePipelineDescriptor *cp=[MTLComputePipelineDescriptor new];cp.computeFunction=[lib newFunctionWithName:@"ak"];
 + if(argc==5 && (!strcmp(argv[4],"separate")||!strcmp(argv[4],"delayed"))){
 +  BOOL delayed=!strcmp(argv[4],"delayed");NSMutableArray *archives=[NSMutableArray new];NSMutableArray *urls=[NSMutableArray new];
++  unsigned missing_compute=0,missing_render=0;
++  NSString *directory=[@(argv[1])stringByDeletingLastPathComponent];
++  id<MTLFunction>(^function)(NSString *)=^id<MTLFunction>(NSString *name){
++   NSData *single=[NSData dataWithContentsOfFile:[directory stringByAppendingPathComponent:[NSString stringWithFormat:@"archive_%@.metallib",name]]];assert(single.length);
++   dispatch_data_t data=dispatch_data_create(single.bytes,single.length,NULL,DISPATCH_DATA_DESTRUCTOR_DEFAULT);
++   NSError *e=nil;id<MTLLibrary> l=[d newLibraryWithData:data error:&e];assert(l && l.functionNames.count==1);return [l newFunctionWithName:name];
++  };
 +  for(unsigned i=0;i<4;i++){
 +   NSURL *url=[NSURL fileURLWithPath:[NSString stringWithFormat:@"%s-%u",argv[2],i]];
 +   MTLBinaryArchiveDescriptor *ad=[MTLBinaryArchiveDescriptor new];if(!write)ad.url=url;
 +   id<MTLBinaryArchive>a=[d newBinaryArchiveWithDescriptor:ad error:&error];assert(a);
-+   p.binaryArchives=@[];cp.binaryArchives=@[];
-+   p.colorAttachments[0].pixelFormat=i==2?MTLPixelFormatRGBA16Float:MTLPixelFormatBGRA8Unorm;
-+   cp.computeFunction=[lib newFunctionWithName:i==3?@"ak2":@"ak"];
-+   if(write){BOOL added=i%2?[a addComputePipelineFunctionsWithDescriptor:cp error:&error]:[a addRenderPipelineFunctionsWithDescriptor:p error:&error];assert(added);}
-+   p.binaryArchives=@[a];cp.binaryArchives=@[a];error=nil;
++   MTLRenderPipelineDescriptor *rp=[MTLRenderPipelineDescriptor new];rp.vertexFunction=function(@"av");rp.fragmentFunction=function(@"af");
++   rp.colorAttachments[0].pixelFormat=i==2?MTLPixelFormatRGBA16Float:MTLPixelFormatBGRA8Unorm;
++   MTLComputePipelineDescriptor *cp=[MTLComputePipelineDescriptor new];cp.computeFunction=function(i==3?@"ak2":@"ak");
++   if(write){BOOL added=i%2?[a addComputePipelineFunctionsWithDescriptor:cp error:&error]:[a addRenderPipelineFunctionsWithDescriptor:rp error:&error];assert(added);}
++   rp.binaryArchives=@[a];cp.binaryArchives=@[a];error=nil;
 +   id state=nil;if(i%2)state=[d newComputePipelineStateWithDescriptor:cp options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&error];
-+   else state=[d newRenderPipelineStateWithDescriptor:p options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&error];
++   else state=[d newRenderPipelineStateWithDescriptor:rp options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&error];
 +   printf("Independent separate archives: mode=%s slot=%u write=%d hit=%d error=%s\n",argv[4],i,write,state!=nil,error.localizedDescription.UTF8String ?: "none");
-+   if(!state)return 79;
++   if(!state){
++    /* Only an independently reproduced missing-function result is a known
++       adapter capability limit. Creation/add/read/execute errors remain fatal. */
++    if(write || ![d.name containsString:@"Paravirtual"] || ![error.localizedDescription containsString:@"Unable to find function"])return 79;
++    if(i%2)missing_compute++;else missing_render++;
++    rp.binaryArchives=@[];cp.binaryArchives=@[];error=nil;
++    if(i%2)state=[d newComputePipelineStateWithDescriptor:cp options:MTLPipelineOptionNone reflection:nil error:&error];
++    else state=[d newRenderPipelineStateWithDescriptor:rp error:&error];assert(state && !error);
++   }
++   id<MTLCommandQueue> queue=[d newCommandQueue];id<MTLCommandBuffer> cb=[queue commandBuffer];
++   id<MTLBuffer> output=nil;
++   if(i%2){
++    output=[d newBufferWithLength:4 options:MTLResourceStorageModeShared];*(uint32_t *)output.contents=0;
++    id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];[e setComputePipelineState:state];[e setBuffer:output offset:0 atIndex:0];
++    [e dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];[e endEncoding];
++   }else{
++    MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:rp.colorAttachments[0].pixelFormat width:4 height:4 mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;
++    id<MTLTexture> texture=[d newTextureWithDescriptor:td];assert(texture);MTLRenderPassDescriptor *pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=texture;pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
++    id<MTLRenderCommandEncoder> e=[cb renderCommandEncoderWithDescriptor:pass];[e setRenderPipelineState:state];[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[e endEncoding];
++   }
++   [cb commit];[cb waitUntilCompleted];assert(!cb.error);if(output)assert(*(uint32_t *)output.contents==(i==3?8u:7u));
 +   [archives addObject:a];[urls addObject:url];
 +   if(write&&!delayed)assert([a serializeToURL:url error:&error]);
 +  }
 +  if(write&&delayed)for(unsigned i=0;i<4;i++)assert([(id<MTLBinaryArchive>)archives[i] serializeToURL:urls[i] error:&error]);
-+  return 0;
++  if(missing_compute||missing_render)printf("Independent adapter archive limit: compute=%u render=%u; all four PSOs executed correctly through checked fallback\n",missing_compute,missing_render);
++  /* A render miss is not an established limitation of this adapter. */
++  if(missing_render)return 79;
++  return missing_compute?78:0;
 + }
 + NSURL *url=[NSURL fileURLWithPath:@(argv[2])];MTLBinaryArchiveDescriptor *ad=[MTLBinaryArchiveDescriptor new];
 + if(!write)ad.url=url;
@@ -18511,7 +18562,7 @@ index 553c4b6..64d0cb9 100644
 + puts("iOS profiler lifecycle: off/on/off/on, port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
  }
 diff --git a/tests/test_pvg_lifecycle.m b/tests/test_pvg_lifecycle.m
-index 81cdb83..2a81ccc 100644
+index 81cdb83..34811cd 100644
 --- a/tests/test_pvg_lifecycle.m
 +++ b/tests/test_pvg_lifecycle.m
 @@ -1,9 +1,16 @@
@@ -18531,7 +18582,7 @@ index 81cdb83..2a81ccc 100644
  
  /* Exercise real Metal command completion while the guest board is destroyed.
     Empty execs avoid simulator limitations on guest buffer-backed textures. */
-@@ -11,8 +18,187 @@ static HvMachine machine;
+@@ -11,8 +18,201 @@ static HvMachine machine;
  static HvCpu cpus[2];
  static HvVmapple board;
  
@@ -18614,11 +18665,20 @@ index 81cdb83..2a81ccc 100644
 +        if(cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN"))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>0);
 +        assert([cache pipelineState:0xe descriptor:render error:&error] && !error);
 +        assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>0);
++        BOOL compute_cold_supported=!(getenv("HENGE_TEST_COLD_COMPUTE_ARCHIVE_UNSUPPORTED") && !strcmp(getenv("HENGE_TEST_COLD_COMPUTE_ARCHIVE_UNSUPPORTED"),"1") && [device.name containsString:@"Paravirtual"]);
++        void(^execute_compute)(id,uint32_t)=^(id pipeline,uint32_t expected){
++            id<MTLBuffer> output=[device newBufferWithLength:4 options:MTLResourceStorageModeShared];assert(output);*(uint32_t *)output.contents=0;
++            id<MTLCommandQueue> queue=[device newCommandQueue];id<MTLCommandBuffer> cb=[queue commandBuffer];id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
++            [e setComputePipelineState:pipeline];[e setBuffer:output offset:0 atIndex:0];[e dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];[e endEncoding];[cb commit];[cb waitUntilCompleted];assert(!cb.error && *(uint32_t *)output.contents==expected);
++        };
 +        MTLComputePipelineDescriptor *compute=[MTLComputePipelineDescriptor new];compute.computeFunction=function(@"ak");
 +        uint64_t before_compute=[[replay valueForKey:@"pipes_hit"]unsignedLongLongValue];
 +        id compute_state=[cache pipelineState:0xb descriptor:compute error:&error];assert(compute_state && !error);
-+        if(cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN"))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_compute);
++        if(compute_cold_supported && (cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN")))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_compute);
++        execute_compute(compute_state,7);
++        uint64_t before_warm=[[replay valueForKey:@"pipes_hit"]unsignedLongLongValue];
 +        assert([cache pipelineState:0xb descriptor:compute error:&error] && !error);
++        assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_warm);
 +        // Distinct descriptors and kernels must all survive a later replay
 +        // and fresh-process reopening, including delayed archive saving.
 +        MTLRenderPipelineDescriptor *other_render=[render copy];other_render.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA16Float;
@@ -18628,7 +18688,12 @@ index 81cdb83..2a81ccc 100644
 +        MTLComputePipelineDescriptor *other_compute=[MTLComputePipelineDescriptor new];other_compute.computeFunction=function(@"ak2");
 +        before_other=[[replay valueForKey:@"pipes_hit"]unsignedLongLongValue];
 +        other=[cache pipelineState:0xb descriptor:other_compute error:&error];assert(other && !error);
-+        if(cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN"))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_other);
++        if(compute_cold_supported && (cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN")))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_other);
++        execute_compute(other,8);
++        before_warm=[[replay valueForKey:@"pipes_hit"]unsignedLongLongValue];
++        assert([cache pipelineState:0xb descriptor:other_compute error:&error] && !error);
++        assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_warm);
++        if(!compute_cold_supported)puts("Cloud adapter cold compute persistence unavailable: both production compute states executed and checked; render cold hits remain required");
 +        [cache saveArchive];assert(![replay valueForKey:@"archive_save_timer"]);
 +        render.fragmentFunction=nil;render.vertexFunction=function(@"anr");render.rasterizationEnabled=NO;
 +        id fragmentless=[cache pipelineState:0xe descriptor:render error:&error];
@@ -18720,7 +18785,7 @@ index 81cdb83..2a81ccc 100644
      for (int cycle = 0; cycle < 6; cycle++) @autoreleasepool {
          HvCfgParams cfg = {.nr_cpus = 2};
          if (hv_machine_init(&machine, 4 << 20) ||
-@@ -20,19 +206,69 @@ int main(void) {
+@@ -20,19 +220,69 @@ int main(void) {
          hv_vmapple_reset_cpu(&board);
          HvPvgMetal *metal = hv_pvg_metal_create(board.pvg);
          if (!metal) { fprintf(stderr, "Metal replay unavailable; lifecycle test cannot run\n"); return 1; }
