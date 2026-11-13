@@ -15068,10 +15068,10 @@ index 5b25291..b3bb1a6 100755
  trap 'rm -rf "$STAGE"' EXIT
 diff --git a/tests/archive_fixture.metal b/tests/archive_fixture.metal
 new file mode 100644
-index 0000000..8eff720
+index 0000000..67159eb
 --- /dev/null
 +++ b/tests/archive_fixture.metal
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,8 @@
 +#include <metal_stdlib>
 +using namespace metal;
 +struct ArchiveVertex { float4 position [[position]]; };
@@ -15079,6 +15079,7 @@ index 0000000..8eff720
 +fragment float4 af() { return float4(1,0,0,1); }
 +vertex void anr(uint i [[vertex_id]]) { (void)i; }
 +kernel void ak(device uint *v [[buffer(0)]]) { v[0]=7; }
++kernel void ak2(device uint *v [[buffer(0)]]) { v[0]=8; }
 diff --git a/tests/audio_test_api.h b/tests/audio_test_api.h
 index 091433d..d5481c3 100644
 --- a/tests/audio_test_api.h
@@ -18115,10 +18116,10 @@ index 0000000..7b94b08
 +print('PASS production persistent Metal archive: fresh-process hits, corrupt/stale rejection, bounded disk and normal compilation fallback')
 diff --git a/tests/test_pipeline_archive_api.m b/tests/test_pipeline_archive_api.m
 new file mode 100644
-index 0000000..d26f1d1
+index 0000000..5300f71
 --- /dev/null
 +++ b/tests/test_pipeline_archive_api.m
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,34 @@
 +/* Independent public Metal API probe: distinguishes a replay integration defect
 +   from a host adapter that cannot reopen its own binary archives. */
 +#import <Foundation/Foundation.h>
@@ -18143,9 +18144,14 @@ index 0000000..d26f1d1
 +  printf("Independent Metal archive API: wrote %s mode=%s\n",url.lastPathComponent.UTF8String,mixed?"render+compute":compute?"compute":"render");return 0;
 + }
 + p.binaryArchives=@[a];cp.binaryArchives=@[a];error=nil;
-+ id state=compute?[d newComputePipelineStateWithDescriptor:cp options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&error]:[d newRenderPipelineStateWithDescriptor:p options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&error];
++ id state=nil;
++ if(compute){state=[d newComputePipelineStateWithDescriptor:cp options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&error];}
++ else{state=[d newRenderPipelineStateWithDescriptor:p options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&error];}
 + printf("Independent Metal archive API: device=%s library_bytes=%lu archive_bytes=%llu reopened_hit=%d error=%s\n",d.name.UTF8String,(unsigned long)bytes.length,[[NSFileManager.defaultManager attributesOfItemAtPath:url.path error:nil]fileSize],state!=nil,error.localizedDescription.UTF8String ?: "none");
-+ if(!state){p.binaryArchives=@[];cp.binaryArchives=@[];error=nil;state=compute?[d newComputePipelineStateWithDescriptor:cp options:MTLPipelineOptionNone reflection:nil error:&error]:[d newRenderPipelineStateWithDescriptor:p error:&error];assert(state);puts("Independent Metal archive API: ordinary compilation fallback succeeded");return 78;}
++ if(!state){p.binaryArchives=@[];cp.binaryArchives=@[];error=nil;
++ if(compute){state=[d newComputePipelineStateWithDescriptor:cp options:MTLPipelineOptionNone reflection:nil error:&error];}
++ else{state=[d newRenderPipelineStateWithDescriptor:p error:&error];}
++ assert(state);puts("Independent Metal archive API: ordinary compilation fallback succeeded");return 78;}
 + return 0;
 +}}
 diff --git a/tests/test_planar_registry.m b/tests/test_planar_registry.m
@@ -18208,7 +18214,7 @@ index 553c4b6..64d0cb9 100644
 + puts("iOS profiler lifecycle: off/on/off/on, port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
  }
 diff --git a/tests/test_pvg_lifecycle.m b/tests/test_pvg_lifecycle.m
-index 81cdb83..2b861ca 100644
+index 81cdb83..6cb1d5b 100644
 --- a/tests/test_pvg_lifecycle.m
 +++ b/tests/test_pvg_lifecycle.m
 @@ -1,9 +1,15 @@
@@ -18227,7 +18233,7 @@ index 81cdb83..2b861ca 100644
  
  /* Exercise real Metal command completion while the guest board is destroyed.
     Empty execs avoid simulator limitations on guest buffer-backed textures. */
-@@ -11,8 +17,170 @@ static HvMachine machine;
+@@ -11,8 +17,180 @@ static HvMachine machine;
  static HvCpu cpus[2];
  static HvVmapple board;
  
@@ -18308,6 +18314,16 @@ index 81cdb83..2b861ca 100644
 +        id compute_state=[cache pipelineState:0xb descriptor:compute error:&error];assert(compute_state && !error);
 +        if(cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN"))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_compute);
 +        assert([cache pipelineState:0xb descriptor:compute error:&error] && !error);
++        // Multiple pipelines per kind must survive serialization too: one
++        // entry per file would conceal a last-pipeline-wins driver failure.
++        MTLRenderPipelineDescriptor *other_render=[render copy];other_render.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA16Float;
++        uint64_t before_other=[[replay valueForKey:@"pipes_hit"]unsignedLongLongValue];
++        id other=[cache pipelineState:0xe descriptor:other_render error:&error];assert(other && !error);
++        if(cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN"))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_other);
++        MTLComputePipelineDescriptor *other_compute=[MTLComputePipelineDescriptor new];other_compute.computeFunction=[library newFunctionWithName:@"ak2"];
++        before_other=[[replay valueForKey:@"pipes_hit"]unsignedLongLongValue];
++        other=[cache pipelineState:0xb descriptor:other_compute error:&error];assert(other && !error);
++        if(cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN"))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_other);
 +        [cache saveArchive];assert(![replay valueForKey:@"archive_save_timer"]);
 +        render.fragmentFunction=nil;render.vertexFunction=[library newFunctionWithName:@"anr"];render.rasterizationEnabled=NO;
 +        id fragmentless=[cache pipelineState:0xe descriptor:render error:&error];
@@ -18399,7 +18415,7 @@ index 81cdb83..2b861ca 100644
      for (int cycle = 0; cycle < 6; cycle++) @autoreleasepool {
          HvCfgParams cfg = {.nr_cpus = 2};
          if (hv_machine_init(&machine, 4 << 20) ||
-@@ -20,19 +188,69 @@ int main(void) {
+@@ -20,19 +198,69 @@ int main(void) {
          hv_vmapple_reset_cpu(&board);
          HvPvgMetal *metal = hv_pvg_metal_create(board.pvg);
          if (!metal) { fprintf(stderr, "Metal replay unavailable; lifecycle test cannot run\n"); return 1; }
