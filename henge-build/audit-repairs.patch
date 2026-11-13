@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 81b0736..7a49c97 100644
+index 81b0736..cdd13a6 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -5,14 +5,14 @@ B = build
@@ -56,7 +56,7 @@ index 81b0736..7a49c97 100644
  $(B)/%.o: devices/%.c devices/*.h core/*.h host/*.h | $(B)
  	$(CC) $(CFLAGS) -c $< -o $@
  
-@@ -107,15 +109,22 @@ $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
+@@ -107,15 +109,26 @@ $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
  $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
  	$(CC) $(CFLAGS) $^ -o $@
  
@@ -78,12 +78,16 @@ index 81b0736..7a49c97 100644
 +	xcrun -sdk macosx metal -c $< -o $(B)/archive_fixture.air
 +	xcrun -sdk macosx metallib $(B)/archive_fixture.air -o $@
 +
-+$(B)/test_pvg_lifecycle: tests/test_pvg_lifecycle.m $(ENGINE) $(DEV) $(B)/archive_fixture.metallib
++$(B)/archive_%.metallib: tests/archive_fixture.metal | $(B)
++	xcrun -sdk macosx metal -DHENGE_ARCHIVE_FUNC_$*=1 -c $< -o $(B)/archive_$*.air
++	xcrun -sdk macosx metallib $(B)/archive_$*.air -o $@
++
++$(B)/test_pvg_lifecycle: tests/test_pvg_lifecycle.m $(ENGINE) $(DEV) $(B)/archive_fixture.metallib $(foreach f,av af anr ak ak2,$(B)/archive_$(f).metallib)
 +	$(CC) $(CFLAGS) -fobjc-arc -DHENGE_TEST_ARCHIVE_FIXTURE='"$(B)/archive_fixture.metallib"' $(filter-out %.metallib,$^) $(METAL_LIBS) -o $@
  
  $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
  	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
-@@ -165,7 +174,7 @@ IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isy
+@@ -165,7 +178,7 @@ IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isy
  IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
  IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
  IB = build/ios
@@ -92,7 +96,7 @@ index 81b0736..7a49c97 100644
            $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
  IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
  
-@@ -259,6 +268,25 @@ test-native-touch: $(B)/test_native_touch $(B)/test_native_touch_session
+@@ -259,6 +272,25 @@ test-native-touch: $(B)/test_native_touch $(B)/test_native_touch_session
  	./$(B)/test_native_touch_session
  .PHONY: test-native-touch
  
@@ -118,7 +122,7 @@ index 81b0736..7a49c97 100644
  # Session-owned display routing, independent of JIT, Metal and a connected monitor.
  $(B)/test_display_targets: ios/Henge/DisplayTargetSelection.swift tests/test_display_targets.swift | $(B)
  	xcrun --sdk macosx swiftc $^ -o $@
-@@ -316,5 +344,24 @@ $(B)/test_cpu_sync: tests/test_cpu_sync.c $(ENGINE)
+@@ -316,5 +348,24 @@ $(B)/test_cpu_sync: tests/test_cpu_sync.c $(ENGINE)
  $(B)/test_timer_dispatch: tests/test_timer_dispatch.c $(ENGINE)
  	$(CC) $(CFLAGS) $< $(ENGINE) -o $@
  
@@ -5777,10 +5781,10 @@ index 0000000..a79226b
 +remote-server latency, guest decompression and I/O queueing are not directly timed.
 diff --git a/docs/upstream-desktop/PROGRESS.md b/docs/upstream-desktop/PROGRESS.md
 new file mode 100644
-index 0000000..4045f45
+index 0000000..44dbb1e
 --- /dev/null
 +++ b/docs/upstream-desktop/PROGRESS.md
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,125 @@
 +# Desktop integration after 0.3.5
 +
 +Base delivered commit a3fd806, patch c09b2eb. Latest upstream main e98920c.
@@ -5897,6 +5901,15 @@ index 0000000..4045f45
 +and compute hits from separate files. The unused mixed reference case records
 +its actual supported/unsupported result and verifies normal compilation on a miss;
 +it does not excuse a failure in either production container.
++
++Additional fixture coverage now uses the real guest function-record contract:
++each exact metallib contains one entrypoint (the production loader explicitly
++rejects multi-entrypoint function records). Independent public API controls keep
++the multi-entrypoint library to retain evidence of its stage/function collision.
++The production fixture requires multiple distinct render and compute PSOs to
++reload cold, with distinct single-function library bytes and no relaxed hit checks.
++Settings descriptions now distinguish JIT translations from saved shaders and
++CPU-only background grants from the additional GPU entitlement requirement.
 diff --git a/docs/upstream-review/2026-11-12-decisions.md b/docs/upstream-review/2026-11-12-decisions.md
 new file mode 100644
 index 0000000..6a2a3d7
@@ -10861,10 +10874,10 @@ index 47b0ced..af8939d 100644
      }
  }
 diff --git a/ios/Henge/EngineTuning.swift b/ios/Henge/EngineTuning.swift
-index e579188..6d1fcc8 100644
+index e579188..83a4be6 100644
 --- a/ios/Henge/EngineTuning.swift
 +++ b/ios/Henge/EngineTuning.swift
-@@ -4,13 +4,22 @@ import Foundation
+@@ -4,37 +4,58 @@ import Foundation
  /// then Documents/henge-env.txt (KEY=VALUE per line, # comments; {Documents} in a value is that folder) overrides them all.
  /// Applied at launch and again before each Mac starts, so changes need no relaunch.
  enum EngineTuning {
@@ -10886,8 +10899,13 @@ index e579188..6d1fcc8 100644
 +    }
  
      static let defaults: [String: String] = [
-         // 60, not 120: every frame macOS draws is emulated and replayed, so 120 Hz
-@@ -21,20 +30,32 @@ enum EngineTuning {
+-        // 60, not 120: every frame macOS draws is emulated and replayed, so 120 Hz
+-        // halves the CPU left for apps for animation few will notice.
++        // Default to60Hz; users retain120Hz. Higher guest animation cadence can
++        // increase emulation/replay work; it does not halve app CPU time universally.
+         "HV_HZ": "60",         // the refresh rate macOS is told its display has
+         "HV_WFI_SPIN": "0",    // microseconds an idle CPU watches for work before sleeping
+         "HV_FLUSH": "2",       // disk flush: F_BARRIERFSYNC, ordered but without a full fsync
          "HV_STW_WAIT": "1", // event-driven quiescence during global code flushes
          "HV_SYNC_WAIT": "1", // bounded sleep after short spin while awaiting CPU acknowledgement
          "HV_RECHECK": "1",    // exact same-page check before full memory helper at page tails
@@ -14810,7 +14828,7 @@ index 0000000..75768bd
 +    }
 +}
 diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
-index e1693b0..0327c00 100644
+index e1693b0..5dd33d9 100644
 --- a/ios/Henge/SettingsView.swift
 +++ b/ios/Henge/SettingsView.swift
 @@ -10,6 +10,7 @@ struct SettingsView: View {
@@ -14873,7 +14891,7 @@ index e1693b0..0327c00 100644
                          .font(.footnote).foregroundStyle(.secondary)
                      Toggle("Faster disk writes", isOn: $fastFlush)
                      Toggle("Quicker wake from idle", isOn: $wfiSpin)
-@@ -168,6 +186,9 @@ struct SettingsView: View {
+@@ -168,12 +186,15 @@ struct SettingsView: View {
                      Toggle("Superblocks (experimental)", isOn: $superblocks)
                      Text("Continues translated code through conditional branches within the same page, bounded to 48 instructions at a conditional exit. May reduce dispatch work but increase code-cache pressure. Off by default; performance on your device is unverified. Applies to a new Mac session.")
                          .font(.footnote).foregroundStyle(.secondary)
@@ -14883,12 +14901,19 @@ index e1693b0..0327c00 100644
                      Picker("Code cache", selection: $codeCacheMB) {
                          Text("512 MB").tag(512)
                          Text("1 GB").tag(1024)
+                         Text("1.5 GB").tag(1536)
+                     }
+-                    Text("A bigger code cache empties less often and takes more memory (about 1.75 times its size); Henge picks one by its memory limit: 1.5 GB where there is plenty, 512 MB where there is little. Compiled code is not saved between app launches. Applies the next time Henge opens. If JIT stops turning on, or a Mac closes Henge during setup, choose a smaller one.")
++                    Text("A larger code region keeps more translations and uses more memory (about 1.75 times its size). Henge chooses a size from its process memory limit. Oldest segments are recycled when possible, with full reset as a fallback. Guest CPU translations are not saved between app launches. Applies the next time Henge opens. If JIT stops turning on, or a Mac closes Henge during setup, choose a smaller one.")
+                         .font(.footnote).foregroundStyle(.secondary)
+                     Text("60 Hz leaves more of the emulated CPU to apps. Faster disk writes order them without waiting for a full sync; a sudden power loss could lose the last ones. Quicker wake keeps an idle CPU watching for work for 50 µs, at some battery cost. Superblocks let translated code run past conditional branches. Changes apply the next time a Mac starts.")
+                         .font(.footnote).foregroundStyle(.secondary)
 @@ -182,7 +203,7 @@ struct SettingsView: View {
                  Section("Background execution") {
                      LabeledContent("Background GPU capability", value: BackgroundExecutionStatus.gpuSupport)
                      LabeledContent("Signed GPU entitlement", value: BackgroundExecutionStatus.signedGPUAccess)
 -                    Text("These are separate capability checks, not confirmation of background execution. Running the Mac in the background is not implemented in this build. Keep Henge visible while your runner builds. No signing entitlement has been added.")
-+                    Text("These capability checks do not confirm a running background task. Optional Runner background processing requires the GPU entitlement and an active grant from iOS, which can expire. Standard signing should use Henge in the foreground or Split View; PiP alone does not grant GPU execution.")
++                    Text("These capability checks do not confirm a running background task. CPU-only Runner processing requires an active continued-processing grant from iOS; graphics wait until foreground restoration. GPU Runner processing additionally requires the signed GPU entitlement. Grants can expire or be denied. Foreground or Split View remains the reliable option; PiP alone does not grant VM execution.")
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  .listRowBackground(Desk.card)
@@ -15068,18 +15093,33 @@ index 5b25291..b3bb1a6 100755
  trap 'rm -rf "$STAGE"' EXIT
 diff --git a/tests/archive_fixture.metal b/tests/archive_fixture.metal
 new file mode 100644
-index 0000000..67159eb
+index 0000000..477e3cd
 --- /dev/null
 +++ b/tests/archive_fixture.metal
-@@ -0,0 +1,8 @@
+@@ -0,0 +1,23 @@
 +#include <metal_stdlib>
 +using namespace metal;
++#if defined(HENGE_ARCHIVE_FUNC_av)
++struct ArchiveVertex { float4 position [[position]]; };
++vertex ArchiveVertex av(uint i [[vertex_id]]) { (void)i; return {float4(0,0,0,1)}; }
++#elif defined(HENGE_ARCHIVE_FUNC_af)
++fragment float4 af() { return float4(1,0,0,1); }
++#elif defined(HENGE_ARCHIVE_FUNC_anr)
++vertex void anr(uint i [[vertex_id]]) { (void)i; }
++#elif defined(HENGE_ARCHIVE_FUNC_ak)
++kernel void ak(device uint *v [[buffer(0)]]) { v[0]=7; }
++#elif defined(HENGE_ARCHIVE_FUNC_ak2)
++kernel void ak2(device uint *v [[buffer(0)]]) { v[0]=8; }
++#else
++// Independent API control: several entrypoints in one library, unlike guest
++// function records, which each contain one exact single-function metallib.
 +struct ArchiveVertex { float4 position [[position]]; };
 +vertex ArchiveVertex av(uint i [[vertex_id]]) { (void)i; return {float4(0,0,0,1)}; }
 +fragment float4 af() { return float4(1,0,0,1); }
 +vertex void anr(uint i [[vertex_id]]) { (void)i; }
 +kernel void ak(device uint *v [[buffer(0)]]) { v[0]=7; }
 +kernel void ak2(device uint *v [[buffer(0)]]) { v[0]=8; }
++#endif
 diff --git a/tests/audio_test_api.h b/tests/audio_test_api.h
 index 091433d..d5481c3 100644
 --- a/tests/audio_test_api.h
@@ -18214,7 +18254,7 @@ index 553c4b6..64d0cb9 100644
 + puts("iOS profiler lifecycle: off/on/off/on, port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
  }
 diff --git a/tests/test_pvg_lifecycle.m b/tests/test_pvg_lifecycle.m
-index 81cdb83..6cb1d5b 100644
+index 81cdb83..495d695 100644
 --- a/tests/test_pvg_lifecycle.m
 +++ b/tests/test_pvg_lifecycle.m
 @@ -1,9 +1,15 @@
@@ -18233,7 +18273,7 @@ index 81cdb83..6cb1d5b 100644
  
  /* Exercise real Metal command completion while the guest board is destroyed.
     Empty execs avoid simulator limitations on guest buffer-backed textures. */
-@@ -11,8 +17,180 @@ static HvMachine machine;
+@@ -11,8 +17,186 @@ static HvMachine machine;
  static HvCpu cpus[2];
  static HvVmapple board;
  
@@ -18296,11 +18336,17 @@ index 81cdb83..6cb1d5b 100644
 +#define HENGE_TEST_ARCHIVE_FIXTURE "build/archive_fixture.metallib"
 +#endif
 +        NSError *error=nil;
-+        NSData *bytes=[NSData dataWithContentsOfFile:@HENGE_TEST_ARCHIVE_FIXTURE];assert(bytes.length);
-+        dispatch_data_t data=dispatch_data_create(bytes.bytes,bytes.length,NULL,DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-+        id<MTLLibrary> library=[device newLibraryWithData:data error:&error];assert(library && !error);
++        NSString *directory=[@HENGE_TEST_ARCHIVE_FIXTURE stringByDeletingLastPathComponent];
++        id<MTLFunction>(^function)(NSString *)=^id<MTLFunction>(NSString *name){
++            NSString *path=[directory stringByAppendingPathComponent:[NSString stringWithFormat:@"archive_%@.metallib",name]];
++            NSData *bytes=[NSData dataWithContentsOfFile:path];assert(bytes.length);
++            dispatch_data_t data=dispatch_data_create(bytes.bytes,bytes.length,NULL,DISPATCH_DATA_DESTRUCTOR_DEFAULT);
++            NSError *load_error=nil;id<MTLLibrary> single=[device newLibraryWithData:data error:&load_error];
++            assert(single && single.functionNames.count==1 && !load_error);
++            id<MTLFunction> f=[single newFunctionWithName:name];assert(f);return f;
++        };
 +        MTLRenderPipelineDescriptor *render=[MTLRenderPipelineDescriptor new];
-+        render.vertexFunction=[library newFunctionWithName:@"av"];render.fragmentFunction=[library newFunctionWithName:@"af"];
++        render.vertexFunction=function(@"av");render.fragmentFunction=function(@"af");
 +        render.colorAttachments[0].pixelFormat=MTLPixelFormatBGRA8Unorm;
 +        id<ArchiveTesting> cache=(id)replay;
 +        id initial=[cache pipelineState:0xe descriptor:render error:&error];
@@ -18309,7 +18355,7 @@ index 81cdb83..6cb1d5b 100644
 +        if(cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN"))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>0);
 +        assert([cache pipelineState:0xe descriptor:render error:&error] && !error);
 +        assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>0);
-+        MTLComputePipelineDescriptor *compute=[MTLComputePipelineDescriptor new];compute.computeFunction=[library newFunctionWithName:@"ak"];
++        MTLComputePipelineDescriptor *compute=[MTLComputePipelineDescriptor new];compute.computeFunction=function(@"ak");
 +        uint64_t before_compute=[[replay valueForKey:@"pipes_hit"]unsignedLongLongValue];
 +        id compute_state=[cache pipelineState:0xb descriptor:compute error:&error];assert(compute_state && !error);
 +        if(cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN"))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_compute);
@@ -18320,12 +18366,12 @@ index 81cdb83..6cb1d5b 100644
 +        uint64_t before_other=[[replay valueForKey:@"pipes_hit"]unsignedLongLongValue];
 +        id other=[cache pipelineState:0xe descriptor:other_render error:&error];assert(other && !error);
 +        if(cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN"))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_other);
-+        MTLComputePipelineDescriptor *other_compute=[MTLComputePipelineDescriptor new];other_compute.computeFunction=[library newFunctionWithName:@"ak2"];
++        MTLComputePipelineDescriptor *other_compute=[MTLComputePipelineDescriptor new];other_compute.computeFunction=function(@"ak2");
 +        before_other=[[replay valueForKey:@"pipes_hit"]unsignedLongLongValue];
 +        other=[cache pipelineState:0xb descriptor:other_compute error:&error];assert(other && !error);
 +        if(cycle || getenv("HENGE_TEST_ARCHIVE_REOPEN"))assert([[replay valueForKey:@"pipes_hit"]unsignedLongLongValue]>before_other);
 +        [cache saveArchive];assert(![replay valueForKey:@"archive_save_timer"]);
-+        render.fragmentFunction=nil;render.vertexFunction=[library newFunctionWithName:@"anr"];render.rasterizationEnabled=NO;
++        render.fragmentFunction=nil;render.vertexFunction=function(@"anr");render.rasterizationEnabled=NO;
 +        id fragmentless=[cache pipelineState:0xe descriptor:render error:&error];
 +        if(!fragmentless || error)fprintf(stderr,"fragmentless pipeline: %s\n",error.localizedDescription.UTF8String ?: "no state");
 +        assert(fragmentless && !error && !render.binaryArchives.count);
@@ -18415,7 +18461,7 @@ index 81cdb83..6cb1d5b 100644
      for (int cycle = 0; cycle < 6; cycle++) @autoreleasepool {
          HvCfgParams cfg = {.nr_cpus = 2};
          if (hv_machine_init(&machine, 4 << 20) ||
-@@ -20,19 +198,69 @@ int main(void) {
+@@ -20,19 +204,69 @@ int main(void) {
          hv_vmapple_reset_cpu(&board);
          HvPvgMetal *metal = hv_pvg_metal_create(board.pvg);
          if (!metal) { fprintf(stderr, "Metal replay unavailable; lifecycle test cannot run\n"); return 1; }
