@@ -1125,7 +1125,7 @@ index 3a4ee8f..89ad6ac 100644
     can be read before the page ends. On a fault, the instruction abort is taken
     and NULL is returned. */
 diff --git a/core/translate.c b/core/translate.c
-index cebfb7d..6bf4bd8 100644
+index cebfb7d..800f7fc 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -48,6 +48,8 @@ typedef struct {
@@ -1406,7 +1406,19 @@ index cebfb7d..6bf4bd8 100644
              KILL(insn);
              continue;
          }
-@@ -1926,13 +2001,14 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1923,16 +1998,26 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+             continue;
+         }
+         if (kind == HV_INSN_PREFETCH) continue;
++        if (kind == HV_INSN_BARRIER) {
++            unsigned op2=(insn>>5)&7;
++            if(op2!=2 && op2!=6) {
++                // DMB/DSB/SB execute unchanged. Never reuse a translation
++                // across the barrier, but independently plan later accesses.
++                for(int r=0;r<32;r++){cur[r]=-1;delta[r]=0;}
++                continue;
++            }
++        }
          if (kind != HV_INSN_MEMORY) break;
          HvMemOp op;
          if (hv_mem_decode(insn, &op) != 0) break;
@@ -1423,7 +1435,7 @@ index cebfb7d..6bf4bd8 100644
                  else {
                      g->lo = (int32_t)lo, g->hi = (int32_t)hi, g->last = (uint16_t)i, g->store |= op.store;
                      e->gid[i] = (int8_t)cur[b], e->grole[i] = 2, e->goff[i] = (int32_t)off;
-@@ -1966,8 +2042,12 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1966,8 +2051,12 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
      uint16_t slot_free[GROUP_SLOTS] = {0};
      for (uint32_t k = 0; k < e->ngrp; k++) {
          Group *g = &e->grp[k];
@@ -1437,7 +1449,7 @@ index cebfb7d..6bf4bd8 100644
          for (int s = 0; s < GROUP_SLOTS; s++)
              if (slot_free[s] <= g->first) {
                  g->slot = (uint8_t)s, g->live = 1;
-@@ -1996,13 +2076,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1996,13 +2085,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
  /* After the block: each live group's plain copy. Returns -1 if they do not fit. */
  static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_t ntrans) {
      e->nogroup = 1;
@@ -1465,7 +1477,7 @@ index cebfb7d..6bf4bd8 100644
              e->cur_pc = va + 4ull * i;
              e->cur_i = i;
              e->u_prev = e->u_live = 0;
-@@ -2017,8 +2111,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
+@@ -2017,8 +2120,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
  static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup);
  
  int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
@@ -1477,7 +1489,7 @@ index cebfb7d..6bf4bd8 100644
      if (hv_knob[HV_K_GROUPS] && translate_emit(m, b, code, avail, 0) == 0) return 0;
      return translate_emit(m, b, code, avail, 1);
  }
-@@ -2113,13 +2208,20 @@ static __thread struct {
+@@ -2113,13 +2217,20 @@ static __thread struct {
      HvMachine *m;
      uint64_t gen;
      uint32_t *hot, *cold;
@@ -1500,7 +1512,7 @@ index cebfb7d..6bf4bd8 100644
          if (want < (size_t)hot + cold) want = (size_t)hot + cold;
          uint32_t *p = hv_jit_reserve(&m->jit, want);
          if (!p && m->jit_tail_enabled && want > (size_t)hot + cold) {
-@@ -2131,6 +2233,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
+@@ -2131,6 +2242,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
          }
          if (!p) { chunk.hot = NULL; return -1; }
          chunk.m = m, chunk.gen = gen, chunk.hot = p, chunk.cold = p + ((want + 1) & ~(size_t)1);
@@ -5385,10 +5397,10 @@ index 0000000..a464f06
 +Safety decisions: persistent archive hints select candidate files; Metal itself validates the complete descriptor. They are not proof of exact PSO identity, so no unsafe direct pipeline-state reuse is added from those partial keys. Guest-visible CPUs remain static and user selectable; OS scheduling is not physical core pinning. No guest translation persistence across app/JIT launches is claimed.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
-index 0000000..c52c30c
+index 0000000..3a7bca5
 --- /dev/null
 +++ b/docs/m4-optimisation/PROGRESS.md
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,166 @@
 +# Current checkpoint
 +
 +- Reconstructed source inherited at wrapper commit 343d2d84, patch 9ee35476;
@@ -5535,6 +5547,26 @@ index 0000000..c52c30c
 +pairs stay plain. Added real emitted-word assertions and a longer interleaved
 +three-field benchmark; exact first-fault regression uses a separately warmed,
 +three-load group. Cloud timing/semantics must pass before the release gate.
++
++Foundational follow-through: memory barriers now end each reuse group but no
++longer prevent independent groups later in the same block. DMB/DSB/SB remain
++unchanged and CLREX/ISB keep their existing boundaries. Emitter regression covers
++two independent three-load groups around a DMB; fault test exercises the later
++group. USB report loss is a transient reconnect state; device remapping retries
++with5s backoff, while unsupported OS/permission failures remain explicit.
++
++User accepts changing the Retina working resolution for the reference layout.
++New M4/Duo machines and the explicit M4 Automatic preset now choose Desktop
++Retina1280 logical/2x. Existing machine choices stay intact until selected;
++Native Retina remains available. M4 rendering pixels4915200 vs5680128 (~13.5%
++fewer), a pixel-work comparison only; fractional panel scaling may soften slightly.
++
++Bounded diagnostics now skip busy lifecycle locks instead of synchronously
++waiting on the UI thread. Sampling uses the existing try-observation; resource
++and cache reads use try-locks. Capture enable/disable intent is atomic and
++reapplied at start/continue/pause, so a deferred stop cannot leave GPU/disk timing
++on after a lifecycle transition. Real native lifecycle test calls these APIs
++while holding the writer lock; no sleeps or ignored test failures.
 diff --git a/docs/m4-optimisation/SPEC.md b/docs/m4-optimisation/SPEC.md
 new file mode 100644
 index 0000000..87f0a22
@@ -8492,7 +8524,7 @@ index eeabe42..7035b1a 100644
            uint32_t seen = 0; uint64_t distinct = 0; (void)seen;
            uint64_t best[4] = {0}; uint32_t bestn[4] = {0};
 diff --git a/host/native_touch.c b/host/native_touch.c
-index 504e669..d1365fa 100644
+index 504e669..49faeb9 100644
 --- a/host/native_touch.c
 +++ b/host/native_touch.c
 @@ -1,4 +1,5 @@
@@ -8555,7 +8587,7 @@ index 504e669..d1365fa 100644
 +        int emitted=hv_touch_encoder_step(&encoder,queued?&queue[0]:NULL,t,&consumed,report);
 +        if(consumed){current=queue[0];memmove(queue,queue+1,(--queued)*sizeof(Frame));}
 +        if(emitted && (!usb.report || !usb.report(usb.context,report))) {
-+            enabled=0;reset_locked();status=HV_TOUCH_DEVICE;return 0;
++            enabled=0;reset_locked();status=HV_TOUCH_TIMEOUT;return 0;
 +        }
 +    }
 +    return cancel_pending?encoder.deadline:hv_touch_encoder_due(&encoder,queued!=0,t);
@@ -12745,14 +12777,19 @@ index cab1ccf..15ca8b3 100644
          if let code = letters[c] { press(code) }
          else if let lower = c.lowercased().first, let code = letters[lower] { press(code, shifted: true) }
 diff --git a/ios/Henge/Installer.swift b/ios/Henge/Installer.swift
-index 2103167..4dcdfc6 100644
+index 2103167..60958e0 100644
 --- a/ios/Henge/Installer.swift
 +++ b/ios/Henge/Installer.swift
-@@ -199,6 +199,7 @@ final class Installer: NSObject, ObservableObject {
+@@ -199,6 +199,12 @@ final class Installer: NSObject, ObservableObject {
          var mac = VirtualMac(name: name, ecid: ecid, seed: 0, ramMB: ramMB, diskBytes: 64 << 30)
          (mac.screenWidth, mac.screenHeight) = Device.fittingScreen
          mac.fitScreen = true
 +        M4Performance.applyRetinaDisplay(to: &mac)
++        if HengeLog.deviceModel == "iPhone19,4" {
++            let desktop = GuestScreenSize.desktopRetina(in: Device.displayViewport)
++            mac.desktopLayout = true; mac.retina = true; mac.fitScreen = false
++            (mac.screenWidth, mac.screenHeight) = (desktop.width, desktop.height)
++        }
          let fm = FileManager.default
          try fm.createDirectory(at: mac.directory, withIntermediateDirectories: true)
          Machines.excludeFromBackup(Machines.root)
@@ -14018,10 +14055,10 @@ index 1bc238f..ccdbb33 100644
  }
 diff --git a/ios/Henge/M4Performance.swift b/ios/Henge/M4Performance.swift
 new file mode 100644
-index 0000000..691168b
+index 0000000..5be105a
 --- /dev/null
 +++ b/ios/Henge/M4Performance.swift
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,35 @@
 +import Foundation
 +
 +/// Hardware selection is authoritative in the native topology detector. These
@@ -14037,10 +14074,11 @@ index 0000000..691168b
 +    /// Existing saved display choices are never migrated implicitly.
 +    static func applyRetinaDisplay(to mac: inout VirtualMac) {
 +        guard enabled else { return }
-+        mac.desktopLayout = false
++        mac.desktopLayout = true
 +        mac.retina = true
 +        mac.fitScreen = false
-+        (mac.screenWidth, mac.screenHeight) = Device.retinaScreen
++        let screen = GuestScreenSize.desktopRetina(in: Device.displayViewport)
++        (mac.screenWidth, mac.screenHeight) = (screen.width, screen.height)
 +    }
 +    /// Explicit preset only; opening/upgrading Henge never overwrites choices.
 +    /// Refresh and JIT reservation are independent user choices and stay intact.
@@ -14079,7 +14117,7 @@ index c0f52d6..0d81556 100644
                          .frame(maxWidth: .infinity, alignment: .leading)
                          .padding(.horizontal, 4).padding(.bottom, 12)
 diff --git a/ios/Henge/MacSettingsView.swift b/ios/Henge/MacSettingsView.swift
-index 800c854..4d7895f 100644
+index 800c854..f355e50 100644
 --- a/ios/Henge/MacSettingsView.swift
 +++ b/ios/Henge/MacSettingsView.swift
 @@ -5,8 +5,10 @@ struct MacSettingsView: View {
@@ -14098,7 +14136,7 @@ index 800c854..4d7895f 100644
                      DeskHeading("Performance")
                      VStack(alignment: .leading, spacing: 12) {
 -                        Button("Apply performance settings") {
-+                        Button(M4Performance.enabled ? "Apply M4 Automatic (Retina)" : "Apply performance settings") {
++                        Button(M4Performance.enabled ? "Apply M4 Automatic (Desktop Retina)" : "Apply performance settings") {
 +                            M4Performance.applyAutomaticDefaults()
                              cpus = 4
                              mac.ramMB = 8192
@@ -14118,7 +14156,7 @@ index 800c854..4d7895f 100644
                          .font(.system(size: 16, weight: .semibold))
 -                        Text("4 CPUs, 8 GB memory and a \(Device.performanceScreen.width) × \(Device.performanceScreen.height) screen. Reduces drawing work and leaves memory for iPadOS and graphics, with a softer image. Applies on the next Mac start. CPU selection applies to all Macs.")
 +                        Text(M4Performance.enabled
-+                             ? "4 CPUs, 8 GB guest memory, automatic scheduling and sleeping CPU waits. Restricted translation reuse is automatic; broad experiments and diagnostic counters stay off. Full native Retina, your refresh selection and code-cache choice are preserved. An optional henge-env.txt still overrides engine settings. Applies on the next Mac start."
++                             ? "4 CPUs, 8 GB guest memory, automatic scheduling and sleeping CPU waits. Restricted translation reuse is automatic; broad experiments and diagnostic counters stay off. Desktop Retina uses 1280 logical points with a 2× backing; Native Retina remains selectable. Your refresh selection and code-cache choice are preserved. An optional henge-env.txt still overrides engine settings. Applies on the next Mac start."
 +                             : "4 CPUs, 8 GB memory and a \(Device.performanceScreen.width) × \(Device.performanceScreen.height) screen. Reduces drawing work with a softer image. Applies on the next Mac start. CPU selection applies to all Macs.")
                              .font(.system(size: 13)).foregroundStyle(Desk.dim)
                      }
@@ -14289,7 +14327,7 @@ index 29c8b3b..45638a3 100644
          all.removeAll { $0.id == id }
          save()
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..37cc38c 100644
+index 34d6a98..1c9e3ed 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
 @@ -3,6 +3,7 @@
@@ -14300,7 +14338,7 @@ index 34d6a98..37cc38c 100644
  #include "fastmem.h"
  
  #include <os/proc.h>
-@@ -23,23 +24,55 @@
+@@ -23,23 +24,58 @@
  
  #include <fcntl.h>
  #include <unistd.h>
@@ -14312,12 +14350,15 @@ index 34d6a98..37cc38c 100644
  HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
  
  static _Atomic int state;
++static _Atomic int capture_requested;
++static void apply_capture_timing_locked(void);
 +typedef void (*StateNotify)(void);
 +static _Atomic(StateNotify) state_notify;
 +void henge_vm_set_state_notify(void (*notify)(void)) { atomic_store(&state_notify, notify); }
 +/* api_lock may be held: observers must only enqueue, never call VM APIs here. */
 +static void set_state(int next) {
 +    if (atomic_exchange(&state, next) == next) return;
++    if(next==1 || next==4)apply_capture_timing_locked();
 +    StateNotify notify = atomic_load(&state_notify);
 +    if (notify) notify();
 +}
@@ -14358,7 +14399,7 @@ index 34d6a98..37cc38c 100644
      exit_reason = reason;
      int halt = hv_vm_cpu(0)->halted;
      exit_outcome = HENGE_VM_OUTCOME_ERROR;
-@@ -49,13 +82,12 @@ static void on_exit(int reason) {
+@@ -49,13 +85,12 @@ static void on_exit(int reason) {
      case HV_HALT_HOST: exit_outcome = HENGE_VM_OUTCOME_HOST_STOP; break;
      case HV_HALT_PANIC: exit_outcome = HENGE_VM_OUTCOME_PANIC; break;
      }
@@ -14375,7 +14416,7 @@ index 34d6a98..37cc38c 100644
      fprintf(stderr, "henge: the machine stopped (%s, halt reason %d); CPU threads ended, disks flushed%s\n",
              exit_description(), halt, installer_session ? "" : ", machine released");
      pthread_rwlock_unlock(&api_lock);
-@@ -67,6 +99,11 @@ static int begin_start(char *err, size_t errlen) {
+@@ -67,6 +102,11 @@ static int begin_start(char *err, size_t errlen) {
          snprintf(err, errlen, "A Mac app ran in this launch. Quit Henge (swipe it away) and open it again to start a Mac.");
          return -1;
      }
@@ -14387,7 +14428,7 @@ index 34d6a98..37cc38c 100644
      pthread_rwlock_wrlock(&api_lock);
      if ((state != 0 && state != 2) || installer_session) {
          snprintf(err, errlen, "%s", installer_session
-@@ -75,26 +112,31 @@ static int begin_start(char *err, size_t errlen) {
+@@ -75,26 +115,31 @@ static int begin_start(char *err, size_t errlen) {
          pthread_rwlock_unlock(&api_lock);
          return -1;
      }
@@ -14424,7 +14465,7 @@ index 34d6a98..37cc38c 100644
      pthread_rwlock_unlock(&api_lock);
      return 0;
  }
-@@ -116,9 +158,25 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
+@@ -116,9 +161,25 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
      return hv_snapshot_check(path, ident, bytes, saved_at);
  }
  
@@ -14452,7 +14493,7 @@ index 34d6a98..37cc38c 100644
          snprintf(err, errlen, "No Mac is running.");
          return -1;
      }
-@@ -133,21 +191,73 @@ int henge_vm_pause(char *err, size_t errlen) {
+@@ -133,21 +194,73 @@ int henge_vm_pause(char *err, size_t errlen) {
          snprintf(err, errlen, "The Mac stopped by itself.");
          return -1;
      }
@@ -14532,7 +14573,7 @@ index 34d6a98..37cc38c 100644
      fprintf(stderr, "henge: %s\n", r ? err : "the paused Mac is saved");
      return r;
  }
-@@ -160,18 +270,39 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
+@@ -160,18 +273,39 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
  }
  
  int henge_vm_continue(void) {
@@ -14575,7 +14616,7 @@ index 34d6a98..37cc38c 100644
      }
      pthread_rwlock_unlock(&api_lock);
      fprintf(stderr, "henge: the Mac runs on%s\n", r ? " -- no, its CPU threads could not start" : "");
-@@ -192,17 +323,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
+@@ -192,17 +326,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
      fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
              jit->size >> 20);
      if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
@@ -14604,7 +14645,7 @@ index 34d6a98..37cc38c 100644
  }
  
  static volatile int install_step = -1;
-@@ -239,7 +378,7 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
+@@ -239,7 +381,7 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
          snprintf(err, errlen, "The installer could not start.");
          return failed_start();
      }
@@ -14613,7 +14654,7 @@ index 34d6a98..37cc38c 100644
  }
  
  int henge_install_step(void) { return install_step; }
-@@ -293,22 +432,29 @@ static int lock_running(void) {
+@@ -293,22 +435,29 @@ static int lock_running(void) {
      return 0;
  }
  void henge_vm_stop(void) {
@@ -14654,7 +14695,17 @@ index 34d6a98..37cc38c 100644
  }
  
  long henge_vm_balloon(long target_mb) {
-@@ -344,13 +490,13 @@ void henge_vm_log_cache(void) {
+@@ -336,7 +485,8 @@ int henge_vm_knob(const char *name, int value) {
+     return result;
+ }
+ void henge_vm_log_cache(void) {
+-    if (!lock_running()) return;
++    if (pthread_rwlock_tryrdlock(&api_lock)) return;
++    if(state!=1){pthread_rwlock_unlock(&api_lock);return;}
+     hv_fastmem_log(hv_vm_machine(), stderr);
+     hv_vm_log_ticker();
+     pthread_rwlock_unlock(&api_lock);
+@@ -344,13 +494,13 @@ void henge_vm_log_cache(void) {
  
  uint64_t henge_vm_blocks(void) {
      pthread_rwlock_rdlock(&api_lock);
@@ -14670,7 +14721,7 @@ index 34d6a98..37cc38c 100644
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
-@@ -375,9 +521,35 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
+@@ -375,9 +525,35 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
      if (hv_share_start(folder, socket_path, agent) == 0) hv_net_set_share_socket(socket_path);
  }
  void henge_share_set_clipboard(const char *text) { hv_share_set_clipboard(text); }
@@ -14706,7 +14757,7 @@ index 34d6a98..37cc38c 100644
  void henge_vm_set_display(uint32_t width, uint32_t height) { hv_pvg_lite_set_mode(width, height); }
  void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm) { hv_pvg_lite_set_size_mm(width_mm, height_mm); }
  int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,uint32_t height_mm,uint32_t hz) {
-@@ -388,6 +560,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
+@@ -388,6 +564,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
@@ -14733,7 +14784,7 @@ index 34d6a98..37cc38c 100644
  void henge_vm_link_connected(int connected) {
      if (!lock_running()) return;
      HvVmapple *b = hv_vm_board();
-@@ -454,13 +646,51 @@ void henge_vm_set_display_layer(void *layer) {
+@@ -454,13 +650,51 @@ void henge_vm_set_display_layer(void *layer) {
      hv_vm_set_display_layer(layer);
  }
  uint64_t henge_vm_gpu_frames(void) {
@@ -14788,18 +14839,24 @@ index 34d6a98..37cc38c 100644
      HvBootDisplay d;
      int result = -1;
      if (hv_vm_boot_display(&d) == 0) {
-@@ -509,3 +739,88 @@ uint64_t henge_largest_mapping_mb(void) {
+@@ -509,3 +743,97 @@ uint64_t henge_largest_mapping_mb(void) {
      }
      return 0;
  }
 +
++static void apply_capture_timing_locked(void) {
++    int enabled=atomic_load(&capture_requested);
++    HvVmapple *board=hv_vm_board();
++    (void)hv_pvg_lite_capture_timing(board->pvg,enabled,NULL);
++    hv_virtio_blk_capture_timing(board->root_blk,enabled);
++    hv_virtio_blk_capture_timing(board->aux_blk,enabled);
++}
 +void henge_vm_capture_timing(int enabled) {
-+    pthread_rwlock_rdlock(&api_lock);
-+    if (state==1 || state==4) {
-+        (void)hv_pvg_lite_capture_timing(hv_vm_board()->pvg,!!enabled,NULL);
-+        hv_virtio_blk_capture_timing(hv_vm_board()->root_blk,enabled);
-+        hv_virtio_blk_capture_timing(hv_vm_board()->aux_blk,enabled);
-+    }
++    atomic_store(&capture_requested,!!enabled);
++    // Capture controls are called on the UI thread. A lifecycle writer owns
++    // the resources until its state transition reapplies this requested value.
++    if(pthread_rwlock_tryrdlock(&api_lock))return;
++    if(state==1 || state==4)apply_capture_timing_locked();
 +    pthread_rwlock_unlock(&api_lock);
 +}
 +
@@ -14821,7 +14878,10 @@ index 34d6a98..37cc38c 100644
 +    out->headroom=os_proc_available_memory();
 +    out->available|=4;
 +#endif
-+    pthread_rwlock_rdlock(&api_lock);
++    if(pthread_rwlock_tryrdlock(&api_lock)) {
++        out->generation=atomic_load(&generation);out->state=-1;
++        return; // process-only data; caller rejects a mixed lifecycle sample
++    }
 +    out->generation=atomic_load(&generation);out->epoch=counter_epoch;out->state=state;
 +    if (state==1 || state==4) {
 +        out->available|=8;
@@ -15001,7 +15061,7 @@ index b8c41fa..281319b 100644
  void henge_vm_key_hid(uint8_t usage, int down); /* a hardware keyboard: iOS gives each key's HID usage */
  void henge_vm_mouse_move(int dx, int dy);
 diff --git a/ios/Henge/NativeTouchSession.swift b/ios/Henge/NativeTouchSession.swift
-index 25e7bad..246a6f8 100644
+index 25e7bad..1d63f5d 100644
 --- a/ios/Henge/NativeTouchSession.swift
 +++ b/ios/Henge/NativeTouchSession.swift
 @@ -15,6 +15,19 @@ final class NativeTouchSession {
@@ -15024,6 +15084,19 @@ index 25e7bad..246a6f8 100644
  
      init(defaults: UserDefaults = .standard,
           now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+@@ -54,9 +67,10 @@ final class NativeTouchSession {
+         }
+         status = hv_native_touch_status()
+         ready = status == 2
+-        // Only transport timeouts are transient. Permission and device errors
+-        // remain visible until the user changes the setup or reconnects.
++        // Transport timeouts and device/display reattachment are recoverable.
++        // Unsupported OS and permission failures remain explicit, without loops.
+         if status == 6 { retryAfter = now() + 2 }
++        if status == 5 { retryAfter = now() + 5 }
+     }
+ 
+     func stop() {
 diff --git a/ios/Henge/NativeTouchSurface.swift b/ios/Henge/NativeTouchSurface.swift
 index b89dc8a..76bba68 100644
 --- a/ios/Henge/NativeTouchSurface.swift
@@ -15552,10 +15625,10 @@ index 0000000..3bc275d
 +}
 diff --git a/ios/Henge/SessionDiagnosticCapture.swift b/ios/Henge/SessionDiagnosticCapture.swift
 new file mode 100644
-index 0000000..7aee05b
+index 0000000..36cc045
 --- /dev/null
 +++ b/ios/Henge/SessionDiagnosticCapture.swift
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,82 @@
 +import Foundation
 +import Combine
 +
@@ -15589,9 +15662,16 @@ index 0000000..7aee05b
 +        guard active else { return }
 +        let now = ProcessInfo.processInfo.systemUptime
 +        guard now >= (nextDeadline ?? now) else { return }
-+        var vm = HengeVmCounters(), resources = HengeVmResources()
++        var observation = HengeVmObservation()
++        guard henge_vm_try_observation(&observation) != 0 else {
++            previous=nil;nextDeadline=min(end,now+5)
++            if now>=end { stop() }
++            return
++        }
++        let vm = observation.counters
++        var resources = HengeVmResources()
 +        henge_vm_capture_timing(1) // also handles a newly created replay during this capture
-+        henge_vm_counters(&vm); henge_vm_resources(&resources)
++        henge_vm_resources(&resources)
 +        guard vm.generation==resources.generation, vm.epoch==resources.epoch, vm.state==resources.state else {
 +            previous = nil; nextDeadline = min(end,now+5)
 +            HengeLog.log("capture","Lifecycle changed during sample; mixed VM statistics discarded")
@@ -15708,7 +15788,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..ceb72fd 100644
+index f84465e..c5eafb8 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,17 @@ struct SessionView: View {
@@ -16132,7 +16212,7 @@ index f84465e..ceb72fd 100644
 -                    default: Text("Trackpad is active. Native touch connects after you close Details.")
 +                    case 3: Text("This guest needs macOS 27.2 or later. Turn Native touch off to use trackpad.")
 +                    case 4: Text("Update the guest sharing helper to use USB touch. Turn Native touch off to use trackpad.")
-+                    case 5: Text("The Mac could not connect its touchscreen. Update the helper and try again. Turn Native touch off to use trackpad.")
++                    case 5: Text("The Mac could not connect its touchscreen. Reconnecting with a short backoff. Update the helper if this continues; turn Native touch off to use trackpad.")
 +                    case 6: Text("The touch helper did not respond. Reconnecting automatically; touchscreen stays selected.")
 +                    case 1: Text("Waiting for the updated guest sharing helper. Connecting without restarting the Mac.")
 +                    default: Text("Native touch off uses the trackpad. When selected, waiting for the guest helper.")
@@ -20429,7 +20509,7 @@ index 0000000..624db4e
 +}
 diff --git a/tests/test_m4_defaults.swift b/tests/test_m4_defaults.swift
 new file mode 100644
-index 0000000..37476d7
+index 0000000..669e95b
 --- /dev/null
 +++ b/tests/test_m4_defaults.swift
 @@ -0,0 +1,42 @@
@@ -20441,7 +20521,7 @@ index 0000000..37476d7
 +    var retina: Bool? = false, fitScreen: Bool? = true, desktopLayout: Bool? = false
 +    var screenWidth: Int? = 1920, screenHeight: Int? = 1080
 +}
-+enum Device { static let retinaScreen = (width: 2752, height: 2064) }
++enum Device { static let retinaScreen = (width: 2752, height: 2064); static let displayViewport = CGSize(width:1376,height:1032) }
 +@main struct Check {
 +    static func main() {
 +        let d = UserDefaults.standard
@@ -20471,7 +20551,7 @@ index 0000000..37476d7
 +        precondition(mac.retina == false && mac.screenWidth == 1920)
 +        fixtureM4=1;M4Performance.applyRetinaDisplay(to: &mac)
 +        precondition(mac.retina == true && mac.fitScreen == false)
-+        precondition(mac.screenWidth == 2752 && mac.screenHeight == 2064)
++        precondition(mac.desktopLayout == true && mac.screenWidth == 2560 && mac.screenHeight == 1920)
 +        print("M4 defaults: explicit selection, non-M4 exclusion, Retina-independent refresh/JIT preservation passed")
 +    }
 +}
@@ -20777,21 +20857,21 @@ index 0000000..a0458d7
 +}
 diff --git a/tests/test_native_touch_host.c b/tests/test_native_touch_host.c
 new file mode 100644
-index 0000000..77c6c89
+index 0000000..81c30b7
 --- /dev/null
 +++ b/tests/test_native_touch_host.c
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,52 @@
 +#include "native_touch.h"
 +#include <assert.h>
 +#include <stdint.h>
 +#include <stdio.h>
 +#include <string.h>
 +#include <time.h>
-+typedef struct { int connected,reports,mapped;uint8_t last[32]; } USB;
++typedef struct { int connected,reports,mapped,fail_report;uint8_t last[32]; } USB;
 +static int connect_usb(void *c,int v){((USB*)c)->connected=v;return 1;}
 +static int connected(void *c){return ((USB*)c)->connected;}
 +static int mapped(void *c){((USB*)c)->mapped++;return 1;}
-+static int report(void *c,const uint8_t *v){USB *u=c;assert(u->connected);u->reports++;memcpy(u->last,v,32);return 1;}
++static int report(void *c,const uint8_t *v){USB *u=c;assert(u->connected);if(u->fail_report)return 0;u->reports++;memcpy(u->last,v,32);return 1;}
 +static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
 +int main(void){
 +    USB u={0};HvNativeTouchUSB usb={.context=&u,.connect=connect_usb,.connected=connected,.report=report,.mapped=mapped};
@@ -20826,6 +20906,9 @@ index 0000000..77c6c89
 +    double recovery=now();
 +    while(u.last[31]&&now()-recovery<.5)assert(hv_native_touch_next(json,sizeof json));
 +    assert(!u.last[31]&&hv_native_touch_epoch()==e);
++    u.fail_report=1;
++    assert(hv_native_touch_submit(e,&id,&x,&y,1));
++    assert(hv_native_touch_status()==HV_TOUCH_TIMEOUT && hv_native_touch_epoch()!=e && !u.connected);
 +    hv_native_touch_enable(0);assert(!u.connected);assert(!hv_native_touch_usb_report(e,u.last));
 +    hv_native_touch_set_usb(NULL);
 +    puts("PASS host USB touch: direct delivery, stale-report rejection, non-disconnecting handoff, neutral drain and idle suppression");
@@ -20856,13 +20939,25 @@ index 0000000..2c357bc
 +            with self.assertRaises(ValueError):packaging.validate_members([member])
 +if __name__=='__main__':unittest.main()
 diff --git a/tests/test_native_touch_session.swift b/tests/test_native_touch_session.swift
-index 5249aa5..acbc9c9 100644
+index 5249aa5..e92f181 100644
 --- a/tests/test_native_touch_session.swift
 +++ b/tests/test_native_touch_session.swift
-@@ -64,6 +64,15 @@ import Foundation
+@@ -64,6 +64,27 @@ import Foundation
          session.stop()
          precondition(!session.ready && hv_native_touch_status() == 0)
          precondition(NativeTouchSession(defaults: defaults).requested, "Stopping must preserve the choice")
++        session.poll(active: true, helperRunning: true)
++        hv_native_touch_report(hv_native_touch_epoch(), 5)
++        session.poll(active: true, helperRunning: true)
++        let failedDevice = hv_native_touch_epoch()
++        time += 4.9
++        session.poll(active: true, helperRunning: true)
++        precondition(hv_native_touch_epoch() == failedDevice, "Device errors need a backoff")
++        time += 0.2
++        session.poll(active: true, helperRunning: true)
++        precondition(hv_native_touch_epoch() != failedDevice && session.status == 1,
++                     "Reattaching a USB display must recover without changing the setting")
++        session.stop()
 +        let older = session.beginPolling()
 +        let newer = session.beginPolling()
 +        session.poll(active: true, helperRunning: true)
@@ -21644,10 +21739,10 @@ index 0000000..e46fae6
 +} }
 diff --git a/tests/test_register_groups.c b/tests/test_register_groups.c
 new file mode 100644
-index 0000000..ee48d95
+index 0000000..ec38398
 --- /dev/null
 +++ b/tests/test_register_groups.c
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,29 @@
 +#include "translate.h"
 +#include <assert.h>
 +#include <stdio.h>
@@ -21671,6 +21766,9 @@ index 0000000..ee48d95
 +    assert(hot(0,clobber,6)==hot(2,clobber,6));
 +    assert(hot(2,stream+1,4)+6<hot(0,stream+1,4)); /* three-field objects also reuse the translation */
 +    assert(hot(0,stream+2,3)==hot(2,stream+2,3)); /* two accesses stay plain */
++    const uint32_t barrier[]={0xf9400001,0xf9400402,0xf9400803,0xd5033bbf,
++                              0xf9400001,0xf9400402,0xf9400803,0xd65f03c0};
++    assert(hot(2,barrier,8)+12<hot(0,barrier,8)); /* independent groups on both sides of DMB */
 +    hv_machine_free(&machine);
 +    puts("PASS register groups: real inline-path reduction; scratch clobber and short groups retain reference emission");
 +}
@@ -22575,7 +22673,7 @@ index 0000000..f2c797b
 +    return 0;
 +}
 diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
-index a13a70d..6cd37c1 100644
+index a13a70d..cf5c637 100644
 --- a/tests/test_vm_lifecycle.c
 +++ b/tests/test_vm_lifecycle.c
 @@ -3,6 +3,9 @@
@@ -22724,7 +22822,7 @@ index a13a70d..6cd37c1 100644
          henge_vm_balloon(-1);
          henge_vm_set_display_layer(NULL);
          if (!henge_vm_boot_display(&pixels, &width, &height, &stride)) henge_vm_free_display(pixels);
-@@ -76,8 +180,22 @@ static void *read_ui(void *unused) {
+@@ -76,8 +180,26 @@ static void *read_ui(void *unused) {
      }
      return NULL;
  }
@@ -22742,13 +22840,17 @@ index a13a70d..6cd37c1 100644
 +    const uint8_t *boot_pixels=NULL;int boot_w=0,boot_h=0,boot_stride=0;
 +    check("firmware display never waits for lifecycle writer",henge_vm_boot_display(&boot_pixels,&boot_w,&boot_h,&boot_stride)==-1);
 +    henge_vm_trim_memory(); /* memory warnings also cannot block on the writer */
++    HengeVmResources busy_resources;
++    henge_vm_capture_timing(1);henge_vm_capture_timing(0);
++    henge_vm_resources(&busy_resources);henge_vm_log_cache();
++    check("diagnostics never wait for lifecycle writer",busy_resources.state==-1 && !(busy_resources.available&8));
 +    henge_vm_test_write_lock(0);
 +    check("observation resumes after lifecycle ownership",henge_vm_try_observation(&observation)==1 && observation.counters.state==0);
 +
      char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
      if (!mkdtemp(dir) || hv_jit_region_open(&jit, 8 << 20)) return 1;
      snprintf(rom, sizeof rom, "%s/rom", dir);
-@@ -91,6 +209,10 @@ int main(void) {
+@@ -91,6 +213,10 @@ int main(void) {
      write_file(aux, NULL, 1 << 20);
      mapping = (HengeDualMapping){.rx_addr = (uint8_t *)jit.base,
          .rw_addr = (uint8_t *)jit.base + jit.rw_diff, .size = jit.capacity * 4};
@@ -22759,7 +22861,7 @@ index a13a70d..6cd37c1 100644
      pthread_t reader;
      if (pthread_create(&reader, NULL, read_ui, NULL)) return 1;
      /* Warm the process-wide pointer queue before counting worker threads. */
-@@ -102,6 +224,7 @@ int main(void) {
+@@ -102,6 +228,7 @@ int main(void) {
      /* Missing ROM fails after disks, RAM and device workers were created. */
      for (int i = 0; i < 3; i++) {
          check("failed boot reports an error", henge_vm_boot(rom, disk, aux, 1, 0, 64, 4, error, sizeof error) != 0);
@@ -22767,7 +22869,7 @@ index a13a70d..6cd37c1 100644
          check("failed boot allows retry", henge_vm_state() == 0 && henge_vm_can_start());
          check("failed boot closes files", fds() == initial_fds);
          check("failed boot joins workers", threads() == initial_threads);
-@@ -150,9 +273,35 @@ int main(void) {
+@@ -150,9 +277,35 @@ int main(void) {
          write_file(rom, code, sizeof code);
          int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
          check("resume test boots", rc == 0);
@@ -22803,7 +22905,7 @@ index a13a70d..6cd37c1 100644
          rc = henge_vm_suspend(snap, "test", error, sizeof error);
          if (rc) fprintf(stderr, "suspend: %s\n", error);
          check("suspend saves", rc == 0 && henge_vm_state() == 4 && access(snap, F_OK) == 0);
-@@ -160,35 +309,98 @@ int main(void) {
+@@ -160,35 +313,98 @@ int main(void) {
              fprintf(stderr, "Suspend failed: refusing to inspect potentially released guest RAM\n");
              return 1;
          }
@@ -22912,7 +23014,7 @@ index a13a70d..6cd37c1 100644
          count = (volatile uint64_t *)hv_vm_board()->ram;
          check("resumed: the counter is where it was", *count >= c2);
          for (int n = 0; n < 1000 && *count == c2; n++) usleep(1000);
-@@ -209,6 +421,97 @@ int main(void) {
+@@ -209,6 +425,97 @@ int main(void) {
          check("a changed disk refuses the saved Mac", rc != 0 && strstr(error, "disk has changed") != NULL);
          check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
          unlink(snap);
@@ -23154,7 +23256,7 @@ index 70d7ccb..e4f9089 100755
 +test -s "$BUILD/libhengerestore.a"
  ls -la "$BUILD/libhengerestore.a"
 diff --git a/tools/check_host_scheduling.sh b/tools/check_host_scheduling.sh
-index 509bce1..2febc7d 100755
+index 509bce1..157ba1a 100755
 --- a/tools/check_host_scheduling.sh
 +++ b/tools/check_host_scheduling.sh
 @@ -2,6 +2,22 @@
@@ -23196,7 +23298,7 @@ index 509bce1..2febc7d 100755
  "$task_out/test_session_statistics"
 +swiftc -parse-as-library -swift-version 5 -sanitize=address ios/Henge/SessionWakeups.swift tests/test_session_wakeups.swift -o "$task_out/test_session_wakeups"
 +"$task_out/test_session_wakeups"
-+swiftc -parse-as-library -swift-version 5 ios/Henge/EngineTuning.swift ios/Henge/M4Performance.swift tests/test_m4_defaults.swift -o "$task_out/test_m4_defaults"
++swiftc -parse-as-library -swift-version 5 ios/Henge/EngineTuning.swift ios/Henge/GuestScreenSize.swift ios/Henge/M4Performance.swift tests/test_m4_defaults.swift -o "$task_out/test_m4_defaults"
 +"$task_out/test_m4_defaults"
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -DHV_PROF_TEST -Icore -Ihost -Idevices \
      host/prof_ios.c host/scheduling.c tests/test_prof_ios.c -o "$task_out/test_prof_ios"
