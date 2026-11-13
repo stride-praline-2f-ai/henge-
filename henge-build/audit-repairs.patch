@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 81b0736..0645b69 100644
+index 81b0736..84f6938 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -5,14 +5,14 @@ B = build
@@ -113,7 +113,7 @@ index 81b0736..0645b69 100644
  # Session-owned display routing, independent of JIT, Metal and a connected monitor.
  $(B)/test_display_targets: ios/Henge/DisplayTargetSelection.swift tests/test_display_targets.swift | $(B)
  	xcrun --sdk macosx swiftc $^ -o $@
-@@ -316,5 +345,27 @@ $(B)/test_cpu_sync: tests/test_cpu_sync.c $(ENGINE)
+@@ -316,5 +345,30 @@ $(B)/test_cpu_sync: tests/test_cpu_sync.c $(ENGINE)
  $(B)/test_timer_dispatch: tests/test_timer_dispatch.c $(ENGINE)
  	$(CC) $(CFLAGS) $< $(ENGINE) -o $@
  
@@ -141,6 +141,9 @@ index 81b0736..0645b69 100644
 +	$(CC) $(CFLAGS) -D_DARWIN_C_SOURCE -pthread $< $(ENGINE) -o $@
 +$(B)/test_pvg_linear_bounds: tests/test_pvg_linear_bounds.c devices/pvg_linear_bounds.h | $(B)
 +	$(CC) $(CFLAGS) -O1 -fsanitize=address,undefined $< -o $@
++
++$(B)/test_snapshot_pack: tests/test_snapshot_pack.c host/snapshot.c host/snapshot.h | $(B)
++	$(CC) $(CFLAGS) -fblocks -ffunction-sections -fdata-sections -O1 -fsanitize=address,undefined tests/test_snapshot_pack.c -lcompression -Wl,-dead_strip -o $@
 diff --git a/core/dispatch.c b/core/dispatch.c
 index 12bd4a9..d8030ad 100644
 --- a/core/dispatch.c
@@ -8497,26 +8500,60 @@ index 083d66e..d51f8b2 100644
  
  typedef struct {
 diff --git a/host/share.c b/host/share.c
-index 9c7244a..492ecc5 100644
+index 9c7244a..fd5395a 100644
 --- a/host/share.c
 +++ b/host/share.c
-@@ -47,6 +47,15 @@ static char *device_clip; /* the device's, for the guest */
- static unsigned long device_seq;
+@@ -44,17 +44,44 @@ static char agent_path[PATH_MAX];
+ static pthread_mutex_t clip_mu = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t clip_cond = PTHREAD_COND_INITIALIZER;
+ static char *device_clip; /* the device's, for the guest */
+-static unsigned long device_seq;
++static unsigned long device_seq, delivered_seq;
++static int agent_ack;
  static char *guest_clip; /* the guest's, until the device takes it */
  static time_t agent_seen;
 +static void (*clipboard_notify)(void);
-+
+ 
+-void hv_share_set_clipboard(const char *text) {
 +void hv_share_set_clipboard_notify(void (*notify)(void)) {
-+    pthread_mutex_lock(&clip_mu);
+     pthread_mutex_lock(&clip_mu);
+-    free(device_clip);
+-    device_clip = strdup(text);
+-    device_seq++;
 +    clipboard_notify = notify;
 +    int pending = guest_clip != NULL;
 +    pthread_mutex_unlock(&clip_mu);
 +    if (notify && pending) notify();
 +}
++
++unsigned long hv_share_publish_clipboard(const char *text) {
++    if (!text || strlen(text) > SMALL_BODY_MAX) return 0;
++    char *copy = strdup(text);
++    if (!copy) return 0;
++    pthread_mutex_lock(&clip_mu);
++    free(device_clip); device_clip = copy;
++    if (!++device_seq) ++device_seq;
++    unsigned long seq = device_seq;
+     pthread_cond_broadcast(&clip_cond);
+     pthread_mutex_unlock(&clip_mu);
++    return seq;
++}
++void hv_share_set_clipboard(const char *text) { (void)hv_share_publish_clipboard(text); }
++int hv_share_clipboard_ready(void) {
++    pthread_mutex_lock(&clip_mu);
++    int ready = agent_ack && agent_seen && time(NULL) - agent_seen < 40;
++    pthread_mutex_unlock(&clip_mu);
++    return ready;
++}
++int hv_share_clipboard_delivered(unsigned long seq) {
++    pthread_mutex_lock(&clip_mu);
++    int delivered = seq && seq == device_seq && seq == delivered_seq;
++    pthread_mutex_unlock(&clip_mu);
++    return delivered;
+ }
  
- void hv_share_set_clipboard(const char *text) {
-     pthread_mutex_lock(&clip_mu);
-@@ -590,13 +599,26 @@ static const char install_script[] =
+ char *hv_share_take_clipboard(void) {
+@@ -590,13 +617,26 @@ static const char install_script[] =
      "launchctl bootout \"gui/$(id -u)/com.henge.agent\" 2>/dev/null\n"
      "curl -fsS http://" HV_SHARE_ADDR "/.henge/agent | gunzip > \"$D/henge-agent\" || { echo 'Could not reach Henge.'; exit 1; }\n"
      "chmod 755 \"$D/henge-agent\"\n"
@@ -8545,7 +8582,7 @@ index 9c7244a..492ecc5 100644
      "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n"
      "<key>LimitLoadToSessionType</key><string>Aqua</string>\n"
      "<key>ProcessType</key><string>Background</string>\n"
-@@ -612,7 +634,7 @@ static int serve_agent(Conn *c, Request *r, int touch) {
+@@ -612,7 +652,7 @@ static int serve_agent(Conn *c, Request *r, int touch) {
      if (touch) {
          char *slash = strrchr(path, '/');
          if (!slash || (size_t)(slash-path)+32 >= sizeof path) return respond_empty(c, r, 404, "Not Found");
@@ -8554,13 +8591,50 @@ index 9c7244a..492ecc5 100644
      }
      int fd = path[0] ? open(path, O_RDONLY) : -1;
      struct stat st;
-@@ -662,18 +684,55 @@ static int clipboard_put(Conn *c, Request *r) {
+@@ -642,10 +682,17 @@ static int clipboard_get(Conn *c, Request *r) {
+     until.tv_nsec = now.tv_usec * 1000;
+     pthread_mutex_lock(&clip_mu);
+     agent_seen = time(NULL);
+-    while (device_seq <= since && pthread_cond_timedwait(&clip_cond, &clip_mu, &until) != ETIMEDOUT) {}
++    int initial = strstr(r->query, "initial=1") != NULL;
++    agent_ack = !initial && strstr(r->query, "ack=1") != NULL;
++    if (!initial) {
++        while (device_seq <= since) {
++            int rc = pthread_cond_timedwait(&clip_cond, &clip_mu, &until);
++            if (rc) break; /* no busy loop if a wait fails */
++        }
++    }
+     agent_seen = time(NULL);
+     unsigned long seq = device_seq;
+-    char *text = seq > since && device_clip ? strdup(device_clip) : NULL;
++    char *text = !initial && seq > since && device_clip ? strdup(device_clip) : NULL;
+     pthread_mutex_unlock(&clip_mu);
+     char headers[64];
+     snprintf(headers, sizeof headers, "X-Henge-Seq: %lu\r\n", seq);
+@@ -662,18 +709,72 @@ static int clipboard_put(Conn *c, Request *r) {
      free(guest_clip);
      guest_clip = text;
      agent_seen = time(NULL);
 +    void (*notify)(void) = clipboard_notify;
-     pthread_mutex_unlock(&clip_mu);
++    pthread_mutex_unlock(&clip_mu);
 +    if (notify) notify();
++    return respond_empty(c, r, 204, "No Content");
++}
++
++/* Acknowledged only after the companion installs the text on NSPasteboard. */
++static int clipboard_ack(Conn *c, Request *r) {
++    size_t len = 0;
++    char *body = body_small(c, r, &len), *end = NULL;
++    if (!body) return -1;
++    errno = 0;
++    unsigned long seq = strtoul(body, &end, 10);
++    int valid = len > 0 && len < 32 && body[0] >= '0' && body[0] <= '9' && !errno && end == body + len && seq;
++    free(body);
++    if (!valid) return respond_empty(c, r, 400, "Bad Request");
++    pthread_mutex_lock(&clip_mu);
++    if (seq == device_seq) delivered_seq = seq;
++    agent_seen = time(NULL);
+     pthread_mutex_unlock(&clip_mu);
      return respond_empty(c, r, 204, "No Content");
  }
  
@@ -8610,12 +8684,25 @@ index 9c7244a..492ecc5 100644
      if (!strcmp(what, "native-touch") && !strcmp(r->method, "GET")) {
          if (body_discard(c, r) != 0) return -1;
          char json[1024]; size_t n = hv_native_touch_next(json, sizeof json);
+@@ -691,6 +792,7 @@ static int serve_henge(Conn *c, Request *r) {
+         hv_native_touch_report(generation, state);
+         return respond_empty(c, r, 204, "No Content");
+     }
++    if (!strcmp(what, "clipboard-ack") && !strcmp(r->method, "POST")) return clipboard_ack(c, r);
+     if (!strcmp(what, "clipboard") && !strcmp(r->method, "GET")) return clipboard_get(c, r);
+     if (!strcmp(what, "clipboard") && !strcmp(r->method, "PUT")) return clipboard_put(c, r);
+     if (body_discard(c, r) != 0) return -1;
 diff --git a/host/share.h b/host/share.h
-index 37b2313..b767e3b 100644
+index 37b2313..0036e5b 100644
 --- a/host/share.h
 +++ b/host/share.h
-@@ -13,6 +13,10 @@ int hv_share_start(const char *folder, const char *socket_path, const char *agen
+@@ -11,8 +11,15 @@ int hv_share_start(const char *folder, const char *socket_path, const char *agen
+ 
+ /* The device's clipboard, for the guest to pick up. */
  void hv_share_set_clipboard(const char *text);
++unsigned long hv_share_publish_clipboard(const char *text);
++int hv_share_clipboard_ready(void);
++int hv_share_clipboard_delivered(unsigned long seq);
  /* What the guest last copied, once: a malloc'd string, or NULL if nothing is new. */
  char *hv_share_take_clipboard(void);
 +/* Called after a guest update, outside the clipboard lock, on the server thread.
@@ -8626,7 +8713,7 @@ index 37b2313..b767e3b 100644
  long hv_share_agent_seen(void);
  
 diff --git a/host/snapshot.c b/host/snapshot.c
-index 383ae01..5541ce9 100644
+index 383ae01..470ae8c 100644
 --- a/host/snapshot.c
 +++ b/host/snapshot.c
 @@ -27,11 +27,26 @@
@@ -8747,7 +8834,15 @@ index 383ae01..5541ce9 100644
  }
  
  #define R_RANGE(r, tag, p, from, to) r_section(r, tag, (uint8_t *)(p) + offsetof(__typeof__(*(p)), from), \
-@@ -271,8 +308,15 @@ static void slots_free(Slot *s, int n) {
+@@ -251,6 +288,7 @@ typedef struct Slot {
+     ChunkHdr h;
+     uint8_t *stage; /* the chunk's stored pages, one after another */
+     uint8_t *out;   /* compressed */
++    const uint8_t *raw_source; /* immutable paused guest RAM when the whole chunk is dense */
+     void *scratch;
+ } Slot;
+ 
+@@ -271,11 +309,19 @@ static void slots_free(Slot *s, int n) {
      for (int i = 0; i < n; i++) free(s[i].stage), free(s[i].out), free(s[i].scratch);
  }
  
@@ -8764,7 +8859,11 @@ index 383ae01..5541ce9 100644
      uint64_t from = (uint64_t)index * CHUNK_BYTES;
      uint32_t pages = (uint32_t)((size - from < CHUNK_BYTES ? size - from : CHUNK_BYTES) / PAGE);
      memset(&s->h, 0, sizeof s->h);
-@@ -284,6 +328,7 @@ static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t ind
++    s->raw_source = s->stage;
+     s->h.index = index;
+     size_t host_page = (size_t)getpagesize();
+     size_t vec_n = (size_t)(pages * PAGE + host_page - 1) / host_page;
+@@ -284,6 +330,7 @@ static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t ind
         then looks the same while it holds data: file-backed RAM is read whole. */
      int have_vec = use_mincore && mincore((void *)(base + from), (size_t)pages * PAGE, vec) == 0;
      for (uint32_t i = 0; i < pages; i++) {
@@ -8772,21 +8871,37 @@ index 383ae01..5541ce9 100644
          const uint8_t *pg = base + from + (uint64_t)i * PAGE;
          if (have_vec) {
              int touched = 0;
-@@ -298,10 +343,12 @@ static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t ind
+@@ -293,15 +340,26 @@ static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t ind
+             if (!touched) continue;
+         }
+         if (page_zero(pg)) continue;
+-        memcpy(s->stage + (uint64_t)s->h.stored * PAGE, pg, PAGE);
+         s->h.bitmap[i / 8] |= (uint8_t)(1u << (i % 8));
          s->h.stored++;
      }
      size_t raw = (size_t)s->h.stored * PAGE;
 -    if (!raw) return;
+-    size_t got = compression_encode_buffer(s->out, CHUNK_BYTES, s->stage, raw, s->scratch, COMPRESSION_LZ4);
 +    if (cancelled(control)) return;
 +    if (!raw) { s->h.checksum = chunk_checksum(&s->h, s->stage, 0); return; }
-     size_t got = compression_encode_buffer(s->out, CHUNK_BYTES, s->stage, raw, s->scratch, COMPRESSION_LZ4);
++    /* Dense chunks already have exactly the serialized page order. CPUs and
++       DMA are quiesced for the whole save, so borrow this immutable RAM until
++       the writer completes instead of copying another4MB through a stage. */
++    if (s->h.stored == pages) s->raw_source = base + from;
++    else {
++        unsigned k = 0;
++        for (unsigned i = 0; i < pages; i++)
++            if (s->h.bitmap[i / 8] & (1u << (i % 8)))
++                memcpy(s->stage + (uint64_t)k++ * PAGE, base + from + (uint64_t)i * PAGE, PAGE);
++    }
++    size_t got = compression_encode_buffer(s->out, CHUNK_BYTES, s->raw_source, raw, s->scratch, COMPRESSION_LZ4);
      if (got && got < raw) s->h.bytes = (uint32_t)got;
      else s->h.raw = 1, s->h.bytes = (uint32_t)raw;
-+    s->h.checksum = chunk_checksum(&s->h, s->stage, raw);
++    s->h.checksum = chunk_checksum(&s->h, s->raw_source, raw);
  }
  
  static double pack_secs, write_secs, wait_secs; /* for the log: compressing, writing, and waiting for a batch to be compressed */
-@@ -314,17 +361,20 @@ static double mono(void) {
+@@ -314,16 +372,24 @@ static double mono(void) {
  
  /* Chunks are compressed a batch at a time on every core, the next batch while the last one is written. */
  static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
@@ -8802,16 +8917,21 @@ index 383ae01..5541ce9 100644
      Slot set[2][BATCH];
      memset(set, 0, sizeof set);
 -    if (slots_alloc(set[0], BATCH) || slots_alloc(set[1], BATCH)) {
-+    if (slots_alloc(set[0], batch) || slots_alloc(set[1], batch)) {
-         slots_free(set[0], BATCH), slots_free(set[1], BATCH);
-         return w->err = ENOMEM, -1;
+-        slots_free(set[0], BATCH), slots_free(set[1], BATCH);
+-        return w->err = ENOMEM, -1;
++    while (slots_alloc(set[0], batch) || slots_alloc(set[1], batch)) {
++        slots_free(set[0], BATCH); slots_free(set[1], BATCH);
++        memset(set, 0, sizeof set);
++        if (batch == 1) return w->err = ENOMEM, -1;
++        batch = batch > 2 ? batch / 2 : 1;
      }
--    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
-+    dispatch_queue_t q = dispatch_get_global_queue(control && control->background ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INITIATED, 0);
++    /* A bounded, explicitly enabled automatic save must finish before iOS
++       expires its assertion. It is user-requested work, not deferrable upkeep.
++       Guest CPUs remain paused; this does not change their scheduling policy. */
+     dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
      dispatch_group_t packing = dispatch_group_create();
      const uint8_t *base = ram->host;
-     uint64_t size = ram->size;
-@@ -332,24 +382,26 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
+@@ -332,24 +398,26 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
      void (^pack)(Slot *, uint32_t, uint32_t) = ^(Slot *sl, uint32_t first, uint32_t n) {
          dispatch_group_async(packing, q, ^{
              double t0 = mono();
@@ -8844,15 +8964,19 @@ index 383ae01..5541ce9 100644
          uint64_t at[BATCH], pos = w->total;
          for (uint32_t k = 0; k < n; k++) {
              at[k] = pos;
-@@ -363,6 +415,7 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
-             struct iovec v[2] = {{&sl[k].h, sizeof sl[k].h}, {sl[k].h.raw ? sl[k].stage : sl[k].out, sl[k].h.bytes}};
+@@ -360,9 +428,10 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
+         int fd = w->fd;
+         const uint64_t *atp = at;
+         dispatch_apply(n, q, ^(size_t k) {
+-            struct iovec v[2] = {{&sl[k].h, sizeof sl[k].h}, {sl[k].h.raw ? sl[k].stage : sl[k].out, sl[k].h.bytes}};
++            struct iovec v[2] = {{&sl[k].h, sizeof sl[k].h}, {sl[k].h.raw ? (void *)sl[k].raw_source : sl[k].out, sl[k].h.bytes}};
              size_t want = v[0].iov_len + v[1].iov_len, done = 0;
              while (done < want) {
 +                if (cancelled(control)) { failed = ECANCELED; return; }
                  ssize_t got = pwritev(fd, v, v[1].iov_len ? 2 : 1, (off_t)(atp[k] + done));
                  if (got < 0 && errno == EINTR) continue;
                  if (got <= 0) {
-@@ -381,10 +434,16 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
+@@ -381,10 +450,16 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
          if (lseek(fd, (off_t)pos, SEEK_SET) != (off_t)pos && !w->err) w->err = errno;
          write_secs += mono() - t1;
          wait_secs += t1 - t0;
@@ -8869,7 +8993,7 @@ index 383ae01..5541ce9 100644
      return w->err ? -1 : 0;
  }
  
-@@ -392,12 +451,19 @@ static int chunk_unpack(Slot *s, uint8_t *base, uint64_t size) {
+@@ -392,12 +467,19 @@ static int chunk_unpack(Slot *s, uint8_t *base, uint64_t size) {
      uint64_t from = (uint64_t)s->h.index * CHUNK_BYTES;
      if (from >= size) return -1;
      uint32_t pages = (uint32_t)((size - from < CHUNK_BYTES ? size - from : CHUNK_BYTES) / PAGE);
@@ -8889,7 +9013,7 @@ index 383ae01..5541ce9 100644
      uint32_t k = 0;
      for (uint32_t i = 0; i < pages && k < s->h.stored; i++)
          if (s->h.bitmap[i / 8] & (1u << (i % 8))) memcpy(base + from + (uint64_t)i * PAGE, src + (uint64_t)k++ * PAGE, PAGE);
-@@ -442,7 +508,7 @@ static int load_ram(R *r, HvRam *ram) {
+@@ -442,7 +524,7 @@ static int load_ram(R *r, HvRam *ram) {
          dispatch_group_async(unpacking, q, ^{
              double t1 = mono();
              dispatch_apply(n, q, ^(size_t k) {
@@ -8898,7 +9022,7 @@ index 383ae01..5541ce9 100644
              });
              unpacked += mono() - t1;
          });
-@@ -529,12 +595,16 @@ static void save_devices(W *w, HvVmapple *b) {
+@@ -529,12 +611,16 @@ static void save_devices(W *w, HvVmapple *b) {
      }
      size_t pn = hv_pvg_lite_state(b->pvg, NULL, 0);
      uint8_t *pb = malloc(pn);
@@ -8916,7 +9040,7 @@ index 383ae01..5541ce9 100644
      w_section(w, TAG('P', 'V', 'G', 'D'), db, db ? dn : 0);
      free(db);
  }
-@@ -577,6 +647,13 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
+@@ -577,6 +663,13 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
              r_section(r, XHCI, (uint8_t *)x + offsetof(HvXhci, usbcmd), offsetof(HvXhci, mu) - offsetof(HvXhci, usbcmd)) ||
              r_section(r, XHCI, (uint8_t *)x + offsetof(HvXhci, reports), sizeof(HvXhci) - offsetof(HvXhci, reports)))
              return -1;
@@ -8930,7 +9054,7 @@ index 383ae01..5541ce9 100644
      }
      void *blob;
      uint64_t len;
-@@ -592,12 +669,22 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
+@@ -592,12 +685,22 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
  /* ---- the file ---- */
  
  int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errlen) {
@@ -8954,7 +9078,7 @@ index 383ae01..5541ce9 100644
      struct timespec t0, t1;
      clock_gettime(CLOCK_MONOTONIC, &t0);
      char tmp[1100];
-@@ -605,7 +692,9 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+@@ -605,7 +708,9 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
      int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
      if (fd < 0) return fail(err, errlen, "Cannot write %s: %s", tmp, strerror(errno));
      fcntl(fd, F_NOCACHE, 1);
@@ -8965,7 +9089,7 @@ index 383ae01..5541ce9 100644
      w.buf = malloc(w.cap);
      if (!w.buf) {
          close(fd);
-@@ -624,6 +713,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+@@ -624,6 +729,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
          unlink(tmp);
          return fail(err, errlen, "Cannot read the disk's details.");
      }
@@ -8973,7 +9097,7 @@ index 383ae01..5541ce9 100644
      w_raw(&w, &h, sizeof h);
      for (int i = 0; i < ncpus; i++) {
          CpuState s;
-@@ -641,10 +731,12 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
+@@ -641,10 +747,12 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
      free(w.buf);
      int bad = w.err;
      if (!bad && fsync(fd) != 0) bad = errno;
@@ -8986,7 +9110,7 @@ index 383ae01..5541ce9 100644
          return fail(err, errlen, "Cannot write the saved Mac: %s", strerror(bad));
      }
      clock_gettime(CLOCK_MONOTONIC, &t1);
-@@ -659,11 +751,11 @@ static int read_header(int fd, SnapHeader *h, const char *ident, uint64_t *bytes
+@@ -659,11 +767,11 @@ static int read_header(int fd, SnapHeader *h, const char *ident, uint64_t *bytes
      struct stat st;
      Trailer t;
      if (fstat(fd, &st) != 0 || (uint64_t)st.st_size < sizeof *h + sizeof t) return -1;
@@ -9002,7 +9126,7 @@ index 383ae01..5541ce9 100644
      if (pread(fd, &t, sizeof t, st.st_size - (off_t)sizeof t) != (ssize_t)sizeof t || t.tag != TAG('E', 'N', 'D', ' ') ||
          t.total != (uint64_t)st.st_size)
          return -1;
-@@ -675,12 +767,26 @@ int hv_snapshot_check(const char *path, const char *ident, uint64_t *bytes, int6
+@@ -675,12 +783,26 @@ int hv_snapshot_check(const char *path, const char *ident, uint64_t *bytes, int6
      int fd = open(path, O_RDONLY);
      if (fd < 0) return -1;
      SnapHeader h;
@@ -9030,7 +9154,7 @@ index 383ae01..5541ce9 100644
  int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t errlen) {
      HvMachine *m = hv_vm_machine();
      HvVmapple *b = hv_vm_board();
-@@ -692,10 +798,11 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
+@@ -692,10 +814,11 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
      if (fd < 0) return fail(err, errlen, "No saved Mac: %s", strerror(errno));
      fcntl(fd, F_NOCACHE, 1);
      SnapHeader h;
@@ -9044,7 +9168,7 @@ index 383ae01..5541ce9 100644
      }
      char disk_now[256];
      h.disk[sizeof h.disk - 1] = 0;
-@@ -728,7 +835,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
+@@ -728,7 +851,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
      if (!bad) bad = r_raw(&r, &t, sizeof t) || t.tag != TAG('E', 'N', 'D', ' ');
      free(r.buf);
      close(fd);
@@ -9054,12 +9178,22 @@ index 383ae01..5541ce9 100644
      if (bad) return fail(err, errlen, "The saved Mac could not be read (%s).", strerror(r.err ? r.err : EINVAL));
      /* The guest's clock goes on as far as the wall clock went since it stopped (see hv_vm_resume_counter). */
 diff --git a/host/snapshot.h b/host/snapshot.h
-index 67fc764..2ca437b 100644
+index 67fc764..d061ad7 100644
 --- a/host/snapshot.h
 +++ b/host/snapshot.h
-@@ -14,8 +14,24 @@
+@@ -13,9 +13,34 @@
+ 
     The disk is not in the file: it has to be exactly as it was when the file was written, so a file must be resumed at
     most once, and never after the Mac has run on without it. */
++/* Two packing sets, stage + output per4MB chunk: about16MB per worker.
++   Preserve64MB headroom; allocation failure can reduce the batch further. */
++static inline unsigned hv_snapshot_workers(unsigned active, uint64_t headroom) {
++    unsigned count = active ? (active < 8 ? active : 8) : 1;
++    uint64_t room = headroom > (64ull << 20) ? (headroom - (64ull << 20)) / (16ull << 20) : 1;
++    if (!room) room = 1;
++    return room < count ? (unsigned)room : count;
++}
++
  int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errlen);
 +/* Callbacks may run on packing workers. Cancellation must be thread safe and
 +   stay set for this operation; progress runs on the writer. No file format or
@@ -9069,7 +9203,7 @@ index 67fc764..2ca437b 100644
 +    void (*progress)(uint64_t scanned, uint64_t total, void *context);
 +    void *context;
 +    unsigned workers; /* 0: existing batch size; otherwise 1..8 */
-+    int background;   /* deferrable compression, never a vCPU QoS change */
++    int background;   /* bounded automatic save; never a vCPU QoS change */
 +} HvSnapshotControl;
 +int hv_snapshot_save_controlled(const char *path, const char *ident, const HvSnapshotControl *control,
 +                                char *err, size_t errlen);
@@ -9630,6 +9764,220 @@ index 7392fda..062c485 100644
      }
  
      func makeUIView(context: Context) -> Screen {
+diff --git a/ios/Henge/ClipboardDelivery.swift b/ios/Henge/ClipboardDelivery.swift
+new file mode 100644
+index 0000000..baf9ffe
+--- /dev/null
++++ b/ios/Henge/ClipboardDelivery.swift
+@@ -0,0 +1,17 @@
++import Foundation
++
++/// Only runs for an explicit Paste. Idle clipboard reception remains event driven.
++enum ClipboardDelivery {
++    enum Outcome: Equatable { case delivered, interrupted, timedOut }
++    @MainActor static func wait(isCurrent: () -> Bool, isDelivered: () -> Bool,
++                               attempts: Int = 80,
++                               sleep: () async throws -> Void = { try await Task.sleep(nanoseconds: 100_000_000) }) async -> Outcome {
++        for _ in 0..<attempts {
++            guard !Task.isCancelled, isCurrent() else { return .interrupted }
++            if isDelivered() { return .delivered }
++            do { try await sleep() } catch { return .interrupted }
++        }
++        guard !Task.isCancelled, isCurrent() else { return .interrupted }
++        return isDelivered() ? .delivered : .timedOut
++    }
++}
+diff --git a/ios/Henge/Components/InterfaceStyle.swift b/ios/Henge/Components/InterfaceStyle.swift
+new file mode 100644
+index 0000000..c6cb225
+--- /dev/null
++++ b/ios/Henge/Components/InterfaceStyle.swift
+@@ -0,0 +1,26 @@
++import SwiftUI
++import UIKit
++
++enum Desk {
++    static let page = tone(light: (242, 243, 247), dark: (11, 12, 16))
++    static let card = tone(light: (255, 255, 255), dark: (22, 24, 31))
++    static let raised = tone(light: (228, 230, 236), dark: (35, 38, 47))
++    static let text = tone(light: (17, 19, 24), dark: (242, 243, 247))
++    static let dim = tone(light: (92, 97, 112), dark: (144, 149, 164))
++    static let faint = tone(light: (138, 143, 157), dark: (106, 111, 126))
++    static let accent = Color(red: 46 / 255, green: 107 / 255, blue: 1)
++    /// Blue for tints and text: lighter on the dark page, deeper on the light one.
++    static let accentLight = tone(light: (31, 91, 235), dark: (91, 141, 255))
++    static let good = tone(light: (20, 145, 90), dark: (57, 217, 138))
++    static let warn = tone(light: (184, 119, 0), dark: (255, 188, 46))
++    static let bad = tone(light: (210, 56, 43), dark: (255, 122, 112))
++    static let hairline = Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 1, alpha: 0.1) : UIColor(white: 0, alpha: 0.1) })
++
++    private static func tone(light: (Int, Int, Int), dark: (Int, Int, Int)) -> Color {
++        func ui(_ c: (Int, Int, Int)) -> UIColor {
++            UIColor(red: CGFloat(c.0) / 255, green: CGFloat(c.1) / 255, blue: CGFloat(c.2) / 255, alpha: 1)
++        }
++        let l = ui(light), d = ui(dark)
++        return Color(UIColor { $0.userInterfaceStyle == .dark ? d : l })
++    }
++}
+diff --git a/ios/Henge/Components/OpeningDashboard.swift b/ios/Henge/Components/OpeningDashboard.swift
+new file mode 100644
+index 0000000..af7116d
+--- /dev/null
++++ b/ios/Henge/Components/OpeningDashboard.swift
+@@ -0,0 +1,153 @@
++import SwiftUI
++
++/// Presentation only: callers retain machine, JIT and connection ownership.
++struct OpeningDashboard<Mac: View, Connections: View>: View {
++    let wide: Bool
++    let mac: () -> Mac
++    let connections: () -> Connections
++    init(wide: Bool, @ViewBuilder mac: @escaping () -> Mac, @ViewBuilder connections: @escaping () -> Connections) {
++        self.wide = wide; self.mac = mac; self.connections = connections
++    }
++    var body: some View {
++        VStack(alignment: .leading, spacing: 24) {
++            VStack(alignment: .leading, spacing: 6) {
++                Text("Your workspace").font(.largeTitle.bold())
++                Text("A Mac when you need it. Your devices, connected.")
++                    .font(.subheadline).foregroundStyle(Desk.dim)
++            }.accessibilityElement(children: .combine)
++            if wide {
++                HStack(alignment: .top, spacing: 24) {
++                    mac().frame(maxWidth: .infinity)
++                    connections().frame(width: 320)
++                }
++            } else {
++                mac()
++                connections()
++            }
++        }
++        .foregroundStyle(Desk.text)
++        .frame(maxWidth: 1120, alignment: .leading)
++        .frame(maxWidth: .infinity)
++    }
++}
++
++struct MacLaunchCard: View {
++    let name: String
++    let summary: String
++    let ready: Bool
++    let saved: Bool
++    var preview: UIImage?
++    var setupNote: String?
++    let start: () -> Void
++    let setup: () -> Void
++    let configure: () -> Void
++    var body: some View {
++        VStack(alignment: .leading, spacing: 20) {
++            ZStack {
++                RoundedRectangle(cornerRadius: 20).fill(Desk.raised)
++                if let preview {
++                    Image(uiImage: preview).resizable().scaledToFill()
++                } else {
++                    VStack(spacing: 12) {
++                        Image(systemName: "desktopcomputer").font(.system(size: 44, weight: .light))
++                        Text("Your Mac desktop").font(.subheadline)
++                    }.foregroundStyle(Desk.dim)
++                }
++            }
++            .frame(maxWidth: .infinity).frame(height: 200)
++            .clipped().clipShape(RoundedRectangle(cornerRadius: 20))
++            .accessibilityHidden(true)
++            ViewThatFits(in: .horizontal) {
++                HStack(alignment: .top) { title; Spacer(minLength: 12); status }
++                VStack(alignment: .leading, spacing: 10) { title; status }
++            }
++            if !ready, let setupNote {
++                Label(setupNote, systemImage: "info.circle")
++                    .font(.footnote).foregroundStyle(Desk.dim).fixedSize(horizontal: false, vertical: true)
++            }
++            Button(action: ready ? start : setup) {
++                HStack {
++                    Image(systemName: ready ? (saved ? "arrow.clockwise" : "play.fill") : "bolt.fill")
++                    Text(ready ? (saved ? "Resume Mac" : "Start Mac") : "Enable JIT")
++                    Spacer()
++                    Image(systemName: "arrow.right")
++                }.font(.headline).padding(.horizontal, 20).frame(minHeight: 54)
++                    .foregroundStyle(.white).background(Desk.accent, in: RoundedRectangle(cornerRadius: 16))
++            }
++            .buttonStyle(.plain).accessibilityIdentifier("launch-mac")
++            Button(action: configure) {
++                Label("Mac settings", systemImage: "slider.horizontal.3")
++                    .font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 44)
++            }.buttonStyle(.plain).foregroundStyle(Desk.accentLight)
++        }
++        .padding(20)
++        .background(Desk.card, in: RoundedRectangle(cornerRadius: 28))
++        .overlay(RoundedRectangle(cornerRadius: 28).strokeBorder(Desk.hairline))
++    }
++    private var title: some View {
++        VStack(alignment: .leading, spacing: 6) {
++            Text(name).font(.title2.bold()).lineLimit(2)
++            Text(summary).font(.subheadline).foregroundStyle(Desk.dim).fixedSize(horizontal: false, vertical: true)
++        }
++    }
++    private var status: some View {
++        Label(ready ? (saved ? "Saved session" : "Ready") : "Setup needed",
++              systemImage: ready ? (saved ? "pause.circle.fill" : "checkmark.circle.fill") : "bolt.circle")
++            .font(.caption.weight(.semibold)).foregroundStyle(ready ? Desk.good : Desk.warn)
++            .padding(.horizontal, 10).padding(.vertical, 7)
++            .background((ready ? Desk.good : Desk.warn).opacity(0.12), in: Capsule())
++    }
++}
++
++struct WorkspaceConnections: View {
++    var canExtend = false
++    let controls: () -> Void
++    let display: () -> Void
++    let extend: () -> Void
++    var body: some View {
++        VStack(alignment: .leading, spacing: 12) {
++            Text("CONNECT YOUR DEVICES").font(.caption.weight(.semibold)).tracking(1).foregroundStyle(Desk.dim)
++            action("Wireless controller", detail: "Keyboard, touchpad and gamepad", icon: "gamecontroller.fill", tint: Desk.accentLight, action: controls)
++            action("Use as a display", detail: "Show a Mac from another device", icon: "rectangle.on.rectangle", tint: Desk.good, action: display)
++            if canExtend {
++                action("Extend your Mac", detail: "Add a second screen wirelessly", icon: "display.2", tint: Desk.accentLight, action: extend)
++            }
++        }
++    }
++    private func action(_ title: String, detail: String, icon: String, tint: Color, action: @escaping () -> Void) -> some View {
++        Button(action: action) {
++            HStack(spacing: 14) {
++                Image(systemName: icon).font(.title3).foregroundStyle(tint)
++                    .frame(width: 44, height: 44).background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 13))
++                VStack(alignment: .leading, spacing: 4) {
++                    Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(Desk.text)
++                    Text(detail).font(.caption).foregroundStyle(Desk.dim)
++                }.frame(maxWidth: .infinity, alignment: .leading)
++                Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(Desk.dim)
++            }.padding(16).frame(maxWidth: .infinity, minHeight: 76)
++                .background(Desk.card, in: RoundedRectangle(cornerRadius: 20))
++                .overlay(RoundedRectangle(cornerRadius: 20).strokeBorder(Desk.hairline))
++        }.buttonStyle(.plain).accessibilityElement(children: .combine)
++    }
++}
++
++struct AutomaticSaveCard: View {
++    @Binding var enabled: Bool
++    var body: some View {
++        VStack(alignment: .leading, spacing: 12) {
++            HStack {
++                Label("Automatic saving", systemImage: "clock.arrow.circlepath").font(.subheadline.weight(.semibold))
++                Spacer()
++                Text(enabled ? "On" : "Off").font(.caption.bold()).foregroundStyle(enabled ? Desk.good : Desk.dim)
++            }
++            Text(enabled ? "Starts saving when you leave. Returning safely cancels an unfinished save and resumes the Mac." : "Keep your place when switching apps. Enable Instant Resume to save automatically.")
++                .font(.caption).foregroundStyle(Desk.dim).fixedSize(horizontal: false, vertical: true)
++            if !enabled {
++                Button("Enable automatic saving") { enabled = true }.font(.subheadline.weight(.semibold)).frame(minHeight: 44)
++            }
++            Text("iOS may interrupt large saves. Use Save Mac & Leave and wait for completion for a persistent save.")
++                .font(.caption2).foregroundStyle(Desk.dim)
++        }.padding(16).background(Desk.card, in: RoundedRectangle(cornerRadius: 20))
++            .overlay(RoundedRectangle(cornerRadius: 20).strokeBorder(Desk.hairline))
++    }
++}
 diff --git a/ios/Henge/Controls/ControllerPostureLayout.swift b/ios/Henge/Controls/ControllerPostureLayout.swift
 new file mode 100644
 index 0000000..6feaff5
@@ -9912,7 +10260,7 @@ index 0000000..437d2f5
 +}
 diff --git a/ios/Henge/Controls/GamepadLayout.swift b/ios/Henge/Controls/GamepadLayout.swift
 new file mode 100644
-index 0000000..d12c37e
+index 0000000..58c1aae
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadLayout.swift
 @@ -0,0 +1,84 @@
@@ -9980,10 +10328,10 @@ index 0000000..d12c37e
 +        switch control {
 +        case .move: r = CGRect(x:22,y:114,width:112,height:112)
 +        case .look: r = CGRect(x:w-236,y:204,width:112,height:112)
-+        case .a: r = CGRect(x:w-100,y:174,width:44,height:44)
-+        case .b: r = CGRect(x:w-48,y:122,width:44,height:44)
-+        case .x: r = CGRect(x:w-152,y:122,width:44,height:44)
-+        case .y: r = CGRect(x:w-100,y:70,width:44,height:44)
++        case .a: r = CGRect(x:w-116,y:174,width:44,height:44)
++        case .b: r = CGRect(x:w-64,y:122,width:44,height:44)
++        case .x: r = CGRect(x:w-168,y:122,width:44,height:44)
++        case .y: r = CGRect(x:w-116,y:70,width:44,height:44)
 +        case .lb: r = CGRect(x:24,y:24,width:90,height:40)
 +        case .rb: r = CGRect(x:w-114,y:24,width:90,height:40)
 +        case .lt: r = CGRect(x:128,y:10,width:58,height:70)
@@ -10122,10 +10470,10 @@ index 0000000..77e4f94
 +}
 diff --git a/ios/Henge/Controls/GamepadSurface.swift b/ios/Henge/Controls/GamepadSurface.swift
 new file mode 100644
-index 0000000..64ed4c4
+index 0000000..5913aef
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadSurface.swift
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,159 @@
 +import SwiftUI
 +import UIKit
 +
@@ -10204,8 +10552,11 @@ index 0000000..64ed4c4
 +        for control in PadControl.allCases {
 +            let r = layout.rect(control), down = active(control) != nil
 +            let stick = control == .move || control == .look
-+            let shape = UIBezierPath(roundedRect:r,cornerRadius:stick ? r.width/2 : min(16*layout.scale,r.height/2))
-+            UIColor.black.withAlphaComponent(tuning.opacity).setFill(); shape.fill()
++            let face = [.a, .b, .x, .y].contains(control)
++            let shape = UIBezierPath(roundedRect:r,cornerRadius:stick || face ? r.width/2 : min(16*layout.scale,r.height/2))
++            let tint: UIColor = control == .a ? .systemGreen : control == .b ? .systemRed : control == .x ? .systemBlue : control == .y ? .systemYellow : .systemBlue
++            UIColor(white: down ? 0.2 : 0.09, alpha: tuning.opacity).setFill(); shape.fill()
++            if face { tint.withAlphaComponent(down ? 0.45 : 0.14).setFill(); shape.fill() }
 +            UIColor.white.withAlphaComponent(down ? 0.85 : 0.35).setStroke(); shape.lineWidth = max(1,1.5*layout.scale); shape.stroke()
 +            if stick {
 +                if let finger = active(control) {
@@ -10557,10 +10908,10 @@ index 0000000..f4bf2f7
 +}
 diff --git a/ios/Henge/Controls/WirelessControlsPanel.swift b/ios/Henge/Controls/WirelessControlsPanel.swift
 new file mode 100644
-index 0000000..d2481fd
+index 0000000..24520e6
 --- /dev/null
 +++ b/ios/Henge/Controls/WirelessControlsPanel.swift
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,174 @@
 +import SwiftUI
 +
 +enum WirelessControlMode: Int, CaseIterable, Identifiable {
@@ -10612,13 +10963,14 @@ index 0000000..d2481fd
 +                    Group {
 +                        if short { ScrollView(.vertical) { navigation(compact:true) }.scrollIndicators(.hidden) }
 +                        else { navigation(compact:false) }
-+                    }.frame(width:100)
++                    }.frame(width:short ? 76 : 176)
 +                    content(portrait:portrait)
 +                }
 +            } else {
 +                VStack(spacing:12) { header;modePicker;content(portrait:portrait) }
 +            }
 +        }.padding(wide ? 14 : 18)
++        .background(Desk.page)
 +    }
 +    private func tabletop(_ layout:ControllerPostureLayout) -> some View {
 +        VStack(spacing:0) {
@@ -10633,7 +10985,7 @@ index 0000000..d2481fd
 +    }
 +    private var header: some View {
 +        HStack(spacing:12) {
-+            Image(systemName:"antenna.radiowaves.left.and.right").foregroundStyle(.green)
++            Image(systemName:acceptsInput ? "wifi" : "wifi.exclamationmark").foregroundStyle(acceptsInput ? Desk.good : Desk.warn)
 +            VStack(alignment:.leading,spacing:3) {
 +                Text(isDuo ? "Duo wireless controls" : "Wireless controls").font(.headline)
 +                Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(2)
@@ -10660,25 +11012,46 @@ index 0000000..d2481fd
 +            .accessibilityLabel("Controller layout")
 +    }
 +    private func navigation(compact: Bool) -> some View {
-+        VStack(spacing:compact ? 8 : 18) {
-+            if !compact { Image(systemName:"antenna.radiowaves.left.and.right").font(.title2).foregroundStyle(.green) }
-+            Text(status).font(.caption2).foregroundStyle(.secondary).lineLimit(compact ? 1 : 3)
++        VStack(alignment: .leading, spacing: compact ? 8 : 14) {
++            if !compact {
++                Label("CONTROLLER", systemImage: "wifi")
++                    .font(.caption.weight(.semibold)).tracking(0.6)
++                    .foregroundStyle(acceptsInput ? Desk.good : Desk.warn)
++                Text(status).font(.caption).foregroundStyle(Desk.dim).lineLimit(3)
++                Divider().padding(.vertical, 2)
++            }
 +            ForEach(WirelessControlMode.allCases) { control in
 +                Button { mode = control } label: {
 +                    Group {
-+                        if compact { Label(control.title,systemImage:control.icon).font(.caption) }
-+                        else { VStack(spacing:6) { Image(systemName:control.icon).font(.title2); Text(control.title).font(.caption) } }
++                        if compact {
++                            VStack(spacing: 5) { Image(systemName: control.icon).font(.title3); Text(control.title).font(.caption2) }
++                        } else {
++                            Label(control.title, systemImage: control.icon).font(.subheadline.weight(.semibold))
++                        }
 +                    }
-+                    .frame(maxWidth:.infinity).padding(.vertical,compact ? 8 : 10)
-+                    .background(mode == control ? Color.blue.opacity(0.3) : .clear,in:RoundedRectangle(cornerRadius:14))
-+                }.accessibilityLabel(control.title).accessibilityAddTraits(mode == control ? .isSelected : [])
++                    .frame(maxWidth: .infinity, minHeight: compact ? 52 : 50, alignment: compact ? .center : .leading)
++                    .padding(.horizontal, compact ? 2 : 12)
++                    .foregroundStyle(mode == control ? Desk.accentLight : Desk.dim)
++                    .background(mode == control ? Desk.accent.opacity(0.16) : .clear, in: RoundedRectangle(cornerRadius: 14))
++                }.buttonStyle(.plain).accessibilityLabel(control.title)
++                    .accessibilityAddTraits(mode == control ? .isSelected : [])
 +            }
-+            Spacer(minLength:0)
-+            if isDuo && mode == .gamepad { layoutMenu }
-+            if supportsVideo { videoButton }
-+            settingsButton
-+            Button("Disconnect",systemImage:"xmark.circle",action:disconnect).font(.caption)
-+        }.padding(.vertical,8)
++            Spacer(minLength: 8)
++            Group {
++                if compact { VStack(spacing: 0) { navigationTools } }
++                else { HStack(spacing: 0) { navigationTools } }
++            }.foregroundStyle(Desk.dim)
++            Button("Disconnect", systemImage: "xmark.circle", action: disconnect)
++                .font(.caption.weight(.semibold)).foregroundStyle(Desk.bad)
++                .frame(maxWidth: .infinity, minHeight: 44)
++        }
++        .padding(compact ? 6 : 12)
++        .background(Desk.card, in: RoundedRectangle(cornerRadius: 22))
++    }
++    @ViewBuilder private var navigationTools: some View {
++        if isDuo && mode == .gamepad { layoutMenu }
++        if supportsVideo { videoButton }
++        settingsButton
 +    }
 +    private var videoButton:some View {
 +        Button(action:enableVideo) { Image(systemName:"video").frame(width:44,height:44) }.accessibilityLabel("Show Mac video with controls")
@@ -10689,7 +11062,7 @@ index 0000000..d2481fd
 +    }
 +    private func pointingPad(identifier:String) -> some View {
 +        WirelessInputSurface(keyboard:false,send:sendPointer,acceptsInput:acceptsInput,identifier:identifier)
-+            .background(.white.opacity(0.06),in:RoundedRectangle(cornerRadius:24))
++            .background(Desk.card,in:RoundedRectangle(cornerRadius:24))
 +            .overlay(alignment:.bottom) {
 +                Text("Touchpad · Tap to click · Two fingers scroll").font(.caption).foregroundStyle(.secondary).padding(10).allowsHitTesting(false)
 +            }
@@ -10701,11 +11074,11 @@ index 0000000..d2481fd
 +                .frame(maxWidth:.infinity,maxHeight:.infinity)
 +        } else {
 +            VStack(alignment:.leading,spacing:10) {
-+                Label(mode == .keyboard ? "Keyboard + touchpad" : "Touchpad",systemImage:mode.icon).font(.headline)
++                Label(mode == .keyboard ? "Keyboard + touchpad" : "Touchpad",systemImage:mode.icon).font(.title3.weight(.semibold))
 +                input(mode)
 +                    .disabled(!acceptsInput)
 +                    .frame(maxWidth:.infinity,maxHeight:.infinity)
-+                    .background(.white.opacity(0.06),in:RoundedRectangle(cornerRadius:24))
++                    .background(Desk.card,in:RoundedRectangle(cornerRadius:24))
 +                    .overlay(RoundedRectangle(cornerRadius:24).strokeBorder(.white.opacity(0.12)).allowsHitTesting(false))
 +                Text(mode == .keyboard ? "Type below or use a hardware keyboard. The area above stays a touchpad." : "Tap to click · Two fingers scroll · Hold and drag moves windows")
 +                    .font(.footnote).foregroundStyle(.secondary)
@@ -11257,10 +11630,22 @@ index 037685f..bbea374 100644
          log("boot", "cache lifecycle: JIT translations and kernel read lookups are RAM-only; no cross-launch executable cache")
          if let source = info["HengeCustomSourceCommit"] as? String {
 diff --git a/ios/Henge/HomeView.swift b/ios/Henge/HomeView.swift
-index 2c11af9..1f11170 100644
+index 2c11af9..089af4b 100644
 --- a/ios/Henge/HomeView.swift
 +++ b/ios/Henge/HomeView.swift
-@@ -11,6 +11,7 @@ struct HomeView: View {
+@@ -1,4 +1,5 @@
+ import SwiftUI
++import UIKit
+ import UniformTypeIdentifiers
+ 
+ /// Your Mac as you left it, and one big button.
+@@ -8,9 +9,13 @@ struct HomeView: View {
+     @ObservedObject private var installer = Installer.shared
+     @Binding var running: VirtualMac?
+     @Binding var tab: RootView.Tab
++    @Environment(\.scenePhase) private var scenePhase
++    @State private var path: [VirtualMac] = []
++    @AppStorage(InstantResume.key) private var automaticSave = true
      @State private var picking = false
      @State private var showingLink = false
      @AppStorage("henge.link.viewerOnly") private var viewerOnly = false
@@ -11268,30 +11653,204 @@ index 2c11af9..1f11170 100644
      @State private var jitReady = JITBootstrap.ready
      @State private var chosen: UUID?
      @State private var showMacApps = false
-@@ -44,10 +45,13 @@ struct HomeView: View {
-                         }.disabled(!jitReady)
-                     }
-                     Button {
+@@ -23,38 +28,43 @@ struct HomeView: View {
+     }
+ 
+     var body: some View {
+-        NavigationStack {
+-            ScrollView {
+-                VStack(spacing: 14) {
+-                    notices
+-                    if let mac {
+-                        MacHero(mac: mac, jitReady: jitReady, start: { running = Machines.shared.fittedForStart(mac) }, turnOnJIT: { jit.enable() },
+-                                jitNote: jitReady ? nil : (JITBootstrap.lastFailure ?? jit.automaticDescription))
+-                        HStack(spacing: 10) {
+-                            FactTile(title: "Disk", value: ByteText.string(UInt64(max(mac.bytesUsed, 0))))
+-                            FactTile(title: "Last used", value: mac.lastUsedText)
++        NavigationStack(path: $path) {
++            GeometryReader { geometry in
++                ScrollView {
++                    VStack(spacing: 20) {
++                        notices
++                        OpeningDashboard(wide: geometry.size.width >= 900) {
++                            if let mac {
++                                MacHero(mac: mac, jitReady: jitReady,
++                                    start: { running = Machines.shared.fittedForStart(mac) },
++                                    turnOnJIT: { jit.enable() }, configure: { path.append(mac) },
++                                    jitNote: jitReady ? nil : (JITBootstrap.lastFailure ?? jit.automaticDescription))
++                            } else { firstMac }
++                        } connections: {
++                            VStack(spacing: 20) {
++                                WorkspaceConnections(canExtend: mac != nil && jitReady,
++                                    controls: { connect(controls: true) }, display: { connect(controls: false) },
++                                    extend: { showingLink = true })
++                                if mac != nil {
++                                    AutomaticSaveCard(enabled: $automaticSave)
++                                }
++                                if let mac {
++                                    HStack(spacing: 12) {
++                                        FactTile(title: "Disk used", value: ByteText.string(UInt64(max(mac.bytesUsed, 0))))
++                                        FactTile(title: "Last opened", value: mac.lastUsedText)
++                                    }
++                                }
++                            }
+                         }
+-                        others(besides: mac)
+-                    } else {
+-                        firstMac
+-                    }
+-                    if mac != nil {
+-                        Button { showingLink = true } label: {
+-                            Label("Extend this Mac to another device…", systemImage: "display.2")
+-                        }.disabled(!jitReady)
+-                    }
+-                    Button {
 -                        LinkHostService.shared.stop(); jit.showSetup = false; viewerOnly = true
-+                        LinkHostService.shared.stop(); jit.showSetup = false; controlsOnly = false; viewerOnly = true
-                     } label: {
-                         Label("Use this device as a display", systemImage: "rectangle.on.rectangle")
+-                    } label: {
+-                        Label("Use this device as a display", systemImage: "rectangle.on.rectangle")
++                        if let mac { others(besides: mac) }
                      }
-+                    Button {
-+                        LinkHostService.shared.stop(); jit.showSetup = false; controlsOnly = true; viewerOnly = true
-+                    } label: { Label("Use as wireless keyboard or gamepad",systemImage:"gamecontroller") }
++                    .padding(geometry.size.width >= 900 ? 28 : 18)
++                    .frame(maxWidth: 1176).frame(maxWidth: .infinity)
                  }
-                 .padding(.horizontal, 16)
-                 .padding(.bottom, 24)
-@@ -206,7 +210,7 @@ private struct MacHero: View {
-             .buttonStyle(.plain)
-             if jitReady {
-                 Button(action: start) {
+-                .padding(.horizontal, 16)
+-                .padding(.bottom, 24)
+-                .deskColumn()
+             }
+             .background(Desk.page)
+             .navigationTitle("Henge")
++            .navigationBarTitleDisplayMode(.inline)
+             .navigationDestination(for: VirtualMac.self) { MacSettingsView(mac: $0) }
+             .toolbar {
+                 ToolbarItem(placement: .primaryAction) {
+@@ -75,15 +85,22 @@ struct HomeView: View {
+                 if case let .success(url) = result { machines.importFolder(url) }
+             }
+             .sheet(isPresented: $showMacApps) { MacAppsView() }
+-            .task {
+-                while !Task.isCancelled { // the region may be claimed after a hand-off to StikDebug
++            .task(id: scenePhase == .active && running == nil) {
++                guard scenePhase == .active, running == nil else { return }
++                repeat {
+                     jitReady = JITBootstrap.ready
++                    if jitReady { return }
+                     try? await Task.sleep(nanoseconds: 1_000_000_000)
+-                }
++                } while !Task.isCancelled
+             }
+         }
+     }
+ 
++    private func connect(controls: Bool) {
++        LinkHostService.shared.stop(); jit.showSetup = false
++        controlsOnly = controls; viewerOnly = true
++    }
++
+     @ViewBuilder private var notices: some View {
+         if Device.chipTooOld {
+             NoticeRow(symbol: "exclamationmark.triangle.fill", text: Device.chipTooOldText, tint: Desk.bad)
+@@ -174,77 +191,19 @@ private struct MacHero: View {
+     let jitReady: Bool
+     let start: () -> Void
+     let turnOnJIT: () -> Void
++    let configure: () -> Void
+     let jitNote: String?
+     @AppStorage("henge.cpus") private var cpus = 4
+-
++    @State private var previewImage: UIImage?
+     var body: some View {
+-        VStack(spacing: 0) {
+-            NavigationLink(value: mac) {
+-                VStack(spacing: 0) {
+-                    preview
+-                    HStack {
+-                        Text(mac.name).font(.system(size: 24, weight: .bold)).foregroundStyle(Desk.text).lineLimit(1)
+-                        Spacer()
+-                        Text(jitReady ? "JIT on" : "JIT off")
+-                            .font(.system(size: 13, weight: .semibold))
+-                            .foregroundStyle(jitReady ? Desk.good : Desk.warn)
+-                            .padding(.horizontal, 11)
+-                            .padding(.vertical, 5)
+-                            .background((jitReady ? Desk.good : Desk.warn).opacity(0.13), in: Capsule())
+-                        Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold)).foregroundStyle(Desk.faint)
+-                    }
+-                    .padding(.top, 15)
+-                    .padding(.horizontal, 5)
+-                    Text("\(mac.summary) · \(cpus) CPUs")
+-                        .font(.system(size: 15))
+-                        .foregroundStyle(Desk.dim)
+-                        .frame(maxWidth: .infinity, alignment: .leading)
+-                        .padding(.horizontal, 5)
+-                        .padding(.top, 3)
+-                }
+-            }
+-            .buttonStyle(.plain)
+-            if jitReady {
+-                Button(action: start) {
 -                    if InstantResume.enabled && InstantResume.hasSave(for: mac) {
-+                    if InstantResume.hasSave(for: mac) {
-                         Label("Resume", systemImage: "play.fill")
-                     } else {
-                         Label("Start", systemImage: "play.fill")
+-                        Label("Resume", systemImage: "play.fill")
+-                    } else {
+-                        Label("Start", systemImage: "play.fill")
+-                    }
+-                }
+-                .buttonStyle(DeskButtonStyle())
+-                .padding(.top, 15)
+-            } else {
+-                if let jitNote {
+-                    Text(jitNote).font(.system(size: 13)).foregroundStyle(Desk.dim)
+-                        .frame(maxWidth: .infinity, alignment: .leading)
+-                        .padding(.horizontal, 5)
+-                        .padding(.top, 10)
+-                }
+-                Button("Turn On JIT", action: turnOnJIT)
+-                    .buttonStyle(DeskButtonStyle())
+-                    .padding(.top, 15)
+-            }
+-        }
+-        .padding(14)
+-        .deskCard(radius: 30)
+-    }
+-
+-    @ViewBuilder private var preview: some View {
+-        ZStack {
+-            Desk.raised.opacity(0.5)
+-            if let image = UIImage(contentsOfFile: MacPreview.file(for: mac).path) {
+-                Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
+-            } else {
+-                Image(systemName: "macwindow.on.rectangle")
+-                    .font(.system(size: 46, weight: .light))
+-                    .foregroundStyle(Desk.faint)
+-            }
++        MacLaunchCard(name: mac.name, summary: "\(mac.summary) · \(cpus) CPUs",
++            ready: jitReady, saved: InstantResume.hasSave(for: mac), preview: previewImage,
++            setupNote: jitNote, start: start, setup: turnOnJIT, configure: configure)
++        .task(id: mac.lastUsed) {
++            let path = MacPreview.file(for: mac).path
++            let image = await Task.detached(priority: .utility) { UIImage(contentsOfFile: path) }.value
++            if !Task.isCancelled { previewImage = image }
+         }
+-        .aspectRatio(mac.aspect, contentMode: .fit)
+-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Desk.hairline, lineWidth: 0.5))
+-        .accessibilityHidden(true)
+     }
+ }
+ 
+diff --git a/ios/Henge/Input.swift b/ios/Henge/Input.swift
+index cab1ccf..a88d735 100644
+--- a/ios/Henge/Input.swift
++++ b/ios/Henge/Input.swift
+@@ -164,6 +164,10 @@ enum Keys {
+         }
+     }
+ 
++    static func canType(_ c: Character) -> Bool {
++        letters[c] != nil || (c.lowercased().first.flatMap { letters[$0] } != nil) || plain[c] != nil || shifted[c] != nil
++    }
++
+     static func type(_ c: Character) {
+         if let code = letters[c] { press(code) }
+         else if let lower = c.lowercased().first, let code = letters[lower] { press(code, shifted: true) }
 diff --git a/ios/Henge/Installer.swift b/ios/Henge/Installer.swift
 index 2103167..4dcdfc6 100644
 --- a/ios/Henge/Installer.swift
@@ -11305,7 +11864,7 @@ index 2103167..4dcdfc6 100644
          try fm.createDirectory(at: mac.directory, withIntermediateDirectories: true)
          Machines.excludeFromBackup(Machines.root)
 diff --git a/ios/Henge/InstantResume.swift b/ios/Henge/InstantResume.swift
-index 8b4bf3b..be9f233 100644
+index 8b4bf3b..5d496dd 100644
 --- a/ios/Henge/InstantResume.swift
 +++ b/ios/Henge/InstantResume.swift
 @@ -1,93 +1,183 @@
@@ -11404,7 +11963,7 @@ index 8b4bf3b..be9f233 100644
 +enum InstantResume {
 +    static let runtime=ResumeRuntimeRegistry()
 +    static let key = "henge.instantResume"
-+    static var enabled: Bool { UserDefaults.standard.bool(forKey:key) }
++    static var enabled: Bool { UserDefaults.standard.object(forKey:key) as? Bool ?? true }
 +    static var buildIdentity: ResumeBuildIdentity {
 +        let i=Bundle.main.infoDictionary ?? [:]
 +        return ResumeBuildIdentity(version:i["CFBundleShortVersionString"] as? String ?? "?",
@@ -12763,7 +13322,7 @@ index 29c8b3b..00f528f 100644
          all.removeAll { $0.id == id }
          save()
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..8a5c5c9 100644
+index 34d6a98..5d05fc1 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
 @@ -3,6 +3,7 @@
@@ -12926,7 +13485,7 @@ index 34d6a98..8a5c5c9 100644
          snprintf(err, errlen, "No Mac is running.");
          return -1;
      }
-@@ -133,21 +191,63 @@ int henge_vm_pause(char *err, size_t errlen) {
+@@ -133,21 +191,70 @@ int henge_vm_pause(char *err, size_t errlen) {
          snprintf(err, errlen, "The Mac stopped by itself.");
          return -1;
      }
@@ -12984,8 +13543,15 @@ index 34d6a98..8a5c5c9 100644
 +    else {
 +        atomic_store(&request->phase,1);
 +        long active = sysconf(_SC_NPROCESSORS_ONLN);
++        uint64_t headroom = UINT64_MAX;
++#if TARGET_OS_IPHONE
++        headroom = os_proc_available_memory();
++#endif
++        unsigned workers = hv_snapshot_workers(active > 0 ? (unsigned)active : 1, headroom);
++        fprintf(stderr, "henge: save policy: workers=%u available=%lluMB background=%d; bounded user-initiated compression\n",
++                workers, (unsigned long long)(headroom >> 20), request->background);
 +        HvSnapshotControl control = {.cancelled=save_cancelled, .progress=save_progress, .context=request,
-+            .workers=(unsigned)(active > 0 && active < 8 ? active : 8), .background=request->background};
++            .workers=workers, .background=request->background};
 +        r = hv_snapshot_save_controlled(path, ident, &control, err, errlen);
      }
 -    int r = hv_snapshot_save(path, ident, err, errlen);
@@ -12996,7 +13562,7 @@ index 34d6a98..8a5c5c9 100644
      fprintf(stderr, "henge: %s\n", r ? err : "the paused Mac is saved");
      return r;
  }
-@@ -160,18 +260,39 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
+@@ -160,18 +267,39 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
  }
  
  int henge_vm_continue(void) {
@@ -13039,7 +13605,7 @@ index 34d6a98..8a5c5c9 100644
      }
      pthread_rwlock_unlock(&api_lock);
      fprintf(stderr, "henge: the Mac runs on%s\n", r ? " -- no, its CPU threads could not start" : "");
-@@ -192,17 +313,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
+@@ -192,17 +320,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
      fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
              jit->size >> 20);
      if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
@@ -13068,7 +13634,7 @@ index 34d6a98..8a5c5c9 100644
  }
  
  static volatile int install_step = -1;
-@@ -239,7 +368,7 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
+@@ -239,7 +375,7 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
          snprintf(err, errlen, "The installer could not start.");
          return failed_start();
      }
@@ -13077,7 +13643,7 @@ index 34d6a98..8a5c5c9 100644
  }
  
  int henge_install_step(void) { return install_step; }
-@@ -293,22 +422,29 @@ static int lock_running(void) {
+@@ -293,22 +429,29 @@ static int lock_running(void) {
      return 0;
  }
  void henge_vm_stop(void) {
@@ -13118,7 +13684,7 @@ index 34d6a98..8a5c5c9 100644
  }
  
  long henge_vm_balloon(long target_mb) {
-@@ -344,13 +480,13 @@ void henge_vm_log_cache(void) {
+@@ -344,13 +487,13 @@ void henge_vm_log_cache(void) {
  
  uint64_t henge_vm_blocks(void) {
      pthread_rwlock_rdlock(&api_lock);
@@ -13134,7 +13700,13 @@ index 34d6a98..8a5c5c9 100644
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
-@@ -378,6 +514,29 @@ void henge_share_set_clipboard(const char *text) { hv_share_set_clipboard(text);
+@@ -375,9 +518,35 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
+     if (hv_share_start(folder, socket_path, agent) == 0) hv_net_set_share_socket(socket_path);
+ }
+ void henge_share_set_clipboard(const char *text) { hv_share_set_clipboard(text); }
++unsigned long henge_share_publish_clipboard(const char *text) { return hv_share_publish_clipboard(text); }
++int henge_share_clipboard_ready(void) { return hv_share_clipboard_ready(); }
++int henge_share_clipboard_delivered(unsigned long seq) { return hv_share_clipboard_delivered(seq); }
  char *henge_share_take_clipboard(void) { return hv_share_take_clipboard(); }
  long henge_share_agent_seen(void) { return hv_share_agent_seen(); }
  
@@ -13164,7 +13736,7 @@ index 34d6a98..8a5c5c9 100644
  void henge_vm_set_display(uint32_t width, uint32_t height) { hv_pvg_lite_set_mode(width, height); }
  void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm) { hv_pvg_lite_set_size_mm(width_mm, height_mm); }
  int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,uint32_t height_mm,uint32_t hz) {
-@@ -388,6 +547,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
+@@ -388,6 +557,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
@@ -13191,7 +13763,7 @@ index 34d6a98..8a5c5c9 100644
  void henge_vm_link_connected(int connected) {
      if (!lock_running()) return;
      HvVmapple *b = hv_vm_board();
-@@ -454,13 +633,51 @@ void henge_vm_set_display_layer(void *layer) {
+@@ -454,13 +643,51 @@ void henge_vm_set_display_layer(void *layer) {
      hv_vm_set_display_layer(layer);
  }
  uint64_t henge_vm_gpu_frames(void) {
@@ -13246,7 +13818,7 @@ index 34d6a98..8a5c5c9 100644
      HvBootDisplay d;
      int result = -1;
      if (hv_vm_boot_display(&d) == 0) {
-@@ -509,3 +726,81 @@ uint64_t henge_largest_mapping_mb(void) {
+@@ -509,3 +736,81 @@ uint64_t henge_largest_mapping_mb(void) {
      }
      return 0;
  }
@@ -13329,7 +13901,7 @@ index 34d6a98..8a5c5c9 100644
 +    hv_vm_release_input_source(source);pthread_rwlock_unlock(&api_lock);
 +}
 diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
-index b8c41fa..bce10ce 100644
+index b8c41fa..54c0e18 100644
 --- a/ios/Henge/Native/henge-vm.h
 +++ b/ios/Henge/Native/henge-vm.h
 @@ -4,6 +4,7 @@
@@ -13427,7 +13999,17 @@ index b8c41fa..bce10ce 100644
  void henge_vm_log_cache(void);           /* optional per-CPU cache-use diagnostics */
  uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
  uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
-@@ -82,7 +136,12 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
+@@ -74,6 +128,9 @@ int henge_vm_guest_el0(void);              /* any CPU running user code right no
+    henge_share_take_clipboard returns what the guest copied, once: a malloc'd string, or NULL. */
+ void henge_vm_share(const char *folder, const char *socket_path, const char *agent);
+ void henge_share_set_clipboard(const char *text);
++unsigned long henge_share_publish_clipboard(const char *text);
++int henge_share_clipboard_ready(void);
++int henge_share_clipboard_delivered(unsigned long seq);
+ char *henge_share_take_clipboard(void);
+ long henge_share_agent_seen(void);
+ 
+@@ -82,7 +139,12 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
  /* The panel's physical size; 0, 0 for the default (a ~122 ppi, 1x screen). Before boot. */
  void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm);
  int henge_vm_set_link_display(uint32_t width, uint32_t height, uint32_t width_mm, uint32_t height_mm, uint32_t hz);
@@ -13479,10 +14061,10 @@ index b89dc8a..01ac5b7 100644
              controlsTap.isEnabled = false
 diff --git a/ios/Henge/ResumeCoordinator.swift b/ios/Henge/ResumeCoordinator.swift
 new file mode 100644
-index 0000000..648237f
+index 0000000..f1f24fa
 --- /dev/null
 +++ b/ios/Henge/ResumeCoordinator.swift
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,265 @@
 +import Foundation
 +
 +struct ResumeSession: Equatable, Sendable {
@@ -13561,6 +14143,12 @@ index 0000000..648237f
 +        guard generation > 0 else { return nil }
 +        lock.lock()
 +        if latest?.generation == generation && intent == .closing { lock.unlock(); return nil }
++        // Returning through inactive, or revisiting the app switcher, must not
++        // cancel a running save or cause a completed unchanged VM to be saved
++        // again. Foreground/resume and explicit stop still supersede it.
++        if next == .pause, latest?.generation == generation, case .save = intent {
++            lock.unlock(); return nil
++        }
 +        if case .save(let session, false) = next, intent == next,
 +           !saveCancelled && (savePending || work != nil || completedSave == session) { lock.unlock(); return nil }
 +        revision &+= 1
@@ -14004,10 +14592,10 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..7b782f6 100644
+index f84465e..5e2ea4a 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
-@@ -9,6 +9,16 @@ struct SessionView: View {
+@@ -9,6 +9,17 @@ struct SessionView: View {
      let close: () -> Void
  
      @StateObject private var display = DisplayRouter()
@@ -14015,6 +14603,7 @@ index f84465e..7b782f6 100644
 +    @State private var showGamepadSettings = false
 +    @State private var showWirelessControls = false
 +    @StateObject private var diagnosticCapture = SessionDiagnosticCapture()
++    @ObservedObject private var clipboardStatus = ClipboardStatus.shared
 +    @ObservedObject private var resumeStatus = InstantResumeStatus.shared
 +    @State private var bootConfiguration: ResumeConfiguration?
 +    @State private var bootGeneration: UInt64 = 0
@@ -14024,7 +14613,7 @@ index f84465e..7b782f6 100644
      @State private var error: String?
      @State private var state: Int32 = 0
      @State private var bootAttempt = 0
-@@ -22,11 +32,11 @@ struct SessionView: View {
+@@ -22,11 +33,11 @@ struct SessionView: View {
      @State private var started = Date()
      @State private var runningScreen: GuestScreenSize?
      @State private var thermalState = ProcessInfo.processInfo.thermalState
@@ -14038,7 +14627,7 @@ index f84465e..7b782f6 100644
      @AppStorage("henge.cursor.sharp") private var sharpCursor = true
      @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = HardwareScroll.defaultSpeed
  
-@@ -45,6 +55,8 @@ struct SessionView: View {
+@@ -45,6 +56,8 @@ struct SessionView: View {
      @AppStorage("henge.tips.stillWallpaperShown") private var stillWallpaperTipShown = false
      @State private var showWallpaperTip = false
      @State private var confirmStop = false
@@ -14047,7 +14636,7 @@ index f84465e..7b782f6 100644
      @State private var zoomCentre = CGPoint(x: 0.5, y: 0.5) // where the zoomed view is, 0...1 of the Mac's screen
      @State private var map: UIImage?
      @State private var zoomFollowing: Task<Void, Never>?
-@@ -53,7 +65,6 @@ struct SessionView: View {
+@@ -53,7 +66,6 @@ struct SessionView: View {
      @State private var shown = CGSize(width: 0.5, height: 0.5) // how much of the Mac's screen the zoomed view shows
      @Environment(\.scenePhase) private var scenePhase
  
@@ -14055,7 +14644,7 @@ index f84465e..7b782f6 100644
      var body: some View {
          GeometryReader { geo in
              let insets = geo.safeAreaInsets
-@@ -190,12 +201,19 @@ struct SessionView: View {
+@@ -190,12 +202,19 @@ struct SessionView: View {
          } message: {
              Text("This turns the Mac off at once. Anything not saved on it is lost.")
          }
@@ -14078,18 +14667,19 @@ index f84465e..7b782f6 100644
          }
          .onChange(of: nativeTouch.requested) { _, _ in nativeTouch.changedRequest() }
          .onChange(of: pointerNeeded) { needed in
-@@ -204,6 +222,10 @@ struct SessionView: View {
+@@ -204,6 +223,11 @@ struct SessionView: View {
              if needed { nativeTouch.stop() }
          }
          .onChange(of: scenePhase) { phase in
 +            guard InstantResume.runtime.ownsView(viewRevision) else { return }
++            Sharing.setClipboardActive(phase == .active)
 +            diagnosticCapture.event("scene=\(phase)")
 +            wakeups.signal()
 +            updateZoomFollowing()
              HardwareMouse.shared.setAcceptsInput(phase == .active && !pointerNeeded)
              guard phase != .active else {
                  display.refresh()
-@@ -211,13 +233,75 @@ struct SessionView: View {
+@@ -211,13 +235,75 @@ struct SessionView: View {
                  return
              }
              nativeTouch.stop()
@@ -14167,7 +14757,7 @@ index f84465e..7b782f6 100644
              if showing {
                  refreshDetails()
                  HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll()
-@@ -228,35 +312,39 @@ struct SessionView: View {
+@@ -228,35 +314,39 @@ struct SessionView: View {
          }
          .onAppear {
              UIApplication.shared.isIdleTimerDisabled = true
@@ -14223,21 +14813,37 @@ index f84465e..7b782f6 100644
  
      // A fold/rotation after boot must fit the mode the guest actually received,
      // rather than stretch it by recalculating only the host view's aspect.
-@@ -485,6 +573,23 @@ struct SessionView: View {
+@@ -411,6 +501,9 @@ struct SessionView: View {
+         .labelStyle(.iconOnly)
+         .buttonBorderShape(.circle)
+         .tint(Desk.raised)
++        .disabled(clipboardStatus.busy || booting || manualSaving || state != 1)
++        .overlay { if clipboardStatus.busy { ProgressView().allowsHitTesting(false) } }
++        .accessibilityLabel(clipboardStatus.busy ? "Sending clipboard to Mac" : "Paste text into Mac")
+     }
+ 
+     /// An iPhone's large screen: an iPhone Duo unfolded, regular both ways.
+@@ -485,6 +578,29 @@ struct SessionView: View {
      /// The controls a column has too.
      @ViewBuilder private var floatingTools: some View {
          tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
 +        Menu {
-+            if InstantResume.enabled,bootConfiguration != nil {
-+                Button("Save Mac & Leave",systemImage:"pause.circle") { saveAndLeave() }.disabled(booting || manualSaving)
++            Section("Session") {
++                if bootConfiguration != nil {
++                    Button("Save Mac & Leave",systemImage:"pause.circle") { saveAndLeave() }.disabled(booting || manualSaving)
++                }
++                Button("Recover sound",systemImage:"speaker.wave.2") { AudioSessionRecovery.shared.recover() }
 +            }
-+            Button(showGamepad ? "Hide Virtual Gamepad" : "Show Virtual Gamepad",systemImage:"gamecontroller") { showGamepad.toggle() }
-+            Button("Recover sound",systemImage:"speaker.wave.2") { AudioSessionRecovery.shared.recover() }
-+            Button("Gamepad Settings",systemImage:"slider.horizontal.3") { showGamepadSettings = true }
-+            Button("Wireless Keyboard / Gamepad",systemImage:"antenna.radiowaves.left.and.right") { showWirelessControls = true }
-+            Button(diagnosticCapture.active ? "Stop Diagnostic Capture" : "Capture Diagnostics (30 seconds)",systemImage:"waveform.path.ecg") {
-+                if diagnosticCapture.active { diagnosticCapture.stop() } else { diagnosticCapture.begin() }
-+                wakeups.signal()
++            Section("Controls") {
++                Button(showGamepad ? "Hide Virtual Gamepad" : "Show Virtual Gamepad",systemImage:"gamecontroller") { showGamepad.toggle() }
++                Button("Gamepad Settings",systemImage:"slider.horizontal.3") { showGamepadSettings = true }
++                Button("Wireless Keyboard / Gamepad",systemImage:"antenna.radiowaves.left.and.right") { showWirelessControls = true }
++            }
++            Section("Diagnostics") {
++                Button(diagnosticCapture.active ? "Stop Diagnostic Capture" : "Capture Diagnostics (30 seconds)",systemImage:"waveform.path.ecg") {
++                    if diagnosticCapture.active { diagnosticCapture.stop() } else { diagnosticCapture.begin() }
++                    wakeups.signal()
++                }
 +            }
 +        } label: {
 +            Image(systemName:"gamecontroller").font(.system(size:19,weight:.medium))
@@ -14247,7 +14853,7 @@ index f84465e..7b782f6 100644
          pasteTool
          tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
          tool("info.circle", "Details", tint: .white) { showDetails = true }
-@@ -513,12 +618,19 @@ struct SessionView: View {
+@@ -513,12 +629,19 @@ struct SessionView: View {
      }
  
      /// Keeps the pointer in view: the view moves when the pointer nears its edge.
@@ -14268,7 +14874,7 @@ index f84465e..7b782f6 100644
              }
              if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / displayAspect)) { map = UIImage(cgImage: image) }
              tick += 1
-@@ -541,10 +653,65 @@ struct SessionView: View {
+@@ -541,10 +664,70 @@ struct SessionView: View {
  
      // MARK: Status
  
@@ -14279,16 +14885,21 @@ index f84465e..7b782f6 100644
 +            if resumeStatus.phase == .saving {
 +                let progress=resumeStatus.progress
 +                ProgressView(value:progress.total>0 ? Double(progress.scanned)/Double(progress.total) : 0)
++                Text("\(ByteText.string(progress.scanned)) of \(ByteText.string(progress.total)) scanned")
++                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
 +                Text(progress.cancelled ? "Cancelling the save…" : "Keep Henge visible until saving finishes. A completed save can survive the app closing.")
 +                    .font(.footnote).foregroundStyle(.secondary)
 +            } else if case .failed(let reason)=resumeStatus.phase {
 +                Text(reason).font(.footnote)
++            } else if resumeStatus.phase == .saved {
++                Label("Saved on this device",systemImage:"checkmark.shield.fill").foregroundStyle(Desk.good)
++                Text("Your Mac can be restored after Henge closes. Continuing safely invalidates this save before the Mac runs again.").font(.footnote).foregroundStyle(.secondary)
 +            } else if state == 4 {
 +                Text("The Mac is paused in memory. Only a completed compatible save can survive Henge being closed.").font(.footnote).foregroundStyle(.secondary)
 +            }
 +            Button("Continue Mac") { manualSaving=false;InstantResume.cameBack(bootMac ?? mac) }
 +                .disabled(resumeStatus.phase == .closing || resumeStatus.phase == .stopping)
-+            if !resumeStatus.busy,InstantResume.enabled,bootConfiguration != nil {
++            if !resumeStatus.busy,bootConfiguration != nil {
 +                Button("Save & Leave") { saveAndLeave() }
 +            }
 +        }
@@ -14334,7 +14945,7 @@ index f84465e..7b782f6 100644
              Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
          }
          .padding(18)
-@@ -577,12 +744,13 @@ struct SessionView: View {
+@@ -577,12 +760,13 @@ struct SessionView: View {
          NavigationStack {
              List {
                  Section(phase) {
@@ -14349,7 +14960,7 @@ index f84465e..7b782f6 100644
                  Section("Display") {
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
-@@ -599,6 +767,7 @@ struct SessionView: View {
+@@ -599,6 +783,7 @@ struct SessionView: View {
                  }
                  Section("Pointer") {
                      Picker("Size", selection: $cursorScale) {
@@ -14357,7 +14968,7 @@ index f84465e..7b782f6 100644
                          Text("1×").tag(1)
                          Text("2×").tag(2)
                          Text("3×").tag(3)
-@@ -608,7 +777,7 @@ struct SessionView: View {
+@@ -608,7 +793,7 @@ struct SessionView: View {
                      LabeledContent("Magic Keyboard / mouse scroll speed", value: String(format: "%.2f×", scrollSpeed))
                      Slider(value: $scrollSpeed, in: HardwareScroll.minimumSpeed...HardwareScroll.maximumSpeed)
                      Button("Reset hardware scroll speed") { scrollSpeed = HardwareScroll.defaultSpeed }
@@ -14366,7 +14977,7 @@ index f84465e..7b782f6 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  Section("Touch input") {
-@@ -618,15 +787,15 @@ struct SessionView: View {
+@@ -618,15 +803,15 @@ struct SessionView: View {
                          Text("Enable Guest sharing in Henge Settings and reopen Henge to use native touch.")
                              .font(.footnote).foregroundStyle(.secondary)
                      }
@@ -14387,7 +14998,21 @@ index f84465e..7b782f6 100644
                      default: Text("Trackpad is active. Native touch connects after you close Details.")
                      }
                      Button("Type the Helper Update Command") {
-@@ -680,6 +849,8 @@ struct SessionView: View {
+@@ -640,8 +825,11 @@ struct SessionView: View {
+                 }
+                 Section("Sharing") {
+                     LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
+-                    if !helperRunning {
+-                        Button("Type the Set Up Command") {
++                    LabeledContent("Confirmed paste", value: helperRunning && henge_share_clipboard_ready() != 0 ? "Ready" : "Companion update needed")
++                    Text("Text only. Copying on the Mac updates this device while Henge is active. Use the system Paste button to send text to the Mac; it waits for confirmation before pressing Command-V. Henge never reads your clipboard automatically. Universal Clipboard also works between nearby Apple devices when the same Apple Account, Handoff, Wi-Fi and Bluetooth are enabled; Apple controls its availability.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                    if !helperRunning || henge_share_clipboard_ready() == 0 {
++                        Button(helperRunning ? "Type Companion Update Command" : "Type the Set Up Command") {
+                             showDetails = false
+                             Task {
+                                 try? await Task.sleep(nanoseconds: 600_000_000)
+@@ -680,6 +868,8 @@ struct SessionView: View {
      }
  
      private func run(viewport: CGSize) async {
@@ -14396,7 +15021,7 @@ index f84465e..7b782f6 100644
          error = nil
          state = 0
          userCode = false
-@@ -693,65 +864,109 @@ struct SessionView: View {
+@@ -693,65 +883,109 @@ struct SessionView: View {
          zoomCentre = CGPoint(x: 0.5, y: 0.5)
          map = nil
          showWallpaperTip = false
@@ -14551,7 +15176,7 @@ index f84465e..7b782f6 100644
              if state == 2 {
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
-@@ -769,38 +984,58 @@ struct SessionView: View {
+@@ -769,38 +1003,58 @@ struct SessionView: View {
                  }
                  break
              }
@@ -14684,10 +15309,10 @@ index 0000000..75768bd
 +    }
 +}
 diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
-index e1693b0..4fdc76a 100644
+index e1693b0..269386b 100644
 --- a/ios/Henge/SettingsView.swift
 +++ b/ios/Henge/SettingsView.swift
-@@ -9,16 +9,13 @@ struct SettingsView: View {
+@@ -9,19 +9,16 @@ struct SettingsView: View {
      @AppStorage(PhysicalMouseButtons.swapKey) private var swapMouseButtons = false
      @AppStorage(Trackpad.scrollSpeedKey) private var trackpadScroll = Trackpad.defaultScrollSpeed
      @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = HardwareScroll.defaultSpeed
@@ -14705,7 +15330,11 @@ index e1693b0..4fdc76a 100644
 -    @AppStorage(EngineTuning.cpuPolicyKey) private var cpuPolicy = "auto"
      @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
      @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
-     @AppStorage(InstantResume.key) private var instantResume = false
+-    @AppStorage(InstantResume.key) private var instantResume = false
++    @AppStorage(InstantResume.key) private var instantResume = true
+     @AppStorage(MacAppsFeature.key) private var macApps = false
+ 
+     /// The second footer paragraph: how you click, given the selected input mode.
 @@ -40,6 +37,8 @@ struct SettingsView: View {
      }
  
@@ -14725,7 +15354,7 @@ index e1693b0..4fdc76a 100644
                          Text("A Magic Keyboard or a Bluetooth mouse moves the Mac's pointer. Pointer speed changes apply the next time a Mac starts; scroll speed changes apply immediately.")
                              .font(.footnote).foregroundStyle(.secondary)
                      }
-@@ -126,23 +122,20 @@ struct SettingsView: View {
+@@ -126,81 +122,46 @@ struct SettingsView: View {
                      .listRowBackground(Desk.card)
                  }
                  Section("Performance") {
@@ -14754,51 +15383,43 @@ index e1693b0..4fdc76a 100644
 -                    if cpuPolicy == "mixed" {
 -                        Text("Duo experiment: the first \(HostScheduling.responsiveCPUs) virtual CPUs keep responsive priority; additional virtual CPUs request utility priority. These are whole macOS CPUs, not just background game workers. This may reduce heat or may slow apps and worsen frame times. Core placement is not guaranteed; compare with Automatic. No measured performance or power benefit is claimed.")
 -                            .font(.footnote).foregroundStyle(.secondary)
++                    NavigationLink { settingsPage("Display & power") { displayControls } } label: {
++                        Label("Display & power", systemImage: "display")
+                     }
+-                    Picker("Mac refresh rate", selection: $refreshRate) {
+-                        Text("30 Hz").tag(30)
+-                        Text("60 Hz").tag(60)
+-                        Text("120 Hz").tag(120)
++                    NavigationLink { settingsPage("Engine & memory") { engineControls } } label: {
++                        Label("Engine & memory", systemImage: "cpu")
+                     }
+-                    .pickerStyle(.segmented)
+-                    Toggle("Thermal display protection", isOn: $thermalProtection)
+-                    Picker("Presentation limit", selection: $presentationCap) {
+-                        Text("Automatic").tag(0)
+-                        Text("60 fps").tag(60)
+-                        Text("30 fps").tag(30)
 -                    }
-                     Picker("Mac refresh rate", selection: $refreshRate) {
-                         Text("30 Hz").tag(30)
-                         Text("60 Hz").tag(60)
-@@ -150,57 +143,51 @@ struct SettingsView: View {
-                     }
-                     .pickerStyle(.segmented)
-                     Toggle("Thermal display protection", isOn: $thermalProtection)
-+                    Toggle("Match Low Power Mode", isOn: $lowPowerAware)
-+                    Toggle("60 Hz Mac in Low Power Mode (next start)",isOn:$lowPowerGuestRefresh)
-+                    Text("Optional: when Low Power Mode is on at startup, a requested 120 Hz Mac starts at 60 Hz to avoid guest animation work that the display cannot show. Turn Low Power Mode off and restart to restore 120 Hz. This is an explicit refresh trade-off, never a Retina resolution reduction.")
-+                        .font(.footnote).foregroundStyle(.secondary)
-+                    Text("Aligns display presentation with the system’s 60 Hz Low Power Mode limit. Turning Low Power Mode off restores your selected presentation policy. Retina, guest CPU count and the saved 60/120 Hz Mac preference stay unchanged.")
-+                        .font(.footnote).foregroundStyle(.secondary)
-                     Picker("Presentation limit", selection: $presentationCap) {
-                         Text("Automatic").tag(0)
-                         Text("60 fps").tag(60)
-                         Text("30 fps").tag(30)
-                     }
 -                    Text("Optional power controls; disabled by default. Keeps Retina. Thermal protection limits presentation to 30 fps when hot and 20 fps in critical heat. This reduces display compositing; the guest may still render faster. Choose a 30 Hz Mac refresh rate before restarting to also reduce guest animation work. Presentation changes apply within about a second while frames arrive.")
 -                        .font(.footnote).foregroundStyle(.secondary)
 -                    Toggle("Faster disk writes", isOn: $fastFlush)
 -                    Toggle("Quicker wake from idle", isOn: $wfiSpin)
 -                    Toggle("Kernel read cache (experimental)", isOn: $fastmem)
 -                    Text("Tries a larger cache for kernel memory reads. May be slower or use more memory. Applies the next time a Mac starts.")
-+                    Text("Presentation limit and thermal protection are optional and off by default. Both preserve Retina. Thermal protection limits presentation to 30 fps when hot and 20 fps in critical heat. This reduces display compositing; the guest may still render faster. Choose a 30 Hz Mac refresh rate before restarting to also reduce guest animation work. Presentation and thermal changes are applied through notifications.")
-                         .font(.footnote).foregroundStyle(.secondary)
+-                        .font(.footnote).foregroundStyle(.secondary)
 -                    Toggle("Cache diagnostic counters", isOn: $cacheDiagnostics)
 -                    Text("Records actual cache hits in the log. Adds overhead: turn this off when comparing speed. Applies the next time a Mac starts.")
-+                    Toggle("Ordered disk writes", isOn: $fastFlush)
-+                    Text("On: preserves write ordering without waiting for a full storage sync, improving write latency. Off: uses full sync for stronger power-loss durability. Applies to the next Mac session.")
-                         .font(.footnote).foregroundStyle(.secondary)
+-                        .font(.footnote).foregroundStyle(.secondary)
 -                    Toggle("Superblocks (experimental)", isOn: $superblocks)
 -                    Text("Continues translated code through conditional branches within the same page, bounded to 48 instructions at a conditional exit. May reduce dispatch work but increase code-cache pressure. Off by default; performance on your device is unverified. Applies to a new Mac session.")
-+                    Toggle("Kernel read cache", isOn: $fastmem)
-+                    Text("Checks a larger permission-validated cache only when the normal translation cache misses. Helps repeated kernel reads when translations collide; uses additional memory. Existing on/off choices are kept. Applies to the next Mac session; per-access counting stays off.")
-                         .font(.footnote).foregroundStyle(.secondary)
-                     Picker("Code cache", selection: $codeCacheMB) {
-                         Text("512 MB").tag(512)
-                         Text("1 GB").tag(1024)
-                         Text("1.5 GB").tag(1536)
-                     }
+-                        .font(.footnote).foregroundStyle(.secondary)
+-                    Picker("Code cache", selection: $codeCacheMB) {
+-                        Text("512 MB").tag(512)
+-                        Text("1 GB").tag(1024)
+-                        Text("1.5 GB").tag(1536)
+-                    }
 -                    Text("A bigger code cache empties less often and takes more memory (about 1.75 times its size); Henge picks one by its memory limit: 1.5 GB where there is plenty, 512 MB where there is little. Compiled code is not saved between app launches. Applies the next time Henge opens. If JIT stops turning on, or a Mac closes Henge during setup, choose a smaller one.")
-+                    Text("A larger code region keeps more translations and uses more memory (about 1.75 times its size). Henge chooses a size from its process memory limit. Oldest segments are recycled when possible, with full reset as a fallback. Guest CPU translations are not saved between app launches. Applies the next time Henge opens. If JIT stops turning on, or a Mac closes Henge during setup, choose a smaller one.")
-                         .font(.footnote).foregroundStyle(.secondary)
+-                        .font(.footnote).foregroundStyle(.secondary)
 -                    Text("60 Hz leaves more of the emulated CPU to apps. Faster disk writes order them without waiting for a full sync; a sudden power loss could lose the last ones. Quicker wake keeps an idle CPU watching for work for 50 µs, at some battery cost. Superblocks let translated code run past conditional branches. Changes apply the next time a Mac starts.")
 -                        .font(.footnote).foregroundStyle(.secondary)
 -                }
@@ -14807,8 +15428,9 @@ index e1693b0..4fdc76a 100644
 -                    LabeledContent("Background GPU capability", value: BackgroundExecutionStatus.gpuSupport)
 -                    LabeledContent("Signed GPU entitlement", value: BackgroundExecutionStatus.signedGPUAccess)
 -                    Text("These are separate capability checks, not confirmation of background execution. Running the Mac in the background is not implemented in this build. Keep Henge visible while your runner builds. No signing entitlement has been added.")
-+                    Text("Event-driven CPU waits, indexed translation reuse, segmented code-cache recycling and direct Metal presentation are automatic. Experimental engine overrides remain available through henge-env.txt.")
++                    Text("Your display quality and engine options are kept on separate pages. Changes marked for the next session apply when the Mac starts again.")
                          .font(.footnote).foregroundStyle(.secondary)
++
                  }
                  .listRowBackground(Desk.card)
                  Section("Guest sharing") {
@@ -14819,8 +15441,9 @@ index e1693b0..4fdc76a 100644
                  }
                  .listRowBackground(Desk.card)
                  Section("Instant Resume") {
-                     Toggle("Resume where you left off", isOn: $instantResume)
+-                    Toggle("Resume where you left off", isOn: $instantResume)
 -                    Text("When you leave Henge, the running Mac is saved to storage, and opening it again picks up where it was in a few seconds, even after iOS closes Henge. The save is about the size of the Mac's memory in use, compressed. The Mac pauses while Henge is in the background, so its sound stops. Experimental.")
++                    Toggle("Save automatically when leaving", isOn: $instantResume)
 +                    Text("Pauses macOS when Henge becomes inactive and tries to save while iOS allows background time. Returning cancels an unfinished save and resumes in memory. Use Save Mac & Leave from the three-finger menu and keep Henge visible to finish a persistent save. Saved sessions retain their original CPU, memory and display configuration. iOS can interrupt background saving; only a completed compatible save survives the app closing. Turning this off stops future automatic saves; existing saved sessions are still restored.")
                          .font(.footnote).foregroundStyle(.secondary)
                  }
@@ -14832,27 +15455,94 @@ index e1693b0..4fdc76a 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  .listRowBackground(Desk.card)
+@@ -223,4 +184,52 @@ struct SettingsView: View {
+             .navigationTitle("Settings")
+         }
+     }
++    private func settingsPage<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
++        Form { Section { content() }.listRowBackground(Desk.card) }
++            .scrollContentBackground(.hidden).background(Desk.page).navigationTitle(title)
++            .navigationBarTitleDisplayMode(.inline)
++    }
++    private var displayControls: some View {
++        Group {
++                    Picker("Mac refresh rate", selection: $refreshRate) {
++                        Text("30 Hz").tag(30)
++                        Text("60 Hz").tag(60)
++                        Text("120 Hz").tag(120)
++                    }
++                    .pickerStyle(.segmented)
++                    Toggle("Thermal display protection", isOn: $thermalProtection)
++                    Toggle("Match Low Power Mode", isOn: $lowPowerAware)
++                    Toggle("60 Hz Mac in Low Power Mode (next start)",isOn:$lowPowerGuestRefresh)
++                    Text("Optional: when Low Power Mode is on at startup, a requested 120 Hz Mac starts at 60 Hz to avoid guest animation work that the display cannot show. Turn Low Power Mode off and restart to restore 120 Hz. This is an explicit refresh trade-off, never a Retina resolution reduction.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                    Text("Aligns display presentation with the system’s 60 Hz Low Power Mode limit. Turning Low Power Mode off restores your selected presentation policy. Retina, guest CPU count and the saved 60/120 Hz Mac preference stay unchanged.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                    Picker("Presentation limit", selection: $presentationCap) {
++                        Text("Automatic").tag(0)
++                        Text("60 fps").tag(60)
++                        Text("30 fps").tag(30)
++                    }
++                    Text("Presentation limit and thermal protection are optional and off by default. Both preserve Retina. Thermal protection limits presentation to 30 fps when hot and 20 fps in critical heat. This reduces display compositing; the guest may still render faster. Choose a 30 Hz Mac refresh rate before restarting to also reduce guest animation work. Presentation and thermal changes are applied through notifications.")
++                        .font(.footnote).foregroundStyle(.secondary)
++        }
++    }
++    private var engineControls: some View {
++        Group {
++                    Toggle("Ordered disk writes", isOn: $fastFlush)
++                    Text("On: preserves write ordering without waiting for a full storage sync, improving write latency. Off: uses full sync for stronger power-loss durability. Applies to the next Mac session.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                    Toggle("Kernel read cache", isOn: $fastmem)
++                    Text("Checks a larger permission-validated cache only when the normal translation cache misses. Helps repeated kernel reads when translations collide; uses additional memory. Existing on/off choices are kept. Applies to the next Mac session; per-access counting stays off.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                    Picker("Code cache", selection: $codeCacheMB) {
++                        Text("512 MB").tag(512)
++                        Text("1 GB").tag(1024)
++                        Text("1.5 GB").tag(1536)
++                    }
++                    Text("A larger code region keeps more translations and uses more memory (about 1.75 times its size). Henge chooses a size from its process memory limit. Oldest segments are recycled when possible, with full reset as a fallback. Guest CPU translations are not saved between app launches. Applies the next time Henge opens. If JIT stops turning on, or a Mac closes Henge during setup, choose a smaller one.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                    Text("Event-driven CPU waits, indexed translation reuse, segmented code-cache recycling and direct Metal presentation are automatic. Experimental engine overrides remain available through henge-env.txt.")
++                        .font(.footnote).foregroundStyle(.secondary)        }
++    }
++
+ }
 diff --git a/ios/Henge/Sharing.swift b/ios/Henge/Sharing.swift
-index eb316cc..0d1a62e 100644
+index eb316cc..752dc6d 100644
 --- a/ios/Henge/Sharing.swift
 +++ b/ios/Henge/Sharing.swift
-@@ -6,6 +6,15 @@ import UIKit
+@@ -1,11 +1,29 @@
+ import SwiftUI
+ import UIKit
++import UniformTypeIdentifiers
+ 
+ /// What a running Mac shares with this device: the Shared folder in Files, and the clipboard. The Mac mounts
+ /// the folder and follows the clipboard through a small helper (host/share.c, tools/henge-agent.m).
++@MainActor final class ClipboardStatus: ObservableObject {
++    static let shared = ClipboardStatus()
++    @Published var busy = false
++    @Published var message: String?
++}
++
  enum Sharing {
      static let enabledKey = "henge.sharing.enabled"
      private(set) static var enabledForSession = false
 +    private static var followingClipboard = false
++    private static var pasteTask: Task<Void, Never>?
++    private static var pasteRevision: UInt64 = 0
 +    // Dispatch merges guest updates before the main queue drains them. This has
 +    // no timer and owns no VM memory; delayed events are harmless after leaving.
 +    private static let clipboardEvents: DispatchSourceUserDataAdd = {
 +        let events = DispatchSource.makeUserDataAddSource(queue: .main)
-+        events.setEventHandler { consumeMacClipboard() }
++        events.setEventHandler { Task { @MainActor in consumeMacClipboard() } }
 +        events.resume()
 +        return events
 +    }()
      static var folder: URL {
          FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("Shared", isDirectory: true)
      }
-@@ -15,6 +24,12 @@ enum Sharing {
+@@ -15,6 +33,12 @@ enum Sharing {
      /// Before a Mac starts.
      static func prepare() {
          enabledForSession = UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
@@ -14865,7 +15555,7 @@ index eb316cc..0d1a62e 100644
          HengeLog.log("sharing", enabledForSession
                       ? "guest folder and clipboard bridge enabled (local virtual address 10.0.2.4)"
                       : "guest folder and automatic clipboard bridge disabled for this launch")
-@@ -34,14 +49,18 @@ enum Sharing {
+@@ -34,25 +58,66 @@ enum Sharing {
  
      /// What is copied on the Mac is copied here too. The other way needs the system's paste button: iOS
      /// asks for permission whenever an app reads the clipboard on its own.
@@ -14877,21 +15567,110 @@ index eb316cc..0d1a62e 100644
 -            }
 -            try? await Task.sleep(nanoseconds: 500_000_000)
 -        }
-+    static func startFollowingClipboard() {
-+        followingClipboard = true
-+        consumeMacClipboard()
++    @MainActor static func startFollowingClipboard() {
++        setClipboardActive(UIApplication.shared.applicationState == .active)
 +    }
 +
-+    static func stopFollowingClipboard() { followingClipboard = false }
++    @MainActor static func setClipboardActive(_ active: Bool) {
++        followingClipboard = active
++        if active { consumeMacClipboard() }
++        else { cancelPaste() }
++    }
++    @MainActor static func cancelPaste() {
++        pasteRevision &+= 1
++        pasteTask?.cancel(); pasteTask = nil
++        ClipboardStatus.shared.busy = false
++    }
++    @MainActor static func stopFollowingClipboard() { setClipboardActive(false) }
 +
-+    private static func consumeMacClipboard() {
++    @MainActor private static func consumeMacClipboard() {
 +        guard followingClipboard, enabledForSession,
 +              let text = henge_share_take_clipboard() else { return }
-+        UIPasteboard.general.string = String(cString: text)
++        // Opt in to the system's Universal Clipboard rather than local-only
++        // storage. Handoff/account/radio availability remains controlled by iOS.
++        UIPasteboard.general.setItems([[UTType.utf8PlainText.identifier: String(cString: text)]], options: [.localOnly: false])
 +        free(text)
      }
  
      /// Text from this device, pasted at the Mac's cursor. Without the helper it is typed, as far as the keyboard can.
+-    static func paste(_ text: String) {
+-        Task { @MainActor in
+-            if helperRunning {
+-                henge_share_set_clipboard(text)
+-                try? await Task.sleep(nanoseconds: 800_000_000) // for the helper to put it on the Mac's clipboard
+-                Keys.chord(Keys.command, "v")
++    @MainActor static func paste(_ text: String) {
++        guard !ClipboardStatus.shared.busy, UIApplication.shared.applicationState == .active,
++              henge_vm_state() == 1 else { return }
++        let generation = henge_vm_generation()
++        let status = ClipboardStatus.shared
++        pasteRevision &+= 1
++        let revision = pasteRevision
++        status.busy = true; status.message = nil
++        pasteTask = Task { @MainActor in
++            defer { if pasteRevision == revision { status.busy = false; pasteTask = nil } }
++            let current = { !Task.isCancelled && UIApplication.shared.applicationState == .active &&
++                henge_vm_generation() == generation && henge_vm_state() == 1 }
++            if helperRunning && henge_share_clipboard_ready() != 0 {
++                let seq = henge_share_publish_clipboard(text)
++                guard seq != 0 else { status.message = "The text is too large or there is not enough memory to send it."; return }
++                switch await ClipboardDelivery.wait(isCurrent: current, isDelivered: { henge_share_clipboard_delivered(seq) != 0 }) {
++                case .delivered:
++                    guard current() else { return }
++                    Keys.chord(Keys.command, "v")
++                case .timedOut:
++                    status.message = "The Mac has not confirmed the clipboard yet. No paste shortcut was sent. Try again once the Mac responds."
++                case .interrupted: break
++                }
+             } else {
+-                await Keys.typeSlowly(text)
++                guard text.allSatisfy({ Keys.canType($0) }) else {
++                    status.message = "Set up or update the Mac sharing companion in Details → Sharing to paste this text without losing characters."
++                    return
++                }
++                // An older or absent companion still has a safe US-keyboard fallback.
++                for character in text {
++                    guard current() else { return }
++                    Keys.type(character)
++                    do { try await Task.sleep(nanoseconds: 25_000_000) } catch { return }
++                }
+             }
+         }
+     }
+diff --git a/ios/Henge/Theme.swift b/ios/Henge/Theme.swift
+index f6aa26a..e487b6c 100644
+--- a/ios/Henge/Theme.swift
++++ b/ios/Henge/Theme.swift
+@@ -4,29 +4,6 @@ import UIKit
+ /// The Desk: a quiet page, cards on it with a hairline edge, and one blue for what you press.
+ /// A Mac's screen is the only colourful thing here. Dark, or light (Settings › Appearance);
+ /// a running Mac's session is always dark.
+-enum Desk {
+-    static let page = tone(light: (242, 243, 247), dark: (11, 12, 16))
+-    static let card = tone(light: (255, 255, 255), dark: (22, 24, 31))
+-    static let raised = tone(light: (228, 230, 236), dark: (35, 38, 47))
+-    static let text = tone(light: (17, 19, 24), dark: (242, 243, 247))
+-    static let dim = tone(light: (92, 97, 112), dark: (144, 149, 164))
+-    static let faint = tone(light: (138, 143, 157), dark: (106, 111, 126))
+-    static let accent = Color(red: 46 / 255, green: 107 / 255, blue: 1)
+-    /// Blue for tints and text: lighter on the dark page, deeper on the light one.
+-    static let accentLight = tone(light: (31, 91, 235), dark: (91, 141, 255))
+-    static let good = tone(light: (20, 145, 90), dark: (57, 217, 138))
+-    static let warn = tone(light: (184, 119, 0), dark: (255, 188, 46))
+-    static let bad = tone(light: (210, 56, 43), dark: (255, 122, 112))
+-    static let hairline = Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 1, alpha: 0.1) : UIColor(white: 0, alpha: 0.1) })
+-
+-    private static func tone(light: (Int, Int, Int), dark: (Int, Int, Int)) -> Color {
+-        func ui(_ c: (Int, Int, Int)) -> UIColor {
+-            UIColor(red: CGFloat(c.0) / 255, green: CGFloat(c.1) / 255, blue: CGFloat(c.2) / 255, alpha: 1)
+-        }
+-        let l = ui(light), d = ui(dark)
+-        return Color(UIColor { $0.userInterfaceStyle == .dark ? d : l })
+-    }
+-}
+ 
+ /// Settings › Appearance.
+ enum DeskAppearance: String, CaseIterable, Identifiable {
 diff --git a/ios/project.yml b/ios/project.yml
 index a3be374..a022ef6 100644
 --- a/ios/project.yml
@@ -15191,10 +15970,10 @@ index 0000000..5435674
 +HengeGamepadPreview.xcodeproj/
 diff --git a/tests/gamepad-preview/App.swift b/tests/gamepad-preview/App.swift
 new file mode 100644
-index 0000000..a2a2c80
+index 0000000..65606de
 --- /dev/null
 +++ b/tests/gamepad-preview/App.swift
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,120 @@
 +import SwiftUI
 +import Metal
 +import UIKit
@@ -15204,10 +15983,15 @@ index 0000000..a2a2c80
 +        try? FileManager.default.removeItem(at:URL.documentsDirectory.appendingPathComponent("ControlsWindowProof",isDirectory:true))
 +        for key in ["henge.gamepad.tuning.v1","henge.touchpad.tuning.v1","henge.link.controllerLayout"] { UserDefaults.standard.removeObject(forKey:key) }
 +    }
-+    var body: some Scene { WindowGroup { PreviewRoot().preferredColorScheme(.dark) } }
++    var body: some Scene { WindowGroup { PreviewRoot() } }
 +}
 +
 +struct PreviewRoot: View {
++    @State private var opening=false
++    @State private var homeState=0
++    @State private var homeDark=true
++    @State private var automaticSave=true
++    @State private var homeActions=0
 +    @State private var wireless=false
 +    @State private var folded=false
 +    @State private var video=false
@@ -15253,6 +16037,11 @@ index 0000000..a2a2c80
 +                HStack {
 +                    Text("\(PreviewFixture.profile) · layout fixture").font(.caption)
 +                    Spacer()
++                    Button(opening ? "Controls" : "Home") { opening.toggle() }.accessibilityIdentifier("show-home")
++                    if opening {
++                        Button("State") { homeState=(homeState+1)%3 }.accessibilityIdentifier("home-state")
++                        Button(homeDark ? "Light" : "Dark") { homeDark.toggle() }.accessibilityIdentifier("home-theme")
++                    }
 +                    Button(wireless ? "Local" : "Wireless") { last = .off;wireless.toggle() }.accessibilityIdentifier("switch-layout")
 +                    if PreviewFixture.profile == "duo-unfolded" {
 +                        Button(folded ? "Unfold" : "Fold") { last = .off;folded.toggle() }.accessibilityIdentifier("fold")
@@ -15271,7 +16060,20 @@ index 0000000..a2a2c80
 +                }.font(.caption.monospacedDigit()).lineLimit(1).minimumScaleFactor(0.5).frame(height:22)
 +                ZStack(alignment:.bottom) {
 +                    LinearGradient(colors:[.indigo.opacity(0.45),.gray.opacity(0.2),.black],startPoint:.topLeading,endPoint:.bottomTrailing)
-+                    if wireless && video {
++                    if opening {
++                        ScrollView {
++                            OpeningDashboard(wide:width>=900) {
++                                MacLaunchCard(name:"Macintosh",summary:"macOS · 8 GB · 4 CPUs",ready:homeState != 2,saved:homeState == 1,
++                                    setupNote:"Enable JIT to start your Mac",start:{homeActions+=1},setup:{homeActions+=1},configure:{homeActions+=1})
++                            } connections: {
++                                VStack(spacing:20) {
++                                    WorkspaceConnections(canExtend:true,controls:{homeActions+=1},display:{homeActions+=1},extend:{homeActions+=1})
++                                    AutomaticSaveCard(enabled:$automaticSave)
++                                    Text("Actions: \(homeActions)").accessibilityIdentifier("home-actions")
++                                }
++                            }.padding(18)
++                        }.background(Desk.page)
++                    } else if wireless && video {
 +                        WirelessVideoControls(isDuo:PreviewFixture.profile == "duo-unfolded",tuning:preferences.value,sendPad:receive,sendPointer:point,
 +                            video:ZStack { Color.indigo.opacity(0.5);Text("Video layout fixture · production controls").accessibilityIdentifier("video-fixture") },
 +                            toolbar:Text("Main Mac screen · fixture").font(.caption))
@@ -15288,15 +16090,16 @@ index 0000000..a2a2c80
 +                Spacer(minLength:0)
 +            }.padding(12).frame(width:geometry.size.width,height:geometry.size.height)
 +            .sheet(isPresented:$settings) { GamepadSettingsPanel(mapping:$mapping,allowsNativeProfile:!wireless) }
++            .preferredColorScheme(opening && !homeDark ? .light : .dark)
 +        }
 +    }
 +}
 diff --git a/tests/gamepad-preview/GamepadPreviewUITests.swift b/tests/gamepad-preview/GamepadPreviewUITests.swift
 new file mode 100644
-index 0000000..fa420ca
+index 0000000..64908b5
 --- /dev/null
 +++ b/tests/gamepad-preview/GamepadPreviewUITests.swift
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,144 @@
 +import XCTest
 +import CoreGraphics
 +
@@ -15338,6 +16141,25 @@ index 0000000..fa420ca
 +            let r=PadLayout(bounds:CGRect(origin:.zero,size:size),size:1,portrait:portrait).rect(control)
 +            surface.coordinate(withNormalizedOffset:CGVector(dx:r.midX/size.width,dy:r.midY/size.height)).tap()
 +        }
++        app.buttons["show-home"].tap()
++        let launch=app.buttons["launch-mac"]
++        XCTAssertTrue(launch.waitForExistence(timeout:5))
++        XCTAssertTrue(launch.isHittable)
++        capture("\(PreviewFixture.profile)-home-ready-dark")
++        launch.tap()
++        XCTAssertEqual(app.staticTexts["home-actions"].label,"Actions: 1")
++        app.buttons["home-state"].tap()
++        XCTAssertTrue(app.staticTexts["Resume Mac"].exists || launch.label.contains("Resume Mac"))
++        capture("\(PreviewFixture.profile)-home-resume")
++        app.buttons["home-theme"].tap()
++        capture("\(PreviewFixture.profile)-home-light")
++        app.buttons["home-state"].tap()
++        XCTAssertTrue(app.staticTexts["Enable JIT"].exists || launch.label.contains("Enable JIT"))
++        launch.tap()
++        XCTAssertEqual(app.staticTexts["home-actions"].label,"Actions: 2")
++        capture("\(PreviewFixture.profile)-home-setup")
++        app.buttons["show-home"].tap()
++        XCTAssertTrue(surface.waitForExistence(timeout:5))
 +        capture("\(PreviewFixture.profile)-local-default")
 +        let bounds=XCTAttachment(string:app.debugDescription);bounds.name="Initial production UI bounds";bounds.lifetime = .keepAlways;add(bounds)
 +        tap(.a)
@@ -15454,10 +16276,10 @@ index 0000000..c1696da
 +workflow with native_duo=true, to retry strict native Duo geometry validation.
 diff --git a/tests/gamepad-preview/project.yml b/tests/gamepad-preview/project.yml
 new file mode 100644
-index 0000000..673cf84
+index 0000000..77a0d74
 --- /dev/null
 +++ b/tests/gamepad-preview/project.yml
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,83 @@
 +name: HengeGamepadPreview
 +options:
 +  deploymentTarget:
@@ -15475,6 +16297,8 @@ index 0000000..673cf84
 +    sources:
 +    - App.swift
 +    - Fixture.swift
++    - ../../ios/Henge/Components/InterfaceStyle.swift
++    - ../../ios/Henge/Components/OpeningDashboard.swift
 +    - ../../ios/Henge/Controls/GamepadState.swift
 +    - ../../ios/Henge/Controls/GamepadTuning.swift
 +    - ../../ios/Henge/Controls/GamepadLayout.swift
@@ -16067,12 +16891,37 @@ index 88db6e8..569ea23 100644
  with tempfile.TemporaryDirectory() as t:
   p=Path(t);(p/'test.c').write_text(source)
   subprocess.run([os.environ.get('CC','cc'),'-std=c11','-O1','-g','-fsanitize=address,undefined','-pthread','-I'+str(root/'core'),'-I'+str(root/'host'),str(p/'test.c'),'-o',str(p/'test')],check=True)
+diff --git a/tests/test_clipboard_delivery.swift b/tests/test_clipboard_delivery.swift
+new file mode 100644
+index 0000000..79b06cd
+--- /dev/null
++++ b/tests/test_clipboard_delivery.swift
+@@ -0,0 +1,19 @@
++import Foundation
++@main struct Check {
++    @MainActor static func main() async {
++        var ticks=0
++        let delayed=await ClipboardDelivery.wait(isCurrent:{true},isDelivered:{ticks>=7},attempts:10,sleep:{ticks+=1})
++        precondition(delayed == .delivered && ticks==7)
++        ticks=0
++        let interrupted=await ClipboardDelivery.wait(isCurrent:{ticks<3},isDelivered:{ticks>=5},attempts:10,sleep:{ticks+=1})
++        precondition(interrupted == .interrupted && ticks==3)
++        ticks=0
++        let timeout=await ClipboardDelivery.wait(isCurrent:{true},isDelivered:{false},attempts:4,sleep:{ticks+=1})
++        precondition(timeout == .timedOut && ticks==4)
++        let cancelled=await ClipboardDelivery.wait(isCurrent:{true},isDelivered:{false},sleep:{throw CancellationError()})
++        precondition(cancelled == .interrupted)
++        let task=Task { @MainActor in await ClipboardDelivery.wait(isCurrent:{true},isDelivered:{true}) }
++        task.cancel();let result=await task.value;precondition(result == .interrupted)
++        print("Clipboard delivery: acknowledgement latency, lifecycle change, timeout and cancellation passed")
++    }
++}
 diff --git a/tests/test_clipboard_notify.py b/tests/test_clipboard_notify.py
 new file mode 100644
-index 0000000..3f68b13
+index 0000000..b6ea897
 --- /dev/null
 +++ b/tests/test_clipboard_notify.py
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,99 @@
 +"""Execute production clipboard publication/notification under concurrent updates.
 +Only the HTTP body/response are fixtures; locks, ownership and callbacks are real.
 +"""
@@ -16084,7 +16933,7 @@ index 0000000..3f68b13
 +root = Path(__file__).resolve().parents[1]
 +source = (root / 'host/share.c').read_text()
 +clipboard = source[source.index('static pthread_mutex_t clip_mu'):source.index('/* ---- connections ---- */')]
-+start = source.index('static int clipboard_put(')
++start = source.index('static int clipboard_get(')
 +end = source.index('\nstatic int serve_henge(', start)
 +fixture = r'''
 +#define _POSIX_C_SOURCE 200809L
@@ -16095,13 +16944,23 @@ index 0000000..3f68b13
 +#include <stdlib.h>
 +#include <string.h>
 +#include <time.h>
++#include <sys/time.h>
++#include <errno.h>
++#define SMALL_BODY_MAX (16 * 1024 * 1024)
 +typedef struct Conn { const char *text; } Conn;
-+typedef struct Request { int unused; } Request;
++typedef struct Request { char query[128]; } Request;
++static int body_discard(Conn *c, Request *r) { (void)c;(void)r;return 0; }
++static unsigned long response_seq;
++static int response_code;
++static int respond(Conn *c, Request *r, int code, const char *reason, const char *headers, const void *text, size_t len) {
++    (void)c;(void)r;(void)reason;(void)text;(void)len;response_code=code;
++    assert(sscanf(headers,"X-Henge-Seq: %lu",&response_seq)==1);return 0;
++}
 +static char *body_small(Conn *c, Request *r, size_t *len) {
 +    (void)r; *len = strlen(c->text); return strdup(c->text);
 +}
 +static int respond_empty(Conn *c, Request *r, int code, const char *reason) {
-+    (void)c; (void)r; assert(code == 204 && !strcmp(reason, "No Content")); return 0;
++    (void)c; (void)r; assert((code == 204 && !strcmp(reason, "No Content")) || code == 400); return 0;
 +}
 +CLIPBOARD
 +PUT
@@ -16119,6 +16978,26 @@ index 0000000..3f68b13
 +    return NULL;
 +}
 +int main(void) {
++    assert(!hv_share_clipboard_ready());
++    Conn handshake = {""}; Request hr = {.query="since=0&ack=1&initial=1"};
++    assert(!clipboard_get(&handshake,&hr) && response_code==204 && !hv_share_clipboard_ready());
++    unsigned long handshake_seq=hv_share_publish_clipboard("first delivery");
++    strcpy(hr.query,"since=0&ack=1");
++    assert(!clipboard_get(&handshake,&hr) && response_code==200 && response_seq==handshake_seq && hv_share_clipboard_ready());
++    strcpy(hr.query,"since=0");
++    assert(!clipboard_get(&handshake,&hr) && !hv_share_clipboard_ready());
++    assert(!hv_share_publish_clipboard(NULL));
++    unsigned long a = hv_share_publish_clipboard("Unicode 🐈 / line1\nline2");
++    assert(a && !hv_share_clipboard_delivered(a));
++    Conn ack = {"invalid"}; Request ar = {0}; assert(!clipboard_ack(&ack,&ar));
++    assert(!hv_share_clipboard_delivered(a));
++    char number[32]; snprintf(number,sizeof number,"%lu",a); ack.text=number;
++    assert(!clipboard_ack(&ack,&ar)); assert(hv_share_clipboard_delivered(a));
++    unsigned long b = hv_share_publish_clipboard("new paste"); assert(b != a);
++    assert(!hv_share_clipboard_delivered(a) && !hv_share_clipboard_delivered(b));
++    assert(!clipboard_ack(&ack,&ar)); assert(!hv_share_clipboard_delivered(b));
++    snprintf(number,sizeof number,"%lu",b); assert(!clipboard_ack(&ack,&ar));
++    assert(hv_share_clipboard_delivered(b));
 +    put("pending before registration"); assert(atomic_load(&calls)==0);
 +    hv_share_set_clipboard_notify(consume); assert(atomic_load(&calls)==1);
 +    assert(!hv_share_take_clipboard());
@@ -19127,10 +20006,10 @@ index 0000000..478d014
 +    print('restore archive: functional failure removes partial archive; cosmetic filtering accepts success')
 diff --git a/tests/test_resume_coordinator.swift b/tests/test_resume_coordinator.swift
 new file mode 100644
-index 0000000..01d8904
+index 0000000..196440a
 --- /dev/null
 +++ b/tests/test_resume_coordinator.swift
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,192 @@
 +import Foundation
 +
 +private final class FakeSave: ResumeSaveWork, @unchecked Sendable {
@@ -19246,6 +20125,18 @@ index 0000000..01d8904
 +            precondition(c.save(f.session,background:true) == nil && f.builds==1)
 +            c.foreground(f.session);c.drain();precondition(f.vm==1)
 +            precondition(c.save(f.session,background:true) != nil);c.drain();precondition(f.builds==2)
++        }
++        // Inactive/app-switcher notifications never cancel the same background save.
++        do {
++            let f=Fixture();f.save=FakeSave(blocked:true);let c=f.coordinator()
++            let ticket=c.save(f.session,background:true)!
++            precondition(f.save.entered.wait(timeout:.now()+5) == .success)
++            precondition(c.pause(generation:1) == nil && !f.save.cancelled && c.accepts(ticket))
++            precondition(c.save(f.session,background:true) == nil)
++            f.save.finished.signal();c.drain()
++            precondition(c.pause(generation:1) == nil && c.save(f.session,background:true) == nil)
++            precondition(f.builds==1 && f.pauses==1 && f.vm==4)
++            c.foreground(f.session);c.drain();precondition(f.vm==1)
 +        }
 +        // A stale generation cannot touch a replacement Mac.
 +        do {
@@ -19484,6 +20375,78 @@ index 0000000..2d3d1bb
 +        print("session wakeups: coalescing, cancellation and timer/signal races passed")
 +    }
 +}
+diff --git a/tests/test_sharing_agent.m b/tests/test_sharing_agent.m
+new file mode 100644
+index 0000000..e597cdd
+--- /dev/null
++++ b/tests/test_sharing_agent.m
+@@ -0,0 +1,66 @@
++/* Execute the production companion HTTP parser and ordered retry queue. No guest or pasteboard access. */
++#import <AppKit/AppKit.h>
++#include <pthread.h>
++#include <assert.h>
++static unsigned short test_port;
++#define HOST "127.0.0.1"
++#define HENGE_SHARE_PORT test_port
++#define main henge_agent_entrypoint
++#include "../tools/henge-agent.m"
++#undef main
++static int listener_fd;
++static NSMutableArray<NSData *> *uploads;
++static void *server(void *unused) {
++    (void)unused;
++    for(unsigned i=0;i<5;i++) { @autoreleasepool {
++        int fd=accept(listener_fd,NULL,NULL);assert(fd>=0);
++        NSMutableData *bytes=[NSMutableData data];NSRange end;
++        size_t expected=0;
++        for(;;) {
++            char buf[4096];ssize_t n=recv(fd,buf,sizeof buf,0);assert(n>0);
++            [bytes appendBytes:buf length:(NSUInteger)n];
++            end=[bytes rangeOfData:[NSData dataWithBytes:"\r\n\r\n" length:4] options:0 range:NSMakeRange(0,bytes.length)];
++            if(end.location==NSNotFound)continue;
++            NSString *head=[[NSString alloc]initWithData:[bytes subdataWithRange:NSMakeRange(0,end.location)]encoding:NSUTF8StringEncoding];
++            NSRange at=[head rangeOfString:@"Content-Length: "];
++            assert(at.location!=NSNotFound);expected=strtoul(head.UTF8String+NSMaxRange(at),NULL,10);
++            if(bytes.length>=NSMaxRange(end)+expected)break;
++        }
++        [uploads addObject:[bytes subdataWithRange:NSMakeRange(NSMaxRange(end),expected)]];
++        const char *response=i==1?"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nab":
++                             i==2?"HTTP/1.1 200 OK\r\n\r\nabc":
++                                  "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nX-Henge-Seq: 3\r\n\r\n";
++        if(i!=3)assert(!send_all(fd,response,strlen(response)));
++        close(fd);
++    }}
++    return NULL;
++}
++static void drain(void) {
++    NSDate *until=[NSDate dateWithTimeIntervalSinceNow:5];
++    while(sendingClipboard && until.timeIntervalSinceNow>0)
++        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
++    assert(!sendingClipboard);
++}
++int main(void) { @autoreleasepool {
++    alarm(20);uploads=[NSMutableArray new];
++    listener_fd=socket(AF_INET,SOCK_STREAM,0);assert(listener_fd>=0);
++    struct sockaddr_in addr={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
++    assert(!bind(listener_fd,(struct sockaddr *)&addr,sizeof addr));
++    socklen_t size=sizeof addr;assert(!getsockname(listener_fd,(struct sockaddr *)&addr,&size));test_port=ntohs(addr.sin_port);
++    assert(!listen(listener_fd,8));pthread_t thread;assert(!pthread_create(&thread,NULL,server,NULL));
++    int status=0;unsigned long seq=0;
++    NSData *unicode=[@"line1\n🐈 café" dataUsingEncoding:NSUTF8StringEncoding];
++    assert(request(@"PUT",@"/.henge/clipboard",unicode,&status,&seq) && status==204 && seq==3);
++    assert(!request(@"GET",@"/.henge/clipboard",nil,&status,NULL)); /* truncated */
++    assert(!request(@"GET",@"/.henge/clipboard",nil,&status,NULL)); /* missing framing */
++    clipboardUploadQueue=dispatch_queue_create("test.clipboard.upload",DISPATCH_QUEUE_SERIAL);
++    pendingClipboard=[@"old" dataUsingEncoding:NSUTF8StringEncoding];pendingRevision=1;
++    uploadClipboard();drain();assert(pendingClipboard && clipboardFailures==1 && retryClipboardAt>0);
++    pendingClipboard=[@"newest" dataUsingEncoding:NSUTF8StringEncoding];pendingRevision++;
++    retryClipboardAt=0;uploadClipboard();drain();assert(!pendingClipboard && !clipboardFailures);
++    pthread_join(thread,NULL);close(listener_fd);
++    assert([uploads[0]isEqual:unicode]);
++    assert([uploads[3]isEqual:[@"old"dataUsingEncoding:NSUTF8StringEncoding]]);
++    assert([uploads[4]isEqual:[@"newest"dataUsingEncoding:NSUTF8StringEncoding]]);
++    puts("Sharing companion: UTF-8, complete framing, truncated response rejection, failure retention and newest retry passed");
++} return 0; }
 diff --git a/tests/test_simulator_profiles.py b/tests/test_simulator_profiles.py
 new file mode 100644
 index 0000000..c0d70a9
@@ -19511,6 +20474,55 @@ index 0000000..c0d70a9
 +meta['devicetypes']=[m4]
 +assert select(meta,'duo-unfolded')[0][1]['identifier']=='m4'
 +print('Simulator selection: dedicated Duo runtime before fallback, latest compatible M4, unavailable runtime and missing-model fallback passed')
+diff --git a/tests/test_snapshot_pack.c b/tests/test_snapshot_pack.c
+new file mode 100644
+index 0000000..11c21fc
+--- /dev/null
++++ b/tests/test_snapshot_pack.c
+@@ -0,0 +1,43 @@
++/* Actual schema3 chunk encoder/decoder. Link dead-strips unrelated VM entrypoints. */
++#include "../host/snapshot.c"
++#include <assert.h>
++
++static void roundtrip(Slot *slot, uint8_t *ram, uint8_t *copy, uint64_t size, unsigned index, int dense) {
++    memset(copy,0,(size_t)size);
++    chunk_pack(slot,ram,size,index,0,NULL);
++    if (dense) assert(slot->raw_source==ram+(uint64_t)index*CHUNK_BYTES);
++    else assert(slot->raw_source==slot->stage);
++    if (slot->h.raw) memcpy(slot->out,slot->raw_source,slot->h.bytes);
++    assert(!chunk_unpack(slot,copy,size));
++    uint64_t from=(uint64_t)index*CHUNK_BYTES;
++    size_t n=(size_t)(size-from<CHUNK_BYTES?size-from:CHUNK_BYTES);
++    assert(!memcmp(ram+from,copy+from,n));
++    slot->h.checksum^=1;
++    assert(chunk_unpack(slot,copy,size)==-1);
++    slot->h.checksum^=1;
++}
++static int cancelled_always(void *ctx) { (void)ctx;return 1; }
++int main(void) {
++    assert(hv_snapshot_workers(0,0)==1);
++    assert(hv_snapshot_workers(10,UINT64_MAX)==8);
++    assert(hv_snapshot_workers(10,128ull<<20)==4);
++    assert(hv_snapshot_workers(4,80ull<<20)==1);
++    assert(hv_snapshot_workers(2,UINT64_MAX)==2);
++    Slot slot={0};assert(!slots_alloc(&slot,1));
++    size_t size=CHUNK_BYTES+3*PAGE;
++    uint8_t *ram=calloc(1,size),*copy=calloc(1,size);assert(ram&&copy);
++    roundtrip(&slot,ram,copy,size,0,0); /* zero bitmap */
++    memset(ram,0x5a,size);
++    roundtrip(&slot,ram,copy,size,0,1); /* dense compressed borrows RAM */
++    roundtrip(&slot,ram,copy,size,1,1); /* partial last chunk */
++    uint32_t state=0x87654321;
++    for(size_t i=0;i<size;i++) {state^=state<<13;state^=state>>17;state^=state<<5;ram[i]=(uint8_t)state;}
++    roundtrip(&slot,ram,copy,size,0,1);assert(slot.h.raw); /* uncompressible borrowed write */
++    for(unsigned i=0;i<CHUNK_PAGES;i+=2)memset(ram+(size_t)i*PAGE,0,PAGE);
++    roundtrip(&slot,ram,copy,size,0,0); /* sparse compaction, unchanged disk schema */
++    HvSnapshotControl control={.cancelled=cancelled_always};
++    chunk_pack(&slot,ram,size,0,0,&control);assert(!slot.h.stored&&!slot.h.bytes);
++    slots_free(&slot,1);free(ram);free(copy);
++    puts("Snapshot chunks: dense/sparse/zero/raw/partial, corruption, cancellation and memory budgets passed");
++    return 0;
++}
 diff --git a/tests/test_stats_lifecycle.py b/tests/test_stats_lifecycle.py
 new file mode 100644
 index 0000000..0724db8
@@ -20364,15 +21376,19 @@ index 70d7ccb..e4f9089 100755
 +test -s "$BUILD/libhengerestore.a"
  ls -la "$BUILD/libhengerestore.a"
 diff --git a/tools/check_host_scheduling.sh b/tools/check_host_scheduling.sh
-index 509bce1..08f0a4d 100755
+index 509bce1..9233e97 100755
 --- a/tools/check_host_scheduling.sh
 +++ b/tools/check_host_scheduling.sh
-@@ -2,6 +2,12 @@
+@@ -2,6 +2,16 @@
  # Native tests + iPhoneOS SDK type checking. Does not build an app or IPA.
  set -euo pipefail
  cd "$(dirname "$0")/.."
 +python3 tests/test_restore_archive.py
 +python3 tests/test_clipboard_notify.py
++xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined tests/test_sharing_agent.m -framework AppKit -o /tmp/henge-test-sharing-agent
++/tmp/henge-test-sharing-agent
++swiftc -parse-as-library -swift-version 5 ios/Henge/ClipboardDelivery.swift tests/test_clipboard_delivery.swift -o /tmp/henge-test-clipboard-delivery
++/tmp/henge-test-clipboard-delivery
 +python3 tests/test_display_pulses.py
 +mkdir -p build
 +cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Idevices tests/test_gamepad.c -o build/test_gamepad
@@ -20380,7 +21396,7 @@ index 509bce1..08f0a4d 100755
  mkdir -p build/scheduling-check
  task_out="$PWD/build/scheduling-check"
  exec > >(tee "$task_out/checks.log") 2>&1
-@@ -9,6 +15,9 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
+@@ -9,6 +19,9 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
  set -x
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread -Ihost \
      host/scheduling.c tests/test_scheduling.c -o "$task_out/test_scheduling"
@@ -20390,7 +21406,7 @@ index 509bce1..08f0a4d 100755
  "$task_out/test_scheduling"
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O2 -Ihost -c host/scheduling.c -o "$task_out/scheduling.o"
  swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h \
-@@ -16,6 +25,10 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
+@@ -16,6 +29,10 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
  "$task_out/test_host_bridge"
  swiftc -parse-as-library -swift-version 5 ios/Henge/SessionStatistics.swift tests/test_session_statistics.swift -o "$task_out/test_session_statistics"
  "$task_out/test_session_statistics"
@@ -20401,7 +21417,7 @@ index 509bce1..08f0a4d 100755
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -DHV_PROF_TEST -Icore -Ihost -Idevices \
      host/prof_ios.c host/scheduling.c tests/test_prof_ios.c -o "$task_out/test_prof_ios"
  "$task_out/test_prof_ios"
-@@ -25,9 +38,15 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=addres
+@@ -25,9 +42,15 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=addres
  xcrun --sdk macosx clang -fobjc-arc -std=c11 -Wall -Wextra -Werror -O2 -Idevices \
      tests/test_display_settings.m -framework Foundation -o "$task_out/test_display_settings"
  "$task_out/test_display_settings"
@@ -20462,10 +21478,10 @@ index eac7481..9c3d185 100755
 +
 +if (( failures )); then exit 1; fi
 diff --git a/tools/henge-agent.m b/tools/henge-agent.m
-index 62cdaee..faae0c4 100644
+index 62cdaee..d1ead46 100644
 --- a/tools/henge-agent.m
 +++ b/tools/henge-agent.m
-@@ -7,6 +7,9 @@
+@@ -7,13 +7,22 @@
  #include <sys/stat.h>
  #include <sys/time.h>
  #include <unistd.h>
@@ -20473,22 +21489,37 @@ index 62cdaee..faae0c4 100644
 +#include <stdatomic.h>
 +#include <errno.h>
  
++#ifndef HOST
  #define HOST "10.0.2.4"
++#endif
++#ifndef HENGE_SHARE_PORT
++#define HENGE_SHARE_PORT 80
++#endif
  
-@@ -22,18 +25,24 @@ static int send_all(int fd, const void *p, size_t n) {
+ static int send_all(int fd, const void *p, size_t n) {
+     const char *c = p;
+     while (n) {
+         ssize_t w = send(fd, c, n, 0);
++        if (w < 0 && errno == EINTR) continue;
+         if (w <= 0) return -1;
+         c += w, n -= (size_t)w;
+     }
+@@ -22,18 +31,25 @@ static int send_all(int fd, const void *p, size_t n) {
  
  // One request on its own connection. A plain socket: the server is ours, and URLSession refuses plain HTTP.
  static NSData *request(NSString *method, NSString *path, NSData *body, int *status, unsigned long *seq) {
++    *status = 0;
 +    static _Atomic int lastConnectionError;
      int fd = socket(AF_INET, SOCK_STREAM, 0);
      if (fd < 0) return nil;
 -    struct timeval timeout = {.tv_sec = 40};
-+    struct timeval timeout = {.tv_sec = [path hasPrefix:@"/.henge/native-touch"] ? 1 : 40};
++    struct timeval timeout = {.tv_sec = [path hasPrefix:@"/.henge/native-touch"] ? 1 : ([method isEqual:@"GET"] ? 40 : 4)};
      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
 +    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
      int on = 1;
      setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
-     struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(80)};
+-    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(80)};
++    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(HENGE_SHARE_PORT)};
      inet_pton(AF_INET, HOST, &addr.sin_addr);
      if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
 +        int error = errno;
@@ -20501,16 +21532,147 @@ index 62cdaee..faae0c4 100644
      NSString *head = [NSString stringWithFormat:@"%@ %@ HTTP/1.1\r\nHost: " HOST "\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n", method, path,
                                                  (unsigned long)body.length];
      const char *text = head.UTF8String;
-@@ -59,6 +68,8 @@ static NSData *request(NSString *method, NSString *path, NSData *body, int *stat
+@@ -45,60 +61,114 @@ static NSData *request(NSString *method, NSString *path, NSData *body, int *stat
+     char piece[16384];
+     for (;;) {
+         ssize_t got = recv(fd, piece, sizeof piece, 0);
+-        if (got <= 0) break;
++        if (got < 0 && errno == EINTR) continue;
++        if (got < 0 || all.length + (NSUInteger)MAX(got,0) > 16 * 1024 * 1024 + 32768) { close(fd); return nil; }
++        if (got == 0) break;
+         [all appendBytes:piece length:(NSUInteger)got];
+     }
+     close(fd);
+     NSRange end = [all rangeOfData:[NSData dataWithBytes:"\r\n\r\n" length:4] options:0 range:NSMakeRange(0, all.length)];
+-    if (end.location == NSNotFound) return nil;
++    if (end.location == NSNotFound || end.location > 32768) return nil;
+     NSString *headers = [[NSString alloc] initWithData:[all subdataWithRange:NSMakeRange(0, end.location)] encoding:NSUTF8StringEncoding];
+-    if (sscanf(headers.UTF8String, "HTTP/1.1 %d", status) != 1) return nil;
++    if (!headers || sscanf(headers.UTF8String, "HTTP/1.1 %d", status) != 1) return nil;
++    // A timed-out/truncated response must never become a truncated paste.
++    NSString *lengthText = nil;
++    for (NSString *line in [headers componentsSeparatedByString:@"\r\n"]) {
++        NSRange colon = [line rangeOfString:@":"];
++        if (colon.location != NSNotFound && [[line substringToIndex:colon.location] caseInsensitiveCompare:@"Content-Length"] == NSOrderedSame)
++            lengthText = [[line substringFromIndex:NSMaxRange(colon)] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
++    }
++    NSScanner *scanner = [NSScanner scannerWithString:lengthText ?: @""];
++    unsigned long long length = 0;
++    if (!lengthText.length || ![scanner scanUnsignedLongLong:&length] || !scanner.isAtEnd || length != all.length - NSMaxRange(end)) return nil;
+     NSRange found = [headers rangeOfString:@"X-Henge-Seq: "];
+     if (found.location != NSNotFound && seq) *seq = strtoul(headers.UTF8String + NSMaxRange(found), NULL, 10);
+     NSUInteger start = NSMaxRange(end);
      return [all subdataWithRange:NSMakeRange(start, all.length - start)];
  }
  
 +
 +
  static NSInteger lastChange;
++// Main-thread-owned outgoing state: one upload, newest pending text, bounded retry.
++static NSData *pendingClipboard;
++static uint64_t pendingRevision;
++static BOOL sendingClipboard;
++static unsigned clipboardFailures;
++static NSTimeInterval retryClipboardAt;
++static dispatch_queue_t clipboardUploadQueue;
  
- // The device's clipboard, as it changes. The server holds each request until there is something new.
-@@ -118,16 +129,81 @@ static void keepMounted(void) {
+-// The device's clipboard, as it changes. The server holds each request until there is something new.
++// The long poll is also the reconnect loop. Establish a baseline immediately,
++// then advertise acknowledgement support before accepting an explicit paste.
+ static void followDevice(void) {
+     unsigned long seq = 0;
+-    for (BOOL first = YES;; first = NO) {
++    BOOL initial = YES;
++    for (;;) { @autoreleasepool {
+         int status = 0;
+         unsigned long now = seq;
+-        NSData *body = request(@"GET", [NSString stringWithFormat:@"/.henge/clipboard?since=%lu", first ? ULONG_MAX >> 1 : seq], nil, &status, &now);
+-        if (!body) {
+-            sleep(5);
+-            continue;
+-        }
+-        BOOL news = !first && status == 200 && now != seq;
+-        seq = now; // what the device had before this helper started isn't news
++        NSString *path = [NSString stringWithFormat:@"/.henge/clipboard?since=%lu&ack=1%@", seq, initial ? @"&initial=1" : @""];
++        NSData *body = request(@"GET", path, nil, &status, &now);
++        if (!body || (status != 200 && status != 204)) { sleep(2); continue; }
++        BOOL news = !initial && status == 200 && now != seq;
++        initial = NO; seq = now;
+         if (!news) continue;
+         NSString *text = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+         if (!text) continue;
++        unsigned long installed = now;
+         dispatch_async(dispatch_get_main_queue(), ^{
+             NSPasteboard *board = NSPasteboard.generalPasteboard;
+             [board clearContents];
+-            [board setString:text forType:NSPasteboardTypeString];
++            if (![board setString:text forType:NSPasteboardTypeString]) return;
+             lastChange = board.changeCount;
++            // Device paste supersedes an older Mac copy waiting to reconnect.
++            pendingClipboard = nil; pendingRevision++;
++            dispatch_async(clipboardUploadQueue, ^{ @autoreleasepool {
++                NSData *ack = [[NSString stringWithFormat:@"%lu", installed] dataUsingEncoding:NSUTF8StringEncoding];
++                for (unsigned attempt = 0; attempt < 3; attempt++) {
++                    int code = 0;
++                    if (request(@"POST", @"/.henge/clipboard-ack", ack, &code, NULL) && code == 204) break;
++                    sleep(1);
++                }
++            }});
+         });
+-    }
++    }}
+ }
+ 
+-// The Mac's clipboard goes to the device, unless the app that copied it marked it as secret.
++static void uploadClipboard(void) {
++    if (sendingClipboard || !pendingClipboard || NSDate.timeIntervalSinceReferenceDate < retryClipboardAt) return;
++    NSData *data = pendingClipboard;
++    uint64_t revision = pendingRevision;
++    sendingClipboard = YES;
++    dispatch_async(clipboardUploadQueue, ^{ @autoreleasepool {
++        int status = 0;
++        BOOL ok = request(@"PUT", @"/.henge/clipboard", data, &status, NULL) != nil && status == 204;
++        dispatch_async(dispatch_get_main_queue(), ^{
++            sendingClipboard = NO;
++            if (revision == pendingRevision && ok) pendingClipboard = nil;
++            if (ok) { clipboardFailures = 0; retryClipboardAt = 0; uploadClipboard(); }
++            else {
++                clipboardFailures = MIN(clipboardFailures + 1, 4u);
++                retryClipboardAt = NSDate.timeIntervalSinceReferenceDate + (1u << (clipboardFailures - 1));
++            }
++        });
++    }});
++}
++
++// AppKit exposes changeCount, not a change notification for other processes.
++// Reuse the existing1Hz lightweight check; no new retry timer or busy polling.
+ static void checkClipboard(void) {
+     NSPasteboard *board = NSPasteboard.generalPasteboard;
+-    if (board.changeCount == lastChange) return;
+-    lastChange = board.changeCount;
+-    if ([board.types containsObject:@"org.nspasteboard.ConcealedType"]) return;
+-    NSString *text = [board stringForType:NSPasteboardTypeString];
+-    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+-    if (!data.length) return;
+-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+-        int status = 0;
+-        request(@"PUT", @"/.henge/clipboard", data, &status, NULL);
+-    });
++    if (board.changeCount != lastChange) {
++        lastChange = board.changeCount;
++        pendingRevision++;
++        pendingClipboard = nil;
++        if (![board.types containsObject:@"org.nspasteboard.ConcealedType"]) {
++            NSString *text = [board stringForType:NSPasteboardTypeString];
++            NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
++            if (data && data.length <= 16 * 1024 * 1024) pendingClipboard = data;
++        }
++    }
++    uploadClipboard();
+ }
+ 
+ static NSString *mountPoint(void) { return [NSHomeDirectory() stringByAppendingPathComponent:@"Henge"]; }
+@@ -118,24 +188,90 @@ static void keepMounted(void) {
      [task launchAndReturnError:NULL];
  }
  
@@ -20597,8 +21759,9 @@ index 62cdaee..faae0c4 100644
 +                launchTouchCompanion(companion);
              }
          }
++        clipboardUploadQueue = dispatch_queue_create("henge.clipboard.upload", DISPATCH_QUEUE_SERIAL);
          lastChange = NSPasteboard.generalPasteboard.changeCount;
-@@ -135,7 +211,7 @@ int main(void) {
+         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ followDevice(); });
          keepMounted();
          [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) { (void)timer; checkClipboard(); }];
          [NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(NSTimer *timer) { (void)timer; keepMounted(); }];
@@ -20770,7 +21933,7 @@ index a06b082..3dddd3a 100644
 +    var lastError: String?
  }
 diff --git a/tools/link/check.sh b/tools/link/check.sh
-index c88ebe4..e8b6228 100755
+index c88ebe4..640a66f 100755
 --- a/tools/link/check.sh
 +++ b/tools/link/check.sh
 @@ -7,13 +7,16 @@ build/link/test_pvg_display
@@ -20788,7 +21951,7 @@ index c88ebe4..e8b6228 100755
 +swiftc -swift-version 5 ios/Henge/Controls/GamepadState.swift ios/Henge/Link/LinkProtocol.swift ios/Henge/Link/LinkReconnectPolicy.swift ios/Henge/Link/LinkPairing.swift ios/Henge/Link/LinkTransport.swift ios/Henge/Link/LinkVideo.swift ios/Henge/Link/LinkFlowControl.swift ios/Henge/Link/LinkDecodeWorker.swift tests/link_flow_checks.swift tests/link_pairing_checks.swift tests/test_link.swift -framework Network -framework Security -framework Metal -framework CoreMedia -framework CoreVideo -framework VideoToolbox -o build/link/test_link
  SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 -xcrun --sdk iphoneos swiftc -typecheck -swift-version 5 -target arm64-apple-ios17.0 -sdk "$SDK" -import-objc-header tests/link_bridge_fixture.h ios/Henge/Link/*.swift tests/link_ui_fixture.swift
-+xcrun --sdk iphoneos swiftc -typecheck -swift-version 5 -target arm64-apple-ios17.0 -sdk "$SDK" -import-objc-header tests/link_bridge_fixture.h ios/Henge/Controls/*.swift ios/Henge/Link/*.swift tests/link_ui_fixture.swift
++xcrun --sdk iphoneos swiftc -typecheck -swift-version 5 -target arm64-apple-ios17.0 -sdk "$SDK" -import-objc-header tests/link_bridge_fixture.h ios/Henge/Components/InterfaceStyle.swift ios/Henge/Controls/*.swift ios/Henge/Link/*.swift tests/link_ui_fixture.swift
  build/link/test_link build/link/screen.metallib
 +
 +python3 tests/test_link_control_services.py
