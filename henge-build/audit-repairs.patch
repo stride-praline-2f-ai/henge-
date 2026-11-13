@@ -1843,6 +1843,50 @@ index 0000000..803678a
 +    return 1;
 +}
 +#endif
+diff --git a/devices/input_ring.h b/devices/input_ring.h
+new file mode 100644
+index 0000000..7c0cdee
+--- /dev/null
++++ b/devices/input_ring.h
+@@ -0,0 +1,38 @@
++#ifndef HENGE_INPUT_RING_H
++#define HENGE_INPUT_RING_H
++#include <stdint.h>
++#define HV_VINPUT_RING 4096
++/* Queue operations run under the device mutex. Keep button states authoritative
++   even if a stalled guest exhausts the bounded motion/event ring. */
++typedef struct HvInputEvent { uint16_t type, code; uint32_t value; } HvInputEvent;
++static inline int hv_input_button_owner(uint8_t owners[3],unsigned button,unsigned source,int down,int *state) {
++    if(button>2 || source>7)return 0;
++    uint8_t before=owners[button],bit=(uint8_t)(1u<<source);
++    owners[button]=down?before|bit:before&~bit;
++    *state=owners[button]!=0;
++    return !!before!=*state;
++}
++static inline void hv_input_enqueue(HvInputEvent *ring, uint32_t *head, uint32_t *tail,
++                                    uint8_t *buttons, uint64_t *dropped, int mouse,
++                                    uint16_t type, uint16_t code, int32_t value) {
++    if (mouse && type == 1 && code >= 0x110 && code <= 0x112) {
++        uint8_t bit = (uint8_t)(1u << (code-0x110));
++        *buttons = value ? *buttons | bit : *buttons & ~bit;
++    }
++    if (*tail - *head == HV_VINPUT_RING) {
++        if (mouse) {
++            /* Drop stale motion as a unit, then reconcile all buttons. A lost
++               up cannot keep the guest dragging indefinitely. New motion follows
++               the reconciliation frame; relative movement cannot change buttons. */
++            *dropped += *tail - *head;
++            *head = *tail;
++            for (unsigned b=0; b<3; b++) {
++                ring[(*tail)++ % HV_VINPUT_RING] = (HvInputEvent){1, (uint16_t)(0x110+b), !!(*buttons & (1u<<b))};
++            }
++            ring[(*tail)++ % HV_VINPUT_RING] = (HvInputEvent){0,0,0};
++            if (type == 1 || type == 0) return;
++        } else { (*head)++; (*dropped)++; }
++    }
++    ring[(*tail)++ % HV_VINPUT_RING] = (HvInputEvent){type,code,(uint32_t)value};
++}
++#endif
 diff --git a/devices/metal_library_cache.h b/devices/metal_library_cache.h
 index 30699bd..28122bd 100644
 --- a/devices/metal_library_cache.h
@@ -4279,8 +4323,57 @@ index e48d5b6..164f44b 100644
  /* Tests: wait for the worker to finish everything submitted, then publish it. */
  void hv_virtio_blk_drain(HvVirtioBlk *b);
  /* After CPUs stop: finish submitted DMA and join workers before disk flush/free. */
+diff --git a/devices/virtio_input.c b/devices/virtio_input.c
+index 1ee8bd3..c6700e2 100644
+--- a/devices/virtio_input.c
++++ b/devices/virtio_input.c
+@@ -100,14 +100,8 @@ static void notify(HvVirtio *v, int q) {
+ void hv_virtio_input_send(HvVirtioInput *d, uint16_t type, uint16_t code, int32_t value) {
+     if (!d) return;
+     pthread_mutex_lock(&d->mu);
+-    if (d->tail - d->head == HV_VINPUT_RING) {
+-        d->head++; /* full: lose the oldest */
+-        d->dropped++;
+-    }
+-    uint32_t i = d->tail++ % HV_VINPUT_RING;
+-    d->ring[i].type = type;
+-    d->ring[i].code = code;
+-    d->ring[i].value = (uint32_t)value;
++    hv_input_enqueue(d->ring, &d->head, &d->tail, &d->producer_buttons,
++                     &d->dropped, d->kind == HV_VINPUT_MOUSE, type, code, value);
+     pthread_mutex_unlock(&d->mu);
+     hv_machine_wake(d->vio.m);
+ }
+diff --git a/devices/virtio_input.h b/devices/virtio_input.h
+index 79a2082..1dd3b3d 100644
+--- a/devices/virtio_input.h
++++ b/devices/virtio_input.h
+@@ -4,6 +4,7 @@
+ #include <pthread.h>
+ 
+ #include "virtio.h"
++#include "input_ring.h"
+ 
+ /* virtio-input (device type 18), Linux input event codes, as macOS's
+    AppleVirtIOInput drivers expect: it calls a device with relative X/Y a
+@@ -24,13 +25,13 @@ enum { HV_VINPUT_KEYBOARD, HV_VINPUT_MOUSE };
+ #define HV_BTN_RIGHT 0x111
+ #define HV_BTN_MIDDLE 0x112
+ 
+-#define HV_VINPUT_RING 4096
+ 
+ typedef struct HvVirtioInput {
+     HvVirtio vio;
+     int kind;
+     pthread_mutex_t mu;
+-    struct { uint16_t type, code; uint32_t value; } ring[HV_VINPUT_RING];
++    HvInputEvent ring[HV_VINPUT_RING];
++    uint8_t producer_buttons;
+     uint32_t head, tail; /* under mu */
+     uint64_t delivered, dropped;
+ } HvVirtioInput;
 diff --git a/devices/xhci.c b/devices/xhci.c
-index c355628..5e34d41 100644
+index c355628..611d9af 100644
 --- a/devices/xhci.c
 +++ b/devices/xhci.c
 @@ -6,6 +6,12 @@
@@ -4722,7 +4815,7 @@ index c355628..5e34d41 100644
 +/* ---- the keyboard's reports ---- */
 +
 +void hv_xhci_key_source(HvXhci *x,uint8_t usage,int down,unsigned source) {
-+    if (!x || usage<4 || usage>231 || source>3) return;
++    if (!x || usage<4 || usage>231 || source>7) return;
 +    pthread_mutex_lock(&x->mu);
 +    uint8_t before=x->key_owners[usage],bit=(uint8_t)(1u<<source);
 +    uint8_t after=down ? before|bit : before&~bit;
@@ -5292,10 +5385,10 @@ index 0000000..a464f06
 +Safety decisions: persistent archive hints select candidate files; Metal itself validates the complete descriptor. They are not proof of exact PSO identity, so no unsafe direct pipeline-state reuse is added from those partial keys. Guest-visible CPUs remain static and user selectable; OS scheduling is not physical core pinning. No guest translation persistence across app/JIT launches is claimed.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
-index 0000000..960e8ef
+index 0000000..9a6e41b
 --- /dev/null
 +++ b/docs/m4-optimisation/PROGRESS.md
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,132 @@
 +# Current checkpoint
 +
 +- Reconstructed source inherited at wrapper commit 343d2d84, patch 9ee35476;
@@ -5399,6 +5492,35 @@ index 0000000..960e8ef
 +framing. Guest copies use a single ordered retry queue. Universal Clipboard is
 +explicitly allowed via UIPasteboard; no automatic device clipboard reads.
 +Pending: exact-source macOS/SDK and UI checks; no IPA before they pass.
++
++
++## Engine and resilient local input, 13 November
++
++Cloud engine run43416062366 passed groups0/1/2 memory/MMU/exact fault-order tests.
++Restricted register reuse halves the selected four-load inline path44->22 words.
++Interleaved longer stream tests: mode0 1.46-1.52x native; mode2 1.05-1.06x.
++Mode2 is now the app default, with safe fallback and explicit env overrides.
++Ring descriptor/hash compaction is one survivor scan. Verified16GB M4 shader
++library budget128/16MiB requires2GB known headroom; warning/critical budgets win.
++No claim of measured device FPS/thermal improvement.
++
++New device logs D971FF show0.3.7/4CPU/12GB, Magic Keyboard reconnects,192 pointer
++lock log events (many duplicates), save8.29-26.45s and restore4.08-4.10s.
++Individual click events were not captured: exact incident cause remains unproven.
++Found and fixed shared physical/touch button ownership, duplicate mouse startup,
++missing pointer-loss neutralization, stale device events, and overflow losing
++mouse button releases. Hardware keyboard modifiers now have independent ownership.
++A single local handoff policy cancels old contact/scroll state; Pencil tip/palm
++priority; guest helper remains mapped. Host USB encoder removes the report HTTP
++roundtrip; immediate motion, membership/lift retention, old-helper fallback.
++New native encoder/transport/queue regression tests pass Linux ASan+UBSan.
++Bounded capture adds button edge/reset/ignored counts, queued/dropped mouse events;
++no key contents and no extra sampling timer.
++
++Desktop Retina is an explicit reference-layout preset:1280 logical width,2x,
++2560x1920 on4:3 iPad and aspect-fitted Duo inner screen; original Native Retina
++is retained. Snapshot restoration retains its saved display configuration.
++Full exact-source macOS/native/iOS SDK/app validation still required; no IPA yet.
 diff --git a/docs/m4-optimisation/SPEC.md b/docs/m4-optimisation/SPEC.md
 new file mode 100644
 index 0000000..87f0a22
@@ -8356,12 +8478,29 @@ index eeabe42..7035b1a 100644
            uint32_t seen = 0; uint64_t distinct = 0; (void)seen;
            uint64_t best[4] = {0}; uint32_t bestn[4] = {0};
 diff --git a/host/native_touch.c b/host/native_touch.c
-index 504e669..3eec420 100644
+index 504e669..564e6cb 100644
 --- a/host/native_touch.c
 +++ b/host/native_touch.c
-@@ -15,8 +15,10 @@ static size_t queued;
+@@ -1,4 +1,5 @@
+ #include "native_touch.h"
++#include "native_touch_encoder.h"
+ #include <math.h>
+ #include <pthread.h>
+ #include <stdio.h>
+@@ -7,18 +8,22 @@
+ 
+ #define QUEUE_SIZE 64
+ #define MAX_CONTACTS 5
+-typedef struct { size_t count; uint8_t ids[5]; double x[5], y[5]; } Frame;
++typedef HvTouchFrame Frame;
+ static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
+ static Frame queue[QUEUE_SIZE], current;
+ static size_t queued;
  static uint32_t epoch = 1;
- static int enabled, status;
+-static int enabled, status;
++static int enabled, status, host_encoded, cancel_pending;
++static HvTouchEncoder encoder;
  static double last_sender, last_helper, started;
 +static HvNativeTouchUSB usb;
  static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
@@ -8369,8 +8508,55 @@ index 504e669..3eec420 100644
 +    if (usb.connect) usb.connect(usb.context, 0);
      if (++epoch == 0) epoch = 1;
      queued = 0; memset(&current, 0, sizeof current);
++    host_encoded = cancel_pending = 0; memset(&encoder,0,sizeof encoder);
      started = last_sender = now(); last_helper = 0;
-@@ -71,7 +73,10 @@ void hv_native_touch_report(uint32_t generation, int value) {
+     status = enabled ? HV_TOUCH_WAITING : HV_TOUCH_OFF;
+     pthread_cond_broadcast(&changed);
+@@ -30,6 +35,36 @@ static void expire_locked(void) {
+         enabled = 0; reset_locked(); status = HV_TOUCH_TIMEOUT;
+     }
+ }
++/* Called only under mutex. Host encoding uses the existing helper long-poll
++   worker to finish required lift intervals; there is no new idle timer/thread. */
++static double encode_locked(void) {
++    if(!host_encoded || !enabled || status!=HV_TOUCH_READY)return 0;
++    double t=now();
++    if(cancel_pending && t>=encoder.deadline) {
++        hv_touch_encoder_cancel(&encoder);cancel_pending=0;
++    }
++    if(!cancel_pending) {
++        uint8_t report[32];int consumed=0;
++        int emitted=hv_touch_encoder_step(&encoder,queued?&queue[0]:NULL,t,&consumed,report);
++        if(consumed){current=queue[0];memmove(queue,queue+1,(--queued)*sizeof(Frame));}
++        if(emitted && (!usb.report || !usb.report(usb.context,report))) {
++            enabled=0;reset_locked();status=HV_TOUCH_DEVICE;return 0;
++        }
++    }
++    return cancel_pending?encoder.deadline:hv_touch_encoder_due(&encoder,queued!=0,t);
++}
++void hv_native_touch_cancel(uint32_t generation) {
++    pthread_mutex_lock(&mutex);expire_locked();
++    if(!enabled || generation!=epoch){pthread_mutex_unlock(&mutex);return;}
++    queued=0;memset(&current,0,sizeof current);
++    if(host_encoded) {
++        cancel_pending=1;encode_locked();
++    } else {
++        // Legacy helpers retain the original neutral frame transport.
++        queue[queued++]=(Frame){0};
++    }
++    pthread_cond_broadcast(&changed);pthread_mutex_unlock(&mutex);
++}
+ uint32_t hv_native_touch_enable(int on) {
+     pthread_mutex_lock(&mutex);
+     if (enabled != !!on || (!on && status != HV_TOUCH_OFF)) { enabled = !!on; reset_locked(); }
+@@ -65,29 +100,88 @@ int hv_native_touch_submit(uint32_t generation, const uint8_t *ids, const double
+     if (queued && queue[queued-1].count == count && !memcmp(queue[queued-1].ids, frame.ids, count)) queue[queued-1] = frame;
+     else if (queued < QUEUE_SIZE) queue[queued++] = frame;
+     else { enabled = 0; reset_locked(); status = HV_TOUCH_DEVICE; pthread_mutex_unlock(&mutex); return 0; }
++    encode_locked();
+     pthread_cond_signal(&changed); pthread_mutex_unlock(&mutex); return 1;
+ }
+ void hv_native_touch_report(uint32_t generation, int value) {
      pthread_mutex_lock(&mutex); expire_locked();
      if (enabled && generation == epoch && value >= HV_TOUCH_READY && value <= HV_TOUCH_DEVICE) {
          last_helper = now(); if (status == HV_TOUCH_WAITING) last_sender = last_helper; status = value;
@@ -8382,13 +8568,27 @@ index 504e669..3eec420 100644
      }
      pthread_mutex_unlock(&mutex);
  }
-@@ -85,9 +90,48 @@ size_t hv_native_touch_next(char *json, size_t capacity) {
-         pthread_cond_timedwait(&changed, &mutex, &until); expire_locked();
+ size_t hv_native_touch_next(char *json, size_t capacity) {
+     if (capacity < 1024) return 0;
+     pthread_mutex_lock(&mutex); expire_locked();
+-    if (!queued) {
++    double due=encode_locked();
++    if (!queued || host_encoded) {
++        double delay=.25;
++        if(due>0) {double remaining=due-now();if(remaining<delay)delay=remaining>0?remaining:.001;}
+         struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
+-        until.tv_nsec += 250000000;
++        until.tv_nsec += (long)(delay*1e9);
+         if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
+-        pthread_cond_timedwait(&changed, &mutex, &until); expire_locked();
++        pthread_cond_timedwait(&changed, &mutex, &until); expire_locked();encode_locked();
      }
-     if (queued) { current = queue[0]; memmove(queue, queue+1, (--queued)*sizeof(Frame)); }
+-    if (queued) { current = queue[0]; memmove(queue, queue+1, (--queued)*sizeof(Frame)); }
 -    size_t n = (size_t)snprintf(json, capacity, "{\"version\":1,\"epoch\":%u,\"enabled\":%s,\"contacts\":[", epoch, enabled ? "true" : "false");
+-    for (size_t i = 0; i < current.count; i++) n += (size_t)snprintf(json+n, capacity-n,
++    if (queued && !host_encoded) { current = queue[0]; memmove(queue, queue+1, (--queued)*sizeof(Frame)); }
 +    size_t n = (size_t)snprintf(json, capacity, "{\"version\":1,\"epoch\":%u,\"enabled\":%s,\"usb\":%s,\"contacts\":[", epoch, enabled ? "true" : "false", usb.connect ? "true" : "false");
-     for (size_t i = 0; i < current.count; i++) n += (size_t)snprintf(json+n, capacity-n,
++    for (size_t i = 0; !host_encoded && i < current.count; i++) n += (size_t)snprintf(json+n, capacity-n,
          "%s{\"id\":%u,\"x\":%.9f,\"y\":%.9f}", i ? "," : "", current.ids[i], current.x[i], current.y[i]);
      n += (size_t)snprintf(json+n, capacity-n, "]}");
      pthread_mutex_unlock(&mutex); return n;
@@ -8404,7 +8604,7 @@ index 504e669..3eec420 100644
 +size_t hv_native_touch_usb_state(char *json, size_t capacity) {
 +    pthread_mutex_lock(&mutex); expire_locked();
 +    int connected = usb.connected && usb.connected(usb.context);
-+    int n = snprintf(json, capacity, "{\"version\":1,\"epoch\":%u,\"available\":%s,\"connected\":%s}",
++    int n = snprintf(json, capacity, "{\"version\":1,\"epoch\":%u,\"available\":%s,\"connected\":%s,\"hostEncoding\":true}",
 +                     epoch, usb.connect ? "true" : "false", connected ? "true" : "false");
 +    pthread_mutex_unlock(&mutex);
 +    return n >= 0 && (size_t)n < capacity ? (size_t)n : 0;
@@ -8421,7 +8621,7 @@ index 504e669..3eec420 100644
 +    if (!report) return 0;
 +    pthread_mutex_lock(&mutex); expire_locked();
 +    /* The startup dispatch is neutral. Contacts cannot precede readiness. */
-+    int accepted = enabled && generation == epoch && usb.report &&
++    int accepted = enabled && !host_encoded && generation == epoch && usb.report &&
 +                   (status == HV_TOUCH_READY || (status == HV_TOUCH_WAITING && report[31] == 0)) &&
 +                   usb.report(usb.context, report);
 +    pthread_mutex_unlock(&mutex); return accepted;
@@ -8432,11 +8632,31 @@ index 504e669..3eec420 100644
 +    int accepted = enabled && generation == epoch && usb.mapped && usb.mapped(usb.context);
 +    pthread_mutex_unlock(&mutex); return accepted;
 +}
++
++int hv_native_touch_usb_host_encoding(uint32_t generation) {
++    pthread_mutex_lock(&mutex);expire_locked();
++    int accepted=enabled && generation==epoch && usb.connected && usb.connected(usb.context)
++                 && usb.mapped && usb.mapped(usb.context) && usb.report;
++    if(accepted && !host_encoded) {
++        host_encoded=1;queued=0;memset(&current,0,sizeof current);
++        memset(&encoder,0,sizeof encoder);
++        if(status==HV_TOUCH_READY)encode_locked();
++        pthread_cond_broadcast(&changed);
++    }
++    pthread_mutex_unlock(&mutex);return accepted;
++}
 diff --git a/host/native_touch.h b/host/native_touch.h
-index 4072159..760f33f 100644
+index 4072159..922ecae 100644
 --- a/host/native_touch.h
 +++ b/host/native_touch.h
-@@ -13,4 +13,19 @@ int hv_native_touch_submit(uint32_t epoch, const uint8_t *ids, const double *x,
+@@ -9,8 +9,26 @@ uint32_t hv_native_touch_enable(int enabled);
+ uint32_t hv_native_touch_epoch(void);
+ uint32_t hv_native_touch_reset(void);
+ int hv_native_touch_status(void);
++/* Release contacts without disconnecting/remapping the USB display. */
++void hv_native_touch_cancel(uint32_t epoch);
++int hv_native_touch_usb_host_encoding(uint32_t epoch);
+ int hv_native_touch_submit(uint32_t epoch, const uint8_t *ids, const double *x, const double *y, size_t count);
  /* Guest helper transport. next waits at most 250 ms; new input wakes it immediately. */
  size_t hv_native_touch_next(char *json, size_t capacity);
  void hv_native_touch_report(uint32_t epoch, int status);
@@ -8456,6 +8676,122 @@ index 4072159..760f33f 100644
 +int hv_native_touch_usb_mapped(uint32_t epoch);
 +int hv_native_touch_usb_report(uint32_t epoch, const uint8_t report[32]);
  #endif
+diff --git a/host/native_touch_encoder.h b/host/native_touch_encoder.h
+new file mode 100644
+index 0000000..ad71d74
+--- /dev/null
++++ b/host/native_touch_encoder.h
+@@ -0,0 +1,110 @@
++#ifndef HENGE_NATIVE_TOUCH_ENCODER_H
++#define HENGE_NATIVE_TOUCH_ENCODER_H
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++/* Exact five-slot USB format used by the entitlement-free guest companion.
++   The caller owns validation, locking, scheduling and transport. */
++typedef struct HvTouchFrame { size_t count; uint8_t ids[5]; double x[5], y[5]; } HvTouchFrame;
++typedef struct HvTouchSlot {
++    uint8_t id, down, published;
++    double x,y,lifted;
++} HvTouchSlot;
++typedef struct HvTouchEncoder {
++    HvTouchSlot slots[5];
++    uint8_t last[32];
++    int has_last;
++    double deadline;
++} HvTouchEncoder;
++static inline int hv_touch_member(const HvTouchFrame *f, unsigned id) {
++    for(size_t i=0;i<f->count;i++)if(f->ids[i]==id)return (int)i;
++    return -1;
++}
++static inline unsigned hv_touch_down_mask(const HvTouchEncoder *e) {
++    unsigned mask=0;for(unsigned i=0;i<5;i++)if(e->slots[i].id&&e->slots[i].down)mask|=1u<<i;return mask;
++}
++static inline void hv_touch_encoder_cancel(HvTouchEncoder *e) {
++    for(unsigned i=0;i<5;i++) {
++        HvTouchSlot *s=&e->slots[i];
++        if(!s->published)memset(s,0,sizeof *s);
++        else if(s->down){s->down=0;s->lifted=0;}
++    }
++}
++/* Consumed is set only when the complete desired membership was installed.
++   Motion may update immediately during a membership settling interval. */
++static inline int hv_touch_encoder_step(HvTouchEncoder *e,const HvTouchFrame *f,double now,
++                                        int *consumed,uint8_t report[32]) {
++    *consumed=0;
++    unsigned before=0;
++    if(e->has_last)for(unsigned i=0;i<5;i++) {
++        unsigned at=1+6*i,id=e->last[at+1];
++        if(e->last[at]==3&&id>=1&&id<=5)before|=1u<<(id-1);
++    }
++    for(unsigned i=0;i<5;i++) {
++        HvTouchSlot *s=&e->slots[i];
++        if(s->id&&!s->down&&s->lifted>0&&now-s->lifted>=.06)memset(s,0,sizeof *s);
++    }
++    if(f) {
++        unsigned down=0;int same=1;
++        for(unsigned i=0;i<5;i++)if(e->slots[i].id&&e->slots[i].down) {
++            down++;if(hv_touch_member(f,e->slots[i].id)<0)same=0;
++        }
++        same=same&&down==f->count;
++        if(same||now>=e->deadline) {
++            unsigned fresh=0,free_slots=0;int retired=0;
++            for(unsigned i=0;i<5;i++)if(!e->slots[i].id)free_slots++;
++            for(size_t j=0;j<f->count;j++) {
++                int found=0;
++                for(unsigned i=0;i<5;i++)if(e->slots[i].id==f->ids[j]) {
++                    found=1;if(!e->slots[i].down)retired=1;
++                }
++                if(!found)fresh++;
++            }
++            {
++                for(unsigned i=0;i<5;i++)if(e->slots[i].id&&e->slots[i].down) {
++                    int j=hv_touch_member(f,e->slots[i].id);
++                    if(j<0){e->slots[i].down=0;e->slots[i].lifted=0;}
++                    else {e->slots[i].x=f->x[j];e->slots[i].y=f->y[j];}
++                }
++                if(!retired&&fresh<=free_slots) {
++                for(size_t j=0;j<f->count;j++) {
++                    int found=0;for(unsigned i=0;i<5;i++)if(e->slots[i].id==f->ids[j])found=1;
++                    if(!found)for(unsigned i=0;i<5;i++)if(!e->slots[i].id) {
++                        e->slots[i]=(HvTouchSlot){.id=f->ids[j],.down=1,.x=f->x[j],.y=f->y[j]};break;
++                    }
++                }
++                *consumed=1;
++                }
++            }
++        }
++    }
++    memset(report,0,32);report[0]=1;
++    unsigned occupied=0;
++    for(unsigned i=0;i<5;i++)if(e->slots[i].id) {
++        HvTouchSlot *s=&e->slots[i];unsigned at=1+6*occupied++;
++        uint16_t x=(uint16_t)(s->x*32767+.5),y=(uint16_t)(s->y*32767+.5);
++        report[at]=s->down?3:2;report[at+1]=(uint8_t)(i+1);
++        report[at+2]=(uint8_t)x;report[at+3]=(uint8_t)(x>>8);
++        report[at+4]=(uint8_t)y;report[at+5]=(uint8_t)(y>>8);
++    }
++    report[31]=(uint8_t)occupied;
++    if(e->has_last&&!memcmp(e->last,report,32))return 0;
++    unsigned after=hv_touch_down_mask(e);
++    if(before!=after || (!e->has_last&&after))e->deadline=now+.06;
++    for(unsigned i=0;i<5;i++)if(e->slots[i].id) {
++        if(e->slots[i].down)e->slots[i].published=1;
++        else if(!e->slots[i].lifted)e->slots[i].lifted=now;
++    }
++    memcpy(e->last,report,32);e->has_last=1;return 1;
++}
++static inline double hv_touch_encoder_due(const HvTouchEncoder *e,int pending,double now) {
++    double retired=0;
++    for(unsigned i=0;i<5;i++)if(e->slots[i].id&&!e->slots[i].down&&e->slots[i].lifted>0) {
++        double t=e->slots[i].lifted+.06;
++        if(!retired||t<retired)retired=t;
++    }
++    double due=pending?(e->deadline>now?e->deadline:(retired>now?retired:now)):0;
++    if(retired&&(!due||retired<due))due=retired;
++    return due;
++}
++#endif
 diff --git a/host/prof_ios.c b/host/prof_ios.c
 index b7ff92a..9a9648c 100644
 --- a/host/prof_ios.c
@@ -8670,7 +9006,7 @@ index 083d66e..d51f8b2 100644
  
  typedef struct {
 diff --git a/host/share.c b/host/share.c
-index 9c7244a..a0bc668 100644
+index 9c7244a..a79205d 100644
 --- a/host/share.c
 +++ b/host/share.c
 @@ -44,17 +44,44 @@ static char agent_path[PATH_MAX];
@@ -8781,7 +9117,7 @@ index 9c7244a..a0bc668 100644
      pthread_mutex_unlock(&clip_mu);
      char headers[64];
      snprintf(headers, sizeof headers, "X-Henge-Seq: %lu\r\n", seq);
-@@ -658,22 +705,77 @@ static int clipboard_put(Conn *c, Request *r) {
+@@ -658,22 +705,78 @@ static int clipboard_put(Conn *c, Request *r) {
      size_t len = 0;
      char *text = body_small(c, r, &len);
      if (!text) return -1;
@@ -8839,10 +9175,11 @@ index 9c7244a..a0bc668 100644
 +        size_t length; char *body = body_small(c, r, &length);
 +        unsigned generation; int action; char extra;
 +        if (!body) return -1;
-+        int valid = sscanf(body, "%u %d %c", &generation, &action, &extra) == 2 && action >= 0 && action <= 2;
++        int valid = sscanf(body, "%u %d %c", &generation, &action, &extra) == 2 && action >= 0 && action <= 3;
 +        free(body);
 +        if (!valid) return respond_empty(c, r, 400, "Bad Request");
-+        int accepted = action == 2 ? hv_native_touch_usb_mapped(generation) : hv_native_touch_usb_connect(generation, action);
++        int accepted = action == 3 ? hv_native_touch_usb_host_encoding(generation) :
++                       action == 2 ? hv_native_touch_usb_mapped(generation) : hv_native_touch_usb_connect(generation, action);
 +        if (!accepted) return respond_empty(c, r, 409, "Conflict");
 +        return respond_empty(c, r, 204, "No Content");
 +    }
@@ -8859,7 +9196,7 @@ index 9c7244a..a0bc668 100644
      if (!strcmp(what, "native-touch") && !strcmp(r->method, "GET")) {
          if (body_discard(c, r) != 0) return -1;
          char json[1024]; size_t n = hv_native_touch_next(json, sizeof json);
-@@ -691,6 +793,7 @@ static int serve_henge(Conn *c, Request *r) {
+@@ -691,6 +794,7 @@ static int serve_henge(Conn *c, Request *r) {
          hv_native_touch_report(generation, state);
          return respond_empty(c, r, 204, "No Content");
      }
@@ -9450,7 +9787,7 @@ index 67fc764..d061ad7 100644
  
  #endif
 diff --git a/host/vm.c b/host/vm.c
-index db95c05..5557893 100644
+index db95c05..ccf1e59 100644
 --- a/host/vm.c
 +++ b/host/vm.c
 @@ -4,6 +4,7 @@
@@ -9689,39 +10026,35 @@ index db95c05..5557893 100644
          rctrl_user = rctrl_click = 0;
          os_unfair_lock_unlock(&rctrl_lock);
      });
-@@ -752,7 +822,13 @@ static void left_update(void) {
+@@ -752,7 +822,9 @@ static void left_update(void) {
  static void button_now(void *ctx) {
      if (atomic_load(&input_stopping)) return;
      intptr_t v = (intptr_t)ctx;
 -    int button = (int)(v >> 1), down = (int)(v & 1);
 +    int button = (int)((v >> 1)&3), down = (int)(v & 1);
-+    unsigned owner=(unsigned)(v>>3)&3u;
-+    if (button>2) return;
-+    uint8_t before=button_owners[button],bit=(uint8_t)(1u<<owner);
-+    button_owners[button]=down ? before|bit : before&~bit;
-+    down=button_owners[button]!=0;
-+    if (!!before==down) return;
++    unsigned owner=(unsigned)(v>>3)&7u;
++    if(!hv_input_button_owner(button_owners,(unsigned)button,owner,down,&down))return;
      if (button == 0) {
          left_user = down;
          left_update();
-@@ -777,6 +853,16 @@ void hv_vm_mouse_button(int button, int down) {
+@@ -777,6 +849,16 @@ void hv_vm_mouse_button(int button, int down) {
      if (button < 0 || button > 2) return;
      dispatch_async_f(pointer_queue(), (void *)(intptr_t)(button << 1 | !!down), button_now);
  }
 +void hv_vm_mouse_button_source(int button,int down,unsigned source) {
-+    if(button<0 || button>2 || source>3)return;
++    if(button<0 || button>2 || source>7)return;
 +    dispatch_async_f(pointer_queue(),(void *)(intptr_t)(source<<3|button<<1|!!down),button_now);
 +}
 +void hv_vm_key_hid_source(uint8_t usage,int down,unsigned source) { hv_xhci_key_source(board.usb,usage,down,source); }
 +void hv_vm_release_input_source(unsigned source) {
-+    if(source<1 || source>3)return;
++    if(source<1 || source>7)return;
 +    hv_xhci_release_source(board.usb,source);
 +    for(int b=0;b<3;b++)hv_vm_mouse_button_source(b,0,source);
 +}
  
  /* The guest takes a wheel event as 8 bits: -200 arrives as +56, the wrong way. So big moves go in pieces. */
  static void wheel(uint16_t axis, int amount) {
-@@ -802,6 +888,9 @@ void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
+@@ -802,6 +884,9 @@ void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
  void hv_vm_touch_frame(uint32_t ts_ms) { hv_xhci_touch_frame(board.usb, ts_ms); }
  
  void hv_vm_touch_button(int down) { hv_xhci_touch_button(board.usb, down); }
@@ -11702,7 +12035,7 @@ index 47b0ced..f6edeb5 100644
              sendTarget()
          }
 diff --git a/ios/Henge/EngineTuning.swift b/ios/Henge/EngineTuning.swift
-index e579188..40964d0 100644
+index e579188..da1e2f1 100644
 --- a/ios/Henge/EngineTuning.swift
 +++ b/ios/Henge/EngineTuning.swift
 @@ -4,38 +4,65 @@ import Foundation
@@ -11779,7 +12112,7 @@ index e579188..40964d0 100644
 +            HengeLog.log("power","Explicit Low Power guest session: requested=\(requested)Hz effective=60Hz; saved preference and Retina retained; next boot reevaluates; henge-env overrides remain authoritative")
 +        }
 +        env["HV_SUPERBLOCKS"] = "0"
-+        env["HV_GROUPS"] = "0"
++        env["HV_GROUPS"] = "2" // restricted fixed-base register reuse; broad planner remains opt-in
 +        env["HV_GAMEPAD_PROFILE"] = d.string(forKey:"henge.gamepad.profile") == "ds4" ? "ds4" : "generic"
          if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
          let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -11796,6 +12129,240 @@ index e579188..40964d0 100644
          for (k, v) in env.sorted(by: { $0.key < $1.key }) {
              setenv(k, v, 1)
              HengeLog.log("tuning", "\(k)=\(v)")
+diff --git a/ios/Henge/GuestScreenSize.swift b/ios/Henge/GuestScreenSize.swift
+index a0a1e92..6a36fce 100644
+--- a/ios/Henge/GuestScreenSize.swift
++++ b/ios/Henge/GuestScreenSize.swift
+@@ -21,6 +21,20 @@ struct GuestScreenSize: Equatable {
+         return Self(width: 1920, height: max(1080, Int((1920 * (short / long)).rounded())))
+     }
+ 
++    /// Reference desktop composition: 1280 logical points across, rendered at
++    /// 2x. Match the actual viewport, never stretch a 4:3 image onto Duo.
++    /// Explicit alternative to native-panel Retina, not an automatic downgrade.
++    static func desktopRetina(in viewport: CGSize) -> Self {
++        guard viewport.width.isFinite, viewport.height.isFinite,
++              viewport.width > 0, viewport.height > 0 else {
++            return Self(width: 2560, height: 1920)
++        }
++        let ratio = min(viewport.width, viewport.height) / max(viewport.width, viewport.height)
++        // Even height keeps the logical 2x backing integral, within one pixel
++        // of the requested aspect. Width stays 2560 in folded/inner orientations.
++        return Self(width: 2560, height: max(2, Int((1280 * ratio).rounded()) * 2))
++    }
++
+     static func usesFit(width: Int?, height: Int?, selected: Bool?) -> Bool {
+         if let selected { return selected }
+         // Older Fit profiles only stored this size convention. Explicit new
+diff --git a/ios/Henge/Hardware.swift b/ios/Henge/Hardware.swift
+index af0bc1b..6c442d4 100644
+--- a/ios/Henge/Hardware.swift
++++ b/ios/Henge/Hardware.swift
+@@ -123,7 +123,11 @@ enum HardwareKeys {
+                 continue
+             }
+             let usage = UInt8(raw)
+-            henge_vm_key_hid(usage, down ? 1 : 0)
++            // Guest USB owns repeat. Ignore stale ups after focus cleanup and
++            // keep hardware modifiers independent of on-screen shortcuts.
++            if down { guard held.insert(usage).inserted else { continue } }
++            else { guard held.remove(usage) != nil else { continue } }
++            henge_vm_input_key(4, usage, down ? 1 : 0)
+             if usage < 0xe0 { lastKey = CACurrentMediaTime() }
+             if down {
+                 held.insert(usage)
+@@ -138,7 +142,7 @@ enum HardwareKeys {
+     /// iPadOS can keep a key's release when it takes over, as it does for ⌘-Tab: the Mac must not
+     /// go on thinking the key is down.
+     static func releaseAll() {
+-        for usage in held { henge_vm_key_hid(usage, 0) }
++        for usage in held { henge_vm_input_key(4, usage, 0) }
+         held.removeAll()
+     }
+ }
+@@ -147,7 +151,7 @@ enum HardwareKeys {
+ /// that only for an app filling the screen. SwiftUI has no way to ask, so the answer is added to the
+ /// class of the window's root view controller, which is who iPadOS asks.
+ enum PointerLock {
+-    private static var wanted = false
++    private(set) static var wanted = false
+     private static var patched: Set<ObjectIdentifier> = []
+ 
+     static func set(_ on: Bool) {
+@@ -195,11 +199,16 @@ final class HardwareMouse {
+     private var acceptsInput = false
+     private var scrollCallbacks: UInt64 = 0, scrollFrames: UInt64 = 0
+     private var largestScroll: Int32 = 0
++    private var buttonEdges: UInt64 = 0, buttonResets: UInt64 = 0, ignoredButtonEdges: UInt64 = 0
+ 
+     func setAcceptsInput(_ enabled: Bool) {
+         guard acceptsInput != enabled else { return }
+         acceptsInput = enabled
+         if !enabled {
++            LocalPointerInput.cancel()
++            for source in [UInt32(5), 6, 7] { henge_vm_input_release(source) }
++            VolumeClicks.shared.releaseButtons()
++            HardwareKeys.releaseAll()
+             releaseButtons()
+             scrollTimer?.invalidate(); scrollTimer = nil
+             scrollState = HardwareScroll()
+@@ -208,10 +217,13 @@ final class HardwareMouse {
+     }
+ 
+     var scrollDiagnostics: String {
+-        "wheel: callbacks=\(scrollCallbacks) frames=\(scrollFrames) max_axis_units=\(largestScroll) cap=4 scale=\(scrollScale) accepting=\(acceptsInput)"
++        "wheel: callbacks=\(scrollCallbacks) frames=\(scrollFrames) max_axis_units=\(largestScroll) cap=4 scale=\(scrollScale) accepting=\(acceptsInput) button_edges=\(buttonEdges) button_resets=\(buttonResets) ignored_button_edges=\(ignoredButtonEdges) held=\(buttons.held.count)"
+     }
+ 
+     func start() {
++        // Session startup and restored-view attachment can both call start.
++        // Reuse observers and handlers instead of registering a second pipeline.
++        guard observers.isEmpty else { setAcceptsInput(true); return }
+         acceptsInput = true
+         scrollCallbacks = 0; scrollFrames = 0; largestScroll = 0
+         let defaults = UserDefaults.standard
+@@ -243,11 +255,17 @@ final class HardwareMouse {
+             self.scrollTimer = nil
+             self.mice.removeAll { $0 === mouse }
+         })
+-        observers.append(NotificationCenter.default.addObserver(forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main) { note in
++        observers.append(NotificationCenter.default.addObserver(forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main) { [weak self] note in
+             // The scene comes in the user info: the notification's object isn't it.
+             let scene = note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene
+             let locked = scene?.pointerLockState?.isLocked ?? false
+             HengeLog.log("input", "pointer lock: \(locked ? "on" : "off")")
++            if !locked && PointerLock.wanted {
++                self?.releaseForHandoff()
++                LocalPointerInput.cancel()
++                HardwareKeys.releaseAll()
++                StickyKeys.shared.releaseAll()
++            }
+         })
+         PointerLock.set(true)
+     }
+@@ -275,7 +293,16 @@ final class HardwareMouse {
+     }
+ 
+     func releaseButtons() {
+-        for button in buttons.releaseAll() { henge_vm_mouse_button(button, 0) }
++        if !buttons.held.isEmpty { buttonResets &+= 1 }
++        _ = buttons.releaseAll()
++        // Clear the whole source even when UIKit lost its matching release.
++        for button in Int32(0)...2 { henge_vm_input_button(4, button, 0) }
++    }
++
++    func releaseForHandoff() {
++        releaseButtons()
++        scrollTimer?.invalidate(); scrollTimer = nil
++        scrollState = HardwareScroll(); restX = 0; restY = 0
+     }
+ 
+     private func attach(_ mouse: GCMouse) {
+@@ -283,18 +310,38 @@ final class HardwareMouse {
+         mice.append(mouse)
+         mouse.handlerQueue = .main
+         HengeLog.log("input", "mouse: \(mouse.vendorName ?? "?"), right button \(input.rightButton != nil), middle \(input.middleButton != nil)")
+-        input.mouseMovedHandler = { [weak self] _, dx, dy in self?.moved(dx, dy) }
+-        input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(0, pressed) }
+-        input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(1, pressed) }
+-        input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(2, pressed) }
++        input.mouseMovedHandler = { [weak self, weak mouse] _, dx, dy in
++            guard let self, let mouse, self.mice.contains(where: { $0 === mouse }) else { return }
++            self.moved(dx, dy)
++        }
++        input.leftButton.pressedChangedHandler = { [weak self, weak mouse] _, _, pressed in
++            guard let self, let mouse, self.mice.contains(where: { $0 === mouse }) else { return }
++            self.button(0, pressed)
++        }
++        input.rightButton?.pressedChangedHandler = { [weak self, weak mouse] _, _, pressed in
++            guard let self, let mouse, self.mice.contains(where: { $0 === mouse }) else { return }
++            self.button(1, pressed)
++        }
++        input.middleButton?.pressedChangedHandler = { [weak self, weak mouse] _, _, pressed in
++            guard let self, let mouse, self.mice.contains(where: { $0 === mouse }) else { return }
++            self.button(2, pressed)
++        }
+         input.scroll.valueChangedHandler = nil
+-        input.scroll.xAxis.valueChangedHandler = { [weak self] _, delta in self?.scrolled(delta, 0) }
+-        input.scroll.yAxis.valueChangedHandler = { [weak self] _, delta in self?.scrolled(0, delta) }
++        input.scroll.xAxis.valueChangedHandler = { [weak self, weak mouse] _, delta in
++            guard let self, let mouse, self.mice.contains(where: { $0 === mouse }) else { return }
++            self.scrolled(delta, 0)
++        }
++        input.scroll.yAxis.valueChangedHandler = { [weak self, weak mouse] _, delta in
++            guard let self, let mouse, self.mice.contains(where: { $0 === mouse }) else { return }
++            self.scrolled(0, delta)
++        }
+     }
+ 
+     /// GameController's Y runs upward. What doesn't make a whole step yet waits for the next move.
+     private func moved(_ dx: Float, _ dy: Float) {
+         guard acceptsInput, dx.isFinite, dy.isFinite, speed.isFinite else { return }
++        guard dx != 0 || dy != 0 else { return }
++        LocalPointerInput.hardware()
+         restX += min(max(dx * speed, -32767), 32767)
+         restY -= min(max(dy * speed, -32767), 32767)
+         let x = restX.rounded(), y = restY.rounded()
+@@ -305,8 +352,11 @@ final class HardwareMouse {
+     }
+ 
+     private func button(_ physicalButton: Int32, _ pressed: Bool) {
+-        guard acceptsInput, let button = buttons.event(physicalButton, pressed: pressed) else { return }
+-        henge_vm_mouse_button(button, pressed ? 1 : 0)
++        guard acceptsInput else { ignoredButtonEdges &+= 1; return }
++        if pressed { LocalPointerInput.hardware() }
++        guard let button = buttons.event(physicalButton, pressed: pressed) else { return }
++        buttonEdges &+= 1
++        henge_vm_input_button(4, button, pressed ? 1 : 0)
+         if !pressed { StickyKeys.shared.releaseAll() }
+     }
+ 
+@@ -314,7 +364,8 @@ final class HardwareMouse {
+     /// macOS accelerates wheel units roughly quadratically, so use a tunable square root
+     /// and cap each event to keep a small pad gesture from jumping across a page.
+     private func scrolled(_ first: Float, _ second: Float) {
+-        guard acceptsInput else { return }
++        guard acceptsInput, first.isFinite, second.isFinite, first != 0 || second != 0 else { return }
++        LocalPointerInput.hardware()
+         scrollCallbacks &+= 1
+         scrollState.push(first: Double(first), second: Double(second), scale: scrollScale, reversed: reverse)
+         scheduleScrollIfNeeded()
+@@ -344,3 +395,35 @@ final class HardwareMouse {
+         henge_vm_mouse_scroll(event.x, event.y)
+     }
+ }
++
++
++/// Main-thread handoff between actual local input devices. It never restarts the
++/// USB helper, pauses the VM, or interferes with keyboard/remote ownership.
++enum LocalPointerInput {
++    static let changed = Notification.Name("henge.localPointerChanged")
++    static var ownership = LocalPointerOwnership()
++    static var surfaceID: ObjectIdentifier?
++    static var cancelSurface: (() -> Void)?
++    static func install(_ view: UIView, cancel: @escaping () -> Void) {
++        surfaceID = ObjectIdentifier(view); cancelSurface = cancel
++    }
++    static func uninstall(_ view: UIView) {
++        guard surfaceID == ObjectIdentifier(view) else { return }
++        cancelSurface = nil; surfaceID = nil; ownership.reset()
++    }
++    static func direct() {
++        guard ownership.claim(.direct) else { return }
++        HardwareMouse.shared.releaseForHandoff()
++        PointerLock.set(false)
++        NotificationCenter.default.post(name: changed, object: nil)
++    }
++    static func hardware() {
++        guard ownership.claim(.hardware) else { return }
++        cancelSurface?()
++        PointerLock.set(true)
++        NotificationCenter.default.post(name: changed, object: nil)
++    }
++    static func cancel() {
++        ownership.reset(); cancelSurface?()
++    }
++}
 diff --git a/ios/Henge/HengeApp.swift b/ios/Henge/HengeApp.swift
 index 04b1a49..211b233 100644
 --- a/ios/Henge/HengeApp.swift
@@ -12076,10 +12643,58 @@ index 2c11af9..46f9888 100644
  }
  
 diff --git a/ios/Henge/Input.swift b/ios/Henge/Input.swift
-index cab1ccf..a88d735 100644
+index cab1ccf..15ca8b3 100644
 --- a/ios/Henge/Input.swift
 +++ b/ios/Henge/Input.swift
-@@ -164,6 +164,10 @@ enum Keys {
+@@ -20,11 +20,17 @@ struct KeyboardCatcher: UIViewRepresentable {
+         let typer = CatcherView()
+         var typing = false
+         private var hiding: NSObjectProtocol?
++        private var recovery: [NSObjectProtocol] = []
+ 
+         override init(frame: CGRect) {
+             super.init(frame: frame)
+             addSubview(listener)
+             addSubview(typer)
++            for name in [LocalPointerInput.changed, UIApplication.didBecomeActiveNotification] {
++                recovery.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
++                    self?.takeKeyboard()
++                })
++            }
+             hiding = NotificationCenter.default.addObserver(forName: UIResponder.keyboardWillHideNotification,
+                                                             object: nil, queue: .main) { [weak self] _ in
+                 self?.keyboardHid()
+@@ -35,6 +41,7 @@ struct KeyboardCatcher: UIViewRepresentable {
+ 
+         deinit {
+             if let hiding { NotificationCenter.default.removeObserver(hiding) }
++            recovery.forEach(NotificationCenter.default.removeObserver)
+         }
+ 
+         /// iPadOS's own hide-keyboard key closes the keyboard without asking the app, which then went on
+@@ -52,7 +59,7 @@ struct KeyboardCatcher: UIViewRepresentable {
+ 
+         /// Called often, which also takes the keyboard back after a sheet has had it.
+         func takeKeyboard() {
+-            guard let window, window.rootViewController?.presentedViewController == nil else { return }
++            guard let window, window.windowScene?.activationState == .foregroundActive, window.rootViewController?.presentedViewController == nil else { return }
+             let holder: UIView = typing ? typer : listener
+             if !holder.isFirstResponder { holder.becomeFirstResponder() }
+         }
+@@ -61,6 +68,12 @@ struct KeyboardCatcher: UIViewRepresentable {
+     /// Whichever view holds the keyboard hears a hardware keyboard's keys here.
+     class KeyListener: UIView {
+         override var canBecomeFirstResponder: Bool { true }
++        override func resignFirstResponder() -> Bool {
++            let wasFocused = isFirstResponder
++            let resigned = super.resignFirstResponder()
++            if wasFocused && resigned { HardwareKeys.releaseAll() }
++            return resigned
++        }
+         /// Fingers belong to the session (they drive the Mac's trackpad), not to iPadOS's undo/copy/paste bar.
+         override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
+ 
+@@ -164,6 +177,10 @@ enum Keys {
          }
      }
  
@@ -13364,10 +13979,10 @@ index 1bc238f..ccdbb33 100644
  }
 diff --git a/ios/Henge/M4Performance.swift b/ios/Henge/M4Performance.swift
 new file mode 100644
-index 0000000..6b959ab
+index 0000000..691168b
 --- /dev/null
 +++ b/ios/Henge/M4Performance.swift
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,34 @@
 +import Foundation
 +
 +/// Hardware selection is authoritative in the native topology detector. These
@@ -13383,6 +13998,7 @@ index 0000000..6b959ab
 +    /// Existing saved display choices are never migrated implicitly.
 +    static func applyRetinaDisplay(to mac: inout VirtualMac) {
 +        guard enabled else { return }
++        mac.desktopLayout = false
 +        mac.retina = true
 +        mac.fitScreen = false
 +        (mac.screenWidth, mac.screenHeight) = Device.retinaScreen
@@ -13424,7 +14040,7 @@ index c0f52d6..0d81556 100644
                          .frame(maxWidth: .infinity, alignment: .leading)
                          .padding(.horizontal, 4).padding(.bottom, 12)
 diff --git a/ios/Henge/MacSettingsView.swift b/ios/Henge/MacSettingsView.swift
-index 800c854..b2c51e6 100644
+index 800c854..b15ce2c 100644
 --- a/ios/Henge/MacSettingsView.swift
 +++ b/ios/Henge/MacSettingsView.swift
 @@ -5,8 +5,10 @@ struct MacSettingsView: View {
@@ -13438,7 +14054,7 @@ index 800c854..b2c51e6 100644
      @AppStorage("henge.cpus") private var cpus = 4
  
      init(mac: VirtualMac) { _mac = State(initialValue: mac) }
-@@ -26,16 +28,23 @@ struct MacSettingsView: View {
+@@ -26,16 +28,24 @@ struct MacSettingsView: View {
                  if Device.isPad && ProcessInfo.processInfo.physicalMemory >> 20 >= 14_000 {
                      DeskHeading("Performance")
                      VStack(alignment: .leading, spacing: 12) {
@@ -13453,6 +14069,7 @@ index 800c854..b2c51e6 100644
 +                            if M4Performance.enabled {
 +                                M4Performance.applyRetinaDisplay(to: &mac)
 +                            } else {
++                                mac.desktopLayout = false
 +                                mac.retina = false
 +                                mac.fitScreen = false
 +                                (mac.screenWidth, mac.screenHeight) = Device.performanceScreen
@@ -13467,7 +14084,7 @@ index 800c854..b2c51e6 100644
                              .font(.system(size: 13)).foregroundStyle(Desk.dim)
                      }
                      .padding(17)
-@@ -47,7 +56,7 @@ struct MacSettingsView: View {
+@@ -47,7 +57,7 @@ struct MacSettingsView: View {
                      HStack(alignment: .firstTextBaseline) {
                          Text("\(mac.ramMB / 1024) GB").font(.system(size: 26, weight: .bold))
                          Spacer()
@@ -13476,7 +14093,7 @@ index 800c854..b2c51e6 100644
                              .font(.system(size: 13)).foregroundStyle(Desk.dim).multilineTextAlignment(.trailing)
                      }
                      Stepper("Memory", value: Binding(get: { mac.ramMB / 1024 }, set: { mac.ramMB = $0 * 1024; save() }), in: Device.memoryChoices)
-@@ -55,12 +64,18 @@ struct MacSettingsView: View {
+@@ -55,12 +65,18 @@ struct MacSettingsView: View {
                      if let note = Device.memoryNote(mac.ramMB / 1024) {
                          Text(note).font(.system(size: 13)).foregroundStyle(Desk.dim)
                      }
@@ -13496,7 +14113,50 @@ index 800c854..b2c51e6 100644
                      HStack {
                          Text("CPUs").font(.system(size: 16))
                          Spacer()
-@@ -125,6 +140,7 @@ struct MacSettingsView: View {
+@@ -75,6 +91,7 @@ struct MacSettingsView: View {
+                     DeskHeading("Screen")
+                     VStack(alignment: .leading, spacing: 12) {
+                         Picker("Screen", selection: Binding(get: {
++                            if mac.desktopLayout == true { return "desktop" }
+                             if mac.isRetina { return "retina" }
+                             if mac.fitsDeviceScreen { return "fit" }
+                             if mac.screen.width == Device.performanceScreen.width,
+@@ -82,24 +99,30 @@ struct MacSettingsView: View {
+                             if mac.screen.width == 1920, mac.screen.height == 1080 { return "wide" }
+                             return "fit"
+                         }, set: { choice in
+-                            mac.retina = choice == "retina"
++                            mac.desktopLayout = choice == "desktop"
++                            mac.retina = choice == "retina" || choice == "desktop"
+                             mac.fitScreen = choice == "fit"
+                             switch choice {
+-                            case "retina": break
++                            case "retina", "desktop": break
+                             case "performance": (mac.screenWidth, mac.screenHeight) = Device.performanceScreen
+                             case "wide": (mac.screenWidth, mac.screenHeight) = (1920, 1080)
+                             default: (mac.screenWidth, mac.screenHeight) = Device.fitting(for: mac)
+                             }
+                             save()
+                         })) {
++                            Text("Desktop Retina").tag("desktop")
+                             if Device.isPad {
+-                                Text("Retina").tag("retina")
++                                Text("Native Retina").tag("retina")
+                                 Text("Performance").tag("performance")
+                             }
+                             Text("Fit this \(Device.name)").tag("fit")
+                             Text("16:9").tag("wide")
+                         }
+-                        .pickerStyle(.segmented)
++                        .pickerStyle(.menu)
++                        if mac.desktopLayout == true {
++                            Text("Like the mirrored Mac layout: 1280 points across with a sharp 2× backing. The iPad uses 2560 × 1920; Duo fits its current inner-screen proportions. Native Retina remains available for every panel pixel. Display changes apply on the next cold start; a saved Mac keeps its original display until then.")
++                                .font(.system(size: 13)).foregroundStyle(Desk.dim)
++                        }
+                         if Device.largeScreen {
+                             Toggle("Fill the whole screen", isOn: Binding(get: { mac.fillScreen ?? true }, set: { value in
+                                 mac.fillScreen = value
+@@ -125,6 +148,7 @@ struct MacSettingsView: View {
                          Text("of \(ByteText.string(UInt64(max(mac.diskBytes, 0))))").font(.system(size: 16)).foregroundStyle(Desk.dim)
                      }
                      DeskBar(fraction: Double(mac.bytesUsed) / Double(max(mac.diskBytes, 1)))
@@ -13504,7 +14164,7 @@ index 800c854..b2c51e6 100644
                  }
                  .padding(17)
                  .deskCard()
-@@ -139,6 +155,7 @@ struct MacSettingsView: View {
+@@ -139,6 +163,7 @@ struct MacSettingsView: View {
          .background(Desk.page)
          .navigationTitle(mac.name)
          .navigationBarTitleDisplayMode(.inline)
@@ -13512,7 +14172,7 @@ index 800c854..b2c51e6 100644
          .onDisappear(perform: save)
          .fileMover(isPresented: $movingExport, file: machines.lastExport) { result in
              switch result {
-@@ -146,6 +163,7 @@ struct MacSettingsView: View {
+@@ -146,6 +171,7 @@ struct MacSettingsView: View {
              case .failure(let error): machines.lastError = error.localizedDescription
              }
          }
@@ -13521,7 +14181,7 @@ index 800c854..b2c51e6 100644
              Button("Delete", role: .destructive) {
                  machines.delete(mac.id)
 diff --git a/ios/Henge/Machines.swift b/ios/Henge/Machines.swift
-index 29c8b3b..00f528f 100644
+index 29c8b3b..45638a3 100644
 --- a/ios/Henge/Machines.swift
 +++ b/ios/Henge/Machines.swift
 @@ -3,7 +3,7 @@ import UIKit
@@ -13533,7 +14193,7 @@ index 29c8b3b..00f528f 100644
      var id = UUID()
      var name: String
      var ecid: UInt64
-@@ -18,7 +18,8 @@ struct VirtualMac: Identifiable, Codable, Hashable {
+@@ -18,16 +18,27 @@ struct VirtualMac: Identifiable, Codable, Hashable {
      var screenHeight: Int?
      /// Explicit Fit selection; nil retains compatibility with older saved Macs.
      var fitScreen: Bool?
@@ -13541,9 +14201,38 @@ index 29c8b3b..00f528f 100644
 +    /// The iPad's panel at Retina density. Nil preserves an older Mac's display choice;
 +    /// new high-memory M4 Macs explicitly select Retina when they are created.
      var retina: Bool?
++    /// Explicit reference desktop at 1280 logical points, fitted and rendered at 2x.
++    var desktopLayout: Bool?
      /// On an iPhone's large screen (iPhone Duo unfolded): fill it, or leave a strip at the right for the status
      /// bar and Henge's controls. Macs that never chose fill it.
-@@ -236,7 +237,7 @@ final class Machines: ObservableObject {
+     var fillScreen: Bool?
+-    var isRetina: Bool { Device.isPad && (retina ?? false) }
++    var isRetina: Bool { desktopLayout == true || (Device.isPad && (retina ?? false)) }
+     var fitsDeviceScreen: Bool {
+         !isRetina && GuestScreenSize.usesFit(width: screenWidth, height: screenHeight, selected: fitScreen)
+     }
+     func displaySize(in viewport: CGSize) -> GuestScreenSize {
++        if desktopLayout == true {
++            var area = viewport
++            if Device.largeScreen && !(fillScreen ?? true) {
++                if area.width >= area.height { area.width -= Device.sideStrip }
++                else { area.height -= Device.sideStrip }
++            }
++            return GuestScreenSize.desktopRetina(in: area)
++        }
+         if isRetina {
+             let size = Device.retinaScreen
+             return GuestScreenSize(width: size.width, height: size.height)
+@@ -90,7 +101,7 @@ final class Machines: ObservableObject {
+ 
+     /// The files an exported machine folder holds; its disk is disk.img, or disk.img.hvsparse (tools/export_ios.sh packs it).
+     static let required = ["AVPBooter.vmapple2.bin", "auxiliary.bin", "machine.json"]
+-    static let packedDisk = "disk.img.hvsparse"
++    nonisolated static let packedDisk = "disk.img.hvsparse"
+ 
+     nonisolated static func hasDisk(_ folder: URL) -> Bool {
+         let fm = FileManager.default
+@@ -236,7 +247,7 @@ final class Machines: ObservableObject {
      /// in Documents/Exports, which the Files app can reach. Deleting Henge deletes that folder too,
      /// so it has to be moved out of Henge before a reinstall that replaces the app's data.
      func export(_ mac: VirtualMac) {
@@ -13552,7 +14241,7 @@ index 29c8b3b..00f528f 100644
          exporting = mac.name
          exported = 0
          lastExport = nil
-@@ -323,6 +324,7 @@ final class Machines: ObservableObject {
+@@ -323,6 +334,7 @@ final class Machines: ObservableObject {
      }
  
      func delete(_ id: UUID) {
@@ -13561,7 +14250,7 @@ index 29c8b3b..00f528f 100644
          all.removeAll { $0.id == id }
          save()
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..bac3e55 100644
+index 34d6a98..37cc38c 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
 @@ -3,6 +3,7 @@
@@ -14060,7 +14749,7 @@ index 34d6a98..bac3e55 100644
      HvBootDisplay d;
      int result = -1;
      if (hv_vm_boot_display(&d) == 0) {
-@@ -509,3 +739,81 @@ uint64_t henge_largest_mapping_mb(void) {
+@@ -509,3 +739,88 @@ uint64_t henge_largest_mapping_mb(void) {
      }
      return 0;
  }
@@ -14111,6 +14800,13 @@ index 34d6a98..bac3e55 100644
 +        if (hv_pvg_lite_capture_timing(hv_vm_board()->pvg,-1,gpu)==2) out->available|=16;
 +        out->replay_gpu_completed=gpu[0];out->replay_gpu_ns=gpu[1];
 +        out->replay_gpu_max_ns=gpu[2];out->replay_gpu_unavailable=gpu[3];
++        HvVirtioInput *mouse=hv_vm_board()->mouse;
++        if(mouse) {
++            pthread_mutex_lock(&mouse->mu);
++            out->mouse_delivered=mouse->delivered;out->mouse_dropped=mouse->dropped;
++            out->mouse_queued=mouse->tail-mouse->head;
++            pthread_mutex_unlock(&mouse->mu);
++        }
 +        HvXhci *x=hv_vm_board()->usb;
 +        if (x) {
 +            pthread_mutex_lock(&x->mu);
@@ -14131,19 +14827,19 @@ index 34d6a98..bac3e55 100644
 +    return 0;
 +}
 +void henge_vm_input_key(unsigned source,uint8_t usage,int down) {
-+    if(source<1 || source>3 || !lock_running())return;
++    if(source<1 || source>7 || !lock_running())return;
 +    hv_vm_key_hid_source(usage,down,source);pthread_rwlock_unlock(&api_lock);
 +}
 +void henge_vm_input_button(unsigned source,int button,int down) {
-+    if(source<1 || source>3 || !lock_running())return;
++    if(source<1 || source>7 || !lock_running())return;
 +    hv_vm_mouse_button_source(button,down,source);pthread_rwlock_unlock(&api_lock);
 +}
 +void henge_vm_input_release(unsigned source) {
-+    if(source<1 || source>3 || !lock_running())return;
++    if(source<1 || source>7 || !lock_running())return;
 +    hv_vm_release_input_source(source);pthread_rwlock_unlock(&api_lock);
 +}
 diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
-index b8c41fa..54c0e18 100644
+index b8c41fa..281319b 100644
 --- a/ios/Henge/Native/henge-vm.h
 +++ b/ios/Henge/Native/henge-vm.h
 @@ -4,6 +4,7 @@
@@ -14204,7 +14900,7 @@ index b8c41fa..54c0e18 100644
  /* Testing: sets a translation knob (core/machine.h) in the running machine; nonzero if it exists. */
  int henge_vm_knob(const char *name, int value);
  /* The memory balloon (only with HV_BALLOON set before boot): asks the guest to hand over target_mb (when >= 0)
-@@ -62,6 +86,36 @@ int henge_vm_knob(const char *name, int value);
+@@ -62,6 +86,37 @@ int henge_vm_knob(const char *name, int value);
  long henge_vm_balloon(long target_mb);
  
  /* Progress, for the session screen. */
@@ -14223,6 +14919,7 @@ index b8c41fa..54c0e18 100644
 +typedef struct HengeVmResources {
 +    uint64_t process_cpu_us, footprint, resident, headroom, jit_used, jit_capacity, translations, full_flushes;
 +    uint64_t gamepad_delivered, gamepad_coalesced, gamepad_overflow;
++    uint64_t mouse_delivered, mouse_dropped, mouse_queued;
 +    uint64_t replay_gpu_completed, replay_gpu_ns, replay_gpu_max_ns, replay_gpu_unavailable;
 +    int detailed_counters;
 +    unsigned available; /* bits: 0 CPU, 1 memory, 2 headroom, 3 VM, 4 replay GPU timing */
@@ -14236,12 +14933,12 @@ index b8c41fa..54c0e18 100644
 +                     uint8_t left,uint8_t right,uint8_t hat);
 +void henge_vm_input_key(unsigned source,uint8_t usage,int down);
 +void henge_vm_input_button(unsigned source,int button,int down);
-+void henge_vm_input_release(unsigned source); /* 1 remote keyboard, 2 mapped gamepad */
++void henge_vm_input_release(unsigned source); /* 1 Link, 2 mapped gamepad, 3 gamepad pad, 4 physical mouse, 5 touch pad, 6 buttons, 7 volume; keyboard 4 physical */
 +void henge_vm_trim_memory(void); /* release disposable caches; preserves guest RAM and live code */
  void henge_vm_log_cache(void);           /* optional per-CPU cache-use diagnostics */
  uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
  uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
-@@ -74,6 +128,9 @@ int henge_vm_guest_el0(void);              /* any CPU running user code right no
+@@ -74,6 +129,9 @@ int henge_vm_guest_el0(void);              /* any CPU running user code right no
     henge_share_take_clipboard returns what the guest copied, once: a malloc'd string, or NULL. */
  void henge_vm_share(const char *folder, const char *socket_path, const char *agent);
  void henge_share_set_clipboard(const char *text);
@@ -14251,7 +14948,7 @@ index b8c41fa..54c0e18 100644
  char *henge_share_take_clipboard(void);
  long henge_share_agent_seen(void);
  
-@@ -82,7 +139,12 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
+@@ -82,7 +140,12 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
  /* The panel's physical size; 0, 0 for the default (a ~122 ppi, 1x screen). Before boot. */
  void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm);
  int henge_vm_set_link_display(uint32_t width, uint32_t height, uint32_t width_mm, uint32_t height_mm, uint32_t hz);
@@ -14289,9 +14986,18 @@ index 25e7bad..246a6f8 100644
      init(defaults: UserDefaults = .standard,
           now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
 diff --git a/ios/Henge/NativeTouchSurface.swift b/ios/Henge/NativeTouchSurface.swift
-index b89dc8a..28f07f9 100644
+index b89dc8a..a019f29 100644
 --- a/ios/Henge/NativeTouchSurface.swift
 +++ b/ios/Henge/NativeTouchSurface.swift
+@@ -9,7 +9,7 @@ struct NativeTouchSurface: UIViewRepresentable {
+ 
+     func makeUIView(context: Context) -> Surface { Surface() }
+     func updateUIView(_ view: Surface, context: Context) { view.configure(imageRect, revealsControls: revealsControls) }
+-    static func dismantleUIView(_ view: Surface, coordinator: ()) { view.cancel() }
++    static func dismantleUIView(_ view: Surface, coordinator: ()) { view.cancel(); LocalPointerInput.uninstall(view) }
+ 
+     final class Surface: UIView {
+         private struct Finger {
 @@ -29,7 +29,7 @@ struct NativeTouchSurface: UIViewRepresentable {
              super.init(frame: frame)
              isMultipleTouchEnabled = true
@@ -14301,7 +15007,24 @@ index b89dc8a..28f07f9 100644
              controlsTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
              controlsTap.cancelsTouchesInView = true
              controlsTap.isEnabled = false
-@@ -74,7 +74,10 @@ struct NativeTouchSurface: UIViewRepresentable {
+@@ -64,17 +64,34 @@ struct NativeTouchSurface: UIViewRepresentable {
+ 
+         override func didMoveToWindow() {
+             super.didMoveToWindow()
+-            if window == nil { cancel(); heartbeat?.invalidate(); heartbeat = nil }
++            if window == nil {
++                cancel(); heartbeat?.invalidate(); heartbeat = nil
++                LocalPointerInput.uninstall(self)
++            } else {
++                LocalPointerInput.install(self) { [weak self] in self?.cancel() }
++            }
+         }
+ 
+         func cancel() {
+             fingers.removeAll()
+-            _ = hv_native_touch_submit(generation, nil, nil, nil, 0)
++            hv_native_touch_cancel(generation)
+             waitForLift = !held.isEmpty
          }
  
          override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -14309,10 +15032,51 @@ index b89dc8a..28f07f9 100644
 +            // Apple Pencil touches are stylus events, not .direct. Send their
 +            // absolute tip position through the same entitlement-free USB path.
 +            // Indirect pointer events remain owned by HardwareMouse.
-+            let direct = touches.filter { $0.type == .direct || $0.type == .pencil }
++            let stylus = touches.filter { $0.type == .pencil }
++            // While Pencil is down, palm contacts do not become guest fingers.
++            let hasPencil = !stylus.isEmpty || fingers.contains { $0.touch.type == .pencil }
++            let direct = hasPencil ? stylus : touches.filter { $0.type == .direct }
++            guard !direct.isEmpty else { return }
++            if !stylus.isEmpty && fingers.contains(where: { $0.touch.type != .pencil }) {
++                fingers.removeAll()
++                hv_native_touch_cancel(generation)
++            }
++            LocalPointerInput.direct()
              held.formUnion(direct)
              guard !waitForLift, hv_native_touch_status() == 2 else { waitForLift = true; return }
              for touch in direct where fingers.count < 5 {
+diff --git a/ios/Henge/PhysicalMouseButtons.swift b/ios/Henge/PhysicalMouseButtons.swift
+index 9a5c260..df6c43d 100644
+--- a/ios/Henge/PhysicalMouseButtons.swift
++++ b/ios/Henge/PhysicalMouseButtons.swift
+@@ -13,9 +13,9 @@ struct PhysicalMouseButtons {
+         guard (0...2).contains(physicalButton) else { return nil }
+         let guestButton = swapsRightAndMiddle && physicalButton != 0 ? 3 - physicalButton : physicalButton
+         if pressed {
+-            held.insert(guestButton)
++            guard held.insert(guestButton).inserted else { return nil }
+         } else {
+-            held.remove(guestButton)
++            guard held.remove(guestButton) != nil else { return nil }
+         }
+         return guestButton
+     }
+@@ -27,3 +27,15 @@ struct PhysicalMouseButtons {
+         return releases
+     }
+ }
++
++/// One local pointer owner; keyboard and remote sources remain independent.
++struct LocalPointerOwnership {
++    enum Owner { case none, hardware, direct }
++    private(set) var owner: Owner = .none
++    mutating func claim(_ next: Owner) -> Bool {
++        guard owner != next else { return false }
++        owner = next
++        return true
++    }
++    mutating func reset() { owner = .none }
++}
 diff --git a/ios/Henge/ResumeCoordinator.swift b/ios/Henge/ResumeCoordinator.swift
 new file mode 100644
 index 0000000..f1f24fa
@@ -14691,10 +15455,10 @@ index 0000000..3bc275d
 +}
 diff --git a/ios/Henge/SessionDiagnosticCapture.swift b/ios/Henge/SessionDiagnosticCapture.swift
 new file mode 100644
-index 0000000..21b6f54
+index 0000000..7aee05b
 --- /dev/null
 +++ b/ios/Henge/SessionDiagnosticCapture.swift
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,75 @@
 +import Foundation
 +import Combine
 +
@@ -14758,6 +15522,7 @@ index 0000000..21b6f54
 +        let hz = getenv("HV_HZ").map { String(cString:$0) } ?? "unknown"
 +        let policy = getenv("HV_CPU_POLICY").map { String(cString:$0) } ?? "unknown"
 +        HengeLog.log("capture", "\(rates) state=\(vm.state) generation=\(vm.generation) epoch=\(vm.epoch) lpm=\(power) thermal=\(thermal) guest_hz=\(hz) cpu_policy=\(policy) available_bits=\(resources.available) footprint=\(resources.footprint) resident=\(resources.resident) headroom=\(resources.headroom) jit_used=\(resources.jit_used) jit_capacity=\(resources.jit_capacity) translations=\(resources.translations) resets=\(resources.full_flushes) pad_delivered=\(resources.gamepad_delivered) pad_coalesced=\(resources.gamepad_coalesced) pad_overflow=\(resources.gamepad_overflow) detailed_counters=\(resources.detailed_counters)")
++        HengeLog.log("capture-input", "\(HardwareMouse.shared.scrollDiagnostics) mouse_delivered=\(resources.mouse_delivered) mouse_dropped=\(resources.mouse_dropped) mouse_queued=\(resources.mouse_queued) pointer_wanted=\(PointerLock.wanted) owner=\(LocalPointerInput.ownership.owner)")
 +        let preferences = UserDefaults.standard
 +        HengeLog.log("capture-policy","requested_hz=\(preferences.integer(forKey:EngineTuning.refreshKey)) presentation_cap=\(preferences.integer(forKey:"henge.perf.presentationCap")) power_aware=\(preferences.object(forKey:"henge.perf.lowPowerAware") as? Bool ?? true) link_connected=\(LinkHostService.shared.connected) controls_only=\(LinkHostService.shared.controlOnly) grouped=\(getenv("HV_GROUPS").map { String(cString:$0) } ?? "0") superblocks=\(getenv("HV_SUPERBLOCKS").map { String(cString:$0) } ?? "0")")
 +        // Presented-time histogram is enabled by this same bounded capture:
@@ -14846,7 +15611,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..5e2ea4a 100644
+index f84465e..dd7a674 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,17 @@ struct SessionView: View {
@@ -15333,8 +16098,8 @@ index f84465e..5e2ea4a 100644
 +                booting=false;error="There is not enough storage or address space for this Mac's saved memory. The saved state and disk are kept.";return
 +            }
 +            JITBootstrap.releaseLingeringDebugger();Sharing.prepare();EngineTuning.apply()
-+            let mmWidth=restoring?.mmWidth ?? (mac.isRetina ? Int(Device.retinaMM.width) : 0)
-+            let mmHeight=restoring?.mmHeight ?? (mac.isRetina ? Int(Device.retinaMM.height) : 0)
++            let mmWidth=restoring?.mmWidth ?? (mac.isRetina ? Int((Double(screen.width)/264*25.4).rounded()) : 0)
++            let mmHeight=restoring?.mmHeight ?? (mac.isRetina ? Int((Double(screen.height)/264*25.4).rounded()) : 0)
 +            henge_vm_set_display(UInt32(screen.width),UInt32(screen.height))
 +            henge_vm_set_display_mm(UInt32(mmWidth),UInt32(mmHeight))
 +            if let restoring { setenv("HV_HZ",String(restoring.hz),1) }
@@ -15929,6 +16694,150 @@ index f6aa26a..e487b6c 100644
  
  /// Settings › Appearance.
  enum DeskAppearance: String, CaseIterable, Identifiable {
+diff --git a/ios/Henge/Trackpad.swift b/ios/Henge/Trackpad.swift
+index 002b8dd..a8dd4c3 100644
+--- a/ios/Henge/Trackpad.swift
++++ b/ios/Henge/Trackpad.swift
+@@ -18,6 +18,7 @@ struct Trackpad: UIViewRepresentable {
+ 
+     func makeUIView(context: Context) -> Surface { Surface() }
+     func updateUIView(_ view: Surface, context: Context) {}
++    static func dismantleUIView(_ view: Surface, coordinator: ()) { view.cancelInput(); LocalPointerInput.uninstall(view) }
+ 
+     final class Surface: UIView, UIPointerInteractionDelegate {
+         private static let holdTime: TimeInterval = 0.4
+@@ -56,6 +57,7 @@ struct Trackpad: UIViewRepresentable {
+         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+             let touches = touches.filter { $0.type != .indirectPointer }
+             guard !touches.isEmpty else { return }
++            LocalPointerInput.direct()
+             if fingers.isEmpty {
+                 started = Date()
+                 travelled = 0
+@@ -75,14 +77,14 @@ struct Trackpad: UIViewRepresentable {
+                 hadTwoFingers = true
+                 cancelHold()
+                 if fingers.count > 2 { scrollTimer?.invalidate(); scrollTimer = nil; wheel = WheelAccumulator(gain: 6) }
+-                if holding { holding = false; henge_vm_mouse_button(0, 0); StickyKeys.shared.releaseAll() }
++                if holding { holding = false; henge_vm_input_button(5, 0, 0); StickyKeys.shared.releaseAll() }
+             } else {
+                 armHold()
+             }
+         }
+ 
+         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+-            guard !fingers.isEmpty, touches.contains(where: fingers.contains) else { return }
++            guard !gestureCancelled, !fingers.isEmpty, touches.contains(where: fingers.contains) else { return }
+             let movement = motion.update(positions())
+             let dx = movement.x, dy = movement.y
+             travelled += movement.travel
+@@ -120,7 +122,7 @@ struct Trackpad: UIViewRepresentable {
+             cancelHold()
+             if holding {
+                 holding = false
+-                henge_vm_mouse_button(0, 0)
++                henge_vm_input_button(5, 0, 0)
+                 StickyKeys.shared.releaseAll()
+                 return
+             }
+@@ -132,17 +134,17 @@ struct Trackpad: UIViewRepresentable {
+             }
+             guard !cancelled && !gestureCancelled, travelled < Self.tapDistance, Date().timeIntervalSince(started) < Self.tapTime else { return }
+             let button: Int32 = hadTwoFingers ? 1 : 0
+-            henge_vm_mouse_button(button, 1)
+-            henge_vm_mouse_button(button, 0)
++            henge_vm_input_button(5, button, 1)
++            henge_vm_input_button(5, button, 0)
+             StickyKeys.shared.releaseAll()
+         }
+ 
+         private func armHold() {
+             holdTimer?.invalidate()
+             holdTimer = Timer.scheduledTimer(withTimeInterval: Self.holdTime, repeats: false) { [weak self] _ in
+-                guard let self, self.fingers.count == 1, self.travelled < Self.tapDistance else { return }
++                guard let self, !self.gestureCancelled, self.fingers.count == 1, self.travelled < Self.tapDistance else { return }
+                 self.holding = true
+-                henge_vm_mouse_button(0, 1)
++                henge_vm_input_button(5, 0, 1)
+                 self.buzz.impactOccurred()
+             }
+         }
+@@ -173,14 +175,28 @@ struct Trackpad: UIViewRepresentable {
+             RunLoop.main.add(timer, forMode: .common)
+         }
+ 
++        func cancelInput() {
++            gestureCancelled = true
++            cancelHold()
++            scrollTimer?.invalidate(); scrollTimer = nil
++            wheel = WheelAccumulator(gain: 6)
++            holding = false
++            henge_vm_input_release(5)
++        }
++
+         override func didMoveToWindow() {
+             super.didMoveToWindow()
+-            guard window == nil else { return }
++            if window != nil {
++                LocalPointerInput.install(self) { [weak self] in self?.cancelInput() }
++                return
++            }
++            LocalPointerInput.uninstall(self)
++            cancelInput()
+             cancelHold()
+             scrollTimer?.invalidate(); scrollTimer = nil
+             wheel = WheelAccumulator(gain: 6)
+             fingers.removeAll(); motion.reset()
+-            if holding { holding = false; henge_vm_mouse_button(0, 0); StickyKeys.shared.releaseAll() }
++            if holding { holding = false; henge_vm_input_button(5, 0, 0); StickyKeys.shared.releaseAll() }
+         }
+ 
+     }
+@@ -204,15 +220,18 @@ struct MouseButton: View {
+                     .onChanged { _ in
+                         guard !down else { return }
+                         down = true
+-                        henge_vm_mouse_button(button, 1)
++                        henge_vm_input_button(6, button, 1)
+                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                     }
+                     .onEnded { _ in
+                         down = false
+-                        henge_vm_mouse_button(button, 0)
++                        henge_vm_input_button(6, button, 0)
+                         StickyKeys.shared.releaseAll()
+                     }
+             )
++            .onDisappear {
++                if down { down = false; henge_vm_input_button(6, button, 0) }
++            }
+             .accessibilityLabel(title)
+     }
+ }
+diff --git a/ios/Henge/VolumeClicks.swift b/ios/Henge/VolumeClicks.swift
+index 5ff0b60..cbc6de6 100644
+--- a/ios/Henge/VolumeClicks.swift
++++ b/ios/Henge/VolumeClicks.swift
+@@ -51,7 +51,7 @@ final class VolumeClicks: NSObject {
+         let button: Int32 = left ? 0 : 1
+         let currently = left ? leftDown : rightDown
+         guard currently != down else { return }
+-        henge_vm_mouse_button(button, down ? 1 : 0)
++        henge_vm_input_button(7, button, down ? 1 : 0)
+         if left { leftDown = down } else { rightDown = down }
+     }
+ 
+@@ -204,8 +204,8 @@ final class VolumeClicks: NSObject {
+             armTapTimer(left: left, interval: releaseAfter) { [weak self] in self?.finishTapDrag(left: left) }
+         case .idle:
+             let button: Int32 = left ? 0 : 1
+-            henge_vm_mouse_button(button, 1)
+-            henge_vm_mouse_button(button, 0)
++            henge_vm_input_button(7, button, 1)
++            henge_vm_input_button(7, button, 0)
+             buzz.impactOccurred()
+             HengeLog.log("input", "volume: \(left ? "left" : "right") tap (tap then drag)")
+             setTapState(.pending, left: left)
 diff --git a/ios/project.yml b/ios/project.yml
 index a3be374..a022ef6 100644
 --- a/ios/project.yml
@@ -17430,10 +18339,10 @@ index bd64ae5..3bb545e 100644
  }
 diff --git a/tests/test_disk_recovery_macos.py b/tests/test_disk_recovery_macos.py
 new file mode 100644
-index 0000000..b7a9a21
+index 0000000..28c8cbc
 --- /dev/null
 +++ b/tests/test_disk_recovery_macos.py
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,129 @@
 +"""Real APFS integration on an isolated disposable raw image, never the host disk.
 +The Recovery container has real APFS data but no bootable Recovery OS: boot policy
 +and firmware recovery remain physical-guest validation, not claims of this test.
@@ -17477,6 +18386,15 @@ index 0000000..b7a9a21
 +    owned=[v for v in images if Path(v.get('image-path','')).resolve()==image.resolve()]
 +    assert len(owned)==1 and any(v.get('dev-entry')==device for v in owned[0]['system-entities'])
 +    return device
++
++def detach(device):
++    # These mounted test volumes can be held briefly by Disk Arbitration or
++    # Spotlight. Ask the filesystem to unmount before ejecting our owned image;
++    # never force-detach before the offline integrity checks.
++    run('diskutil','unmountDisk',device)
++    run('diskutil','eject',device)
++    images=run('hdiutil','info','-plist',plist=True)['images']
++    assert not any(any(e.get('dev-entry')==device for e in v['system-entities']) for v in images)
 +
 +def containers(device):
 +    prefix=device.removeprefix('/dev/')+'s'
@@ -17528,7 +18446,7 @@ index 0000000..b7a9a21
 +        for volume,name in [(main_vol,main_name),(recovery_vol,recovery_name)]:
 +            path=mounted(volume,name)/'henge-verification.bin'
 +            with path.open('wb') as f:f.write(payload);f.flush();os.fsync(f.fileno())
-+        run('hdiutil','detach',device);device=None
++        detach(device);device=None
 +        recovery_identity=mark_recovery(image)
 +        run(str(DRIVER),str(image),str(2<<30))
 +        inspect=list(map(int,run(str(DRIVER),str(image),'inspect').split()))
@@ -17544,7 +18462,7 @@ index 0000000..b7a9a21
 +        for volume,name in [(main_vol,main_name),(recovery_vol,recovery_name)]:
 +            assert (mounted(volume,name)/'henge-verification.bin').read_bytes()==payload
 +            run('diskutil','verifyVolume',volume['DeviceIdentifier'])
-+        run('hdiutil','detach',device);device=None
++        detach(device);device=None
 +        with image.open('rb') as f:
 +            f.seek(512);h=f.read(512);count,stride=struct.unpack_from('<II',h,80)
 +            f.seek(struct.unpack_from('<Q',h,72)[0]*512);entries=f.read(count*stride)
@@ -18001,7 +18919,7 @@ index 0000000..7b09ed0
 +print('Display snapshot parser: two ports, all header mutations and truncations passed ASan/UBSan')
 diff --git a/tests/test_engine_tuning.swift b/tests/test_engine_tuning.swift
 new file mode 100644
-index 0000000..1cb8fbf
+index 0000000..b2cd270
 --- /dev/null
 +++ b/tests/test_engine_tuning.swift
 @@ -0,0 +1,61 @@
@@ -18060,7 +18978,7 @@ index 0000000..1cb8fbf
 +        EngineTuning.apply()
 +        precondition(value("HV_FIXTURE_OVERRIDE") == nil)
 +        precondition(value("HV_FIXTURE_FOREIGN") == "kept")
-+        precondition(value("HV_WFI_SPIN") == "0" && value("HV_GROUPS") == "0")
++        precondition(value("HV_WFI_SPIN") == "0" && value("HV_GROUPS") == "2")
 +        UserDefaults.standard.removeObject(forKey:"henge.perf.groupedMemory")
 +        UserDefaults.standard.removeObject(forKey:"henge.perf.wfiSpin")
 +        print("PASS engine tuning: actual defaults, explicit overrides, removed overrides, foreign environment and grouped-path activation")
@@ -18793,6 +19711,24 @@ index 0000000..b072380
 +        await connection.close()
 +    }
 +}
+diff --git a/tests/test_guest_screen.swift b/tests/test_guest_screen.swift
+index 6b80564..8336a96 100644
+--- a/tests/test_guest_screen.swift
++++ b/tests/test_guest_screen.swift
+@@ -33,6 +33,13 @@ import Foundation
+         precondition(GuestScreenSize.fitting(in: CGSize(width: CGFloat.greatestFiniteMagnitude,
+                                                        height: CGFloat.greatestFiniteMagnitude)).height == 1920)
+         precondition(GuestScreenSize.fitting(in: CGSize(width: 2556, height: 1179)) == wide)
++        let desktop = GuestScreenSize.desktopRetina(in: CGSize(width:1376,height:1032))
++        precondition(desktop == GuestScreenSize(width:2560,height:1920))
++        let duo = GuestScreenSize.desktopRetina(in: CGSize(width:951,height:669))
++        precondition(duo == GuestScreenSize(width:2560,height:1800))
++        precondition(abs(CGFloat(duo.height)-2560*669/951) <= 1)
++        precondition(GuestScreenSize.desktopRetina(in: CGSize(width:669,height:951)) == duo)
++        precondition(GuestScreenSize.desktopRetina(in: .zero) == desktop)
+         // Legacy Fit migration and explicit mode choices, including equal-sized
+         // custom profiles, must remain distinguishable after encoding/decoding.
+         precondition(GuestScreenSize.usesFit(width: 1920, height: 1320, selected: nil))
 diff --git a/tests/test_idle_integration.c b/tests/test_idle_integration.c
 index 2b1be58..cf28a94 100644
 --- a/tests/test_idle_integration.c
@@ -18852,6 +19788,54 @@ index 2b1be58..cf28a94 100644
      hv_machine_free(&m);
      puts("native WFI integration: guest timer resumes code, activity callback runs at entry/resume, CPU parks on exit");
  }
+diff --git a/tests/test_input_ring.c b/tests/test_input_ring.c
+new file mode 100644
+index 0000000..4d8d982
+--- /dev/null
++++ b/tests/test_input_ring.c
+@@ -0,0 +1,42 @@
++#include "input_ring.h"
++#include <assert.h>
++#include <stdio.h>
++int main(void) {
++    uint8_t owners[3]={0};int state=0;
++    assert(hv_input_button_owner(owners,0,4,1,&state)&&state);
++    assert(!hv_input_button_owner(owners,0,5,1,&state)&&state);
++    assert(!hv_input_button_owner(owners,0,4,0,&state)&&state);
++    assert(hv_input_button_owner(owners,0,5,0,&state)&&!state);
++    assert(!hv_input_button_owner(owners,0,4,0,&state));
++    assert(hv_input_button_owner(owners,1,7,1,&state)&&state);
++    assert(!hv_input_button_owner(owners,1,1,1,&state));
++    assert(!hv_input_button_owner(owners,1,7,0,&state)&&state);
++    assert(hv_input_button_owner(owners,1,1,0,&state)&&!state);
++    assert(!hv_input_button_owner(owners,1,8,1,&state));
++    HvInputEvent ring[HV_VINPUT_RING];
++    uint32_t head=0,tail=0;uint8_t buttons=0;uint64_t dropped=0;
++    hv_input_enqueue(ring,&head,&tail,&buttons,&dropped,1,1,0x110,1);
++    for(unsigned i=1;i<HV_VINPUT_RING;i++)hv_input_enqueue(ring,&head,&tail,&buttons,&dropped,1,2,0,1);
++    // A release at exact capacity must survive, and all guest buttons reconcile.
++    hv_input_enqueue(ring,&head,&tail,&buttons,&dropped,1,1,0x110,0);
++    assert(dropped==HV_VINPUT_RING && tail-head==4 && buttons==0);
++    for(unsigned b=0;b<3;b++) {
++        HvInputEvent e=ring[(head+b)%HV_VINPUT_RING];
++        assert(e.type==1 && e.code==0x110+b && e.value==0);
++    }
++    assert(ring[(head+3)%HV_VINPUT_RING].type==0);
++    // Preserve a genuine held right button through motion saturation.
++    head=tail;
++    hv_input_enqueue(ring,&head,&tail,&buttons,&dropped,1,1,0x111,1);
++    for(unsigned i=1;i<HV_VINPUT_RING;i++)hv_input_enqueue(ring,&head,&tail,&buttons,&dropped,1,0,0,0);
++    hv_input_enqueue(ring,&head,&tail,&buttons,&dropped,1,2,1,-7);
++    assert(tail-head==5 && ring[(head+1)%HV_VINPUT_RING].value==1);
++    assert((int32_t)ring[(head+4)%HV_VINPUT_RING].value==-7);
++    hv_input_enqueue(ring,&head,&tail,&buttons,&dropped,1,1,0x111,0);
++    assert(buttons==0 && ring[(tail-1)%HV_VINPUT_RING].value==0);
++    // Unsigned index wrap retains capacity arithmetic.
++    head=tail=UINT32_MAX-2;
++    for(unsigned i=0;i<HV_VINPUT_RING+2;i++)hv_input_enqueue(ring,&head,&tail,&buttons,&dropped,1,0,0,0);
++    assert(tail-head<HV_VINPUT_RING);
++    puts("PASS input ring: release overflow, held-state reconciliation, motion and index wrap");
++}
 diff --git a/tests/test_jit.c b/tests/test_jit.c
 index 882612c..a7d4cdb 100644
 --- a/tests/test_jit.c
@@ -19302,7 +20286,7 @@ index 0000000..624db4e
 +}
 diff --git a/tests/test_m4_defaults.swift b/tests/test_m4_defaults.swift
 new file mode 100644
-index 0000000..348e938
+index 0000000..37476d7
 --- /dev/null
 +++ b/tests/test_m4_defaults.swift
 @@ -0,0 +1,42 @@
@@ -19311,7 +20295,7 @@ index 0000000..348e938
 +func hv_host_is_m4_16gb() -> Int32 { fixtureM4 }
 +enum HengeLog { static func log(_ a: String, _ b: String) {} }
 +struct VirtualMac {
-+    var retina: Bool? = false, fitScreen: Bool? = true
++    var retina: Bool? = false, fitScreen: Bool? = true, desktopLayout: Bool? = false
 +    var screenWidth: Int? = 1920, screenHeight: Int? = 1080
 +}
 +enum Device { static let retinaScreen = (width: 2752, height: 2064) }
@@ -19603,6 +20587,97 @@ index 1766e60..2ba0d15 100644
 +    unlink(touch_path); unlink(socket_path); rmdir(directory);
      puts("native touch: idle polling, immediate wake, transitions, validation, generations, fallback, timeout and HTTP passed");
  }
+diff --git a/tests/test_native_touch_encoder.c b/tests/test_native_touch_encoder.c
+new file mode 100644
+index 0000000..a0458d7
+--- /dev/null
++++ b/tests/test_native_touch_encoder.c
+@@ -0,0 +1,39 @@
++#include "native_touch_encoder.h"
++#include <assert.h>
++#include <stdio.h>
++int main(void) {
++    HvTouchEncoder e={0};HvTouchFrame f={.count=1,.ids={9},.x={.25},.y={.5}};
++    uint8_t r[32];int consumed;
++    assert(hv_touch_encoder_step(&e,&f,1,&consumed,r)&&consumed&&r[1]==3&&r[2]==1&&r[31]==1);
++    // Position updates have no 16ms polling or 60ms membership delay.
++    f.x[0]=.75;
++    assert(hv_touch_encoder_step(&e,&f,1.001,&consumed,r)&&consumed&&r[3]==255&&r[4]==95);
++    HvTouchFrame lift={0};
++    assert(!hv_touch_encoder_step(&e,&lift,1.002,&consumed,r)&&!consumed);
++    assert(hv_touch_encoder_step(&e,&lift,1.061,&consumed,r)&&consumed&&r[1]==2);
++    assert(hv_touch_encoder_step(&e,NULL,1.122,&consumed,r)&&r[31]==0);
++    assert(hv_touch_encoder_due(&e,0,1.122)==0);
++    f.count=5;for(int i=0;i<5;i++){f.ids[i]=(uint8_t)(i+10);f.x[i]=.5;f.y[i]=.5;}
++    assert(hv_touch_encoder_step(&e,&f,2,&consumed,r)&&consumed&&r[31]==5);
++    hv_touch_encoder_cancel(&e);
++    assert(hv_touch_encoder_step(&e,NULL,2.061,&consumed,r)&&r[1]==2&&r[31]==5);
++    // All occupied slots pack first, with stable HID ids after selective lift.
++    assert(hv_touch_encoder_step(&e,NULL,2.122,&consumed,r)&&r[31]==0);
++    f.count=2;assert(hv_touch_encoder_step(&e,&f,3,&consumed,r)&&consumed);
++    f.count=1;f.ids[0]=11;
++    assert(hv_touch_encoder_step(&e,&f,3.061,&consumed,r)&&consumed);
++    assert(hv_touch_encoder_step(&e,NULL,3.122,&consumed,r)&&r[31]==1&&r[2]==2);
++    // Same-id short re-tap cannot re-use a slot before the lifted report retires.
++    f.count=0;assert(hv_touch_encoder_step(&e,&f,3.2,&consumed,r)&&consumed);
++    f.count=1;f.ids[0]=11;
++    (void)hv_touch_encoder_step(&e,&f,3.22,&consumed,r);assert(!consumed);
++    assert(hv_touch_encoder_step(&e,&f,3.261,&consumed,r)&&consumed&&r[1]==3);
++    // Replace all five contacts: lift before waiting for free retiring slots.
++    memset(&e,0,sizeof e);f.count=5;
++    for(unsigned i=0;i<5;i++)f.ids[i]=(uint8_t)(i+1);
++    assert(hv_touch_encoder_step(&e,&f,4,&consumed,r)&&consumed);
++    for(unsigned i=0;i<5;i++)f.ids[i]=(uint8_t)(i+20);
++    assert(hv_touch_encoder_step(&e,&f,4.061,&consumed,r)&&!consumed&&r[1]==2);
++    assert(hv_touch_encoder_step(&e,&f,4.122,&consumed,r)&&consumed&&r[1]==3&&r[31]==5);
++    puts("PASS host touch encoder: immediate motion, short taps, stable packed slots, lift retention and cancellation");
++}
+diff --git a/tests/test_native_touch_host.c b/tests/test_native_touch_host.c
+new file mode 100644
+index 0000000..da5e533
+--- /dev/null
++++ b/tests/test_native_touch_host.c
+@@ -0,0 +1,40 @@
++#include "native_touch.h"
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++typedef struct { int connected,reports,mapped;uint8_t last[32]; } USB;
++static int connect_usb(void *c,int v){((USB*)c)->connected=v;return 1;}
++static int connected(void *c){return ((USB*)c)->connected;}
++static int mapped(void *c){((USB*)c)->mapped++;return 1;}
++static int report(void *c,const uint8_t *v){USB *u=c;assert(u->connected);u->reports++;memcpy(u->last,v,32);return 1;}
++static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
++int main(void){
++    USB u={0};HvNativeTouchUSB usb={.context=&u,.connect=connect_usb,.connected=connected,.report=report,.mapped=mapped};
++    hv_native_touch_set_usb(&usb);uint32_t e=hv_native_touch_enable(1);
++    assert(!hv_native_touch_usb_host_encoding(e));
++    assert(hv_native_touch_usb_connect(e,1));assert(hv_native_touch_usb_mapped(e));
++    assert(!hv_native_touch_usb_host_encoding(e-1));assert(hv_native_touch_usb_host_encoding(e));
++    hv_native_touch_report(e,HV_TOUCH_READY);
++    uint8_t id=7;double x=.25,y=.5;double start=now();
++    assert(hv_native_touch_submit(e,&id,&x,&y,1));
++    assert(now()-start<.05 && u.last[1]==3 && u.last[31]==1);
++    // No guest HTTP GET, re-encode and PUT is needed for actual touch delivery.
++    int n=u.reports;x=.75;assert(hv_native_touch_submit(e,&id,&x,&y,1));assert(u.reports==n+1);
++    assert(!hv_native_touch_usb_report(e,u.last)); // one encoder, stale guest reports cannot resurrect touches
++    assert(hv_native_touch_usb_host_encoding(e));assert(u.last[31]==1); // idempotent
++    hv_native_touch_cancel(e-1);assert(u.last[1]==3);
++    hv_native_touch_cancel(e);
++    char json[1024];
++    while(u.last[31] && now()-start<.5){hv_native_touch_report(e,HV_TOUCH_READY);assert(hv_native_touch_next(json,sizeof json));assert(strstr(json,"\"contacts\":[]"));}
++    assert(u.last[31]==0 && u.connected && hv_native_touch_status()==HV_TOUCH_READY);
++    assert(hv_native_touch_epoch()==e); // handoff must not remap USB or restart helper
++    n=u.reports;
++    assert(hv_native_touch_submit(e,NULL,NULL,NULL,0));
++    hv_native_touch_report(e,HV_TOUCH_READY);assert(hv_native_touch_next(json,sizeof json));
++    assert(u.reports==n); // unchanged desktop has no USB report loop
++    hv_native_touch_enable(0);assert(!u.connected);assert(!hv_native_touch_usb_report(e,u.last));
++    hv_native_touch_set_usb(NULL);
++    puts("PASS host USB touch: direct delivery, stale-report rejection, non-disconnecting handoff, neutral drain and idle suppression");
++}
 diff --git a/tests/test_native_touch_packaging.py b/tests/test_native_touch_packaging.py
 new file mode 100644
 index 0000000..2c357bc
@@ -19703,6 +20778,33 @@ index 0000000..425a58c
 +    memset(p,0xa5,page*4); assert(((uint8_t *)p)[page*2]==0xa5); free(p);
 +    puts("PASS TLB span permissions/bounds, exact cursor damage, retired-page boundaries and reuse");
 +}
+diff --git a/tests/test_physical_mouse_buttons.swift b/tests/test_physical_mouse_buttons.swift
+index d0f1589..cf1d703 100644
+--- a/tests/test_physical_mouse_buttons.swift
++++ b/tests/test_physical_mouse_buttons.swift
+@@ -28,13 +28,21 @@ struct PhysicalMouseButtonTests {
+         // Concurrent presses and disconnect cleanup must release their mapped IDs.
+         check(swapped.event(1, pressed: true) == 2, "right hold must use middle")
+         check(swapped.event(2, pressed: true) == 1, "middle hold must use right")
+-        check(swapped.event(1, pressed: true) == 2, "duplicate press must remain idempotent")
++        check(swapped.event(1, pressed: true) == nil, "duplicate press must not generate another edge")
+         check(swapped.releaseAll() == [1, 2], "cleanup must release mapped buttons")
+         check(swapped.releaseAll().isEmpty, "cleanup must be idempotent")
+         check(swapped.event(-1, pressed: true) == nil, "negative code must be ignored")
+         check(swapped.event(3, pressed: true) == nil, "unsupported code must be ignored")
+         check(swapped.held.isEmpty, "invalid input must not stick")
+ 
++        check(swapped.event(1, pressed: false) == nil, "late up after cleanup must not release another owner")
++        var ownership = LocalPointerOwnership()
++        check(ownership.claim(.hardware), "first pointer event claims ownership")
++        check(!ownership.claim(.hardware), "motion must not repeat handoff/reset")
++        check(ownership.claim(.direct), "touch preempts pointer")
++        check(ownership.claim(.hardware), "pointer preempts held touch")
++        ownership.reset()
++        check(ownership.claim(.hardware), "focus recovery must reestablish pointer ownership")
+         print("PASS: standard mapping, right/middle swap, left drag, releases and disconnect cleanup")
+     }
+ }
 diff --git a/tests/test_pipeline_archive.py b/tests/test_pipeline_archive.py
 new file mode 100644
 index 0000000..fd66a5c
@@ -21756,10 +22858,10 @@ index a13a70d..6cd37c1 100644
      hv_vm_destroy();
      atomic_store(&reader_done, 1);
 diff --git a/tests/test_xhci_slots.c b/tests/test_xhci_slots.c
-index 41c2faa..8ba03bf 100644
+index 41c2faa..0b459c2 100644
 --- a/tests/test_xhci_slots.c
 +++ b/tests/test_xhci_slots.c
-@@ -4,10 +4,101 @@
+@@ -4,10 +4,107 @@
  static HvMachine machine;
  static HvXhci controller;
  static uint8_t memory[16384] __attribute__((aligned(16384)));
@@ -21808,6 +22910,12 @@ index 41c2faa..8ba03bf 100644
 +    hv_xhci_key_source(x,26,1,0);hv_xhci_key_source(x,26,1,1);
 +    hv_xhci_release_source(x,1);assert(x->state[2]==26);
 +    hv_xhci_key_source(x,26,0,0);assert(!x->state[2]);
++    hv_xhci_key_source(x,0xe4,1,0);hv_xhci_key_source(x,0xe4,1,4);
++    hv_xhci_release_source(x,4);assert(x->state[0]&(1u<<4));
++    hv_xhci_key_source(x,0xe4,0,0);assert(!(x->state[0]&(1u<<4)));
++    hv_xhci_key_source(x,26,1,4);hv_xhci_key_source(x,26,1,1);
++    hv_xhci_release_source(x,1);assert(x->state[2]==26);
++    hv_xhci_release_source(x,4);assert(!x->state[2]);
 +    for(unsigned k=4;k<11;k++)hv_xhci_key_source(x,k,1,2);
 +    assert(x->state[2]==1 && x->state[7]==1);
 +    hv_xhci_release_source(x,2);assert(!x->state[2]);
@@ -21861,7 +22969,7 @@ index 41c2faa..8ba03bf 100644
      struct HvXhciIntr *it=&controller.intr[0];
      unsigned count=0;
      for(unsigned type=9;type<=23;type++)for(unsigned slot=0;slot<256;slot++) {
-@@ -25,6 +116,9 @@ int main(void) {
+@@ -25,6 +122,9 @@ int main(void) {
          assert(controller.cmd.dequeue==0x100010);
          count++;
      }
@@ -21892,13 +23000,19 @@ index 70d7ccb..e4f9089 100755
 +test -s "$BUILD/libhengerestore.a"
  ls -la "$BUILD/libhengerestore.a"
 diff --git a/tools/check_host_scheduling.sh b/tools/check_host_scheduling.sh
-index 509bce1..9233e97 100755
+index 509bce1..2febc7d 100755
 --- a/tools/check_host_scheduling.sh
 +++ b/tools/check_host_scheduling.sh
-@@ -2,6 +2,16 @@
+@@ -2,6 +2,22 @@
  # Native tests + iPhoneOS SDK type checking. Does not build an app or IPA.
  set -euo pipefail
  cd "$(dirname "$0")/.."
++for test in input_ring native_touch_encoder; do
++    cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ihost -Idevices "tests/test_$test.c" -o "/tmp/henge-$test"
++    "/tmp/henge-$test"
++done
++cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread -Ihost tests/test_native_touch_host.c host/native_touch.c -o /tmp/henge-native-touch-host
++/tmp/henge-native-touch-host
 +python3 tests/test_restore_archive.py
 +python3 tests/test_clipboard_notify.py
 +xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined tests/test_sharing_agent.m -framework AppKit -o /tmp/henge-test-sharing-agent
@@ -21912,7 +23026,7 @@ index 509bce1..9233e97 100755
  mkdir -p build/scheduling-check
  task_out="$PWD/build/scheduling-check"
  exec > >(tee "$task_out/checks.log") 2>&1
-@@ -9,6 +19,9 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
+@@ -9,6 +25,9 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
  set -x
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread -Ihost \
      host/scheduling.c tests/test_scheduling.c -o "$task_out/test_scheduling"
@@ -21922,7 +23036,7 @@ index 509bce1..9233e97 100755
  "$task_out/test_scheduling"
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O2 -Ihost -c host/scheduling.c -o "$task_out/scheduling.o"
  swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h \
-@@ -16,6 +29,10 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
+@@ -16,6 +35,10 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
  "$task_out/test_host_bridge"
  swiftc -parse-as-library -swift-version 5 ios/Henge/SessionStatistics.swift tests/test_session_statistics.swift -o "$task_out/test_session_statistics"
  "$task_out/test_session_statistics"
@@ -21933,7 +23047,7 @@ index 509bce1..9233e97 100755
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -DHV_PROF_TEST -Icore -Ihost -Idevices \
      host/prof_ios.c host/scheduling.c tests/test_prof_ios.c -o "$task_out/test_prof_ios"
  "$task_out/test_prof_ios"
-@@ -25,9 +42,15 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=addres
+@@ -25,9 +48,15 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=addres
  xcrun --sdk macosx clang -fobjc-arc -std=c11 -Wall -Wextra -Werror -O2 -Idevices \
      tests/test_display_settings.m -framework Foundation -o "$task_out/test_display_settings"
  "$task_out/test_display_settings"
@@ -22623,7 +23737,7 @@ index 81c453a..a7ff541 100644
              0x05, 0x01, 0x09, 0x30, 0x09, 0x31,
              0x16, 0x00, 0x00, 0x26, 0xFF, 0x7F,
 diff --git a/tools/native-touch/SystemNativeTouchDevice.swift b/tools/native-touch/SystemNativeTouchDevice.swift
-index 7f9c3b6..7cf7dce 100644
+index 7f9c3b6..69a6d26 100644
 --- a/tools/native-touch/SystemNativeTouchDevice.swift
 +++ b/tools/native-touch/SystemNativeTouchDevice.swift
 @@ -1,21 +1,7 @@
@@ -22659,7 +23773,7 @@ index 7f9c3b6..7cf7dce 100644
      private var task: Task<Void, Never>?
      private var slots: [Slot?] = Array(repeating: nil, count: NativeTouchFrame.maximumContacts)
      private var pending: [[NativeTouchContact]] = []
-@@ -35,24 +21,17 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
+@@ -35,27 +21,21 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
      private var lastSentReport: Data?
      private var lastDownIDs = Set<UInt8>()
      private var transitionDeadline: TimeInterval = 0
@@ -22692,7 +23806,15 @@ index 7f9c3b6..7cf7dce 100644
      }
  
      func enqueue(_ contacts: [NativeTouchContact]) {
-@@ -94,18 +73,22 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
++        guard !usb.hostEncoded else { return }
+         guard contacts.count <= NativeTouchFrame.maximumContacts else { releaseAll(); return }
+         // Neutral heartbeats do not need a report loop once every finger has lifted.
+         if contacts.isEmpty && pending.isEmpty && slots.allSatisfy({ $0 == nil }) { return }
+@@ -91,21 +71,26 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
+ 
+     func stop() async {
+         task?.cancel(); await task?.value; task = nil
++        if usb.hostEncoded { await usb.stop(); started = false; hadReport = false; return }
          let remaining = transitionDeadline-ProcessInfo.processInfo.systemUptime
          if remaining > 0 { try? await Task.sleep(for: .seconds(remaining)) }
          releaseAll()
@@ -22720,7 +23842,7 @@ index 7f9c3b6..7cf7dce 100644
          let now = ProcessInfo.processInfo.systemUptime
          // AppKit needs time to consume each contact transition's change mask.
          guard now >= transitionDeadline else { return }
-@@ -142,7 +125,7 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
+@@ -142,7 +127,7 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
              let downIDs = Set(slots.compactMap { $0 }.filter(\.down).map { $0.finger.id })
              for index in slots.indices where slots[index]?.down == true { slots[index]?.published = true }
              for index in slots.indices where slots[index]?.down == false && slots[index]?.liftedAt == nil { slots[index]?.liftedAt = now }
@@ -22729,7 +23851,7 @@ index 7f9c3b6..7cf7dce 100644
              if downIDs != lastDownIDs { transitionDeadline = ProcessInfo.processInfo.systemUptime + 0.06 }
              lastDownIDs = downIDs; lastSentReport = data
              hadReport = occupied
-@@ -158,7 +141,7 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
+@@ -158,7 +143,7 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
                  let slot = occupied[index]
                  let x = UInt16((min(1,max(0,slot.finger.x))*32767).rounded())
                  let y = UInt16((min(1,max(0,slot.finger.y))*32767).rounded())
@@ -22740,10 +23862,10 @@ index 7f9c3b6..7cf7dce 100644
          bytes.append(UInt8(occupied.count))
 diff --git a/tools/native-touch/USBTouchTransport.swift b/tools/native-touch/USBTouchTransport.swift
 new file mode 100644
-index 0000000..e8debbb
+index 0000000..0508937
 --- /dev/null
 +++ b/tools/native-touch/USBTouchTransport.swift
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,197 @@
 +import AppKit
 +import Foundation
 +import IOKit
@@ -22840,12 +23962,14 @@ index 0000000..e8debbb
 +        let epoch: UInt32
 +        let available: Bool
 +        let connected: Bool
++        let hostEncoding: Bool?
 +    }
 +    private let connection: GuestConnection
 +    private let epoch: UInt32
 +    private let mapper = USBDisplayMapper()
 +    private let base = URL(string: "http://10.0.2.4/.henge/native-touch-usb")!
 +    private(set) var active = false
++    private(set) var hostEncoded = false
 +
 +    init(connection: GuestConnection, epoch: UInt32) { self.connection = connection; self.epoch = epoch }
 +
@@ -22907,6 +24031,12 @@ index 0000000..e8debbb
 +                guard ProcessInfo.processInfo.systemUptime < deadline else { throw URLError(.timedOut) }
 +                try await Task.sleep(for: .milliseconds(25))
 +            }
++            // New hosts encode UIKit contacts directly into their emulated USB
++            // endpoint. The companion still owns display association/liveness.
++            if try await state().hostEncoding == true {
++                try await control(3)
++                hostEncoded = true
++            }
 +            active = true
 +        } catch {
 +            await stop()
@@ -22916,6 +24046,7 @@ index 0000000..e8debbb
 +
 +    func send(_ report: Data) async throws {
 +        guard active, report.count == 32 else { throw CocoaError(.featureUnsupported) }
++        if hostEncoded { return }
 +        var generation = epoch.littleEndian
 +        var body = withUnsafeBytes(of: &generation) { Data($0) }
 +        body.append(report)
@@ -22927,7 +24058,7 @@ index 0000000..e8debbb
 +    }
 +
 +    func stop() async {
-+        active = false
++        active = false; hostEncoded = false
 +        try? await setConnected(false)
 +        mapper.stop()
 +    }
