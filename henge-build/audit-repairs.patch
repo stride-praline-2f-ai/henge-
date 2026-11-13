@@ -1125,7 +1125,7 @@ index 3a4ee8f..89ad6ac 100644
     can be read before the page ends. On a fault, the instruction abort is taken
     and NULL is returned. */
 diff --git a/core/translate.c b/core/translate.c
-index cebfb7d..0dcb777 100644
+index cebfb7d..6bf4bd8 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -48,6 +48,8 @@ typedef struct {
@@ -1377,7 +1377,7 @@ index cebfb7d..0dcb777 100644
 +            }
 +        }
 +    }
-+    return count>=4; /* avoid the old two-access groups' code/cache overhead */
++    return count>=3; /* retain a benefit for common three-field objects; pairs stay plain */
 +}
 +
  static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va) {
@@ -5385,10 +5385,10 @@ index 0000000..a464f06
 +Safety decisions: persistent archive hints select candidate files; Metal itself validates the complete descriptor. They are not proof of exact PSO identity, so no unsafe direct pipeline-state reuse is added from those partial keys. Guest-visible CPUs remain static and user selectable; OS scheduling is not physical core pinning. No guest translation persistence across app/JIT launches is claimed.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
-index 0000000..9a6e41b
+index 0000000..c52c30c
 --- /dev/null
 +++ b/docs/m4-optimisation/PROGRESS.md
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,146 @@
 +# Current checkpoint
 +
 +- Reconstructed source inherited at wrapper commit 343d2d84, patch 9ee35476;
@@ -5521,6 +5521,20 @@ index 0000000..9a6e41b
 +2560x1920 on4:3 iPad and aspect-fitted Duo inner screen; original Native Retina
 +is retained. Snapshot restoration retains its saved display configuration.
 +Full exact-source macOS/native/iOS SDK/app validation still required; no IPA yet.
++
++Duo touch-only follow-up: requested touchscreen remains selected during reconnect;
++status overlay explains waiting instead of silently becoming relative trackpad.
++Details temporarily cancels capture but retains guest USB display association.
++Host viewport/fold geometry updates cancel contacts without remapping the guest.
++Only a real hardware pointer event requests pointer capture. Host-encoded mode
++allows2.5s helper jitter; a stale UI sender still releases contacts after0.7s,
++requires resting fingers to lift, and keeps the display mapped. Legacy watchdog
++semantics remain unchanged. Added transport regression for this recovery path.
++
++Restricted register reuse now also selects safe three-field access groups, while
++pairs stay plain. Added real emitted-word assertions and a longer interleaved
++three-field benchmark; exact first-fault regression uses a separately warmed,
++three-load group. Cloud timing/semantics must pass before the release gate.
 diff --git a/docs/m4-optimisation/SPEC.md b/docs/m4-optimisation/SPEC.md
 new file mode 100644
 index 0000000..87f0a22
@@ -8478,7 +8492,7 @@ index eeabe42..7035b1a 100644
            uint32_t seen = 0; uint64_t distinct = 0; (void)seen;
            uint64_t best[4] = {0}; uint32_t bestn[4] = {0};
 diff --git a/host/native_touch.c b/host/native_touch.c
-index 504e669..564e6cb 100644
+index 504e669..d1365fa 100644
 --- a/host/native_touch.c
 +++ b/host/native_touch.c
 @@ -1,4 +1,5 @@
@@ -8487,7 +8501,7 @@ index 504e669..564e6cb 100644
  #include <math.h>
  #include <pthread.h>
  #include <stdio.h>
-@@ -7,18 +8,22 @@
+@@ -7,29 +8,70 @@
  
  #define QUEUE_SIZE 64
  #define MAX_CONTACTS 5
@@ -8499,7 +8513,7 @@ index 504e669..564e6cb 100644
  static size_t queued;
  static uint32_t epoch = 1;
 -static int enabled, status;
-+static int enabled, status, host_encoded, cancel_pending;
++static int enabled, status, host_encoded, cancel_pending, sender_expired;
 +static HvTouchEncoder encoder;
  static double last_sender, last_helper, started;
 +static HvNativeTouchUSB usb;
@@ -8508,11 +8522,23 @@ index 504e669..564e6cb 100644
 +    if (usb.connect) usb.connect(usb.context, 0);
      if (++epoch == 0) epoch = 1;
      queued = 0; memset(&current, 0, sizeof current);
-+    host_encoded = cancel_pending = 0; memset(&encoder,0,sizeof encoder);
++    host_encoded = cancel_pending = sender_expired = 0; memset(&encoder,0,sizeof encoder);
      started = last_sender = now(); last_helper = 0;
      status = enabled ? HV_TOUCH_WAITING : HV_TOUCH_OFF;
      pthread_cond_broadcast(&changed);
-@@ -30,6 +35,36 @@ static void expire_locked(void) {
+ }
+ static void expire_locked(void) {
+     double t = now();
+-    if (enabled && ((status == HV_TOUCH_READY && (t-last_helper > 0.7 || t-last_sender > 0.7)) ||
++    if(enabled && host_encoded && status==HV_TOUCH_READY && t-last_sender>.7 && !sender_expired) {
++        // A UI stall releases contacts, not the mapped USB display. The UIKit
++        // surface fences resting contacts when its heartbeat resumes.
++        sender_expired=1;cancel_pending=1;queued=0;memset(&current,0,sizeof current);
++        pthread_cond_broadcast(&changed);
++    }
++    double helper_timeout=host_encoded?2.5:.7;
++    if (enabled && ((status == HV_TOUCH_READY && (t-last_helper > helper_timeout || (!host_encoded && t-last_sender > .7))) ||
+                     (status == HV_TOUCH_WAITING && t-started > 5))) {
          enabled = 0; reset_locked(); status = HV_TOUCH_TIMEOUT;
      }
  }
@@ -8549,7 +8575,17 @@ index 504e669..564e6cb 100644
  uint32_t hv_native_touch_enable(int on) {
      pthread_mutex_lock(&mutex);
      if (enabled != !!on || (!on && status != HV_TOUCH_OFF)) { enabled = !!on; reset_locked(); }
-@@ -65,29 +100,88 @@ int hv_native_touch_submit(uint32_t generation, const uint8_t *ids, const double
+@@ -55,7 +97,8 @@ int hv_native_touch_submit(uint32_t generation, const uint8_t *ids, const double
+     }
+     pthread_mutex_lock(&mutex); expire_locked();
+     if (!enabled || status != HV_TOUCH_READY || generation != epoch) { pthread_mutex_unlock(&mutex); return 0; }
+-    last_sender = now();
++    last_sender = now();sender_expired=0;
++    if(host_encoded && usb.keepalive)usb.keepalive(usb.context);
+     // Keep the sender watchdog alive without waking the helper for an unchanged idle frame.
+     if (!count && !queued && !current.count) {
+         pthread_mutex_unlock(&mutex);
+@@ -65,29 +108,88 @@ int hv_native_touch_submit(uint32_t generation, const uint8_t *ids, const double
      if (queued && queue[queued-1].count == count && !memcmp(queue[queued-1].ids, frame.ids, count)) queue[queued-1] = frame;
      else if (queued < QUEUE_SIZE) queue[queued++] = frame;
      else { enabled = 0; reset_locked(); status = HV_TOUCH_DEVICE; pthread_mutex_unlock(&mutex); return 0; }
@@ -12155,7 +12191,7 @@ index a0a1e92..6a36fce 100644
          if let selected { return selected }
          // Older Fit profiles only stored this size convention. Explicit new
 diff --git a/ios/Henge/Hardware.swift b/ios/Henge/Hardware.swift
-index af0bc1b..6c442d4 100644
+index af0bc1b..b95f92e 100644
 --- a/ios/Henge/Hardware.swift
 +++ b/ios/Henge/Hardware.swift
 @@ -123,7 +123,11 @@ enum HardwareKeys {
@@ -12221,7 +12257,7 @@ index af0bc1b..6c442d4 100644
          acceptsInput = true
          scrollCallbacks = 0; scrollFrames = 0; largestScroll = 0
          let defaults = UserDefaults.standard
-@@ -243,11 +255,17 @@ final class HardwareMouse {
+@@ -243,13 +255,19 @@ final class HardwareMouse {
              self.scrollTimer = nil
              self.mice.removeAll { $0 === mouse }
          })
@@ -12238,8 +12274,11 @@ index af0bc1b..6c442d4 100644
 +                StickyKeys.shared.releaseAll()
 +            }
          })
-         PointerLock.set(true)
+-        PointerLock.set(true)
++        PointerLock.set(!mice.isEmpty)
      }
+ 
+     func stop() {
 @@ -275,7 +293,16 @@ final class HardwareMouse {
      }
  
@@ -14040,7 +14079,7 @@ index c0f52d6..0d81556 100644
                          .frame(maxWidth: .infinity, alignment: .leading)
                          .padding(.horizontal, 4).padding(.bottom, 12)
 diff --git a/ios/Henge/MacSettingsView.swift b/ios/Henge/MacSettingsView.swift
-index 800c854..b15ce2c 100644
+index 800c854..4d7895f 100644
 --- a/ios/Henge/MacSettingsView.swift
 +++ b/ios/Henge/MacSettingsView.swift
 @@ -5,8 +5,10 @@ struct MacSettingsView: View {
@@ -14079,7 +14118,7 @@ index 800c854..b15ce2c 100644
                          .font(.system(size: 16, weight: .semibold))
 -                        Text("4 CPUs, 8 GB memory and a \(Device.performanceScreen.width) × \(Device.performanceScreen.height) screen. Reduces drawing work and leaves memory for iPadOS and graphics, with a softer image. Applies on the next Mac start. CPU selection applies to all Macs.")
 +                        Text(M4Performance.enabled
-+                             ? "4 CPUs, 8 GB guest memory, automatic scheduling and sleeping CPU waits. Resets experimental paths and diagnostic counters to off. Full native Retina, your refresh selection and code-cache choice are preserved. An optional henge-env.txt still overrides engine settings. Applies on the next Mac start."
++                             ? "4 CPUs, 8 GB guest memory, automatic scheduling and sleeping CPU waits. Restricted translation reuse is automatic; broad experiments and diagnostic counters stay off. Full native Retina, your refresh selection and code-cache choice are preserved. An optional henge-env.txt still overrides engine settings. Applies on the next Mac start."
 +                             : "4 CPUs, 8 GB memory and a \(Device.performanceScreen.width) × \(Device.performanceScreen.height) screen. Reduces drawing work with a softer image. Applies on the next Mac start. CPU selection applies to all Macs.")
                              .font(.system(size: 13)).foregroundStyle(Desk.dim)
                      }
@@ -14986,19 +15025,33 @@ index 25e7bad..246a6f8 100644
      init(defaults: UserDefaults = .standard,
           now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
 diff --git a/ios/Henge/NativeTouchSurface.swift b/ios/Henge/NativeTouchSurface.swift
-index b89dc8a..a019f29 100644
+index b89dc8a..76bba68 100644
 --- a/ios/Henge/NativeTouchSurface.swift
 +++ b/ios/Henge/NativeTouchSurface.swift
-@@ -9,7 +9,7 @@ struct NativeTouchSurface: UIViewRepresentable {
+@@ -6,10 +6,11 @@ import UIKit
+ struct NativeTouchSurface: UIViewRepresentable {
+     let imageRect: CGRect
+     let revealsControls: Bool
++    var acceptsInput = true
  
      func makeUIView(context: Context) -> Surface { Surface() }
-     func updateUIView(_ view: Surface, context: Context) { view.configure(imageRect, revealsControls: revealsControls) }
+-    func updateUIView(_ view: Surface, context: Context) { view.configure(imageRect, revealsControls: revealsControls) }
 -    static func dismantleUIView(_ view: Surface, coordinator: ()) { view.cancel() }
++    func updateUIView(_ view: Surface, context: Context) { view.configure(imageRect, revealsControls: revealsControls, acceptsInput: acceptsInput) }
 +    static func dismantleUIView(_ view: Surface, coordinator: ()) { view.cancel(); LocalPointerInput.uninstall(view) }
  
      final class Surface: UIView {
          private struct Finger {
-@@ -29,7 +29,7 @@ struct NativeTouchSurface: UIViewRepresentable {
+@@ -22,6 +23,8 @@ struct NativeTouchSurface: UIViewRepresentable {
+         private var generation: UInt32 = 0
+         private var heartbeat: Timer?
+         private var waitForLift = false
++        private var acceptsInput = true
++        private var lastSend = ProcessInfo.processInfo.systemUptime
+         private var held = Set<UITouch>()
+         private let controlsTap = UITapGestureRecognizer()
+ 
+@@ -29,7 +32,7 @@ struct NativeTouchSurface: UIViewRepresentable {
              super.init(frame: frame)
              isMultipleTouchEnabled = true
              backgroundColor = .clear
@@ -15007,7 +15060,28 @@ index b89dc8a..a019f29 100644
              controlsTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
              controlsTap.cancelsTouchesInView = true
              controlsTap.isEnabled = false
-@@ -64,17 +64,34 @@ struct NativeTouchSurface: UIViewRepresentable {
+@@ -38,13 +41,18 @@ struct NativeTouchSurface: UIViewRepresentable {
+         }
+         required init?(coder: NSCoder) { fatalError("made in code") }
+ 
+-        func configure(_ rect: CGRect, revealsControls: Bool) {
++        func configure(_ rect: CGRect, revealsControls: Bool, acceptsInput: Bool) {
++            if self.acceptsInput != acceptsInput {
++                self.acceptsInput = acceptsInput
++                if !acceptsInput { cancel() }
++            }
+             if controlsTap.isEnabled != revealsControls {
+                 controlsTap.isEnabled = revealsControls
+             }
+             if imageRect != rect {
+                 cancel()
+-                if imageRect != .zero { hv_native_touch_reset() }
++                // Host letterboxing/rotation changes only the coordinate
++                // transform. The guest display identity and USB mapping persist.
+                 imageRect = rect
+                 generation = hv_native_touch_epoch()
+                 waitForLift = !held.isEmpty
+@@ -64,19 +72,37 @@ struct NativeTouchSurface: UIViewRepresentable {
  
          override func didMoveToWindow() {
              super.didMoveToWindow()
@@ -15042,11 +15116,34 @@ index b89dc8a..a019f29 100644
 +                hv_native_touch_cancel(generation)
 +            }
 +            LocalPointerInput.direct()
++            if !stylus.isEmpty { waitForLift = false }
              held.formUnion(direct)
-             guard !waitForLift, hv_native_touch_status() == 2 else { waitForLift = true; return }
+-            guard !waitForLift, hv_native_touch_status() == 2 else { waitForLift = true; return }
++            guard acceptsInput, !waitForLift, hv_native_touch_status() == 2 else { waitForLift = true; return }
              for touch in direct where fingers.count < 5 {
+                 let point = touch.location(in: self)
+                 guard imageRect.contains(point) else { continue }
+@@ -87,7 +113,7 @@ struct NativeTouchSurface: UIViewRepresentable {
+         }
+ 
+         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+-            guard !waitForLift else { return }
++            guard acceptsInput, !waitForLift else { return }
+             for index in fingers.indices where touches.contains(fingers[index].touch) {
+                 fingers[index].point = fingers[index].touch.location(in: self)
+             }
+@@ -102,6 +128,9 @@ struct NativeTouchSurface: UIViewRepresentable {
+             send()
+         }
+         private func send() {
++            let now = ProcessInfo.processInfo.systemUptime
++            if now - lastSend > 0.65 { cancel() }
++            lastSend = now
+             guard imageRect.width > 0, imageRect.height > 0 else { return }
+             if generation != hv_native_touch_epoch() {
+                 fingers.removeAll(); waitForLift = !held.isEmpty
 diff --git a/ios/Henge/PhysicalMouseButtons.swift b/ios/Henge/PhysicalMouseButtons.swift
-index 9a5c260..df6c43d 100644
+index 9a5c260..4d0a15e 100644
 --- a/ios/Henge/PhysicalMouseButtons.swift
 +++ b/ios/Henge/PhysicalMouseButtons.swift
 @@ -13,9 +13,9 @@ struct PhysicalMouseButtons {
@@ -15068,7 +15165,7 @@ index 9a5c260..df6c43d 100644
 +
 +/// One local pointer owner; keyboard and remote sources remain independent.
 +struct LocalPointerOwnership {
-+    enum Owner { case none, hardware, direct }
++    enum Owner: Equatable { case none, hardware, direct }
 +    private(set) var owner: Owner = .none
 +    mutating func claim(_ next: Owner) -> Bool {
 +        guard owner != next else { return false }
@@ -15611,7 +15708,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..dd7a674 100644
+index f84465e..ceb72fd 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,17 @@ struct SessionView: View {
@@ -15663,7 +15760,26 @@ index f84465e..dd7a674 100644
      var body: some View {
          GeometryReader { geo in
              let insets = geo.safeAreaInsets
-@@ -190,12 +202,19 @@ struct SessionView: View {
+@@ -91,9 +103,16 @@ struct SessionView: View {
+                     .position(x: layout.screen.midX, y: layout.screen.midY)
+                 if state != 2 {
+                 Group {
+-                    if nativeTouch.ready && !display.isExternal {
++                    if nativeTouch.requested && Sharing.enabledForSession && !display.isExternal {
+                         NativeTouchSurface(imageRect: layout.screen.offsetBy(dx: -layout.touch.minX, dy: -layout.touch.minY),
+-                                           revealsControls: controlsHidden)
++                                           revealsControls: controlsHidden, acceptsInput: nativeTouch.ready && !pointerNeeded && scenePhase == .active)
++                            .overlay(alignment: .top) {
++                                if !nativeTouch.ready {
++                                    Text("Touchscreen connecting · Details → Touch input")
++                                        .font(.caption).padding(8).background(.ultraThinMaterial, in: Capsule())
++                                        .padding(.top, 8).allowsHitTesting(false)
++                                }
++                            }
+                     } else {
+                         Trackpad()
+                     }
+@@ -190,20 +209,32 @@ struct SessionView: View {
          } message: {
              Text("This turns the Mac off at once. Anything not saved on it is lost.")
          }
@@ -15686,8 +15802,11 @@ index f84465e..dd7a674 100644
          }
          .onChange(of: nativeTouch.requested) { _, _ in nativeTouch.changedRequest() }
          .onChange(of: pointerNeeded) { needed in
-@@ -204,6 +223,11 @@ struct SessionView: View {
-             if needed { nativeTouch.stop() }
+-            PointerLock.set(!needed)
++            PointerLock.set(!needed && LocalPointerInput.ownership.owner == .hardware)
+             HardwareMouse.shared.setAcceptsInput(!needed && scenePhase == .active)
+-            if needed { nativeTouch.stop() }
++            if needed { LocalPointerInput.cancel() }
          }
          .onChange(of: scenePhase) { phase in
 +            guard InstantResume.runtime.ownsView(viewRevision) else { return }
@@ -15698,7 +15817,7 @@ index f84465e..dd7a674 100644
              HardwareMouse.shared.setAcceptsInput(phase == .active && !pointerNeeded)
              guard phase != .active else {
                  display.refresh()
-@@ -211,13 +235,75 @@ struct SessionView: View {
+@@ -211,13 +242,75 @@ struct SessionView: View {
                  return
              }
              nativeTouch.stop()
@@ -15776,7 +15895,7 @@ index f84465e..dd7a674 100644
              if showing {
                  refreshDetails()
                  HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll()
-@@ -228,35 +314,39 @@ struct SessionView: View {
+@@ -228,35 +321,39 @@ struct SessionView: View {
          }
          .onAppear {
              UIApplication.shared.isIdleTimerDisabled = true
@@ -15827,12 +15946,12 @@ index f84465e..dd7a674 100644
 +    private var pointerNeeded: Bool { booting || manualSaving || resumeStatus.busy || state == 2 || showDetails || confirmStop || error != nil }
 +    private var nativeTouchPolling: Bool {
 +        nativeTouch.requested && Sharing.enabledForSession && state == 1 && scenePhase == .active
-+            && !pointerNeeded && !display.isExternal
++            && !display.isExternal
 +    }
  
      // A fold/rotation after boot must fit the mode the guest actually received,
      // rather than stretch it by recalculating only the host view's aspect.
-@@ -411,6 +501,9 @@ struct SessionView: View {
+@@ -411,6 +508,9 @@ struct SessionView: View {
          .labelStyle(.iconOnly)
          .buttonBorderShape(.circle)
          .tint(Desk.raised)
@@ -15842,7 +15961,7 @@ index f84465e..dd7a674 100644
      }
  
      /// An iPhone's large screen: an iPhone Duo unfolded, regular both ways.
-@@ -485,6 +578,29 @@ struct SessionView: View {
+@@ -485,6 +585,29 @@ struct SessionView: View {
      /// The controls a column has too.
      @ViewBuilder private var floatingTools: some View {
          tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
@@ -15872,7 +15991,7 @@ index f84465e..dd7a674 100644
          pasteTool
          tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
          tool("info.circle", "Details", tint: .white) { showDetails = true }
-@@ -513,12 +629,19 @@ struct SessionView: View {
+@@ -513,12 +636,19 @@ struct SessionView: View {
      }
  
      /// Keeps the pointer in view: the view moves when the pointer nears its edge.
@@ -15893,7 +16012,7 @@ index f84465e..dd7a674 100644
              }
              if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / displayAspect)) { map = UIImage(cgImage: image) }
              tick += 1
-@@ -541,10 +664,70 @@ struct SessionView: View {
+@@ -541,10 +671,70 @@ struct SessionView: View {
  
      // MARK: Status
  
@@ -15964,7 +16083,7 @@ index f84465e..dd7a674 100644
              Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
          }
          .padding(18)
-@@ -577,12 +760,13 @@ struct SessionView: View {
+@@ -577,12 +767,13 @@ struct SessionView: View {
          NavigationStack {
              List {
                  Section(phase) {
@@ -15979,7 +16098,7 @@ index f84465e..dd7a674 100644
                  Section("Display") {
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
-@@ -599,6 +783,7 @@ struct SessionView: View {
+@@ -599,6 +790,7 @@ struct SessionView: View {
                  }
                  Section("Pointer") {
                      Picker("Size", selection: $cursorScale) {
@@ -15987,7 +16106,7 @@ index f84465e..dd7a674 100644
                          Text("1×").tag(1)
                          Text("2×").tag(2)
                          Text("3×").tag(3)
-@@ -608,7 +793,7 @@ struct SessionView: View {
+@@ -608,7 +800,7 @@ struct SessionView: View {
                      LabeledContent("Magic Keyboard / mouse scroll speed", value: String(format: "%.2f×", scrollSpeed))
                      Slider(value: $scrollSpeed, in: HardwareScroll.minimumSpeed...HardwareScroll.maximumSpeed)
                      Button("Reset hardware scroll speed") { scrollSpeed = HardwareScroll.defaultSpeed }
@@ -15996,28 +16115,31 @@ index f84465e..dd7a674 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  Section("Touch input") {
-@@ -618,15 +803,15 @@ struct SessionView: View {
+@@ -618,16 +810,16 @@ struct SessionView: View {
                          Text("Enable Guest sharing in Henge Settings and reopen Henge to use native touch.")
                              .font(.footnote).foregroundStyle(.secondary)
                      }
 -                    Text("Requires macOS 27.2 or later and an Apple-authorized virtual-HID guest helper. The bundled ad-hoc helper may be blocked by macOS signing checks. Accessibility permission alone does not resolve that block.")
-+                    Text("Requires macOS 27.2 or later and the updated Henge sharing helper. Allow Local Network for Henge Sharing Agent if macOS asks. If unavailable, the screen continues to work as a trackpad.")
++                    Text("Requires macOS 27.2 or later and the updated Henge sharing helper. Allow Local Network for Henge Sharing Agent if macOS asks. Touchscreen stays selected while reconnecting. Turn Native touch off to use the screen as a trackpad. Magic Keyboard and Pencil tip input work alongside native touch; pressure, hover and squeeze are not exposed to the Mac.")
                          .font(.footnote).foregroundStyle(.secondary)
                      switch nativeTouch.status {
                      case 2: Text("Native touch is ready.")
-                     case 3: Text("This guest needs macOS 27.2 or later. Using trackpad.")
+-                    case 3: Text("This guest needs macOS 27.2 or later. Using trackpad.")
 -                    case 4: Text("Allow Accessibility for henge-touch-agent in the Mac. Using trackpad.")
 -                    case 5: Text("The Mac could not create its touchscreen. Check the helper’s virtual HID authorization. Using trackpad.")
 -                    case 6: Text("Touch helper unavailable. Check its Mac signing and permissions. Trackpad is active.")
 -                    case 1: Text("Waiting for the guest touch helper. Close Details to connect; check the helper’s Mac signing if this persists.")
-+                    case 4: Text("Update the guest sharing helper to use USB touch. Using trackpad.")
-+                    case 5: Text("The Mac could not connect its touchscreen. Update the helper and try again. Using trackpad.")
-+                    case 6: Text("The touch helper did not respond. Retrying automatically while you use the trackpad.")
-+                    case 1: Text("Waiting for the updated guest sharing helper. Close Details to connect.")
-                     default: Text("Trackpad is active. Native touch connects after you close Details.")
+-                    default: Text("Trackpad is active. Native touch connects after you close Details.")
++                    case 3: Text("This guest needs macOS 27.2 or later. Turn Native touch off to use trackpad.")
++                    case 4: Text("Update the guest sharing helper to use USB touch. Turn Native touch off to use trackpad.")
++                    case 5: Text("The Mac could not connect its touchscreen. Update the helper and try again. Turn Native touch off to use trackpad.")
++                    case 6: Text("The touch helper did not respond. Reconnecting automatically; touchscreen stays selected.")
++                    case 1: Text("Waiting for the updated guest sharing helper. Connecting without restarting the Mac.")
++                    default: Text("Native touch off uses the trackpad. When selected, waiting for the guest helper.")
                      }
                      Button("Type the Helper Update Command") {
-@@ -640,8 +825,11 @@ struct SessionView: View {
+                         showDetails = false
+@@ -640,8 +832,11 @@ struct SessionView: View {
                  }
                  Section("Sharing") {
                      LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
@@ -16031,7 +16153,7 @@ index f84465e..dd7a674 100644
                              showDetails = false
                              Task {
                                  try? await Task.sleep(nanoseconds: 600_000_000)
-@@ -680,6 +868,8 @@ struct SessionView: View {
+@@ -680,6 +875,8 @@ struct SessionView: View {
      }
  
      private func run(viewport: CGSize) async {
@@ -16040,7 +16162,7 @@ index f84465e..dd7a674 100644
          error = nil
          state = 0
          userCode = false
-@@ -693,65 +883,109 @@ struct SessionView: View {
+@@ -693,65 +890,109 @@ struct SessionView: View {
          zoomCentre = CGPoint(x: 0.5, y: 0.5)
          map = nil
          showWallpaperTip = false
@@ -16195,7 +16317,7 @@ index f84465e..dd7a674 100644
              if state == 2 {
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
-@@ -769,38 +1003,58 @@ struct SessionView: View {
+@@ -769,38 +1010,58 @@ struct SessionView: View {
                  }
                  break
              }
@@ -16980,10 +17102,10 @@ index 091433d..d5481c3 100644
  typedef int32_t OSStatus;
  typedef uint32_t UInt32, AudioUnitRenderActionFlags;
 diff --git a/tests/bench_programs.S b/tests/bench_programs.S
-index b4f57c2..6f3d076 100644
+index b4f57c2..f4c9878 100644
 --- a/tests/bench_programs.S
 +++ b/tests/bench_programs.S
-@@ -48,6 +48,51 @@ PROGRAM bench_mem
+@@ -48,6 +48,70 @@ PROGRAM bench_mem
      b.ne 3b
  END bench_mem
  
@@ -17031,6 +17153,25 @@ index b4f57c2..6f3d076 100644
 +    b.ne 1b
 +    mov x5, #0
 +END bench_stream
++
++// Three-field object access: selected reuse must help without a fourth load.
++PROGRAM bench_stream3
++    sub x23, sp, #8192
++    mov x4, #7
++    stp x4, x4, [x23]
++    str x4, [x23, #16]
++    mov x0, #0
++    movz x2, #0x100, lsl #16
++1:  ldr x4, [x23]
++    add x0, x0, x4
++    ldr x5, [x23, #8]
++    add x0, x0, x5
++    ldr x19, [x23, #16]
++    add x0, x0, x19
++    subs x2, x2, #1
++    b.ne 1b
++    mov x5, #0
++END bench_stream3
 +
  // An interpreter loop: a jump table and BR, 300000 times.
  PROGRAM bench_dispatch
@@ -17148,7 +17289,7 @@ index 0000000..74083bb
 + return rc?1:0;
 +}
 diff --git a/tests/exc_programs.S b/tests/exc_programs.S
-index e164bea..e93760a 100644
+index e164bea..2b61258 100644
 --- a/tests/exc_programs.S
 +++ b/tests/exc_programs.S
 @@ -108,6 +108,17 @@ PROGRAM p_dabt
@@ -17158,11 +17299,11 @@ index e164bea..e93760a 100644
 +// A grouped range must preserve completed loads and the exact first fault PC.
 +PROGRAM p_group_fault
 +    SETUP
-+    ldr x15, [x9] // warm the ordinary RAM page without a candidate group
++    ldr x15, [x9] // warm ordinary RAM before the independently planned group
++    dmb ish
 +1:  ldr x1, [x9]
 +    ldr x2, [x9, #8]
 +2:  ldr x3, [x9, #16] // first byte beyond the mapped RAM region
-+    str x1, [x9]
 +    adr x4, 2b
 +END p_group_fault
 +
@@ -17928,20 +18069,21 @@ index dc4e6a8..fcbc8bd 100644
 +    puts("audio lifecycle: render, no duplicate start, stop/uninitialize/dispose, late-start rejection, idempotence, pause stream preservation, interruption, failed-start recovery and reattach passed");
  }
 diff --git a/tests/test_bench.c b/tests/test_bench.c
-index b3af248..3fa2e8b 100644
+index b3af248..8d325db 100644
 --- a/tests/test_bench.c
 +++ b/tests/test_bench.c
-@@ -10,10 +10,12 @@ DECLARE_PROGRAM(bench_calls);
+@@ -10,10 +10,13 @@ DECLARE_PROGRAM(bench_calls);
  DECLARE_PROGRAM(bench_mem);
  DECLARE_PROGRAM(bench_dispatch);
  DECLARE_PROGRAM(bench_loop);
 +DECLARE_PROGRAM(bench_iter_load);
 +DECLARE_PROGRAM(bench_stream);
++DECLARE_PROGRAM(bench_stream3);
  extern const char bench_programs_begin[], bench_programs_finish[];
  
  static const TestProgram programs[] = {
 -    TEST_PROGRAM(bench_calls), TEST_PROGRAM(bench_mem), TEST_PROGRAM(bench_dispatch), TEST_PROGRAM(bench_loop),
-+    TEST_PROGRAM(bench_calls), TEST_PROGRAM(bench_mem), TEST_PROGRAM(bench_dispatch), TEST_PROGRAM(bench_loop), TEST_PROGRAM(bench_iter_load), TEST_PROGRAM(bench_stream),
++    TEST_PROGRAM(bench_calls), TEST_PROGRAM(bench_mem), TEST_PROGRAM(bench_dispatch), TEST_PROGRAM(bench_loop), TEST_PROGRAM(bench_iter_load), TEST_PROGRAM(bench_stream), TEST_PROGRAM(bench_stream3),
  };
  
  /* EL0, so the indirect-branch cache takes these low (user) addresses. */
@@ -19712,10 +19854,10 @@ index 0000000..b072380
 +    }
 +}
 diff --git a/tests/test_guest_screen.swift b/tests/test_guest_screen.swift
-index 6b80564..8336a96 100644
+index 6b80564..5e29e27 100644
 --- a/tests/test_guest_screen.swift
 +++ b/tests/test_guest_screen.swift
-@@ -33,6 +33,13 @@ import Foundation
+@@ -33,6 +33,14 @@ import Foundation
          precondition(GuestScreenSize.fitting(in: CGSize(width: CGFloat.greatestFiniteMagnitude,
                                                         height: CGFloat.greatestFiniteMagnitude)).height == 1920)
          precondition(GuestScreenSize.fitting(in: CGSize(width: 2556, height: 1179)) == wide)
@@ -19726,6 +19868,7 @@ index 6b80564..8336a96 100644
 +        precondition(abs(CGFloat(duo.height)-2560*669/951) <= 1)
 +        precondition(GuestScreenSize.desktopRetina(in: CGSize(width:669,height:951)) == duo)
 +        precondition(GuestScreenSize.desktopRetina(in: .zero) == desktop)
++        print("Desktop Retina: iPad 2560x1920 and Duo aspect/rotation at 1280 logical width passed")
          // Legacy Fit migration and explicit mode choices, including equal-sized
          // custom profiles, must remain distinguishable after encoding/decoding.
          precondition(GuestScreenSize.usesFit(width: 1920, height: 1320, selected: nil))
@@ -20634,10 +20777,10 @@ index 0000000..a0458d7
 +}
 diff --git a/tests/test_native_touch_host.c b/tests/test_native_touch_host.c
 new file mode 100644
-index 0000000..da5e533
+index 0000000..77c6c89
 --- /dev/null
 +++ b/tests/test_native_touch_host.c
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,49 @@
 +#include "native_touch.h"
 +#include <assert.h>
 +#include <stdint.h>
@@ -20674,6 +20817,15 @@ index 0000000..da5e533
 +    assert(hv_native_touch_submit(e,NULL,NULL,NULL,0));
 +    hv_native_touch_report(e,HV_TOUCH_READY);assert(hv_native_touch_next(json,sizeof json));
 +    assert(u.reports==n); // unchanged desktop has no USB report loop
++    // A brief guest-helper delay no longer flips a touch-only phone to cursor
++    // mode, while a stale UI sender still gets a real lift sequence.
++    assert(hv_native_touch_submit(e,&id,&x,&y,1));
++    struct timespec pause={0,800000000};nanosleep(&pause,NULL);
++    assert(hv_native_touch_status()==HV_TOUCH_READY&&u.connected);
++    hv_native_touch_report(e,HV_TOUCH_READY);
++    double recovery=now();
++    while(u.last[31]&&now()-recovery<.5)assert(hv_native_touch_next(json,sizeof json));
++    assert(!u.last[31]&&hv_native_touch_epoch()==e);
 +    hv_native_touch_enable(0);assert(!u.connected);assert(!hv_native_touch_usb_report(e,u.last));
 +    hv_native_touch_set_usb(NULL);
 +    puts("PASS host USB touch: direct delivery, stale-report rejection, non-disconnecting handoff, neutral drain and idle suppression");
@@ -21492,10 +21644,10 @@ index 0000000..e46fae6
 +} }
 diff --git a/tests/test_register_groups.c b/tests/test_register_groups.c
 new file mode 100644
-index 0000000..0bc09ee
+index 0000000..ee48d95
 --- /dev/null
 +++ b/tests/test_register_groups.c
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,26 @@
 +#include "translate.h"
 +#include <assert.h>
 +#include <stdio.h>
@@ -21515,9 +21667,10 @@ index 0000000..0bc09ee
 +    const uint32_t stream[]={0xf9400001,0xf9400402,0xf9400803,0xf9400c04,0xd65f03c0};
 +    unsigned plain=hot(0,stream,5),selected=hot(2,stream,5);
 +    assert(selected+10<plain); /* actual emitter, not a copied cost model */
-+    const uint32_t clobber[]={0xf9400001,0x910004c6,0xf9400402,0xf9400803,0xf9400c04,0xd65f03c0};
++    const uint32_t clobber[]={0xf9400001,0xf9400402,0x910004c6,0xf9400803,0xf9400c04,0xd65f03c0};
 +    assert(hot(0,clobber,6)==hot(2,clobber,6));
-+    assert(hot(0,stream+1,4)==hot(2,stream+1,4)); /* three accesses stay plain */
++    assert(hot(2,stream+1,4)+6<hot(0,stream+1,4)); /* three-field objects also reuse the translation */
++    assert(hot(0,stream+2,3)==hot(2,stream+2,3)); /* two accesses stay plain */
 +    hv_machine_free(&machine);
 +    puts("PASS register groups: real inline-path reduction; scratch clobber and short groups retain reference emission");
 +}
@@ -22858,7 +23011,7 @@ index a13a70d..6cd37c1 100644
      hv_vm_destroy();
      atomic_store(&reader_done, 1);
 diff --git a/tests/test_xhci_slots.c b/tests/test_xhci_slots.c
-index 41c2faa..0b459c2 100644
+index 41c2faa..66454b4 100644
 --- a/tests/test_xhci_slots.c
 +++ b/tests/test_xhci_slots.c
 @@ -4,10 +4,107 @@
@@ -22969,11 +23122,12 @@ index 41c2faa..0b459c2 100644
      struct HvXhciIntr *it=&controller.intr[0];
      unsigned count=0;
      for(unsigned type=9;type<=23;type++)for(unsigned slot=0;slot<256;slot++) {
-@@ -25,6 +122,9 @@ int main(void) {
+@@ -25,6 +122,10 @@ int main(void) {
          assert(controller.cmd.dequeue==0x100010);
          count++;
      }
 +    gamepad_checks();
++    puts("PASS xHCI keyboard owners: hardware4, shortcuts0 and remote sources retain independent modifiers");
 +    compatible_gamepad_checks();
 +    pthread_mutex_destroy(&controller.mu);
      hv_machine_free(&machine);

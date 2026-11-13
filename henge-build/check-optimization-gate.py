@@ -44,6 +44,12 @@ if manifest.get('advanced_controls'):
         assert all(isinstance(blocked.get(k),int) for k in ('run_id','job_id','artifact_id')), 'Missing failed native Duo evidence'
         assert advanced.get('screenshots_inspected') is True, 'Unfolded viewport needs visual verification'
     assert isinstance(advanced.get('preview_run_id'), int), 'Missing traceable controller preview run'
+    waiver=state.get('ui_preview_waiver',{})
+    if waiver:
+        assert waiver.get('source_commit')==validation.get('source_commit') and waiver.get('requested_by')=='user', 'UI waiver applies to another source'
+        assert waiver.get('instruction')=='No need to do preview for ui as long as it’s working.', 'UI waiver needs the explicit user instruction'
+        assert waiver.get('prior_visual_evidence'), 'Preserve the actual historical visual receipt separately'
+
 session = state.get('session_responsiveness')
 if manifest.get('session_responsiveness'):
     assert session and session.get('complete') is True, 'Reliable Instant Resume feature is incomplete'
@@ -67,7 +73,15 @@ assert loading.get('complete') and loading.get('source_commit')==validation.get(
 followup=state.get('ui_resume_clipboard_followup')
 if followup:
     assert followup.get('complete') is True and followup.get('source_commit')==validation.get('source_commit'), 'UI/resume/clipboard follow-up needs exact-source proof'
-    checks=('snapshot_pack','gpu_resource_copyback','clipboard_bridge','clipboard_companion','clipboard_delivery','coordinator','ios_integration','ui_previews')
+    checks=('snapshot_pack','gpu_resource_copyback','clipboard_bridge','clipboard_companion','clipboard_delivery','coordinator','ios_integration')
     assert all(followup.get(k)=='passed' for k in checks), 'UI/resume/clipboard regression checks incomplete'
+    assert followup.get('ui_previews')=='passed' or (followup.get('ui_previews')=='waived_by_user' and state.get('ui_preview_waiver',{}).get('source_commit')==validation.get('source_commit')), 'UI preview needs proof or explicit user waiver'
     assert followup.get('evidence'), 'UI/resume/clipboard evidence missing'
+for name,checks in (
+    ('engine_foundation_followup',('grouped_memory','faults','descriptor_reclamation','shader_budget')),
+    ('input_resilience_followup',('host_encoder','transport','overflow','keyboard_ownership','pointer_model','desktop_layout','ios_sdk'))):
+    feature=state.get(name,{})
+    assert feature.get('complete') and feature.get('source_commit')==validation.get('source_commit'), name+' requires exact-source proof'
+    assert all(feature.get(k)=='passed' for k in checks) and feature.get('evidence'), name+' correctness checks incomplete'
+
 print('PASS complete implementation gate:'  ,  manifest['audit_repairs_sha256'])
