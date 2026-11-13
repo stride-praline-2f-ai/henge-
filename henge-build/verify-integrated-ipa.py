@@ -114,7 +114,7 @@ if manifest.get('upstream_desktop'):
     desktop=state['upstream_desktop']
     assert desktop.get('complete') and desktop.get('source_commit')==state['final_validation']['source_commit']
     executable=(app/'Henge').read_bytes()
-    for marker in (b'jit-ring:',b'saved pipelines:',b'v2-pipelines-',b'henge.planar.owner',b'pipeline archive bypass'):
+    for marker in (b'jit-ring:',b'saved pipelines:',b'v3-pipelines-',b'henge.planar.owner',b'pipeline archive bypass'):
         assert marker in executable,'Missing desktop optimisation runtime: '+repr(marker)
     data['upstream_desktop']=dict(manifest['upstream_desktop'],runtime_markers_verified=True,
         source_validation=desktop['source_commit'],physical_performance_verified=False)
