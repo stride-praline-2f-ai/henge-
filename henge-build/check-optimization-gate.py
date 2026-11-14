@@ -95,4 +95,15 @@ if manifest.get('gpu_submission_followup'):
         assert len(hardware.get('reason',''))>120 and isinstance(hardware.get('run_id'),int), 'Hardware execution blocker needs concrete runner evidence'
     assert gpu.get('evidence') and gpu.get('rejections'), 'NX18 adaptations and technical rejections need evidence'
 
+physical=state.get('physical_112_followup',{})
+if manifest.get('physical_112_followup'):
+    assert physical.get('complete') is True and physical.get('source_commit')==validation.get('source_commit'), 'Physical112 follow-up needs exact-source regression proof'
+    for key in ('cpu_memory','chain_eviction','metal4_plan','snapshot_admission','touch_recovery','ios_integration'):
+        assert physical.get(key)=='passed_cloud', 'Physical112 follow-up incomplete: '+key
+    assert physical.get('evidence') and physical.get('component_measurements'), 'Missing executed follow-up proof'
+    hardware=physical.get('hardware_validation',{})
+    assert hardware.get('state') in ('passed','blocked'), 'Missing physical Metal4 validation state'
+    if hardware.get('state')=='blocked':
+        assert isinstance(hardware.get('run_id'),int) and len(hardware.get('reason',''))>120, 'Physical GPU blocker needs concrete runner evidence'
+
 print('PASS complete implementation gate:'  ,  manifest['audit_repairs_sha256'])

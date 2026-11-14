@@ -995,7 +995,7 @@ index 7a01fdc..ca1491b 100644
          uint64_t off = pa - r->pa;
          uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
 diff --git a/core/machine.h b/core/machine.h
-index cafe156..caf00eb 100644
+index cafe156..1b9db92 100644
 --- a/core/machine.h
 +++ b/core/machine.h
 @@ -62,12 +62,15 @@ typedef struct HvBlock {
@@ -1049,7 +1049,7 @@ index cafe156..caf00eb 100644
 +    int fastmem_tlb_first; /* probe the secondary kernel LUT only after an ordinary TLB miss */
      int fastmem_diagnostics; /* boot-time opt-in; extra instructions count actual JIT outcomes */
      int tlb_preload; /* load the host addend alongside its tag; guard before guest memory */
-+    int chain_stub_reference; /* native differential fixture only; normal machines use inline slots */
++    int chain_stub_reference; /* private fixture:1 compact reference,-1 force inline;0 selects by cache reach */
      int slow_mem;        /* tests: send every load and store through hv_mem_emulate */
      uint64_t switch_flush_pc[4]; /* HV_SWITCH_FLUSH=3: PCs of the TLBI VMALLE1s seen within 20 us of a TTBR0 change (xnu's pmap switch) */
      uint64_t stat_slow_mem; /* hv_mem_emulate calls */
@@ -1195,7 +1195,7 @@ index 3a4ee8f..89ad6ac 100644
     can be read before the page ends. On a fault, the instruction abort is taken
     and NULL is returned. */
 diff --git a/core/translate.c b/core/translate.c
-index cebfb7d..452ae36 100644
+index cebfb7d..4194823 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -48,6 +48,8 @@ typedef struct {
@@ -1285,7 +1285,7 @@ index cebfb7d..452ae36 100644
      uint32_t site_at = e->n;
      put(e, B_OP | 1);
      if (!p0) cold_on(e);
-@@ -453,15 +480,24 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
+@@ -453,15 +480,28 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
          e->site[e->nsite++].stub_cold = (uint8_t)(e->in_cold && !e->flat);
          e->site_direct = !check && !xa;
      }
@@ -1298,7 +1298,11 @@ index cebfb7d..452ae36 100644
 -    put(e, (uint32_t)((uintptr_t)slot >> 32));
 -    put(e, (uint32_t)target);
 -    put(e, (uint32_t)(target >> 32));
-+    if(e->m->chain_stub_reference) {
++    /* A cache no larger than B's reach cannot have a far target. Retain the
++       compact miss-only stub there instead of increasing code-cache pressure
++       for a fast path that cannot be needed. Tests can force either format. */
++    if(e->m->chain_stub_reference>0 ||
++       (e->m->chain_stub_reference==0&&e->m->jit.capacity<=(128u<<20)/4)) {
 +        if(check)link_here(e,to_exit,p0);
 +        put(e,STR_X(30,28,HV_CPU_X(30)));
 +        put(e,LDR_X(15,28,HV_CPU_CHAIN_THUNK));
@@ -1319,7 +1323,7 @@ index cebfb7d..452ae36 100644
      if (xa) {
          link_here(e, to_miss, p0);
          if (use_xjump()) put_xjump(e, target, 0); /* exit_req was checked above if it had to be */
-@@ -483,6 +519,7 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
+@@ -483,6 +523,7 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
     from where the helper would resume (bits 31..19, in words). */
  static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rflags, uint32_t retry) {
      put_helper(e, pc, insn, HV_OP_MEM);
@@ -1327,7 +1331,7 @@ index cebfb7d..452ae36 100644
      uint32_t resume = e->n - 1; /* the ldr x0, [x28] the helper comes back to */
      uint32_t back = resume - retry;
      if (back < (1u << 13) && rflags < (1u << 11)) e->pool[e->npool - 1] = (uint64_t)insn | (uint64_t)(HV_OP_MEM | rflags << 8 | back << 19) << 32;
-@@ -491,6 +528,7 @@ static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rfla
+@@ -491,6 +532,7 @@ static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rfla
  /* The return address is where it goes back to, so the thunk's RET goes where the CPU expects
     and leaves its stack of return addresses as it was. The HvHelperInfo is in the pool. */
  static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
@@ -1335,7 +1339,17 @@ index cebfb7d..452ae36 100644
      uint32_t info = e->npool;
      e->pool[info] = pc;
      e->pool[info + 1] = (uint64_t)insn | (uint64_t)op << 32;
-@@ -811,7 +849,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
+@@ -503,7 +545,8 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
+     put(e, LDR_X(0, 28, 0));
+ }
+ 
+-/* d = n + imm for |imm| < 2^24; n and d are general registers, never SP. */
++/* d = n + imm for |imm| < 2^24. d is general; n may be SP only
++   for a nonzero immediate (MOV's register 31 would instead mean XZR). */
+ static void put_add_imm(Emit *e, int d, int n, int64_t imm) {
+     if (imm == 0) {
+         if (d != n) put(e, MOV_X(d, n));
+@@ -811,7 +854,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
  /* Ends the block (returns 1), or 0 for a conditional branch the block goes on past. */
  static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
      if ((insn & 0x7c000000) == 0x14000000) { /* B, BL */
@@ -1344,7 +1358,7 @@ index cebfb7d..452ae36 100644
          if (insn >> 31) {
              if (use_ras(e)) put_call(e, pc + 4);
              else put_const_to(e, 30, pc + 4);
-@@ -820,7 +858,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -820,7 +863,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
          return 1;
      }
      if ((insn & 0xff000000) == 0x54000000) { /* B.cond, BC.cond */
@@ -1353,7 +1367,7 @@ index cebfb7d..452ae36 100644
          uint32_t cond = insn & 0xf;
          if (cond >= 14) {
              put_branch_exit(e, target, 1);
-@@ -836,7 +874,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -836,7 +879,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
      }
      /* CBZ/CBNZ (imm19) and TBZ/TBNZ (imm14) */
      int tb = (insn & 0x7e000000) == 0x36000000;
@@ -1362,7 +1376,7 @@ index cebfb7d..452ae36 100644
      uint32_t bare = tb ? insn & ~(0x3fffu << 5) : insn & ~(0x7ffffu << 5);
      int rt = insn & 0x1f;
      if (!is_stolen(rt)) {
-@@ -956,6 +994,53 @@ static void put_fastmem_count(Emit *e, int scratch, uint32_t offset) {
+@@ -956,6 +999,53 @@ static void put_fastmem_count(Emit *e, int scratch, uint32_t offset) {
      put(e, STR_X(scratch, 28, offset));
  }
  
@@ -1416,7 +1430,7 @@ index cebfb7d..452ae36 100644
  static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      HvMemOp op;
      if (hv_mem_decode(insn, &op) != 0) {
-@@ -1027,14 +1112,14 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1027,14 +1117,14 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
          put(e, CBNZ_X(U));
          put_ool(e, (Ool){.kind = OOL_GROUP, .pc = (uint64_t)(grp - e->grp), .nrestore = 3, .restore = {A, T, U}});
          put(e, LDR_X(U, T, gtlb + 24));
@@ -1434,22 +1448,21 @@ index cebfb7d..452ae36 100644
  
      /* Effective address into A, or used where it is: a guest base register with nothing added. */
      int sp_base = !literal && op.rn == 31; /* the guest SP, which is the host SP while blocks run */
-@@ -1047,6 +1132,14 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1047,6 +1137,13 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
          /* the address is in A already */
      } else if (literal) {
          put_lit(e, A, pc + op.imm);
-+    } else if (sp_base && (op.mode == HV_ADDR_OFFSET || op.mode == HV_ADDR_PRE) &&
-+               op.imm && ((op.imm > -4096 && op.imm < 4096) ||
-+                           ((op.imm & 4095) == 0 && op.imm > -(4096ll << 12) && op.imm < (4096ll << 12)))) {
++    } else if (sp_base && (op.mode == HV_ADDR_OFFSET || op.mode == HV_ADDR_PRE) && op.imm) {
 +        /* ADD/SUB immediate can read SP directly. Avoid copying guest SP to
-+           A only to add the displacement in a second host instruction. Keep
++           A only to add the displacement. Larger offsets use two ADD/SUBs
++           with the first reading SP, still saving the initial copy. Keep
 +           the effective address in the same scratch and all TLB/slow-path
 +           checks unchanged. Register-offset and post-index forms stay below. */
 +        put_add_imm(e, A, 31, op.imm);
      } else {
          if (base_stolen) {
              put(e, sp_base ? ADD_SP_TO(A) : LDR_X(A, 28, slot_of(op.rn)));
-@@ -1080,42 +1173,12 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1080,42 +1177,12 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      /* Opt-in LUT fastmem for plain scalar kernel loads only. Every failed
         guard falls through to the existing TLB, including allocation failure.
         Like the TLB, leave the final 15 bytes to the helper. No NZCV changes. */
@@ -1497,7 +1510,7 @@ index cebfb7d..452ae36 100644
      uint32_t tlb = put_tlb_slot(e, T, addr, el_idx);
      /* Both CPU-owned fields share a cache line. Issue independent loads
         before checking the tag, instead of serializing the addend load behind
-@@ -1148,9 +1211,10 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1148,9 +1215,10 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
                       .recheck = hv_knob[HV_K_RECHECK] && !(op.align && op.bytes > 1) && op.bytes < HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
                       .t = (uint8_t)T, .u = (uint8_t)U, .bytes = (uint8_t)op.bytes,
                       .tag_off = tlb + (op.store ? 8 : 0), .retry = retry, .rflags = rflags,
@@ -1509,7 +1522,7 @@ index cebfb7d..452ae36 100644
      if (fm_done != ~0u) patch_branch(&e->w[fm_done], (int64_t)e->n - fm_done);
      }
      /* Single loads and stores take [addr, addend] directly; the rest want the host address in A. */
-@@ -1253,7 +1317,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1253,7 +1321,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      unspill(e, s, 3);
      if (slow != ~0u) e->ool[slow].join = e->n;
      /* Stand-ins for x18/x28 and writeback may have used U. */
@@ -1518,7 +1531,7 @@ index cebfb7d..452ae36 100644
  }
  
  /* DC ZVA: zero the 64-byte block holding Xt, on the host's own copy when the
-@@ -1844,8 +1908,9 @@ static void emit_ool(Emit *e) {
+@@ -1844,8 +1912,9 @@ static void emit_ool(Emit *e) {
              plink(e, retry, 1, o->retry, 0);
          }
          uint32_t site_at = link_site(e, o->at);
@@ -1529,7 +1542,7 @@ index cebfb7d..452ae36 100644
              int check = o->preloaded ? o->t : o->u;
              put(e, LDR_X(check, o->t, o->tag_off));
              put(e, SUB_X(check, o->addr, check));
-@@ -1900,6 +1965,35 @@ static int group_op(const HvMemOp *op) {
+@@ -1900,6 +1969,35 @@ static int group_op(const HvMemOp *op) {
             (op->rn == 31 || !is_stolen(op->rn)) && op->bytes <= 64;
  }
  
@@ -1565,7 +1578,7 @@ index cebfb7d..452ae36 100644
  static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va) {
      e->ngrp = 0;
      memset(e->gid, -1, sizeof e->gid);
-@@ -1914,7 +2008,43 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1914,7 +2012,46 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
          HvInsnKind kind = hv_classify(insn);
          if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) break;
          if (kind == HV_INSN_COPY && (insn & 0xfffff01fu) == 0xd503201fu) continue; /* hints (NOP, BTI): no register */
@@ -1578,7 +1591,10 @@ index cebfb7d..452ae36 100644
 +            if (kind == HV_INSN_COPY) {
 +                uint32_t fields = hv_gpr_fields(insn);
 +                for (int f = 0; f < 4; f++)
-+                    if ((fields & (1u << f)) && is_stolen((int)hv_field_reg(insn, f))) boundary = 1;
++                    if (fields & (1u << f)) {
++                        unsigned reg=hv_field_reg(insn,f);
++                        if(is_stolen((int)reg)||(f==0&&cur[reg]>=0))boundary=1;
++                    }
 +            } else if (kind == HV_INSN_MEMORY) {
 +                HvMemOp candidate;
 +                if (hv_mem_decode(insn, &candidate) || !group_op(&candidate) || candidate.mode != HV_ADDR_OFFSET) boundary = 1;
@@ -1609,7 +1625,7 @@ index cebfb7d..452ae36 100644
              KILL(insn);
              continue;
          }
-@@ -1923,16 +2053,26 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1923,16 +2060,26 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
              continue;
          }
          if (kind == HV_INSN_PREFETCH) continue;
@@ -1638,7 +1654,7 @@ index cebfb7d..452ae36 100644
                  else {
                      g->lo = (int32_t)lo, g->hi = (int32_t)hi, g->last = (uint16_t)i, g->store |= op.store;
                      e->gid[i] = (int8_t)cur[b], e->grole[i] = 2, e->goff[i] = (int32_t)off;
-@@ -1966,8 +2106,12 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1966,8 +2113,12 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
      uint16_t slot_free[GROUP_SLOTS] = {0};
      for (uint32_t k = 0; k < e->ngrp; k++) {
          Group *g = &e->grp[k];
@@ -1652,7 +1668,7 @@ index cebfb7d..452ae36 100644
          for (int s = 0; s < GROUP_SLOTS; s++)
              if (slot_free[s] <= g->first) {
                  g->slot = (uint8_t)s, g->live = 1;
-@@ -1996,13 +2140,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1996,13 +2147,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
  /* After the block: each live group's plain copy. Returns -1 if they do not fit. */
  static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_t ntrans) {
      e->nogroup = 1;
@@ -1680,7 +1696,7 @@ index cebfb7d..452ae36 100644
              e->cur_pc = va + 4ull * i;
              e->cur_i = i;
              e->u_prev = e->u_live = 0;
-@@ -2017,8 +2175,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
+@@ -2017,8 +2182,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
  static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup);
  
  int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
@@ -1692,7 +1708,7 @@ index cebfb7d..452ae36 100644
      if (hv_knob[HV_K_GROUPS] && translate_emit(m, b, code, avail, 0) == 0) return 0;
      return translate_emit(m, b, code, avail, 1);
  }
-@@ -2026,6 +2185,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
+@@ -2026,6 +2192,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
  static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup) {
      Emit *e = &E;
      e->n = e->other_n = e->npool = e->nfix = e->nool = e->nsite = e->nrel = 0;
@@ -1700,7 +1716,7 @@ index cebfb7d..452ae36 100644
      e->w = e->hot;
      e->in_cold = 0;
      e->flat = hv_knob[HV_K_TEST2];
-@@ -2113,13 +2273,20 @@ static __thread struct {
+@@ -2113,13 +2280,20 @@ static __thread struct {
      HvMachine *m;
      uint64_t gen;
      uint32_t *hot, *cold;
@@ -1723,7 +1739,7 @@ index cebfb7d..452ae36 100644
          if (want < (size_t)hot + cold) want = (size_t)hot + cold;
          uint32_t *p = hv_jit_reserve(&m->jit, want);
          if (!p && m->jit_tail_enabled && want > (size_t)hot + cold) {
-@@ -2131,6 +2298,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
+@@ -2131,6 +2305,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
          }
          if (!p) { chunk.hot = NULL; return -1; }
          chunk.m = m, chunk.gen = gen, chunk.hot = p, chunk.cold = p + ((want + 1) & ~(size_t)1);
@@ -2345,10 +2361,10 @@ index 0000000..7c0cdee
 +#endif
 diff --git a/devices/metal4_encoder.h b/devices/metal4_encoder.h
 new file mode 100644
-index 0000000..b032620
+index 0000000..fbb7c63
 --- /dev/null
 +++ b/devices/metal4_encoder.h
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,364 @@
 +#pragma once
 +#include "metal4_runtime.h"
 +#include "metal4_pipeline.h"
@@ -2452,14 +2468,17 @@ index 0000000..b032620
 +    NSDictionary *source=objc_getAssociatedObject(state,"henge.metal4.source");
 +    if(!source)return nil;
 +    unsigned tag=[source[@"tag"]unsignedIntValue];
-+    variant=[runtime pipeline:hv_metal4_descriptor(tag,source[@"descriptor"]) tag:tag bundle:nil];
++    NSString *reason=nil;id descriptor=hv_metal4_descriptor_checked(tag,source[@"descriptor"],&reason);
++    variant=descriptor?[runtime pipeline:descriptor tag:tag bundle:nil]:nil;
++    if(!variant&&!reason)reason=@"Metal4 pipeline compilation failed";
 +    if(tag==0xb && variant){
 +        id<MTLComputePipelineState> old=state,new=variant;
 +        if(new.threadExecutionWidth!=old.threadExecutionWidth || new.maxTotalThreadsPerThreadgroup<old.maxTotalThreadsPerThreadgroup ||
-+           new.staticThreadgroupMemoryLength!=old.staticThreadgroupMemoryLength)variant=nil;
++           new.staticThreadgroupMemoryLength!=old.staticThreadgroupMemoryLength){variant=nil;reason=@"compute threadgroup ABI differs from the classic pipeline";}
 +    }
 +    objc_setAssociatedObject(state,"henge.metal4.source",nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 +    objc_setAssociatedObject(state,"henge.metal4.pipeline",variant?:NSNull.null,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++    objc_setAssociatedObject(state,"henge.metal4.reason",reason,OBJC_ASSOCIATION_COPY_NONATOMIC);
 +    return variant;
 +}
 +
@@ -2494,12 +2513,12 @@ index 0000000..b032620
 +}
 +- (void)setRenderPipelineState:(id)state {
 +    id p=hv_metal4_variant(runtime,state);
-+    if(!p)[NSException raise:@"HengeMetal4Fallback" format:@"render pipeline cannot be represented"];
++    if(!p)[NSException raise:@"HengeMetal4Fallback" format:@"render pipeline: %@",objc_getAssociatedObject(state,"henge.metal4.reason")?:@"source descriptor unavailable"];
 +    [runtime retainResource:p job:job];[encoder setRenderPipelineState:p];
 +}
 +- (void)setComputePipelineState:(id)state {
 +    id p=hv_metal4_variant(runtime,state);
-+    if(!p)[NSException raise:@"HengeMetal4Fallback" format:@"compute pipeline cannot be represented"];
++    if(!p)[NSException raise:@"HengeMetal4Fallback" format:@"compute pipeline: %@",objc_getAssociatedObject(state,"henge.metal4.reason")?:@"source descriptor unavailable"];
 +    [runtime retainResource:p job:job];[encoder setComputePipelineState:p];
 +}
 +- (void)buffers:(id<MTLBuffer>const __unsafe_unretained *)buffers offsets:(const NSUInteger *)offsets strides:(const NSUInteger *)step range:(NSRange)range stage:(NSUInteger)stage {
@@ -2712,28 +2731,42 @@ index 0000000..b032620
 +@end
 diff --git a/devices/metal4_pipeline.h b/devices/metal4_pipeline.h
 new file mode 100644
-index 0000000..e295be6
+index 0000000..b12dd17
 --- /dev/null
 +++ b/devices/metal4_pipeline.h
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,70 @@
 +#pragma once
 +#import <Metal/Metal.h>
 +#import <objc/runtime.h>
 +
 +static inline void hv_metal4_note_function(id<MTLFunction> function,id<MTLLibrary> library) {
 +    if (@available(macOS 26.0,iOS 26.0,*)) {
-+        if(!function || !library || ![library.device supportsFamily:MTLGPUFamilyMetal4] || function.functionConstantsDictionary.count)return;
++        /* This is called immediately after UNSPECIALIZED newFunctionWithName.
++           A declaration of optional/default constants is not evidence that
++           unknown specialization values were supplied. Recreate this exact
++           library entry; the Metal4 compiler applies its declared defaults.
++           Values-specialized functions must retain their own descriptor. */
++        if(!function || !library || ![library.device supportsFamily:MTLGPUFamilyMetal4])return;
 +        MTL4LibraryFunctionDescriptor *d=[MTL4LibraryFunctionDescriptor new];
 +        d.library=library;d.name=function.name;
 +        objc_setAssociatedObject(function,"henge.metal4.function",d,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 +    }
 +}
-+static inline id hv_metal4_descriptor(uint32_t tag,id descriptor) API_AVAILABLE(macos(26.0),ios(26.0));
-+static inline id hv_metal4_descriptor(uint32_t tag,id descriptor) {
++static inline id hv_metal4_descriptor_reject(NSString **reason,NSString *message) {
++    if(reason)*reason=message;return nil;
++}
++static inline id hv_metal4_descriptor_checked(uint32_t tag,id descriptor,NSString **reason) API_AVAILABLE(macos(26.0),ios(26.0));
++static inline id hv_metal4_descriptor_checked(uint32_t tag,id descriptor,NSString **reason) {
 +    if(tag==0xb){
 +        MTLComputePipelineDescriptor *old=descriptor;
 +        MTL4FunctionDescriptor *f=objc_getAssociatedObject(old.computeFunction,"henge.metal4.function");
-+        if(!f || old.linkedFunctions.functions.count || old.linkedFunctions.binaryFunctions.count)return nil;
++        if(!f)return hv_metal4_descriptor_reject(reason,@"compute library/function descriptor unavailable");
++        if(old.linkedFunctions.functions.count || old.linkedFunctions.binaryFunctions.count)return hv_metal4_descriptor_reject(reason,@"linked compute functions need compatibility");
++        /* Metal4 has no compute stage-input layout/region interface. Never
++           drop a real legacy vertex-fetch layout when converting a pipeline. */
++        MTLStageInputOutputDescriptor *input=old.stageInputDescriptor;
++        if(input)for(NSUInteger i=0;i<31;i++)
++            if(input.attributes[i].format!=MTLAttributeFormatInvalid)return hv_metal4_descriptor_reject(reason,@"legacy compute stage-input layout needs compatibility");
 +        MTL4ComputePipelineDescriptor *d=[MTL4ComputePipelineDescriptor new];
 +        d.label=old.label;d.computeFunctionDescriptor=f;
 +        d.threadGroupSizeIsMultipleOfThreadExecutionWidth=old.threadGroupSizeIsMultipleOfThreadExecutionWidth;
@@ -2741,14 +2774,14 @@ index 0000000..e295be6
 +        d.supportIndirectCommandBuffers=old.supportIndirectCommandBuffers?MTL4IndirectCommandBufferSupportStateEnabled:MTL4IndirectCommandBufferSupportStateDisabled;
 +        return d;
 +    }
-+    if(tag!=0xe)return nil; /* Tile/tessellation keep their complete classic path. */
++    if(tag!=0xe)return hv_metal4_descriptor_reject(reason,@"tile/unknown pipeline needs compatibility");
 +    MTLRenderPipelineDescriptor *old=descriptor;
 +    MTL4FunctionDescriptor *v=objc_getAssociatedObject(old.vertexFunction,"henge.metal4.function");
 +    MTL4FunctionDescriptor *f=objc_getAssociatedObject(old.fragmentFunction,"henge.metal4.function");
-+    if(!v || (old.fragmentFunction && !f) || (old.rasterizationEnabled && !f) ||
-+       old.vertexFunction.patchType!=MTLPatchTypeNone ||
-+       old.vertexLinkedFunctions.functions.count || old.fragmentLinkedFunctions.functions.count ||
-+       old.vertexLinkedFunctions.binaryFunctions.count || old.fragmentLinkedFunctions.binaryFunctions.count)return nil;
++    if(!v || (old.fragmentFunction && !f))return hv_metal4_descriptor_reject(reason,@"render library/function descriptor unavailable");
++    if(old.vertexFunction.patchType!=MTLPatchTypeNone)return hv_metal4_descriptor_reject(reason,@"tessellation pipeline needs compatibility");
++    if(old.vertexLinkedFunctions.functions.count || old.fragmentLinkedFunctions.functions.count ||
++       old.vertexLinkedFunctions.binaryFunctions.count || old.fragmentLinkedFunctions.binaryFunctions.count)return hv_metal4_descriptor_reject(reason,@"linked render functions need compatibility");
 +    MTL4RenderPipelineDescriptor *d=[MTL4RenderPipelineDescriptor new];
 +    d.label=old.label;d.vertexFunctionDescriptor=v;d.fragmentFunctionDescriptor=f;
 +    d.vertexDescriptor=old.vertexDescriptor;d.rasterSampleCount=old.rasterSampleCount;
@@ -2767,6 +2800,10 @@ index 0000000..e295be6
 +        b.sourceAlphaBlendFactor=a.sourceAlphaBlendFactor;b.destinationAlphaBlendFactor=a.destinationAlphaBlendFactor;
 +    }
 +    return d;
++}
++static inline id hv_metal4_descriptor(uint32_t tag,id descriptor) API_AVAILABLE(macos(26.0),ios(26.0));
++static inline id hv_metal4_descriptor(uint32_t tag,id descriptor) {
++    return hv_metal4_descriptor_checked(tag,descriptor,NULL);
 +}
 diff --git a/devices/metal4_runtime.h b/devices/metal4_runtime.h
 new file mode 100644
@@ -3748,7 +3785,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..023a6fb 100644
+index 9073d22..4ecc080 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -5060,9 +5097,9 @@ index 9073d22..023a6fb 100644
 +                    else [self blit:e tag:tag rec:r task:task];
 +                }
 +            }
-+            if(recordStatus<0&&metal4Job){[(HvMetal4Encoder *)e abortEncoding];return NO;}
++            if(recordStatus<0&&metal4Job){if(@available(macOS 26.0,iOS 26.0,*))[(HvMetal4Encoder *)e abortEncoding];return NO;}
 +        } @catch (NSException *x) {
-+            if(metal4Job){[(HvMetal4Encoder *)e abortEncoding];return NO;}
++            if(metal4Job){if(@available(macOS 26.0,iOS 26.0,*))[(HvMetal4Encoder *)e abortEncoding];return NO;}
 +            [self complain:[NSString stringWithFormat:@"exception: %@", x.reason]];
 +            failed++;
 +        }
@@ -7686,10 +7723,10 @@ index 0000000..a464f06
 +Safety decisions: persistent archive hints select candidate files; Metal itself validates the complete descriptor. They are not proof of exact PSO identity, so no unsafe direct pipeline-state reuse is added from those partial keys. Guest-visible CPUs remain static and user selectable; OS scheduling is not physical core pinning. No guest translation persistence across app/JIT launches is claimed.
 diff --git a/docs/m4-optimisation/PHYSICAL-112-FOLLOWUP.md b/docs/m4-optimisation/PHYSICAL-112-FOLLOWUP.md
 new file mode 100644
-index 0000000..878936f
+index 0000000..a0f3dbe
 --- /dev/null
 +++ b/docs/m4-optimisation/PHYSICAL-112-FOLLOWUP.md
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,28 @@
 +# Physical 112 follow-up
 +
 +The physical M4 run of0.3.11 used4 vCPUs,12GiB RAM and2560x1920 Retina. All453297 guest submissions fell back before Metal4 encoding; display completion was incorrectly easy to confuse with guest execution. Busy vCPU samples were about77% generated code; three ordinary software-TLB loads accounted for19.78% of JIT PC samples. Kernel fastmem hit91.31%; it did not replace user memory checks. The1.5GiB ring had49 partial evictions, zero full resets. Persistent saving took21.41s, dominated by compression. Native touch never received a helper handshake.
@@ -7714,6 +7751,10 @@ index 0000000..878936f
 +- Cloud required: macOS/iOS production Metal SDK compile; production Metal4 plan/adapter fixture; native JIT/MMU/grouping/eviction/lifecycle tests; paired far-chain and snapshot admission benchmarks; app typecheck/build.
 +- A Paravirtual cloud GPU cannot prove physical Metal4 pixel execution. Device thermal/FPS and real guest-command coverage remain physical checks. No speedup percentage or stable60Hz claim is inferred from compilation or a microbenchmark.
 +- No IPA is requested at this development checkpoint.
++
++Second checkpoint: the compact chain stub remains for caches within direct-branch reach; large-cache inline slots are forced in native MMU and ring-eviction regression fixtures. SP folding includes split high/low immediates; grouping stops across SP/base changes. Metal4 preserves unspecialized default constants and valid depth-only pipelines, while actual legacy compute stage-input layouts retain compatibility with a specific reason. Missing-helper recovery now distinguishes an initial absent companion from an interrupted previously ready companion; the existing timeout/retry test remains mandatory.
++
++The first cloud source5217932 passed focused SDK/plan/adapter checks. Its broader run caught the companion retry regression above; it is not a release proof. Native paired component medians were1.94ns vs11.24ns per deliberately far chained branch, and0.26ms vs4.39ms per4MiB high-entropy snapshot chunk with identical raw bytes. These are component timings on the cloud arm64 runner, not whole-guest speed, GPU execution, FPS, cooling or energy results. Mixed/compressible snapshot timings varied. The second checkpoint still needs exact-source cloud checks.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
 index 0000000..a55c4c4
@@ -13675,10 +13716,10 @@ index 0000000..437d2f5
 +}
 diff --git a/ios/Henge/Controls/GamepadLayout.swift b/ios/Henge/Controls/GamepadLayout.swift
 new file mode 100644
-index 0000000..58c1aae
+index 0000000..6bdbf79
 --- /dev/null
 +++ b/ios/Henge/Controls/GamepadLayout.swift
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,83 @@
 +import Foundation
 +import CoreGraphics
 +
@@ -13762,7 +13803,6 @@ index 0000000..58c1aae
 +                      width:r.width*scale,height:r.height*scale)
 +    }
 +}
-+
 diff --git a/ios/Henge/Controls/GamepadSettingsPanel.swift b/ios/Henge/Controls/GamepadSettingsPanel.swift
 new file mode 100644
 index 0000000..0d25155
@@ -17961,16 +18001,17 @@ index b8c41fa..5dbe293 100644
  void henge_vm_key_hid(uint8_t usage, int down); /* a hardware keyboard: iOS gives each key's HID usage */
  void henge_vm_mouse_move(int dx, int dy);
 diff --git a/ios/Henge/NativeTouchSession.swift b/ios/Henge/NativeTouchSession.swift
-index 25e7bad..0d502f5 100644
+index 25e7bad..ca03293 100644
 --- a/ios/Henge/NativeTouchSession.swift
 +++ b/ios/Henge/NativeTouchSession.swift
-@@ -15,6 +15,21 @@ final class NativeTouchSession {
+@@ -15,6 +15,22 @@ final class NativeTouchSession {
      private var attempted = false
      private var wasActive = false
      private var retryAfter: TimeInterval?
 +    private var retryCount = 0
 +    private var readySince: TimeInterval?
 +    private var pollingID: UUID?
++    private var hadCompanion = false
 +
 +    func beginPolling() -> UUID {
 +        let id = UUID()
@@ -17986,7 +18027,7 @@ index 25e7bad..0d502f5 100644
  
      init(defaults: UserDefaults = .standard,
           now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
-@@ -36,8 +51,20 @@ final class NativeTouchSession {
+@@ -36,8 +52,20 @@ final class NativeTouchSession {
              return
          }
          wasActive = true
@@ -17995,7 +18036,7 @@ index 25e7bad..0d502f5 100644
 +            // running. Stop repeating30-second negotiations with an absent
 +            // companion; actual companion traffic restarts setup immediately.
 +            guard hv_native_touch_helper_alive() != 0 else { return }
-+            attempted=false;status=1
++            attempted=false;status=1;hadCompanion=true
 +        }
          // Booting the guest can take much longer than the negotiation timeout.
          guard helperRunning else {
@@ -18007,11 +18048,13 @@ index 25e7bad..0d502f5 100644
              if attempted { stop() }
              wasActive = true
              status = 1
-@@ -53,10 +80,21 @@ final class NativeTouchSession {
+@@ -53,10 +81,23 @@ final class NativeTouchSession {
              hv_native_touch_enable(1)
          }
          status = hv_native_touch_status()
-+        if status == 6 && hv_native_touch_helper_alive() == 0 {
++        let companionAlive = hv_native_touch_helper_alive() != 0
++        hadCompanion = hadCompanion || companionAlive || status == 2 || status == 7
++        if status == 6 && !hadCompanion && !companionAlive {
 +            status=8;ready=false;retryAfter=nil;return
 +        }
          ready = status == 2
@@ -18032,11 +18075,12 @@ index 25e7bad..0d502f5 100644
      }
  
      func stop() {
-@@ -65,5 +103,6 @@ final class NativeTouchSession {
+@@ -65,5 +106,7 @@ final class NativeTouchSession {
          attempted = false
          wasActive = false
          retryAfter = nil
 +        retryCount=0;readySince=nil
++        hadCompanion=false
      }
  }
 diff --git a/ios/Henge/NativeTouchSurface.swift b/ios/Henge/NativeTouchSurface.swift
@@ -21622,10 +21666,10 @@ index 0000000..ee09756
 +}
 diff --git a/tests/test_branch_stub.py b/tests/test_branch_stub.py
 new file mode 100644
-index 0000000..e972dd6
+index 0000000..f244755
 --- /dev/null
 +++ b/tests/test_branch_stub.py
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,91 @@
 +"""Execute the production far-chain emitter: linked/empty slots and host exits.
 +Unicorn checks guest state and generated instruction count, not device FPS.
 +"""
@@ -21656,6 +21700,7 @@ index 0000000..e972dd6
 +    literal.pool[2]^=1;assert(literal.pool[0]==0x123456789abcdef0ull);
 +    static uint32_t *sites[4],*conds[4];
 +    m.slots=slots;m.slot_site=sites;m.slot_cond=conds;m.slot_xa=xa;m.slot_xpa=pa;m.max_slots=4;
++    m.jit.capacity=(256u<<20)/4;
 +    E.m=&m;E.flat=1;E.w=E.hot;E.page=0x100000;E.cur_pc=atoi(argv[1])?0x100000:0x100200;
 +    put_branch_exit(&E,0x100100,1);
 +    if(E.n&1)put(&E,0xd503201f);
@@ -22797,7 +22842,7 @@ index a801c82..ce611b7 100644
      puts("PASS fastmem benchmark: real EL1/page-table/JIT path; all guest sums identical");
  }
 diff --git a/tests/test_fastmem_jit.py b/tests/test_fastmem_jit.py
-index 0cd94a4..280b255 100644
+index 0cd94a4..9b9f104 100644
 --- a/tests/test_fastmem_jit.py
 +++ b/tests/test_fastmem_jit.py
 @@ -4,6 +4,7 @@ Run with Python packages unicorn and capstone installed. The test build replaces
@@ -22908,7 +22953,7 @@ index 0cd94a4..280b255 100644
      checked += 1
      return code
  
-@@ -131,30 +156,52 @@ with tempfile.TemporaryDirectory() as temp:
+@@ -131,30 +156,53 @@ with tempfile.TemporaryDirectory() as temp:
      subprocess.run(["cc", "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-O2", "-ffunction-sections", "-fdata-sections",
                      "-I" + str(ROOT / "core"), "-I" + str(ROOT / "host"), "-I" + str(ROOT / "devices"),
                      str(tmp / "driver.c"), str(ROOT / "core/memop.c"), "-Wl,--gc-sections", "-o", str(driver)], check=True)
@@ -22973,6 +23018,7 @@ index 0cd94a4..280b255 100644
 +        assert last_steps==reference_steps, "TLB-first must add no executed instructions to a warm TLB hit"
 +        for insn, displacement, writeback, storing in (
 +            (0xf94013e0,32,None,False), (0xf90013e0,32,None,True),
++            (0xf94813e0,4128,None,False),
 +            (0xf85e03e0,-32,None,False), (0xf85f0fe0,-16,-16,False),
 +            (0xf84107e0,0,16,False),
 +        ):
@@ -23837,10 +23883,10 @@ index 7013cf9..5c10de9 100644
      return bad;
 diff --git a/tests/test_jit_ring.c b/tests/test_jit_ring.c
 new file mode 100644
-index 0000000..9650b71
+index 0000000..b85e3b8
 --- /dev/null
 +++ b/tests/test_jit_ring.c
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,66 @@
 +#include "machine.h"
 +#include "dispatch.h"
 +#include <assert.h>
@@ -23869,6 +23915,7 @@ index 0000000..9650b71
 +int main(void) {
 +    alarm(60);
 +    assert(!hv_machine_init(&machine,64<<10));
++    machine.chain_stub_reference=-1; /* force the large-cache inline format through tiny-cache evictions */
 +    /* 4096 unique blocks exceed 64 KiB even with ideal publication dedup.
 +       The old 512-block workload could fit when poison-mode timing removed
 +       concurrent chunk wastage; allocator contention is not eviction proof. */
@@ -24237,7 +24284,7 @@ index 0000000..c8dc9dd
 +    }
 +}
 diff --git a/tests/test_mem.c b/tests/test_mem.c
-index 35ecb46..a80fef1 100644
+index 35ecb46..cdfe161 100644
 --- a/tests/test_mem.c
 +++ b/tests/test_mem.c
 @@ -16,13 +16,17 @@ DECLARE_PROGRAM(epilogue);
@@ -24259,10 +24306,11 @@ index 35ecb46..a80fef1 100644
  };
  
  #define DATA_SIZE 65536
-@@ -164,6 +168,8 @@ int main(void) {
+@@ -164,6 +168,9 @@ int main(void) {
      setvbuf(stdout, NULL, _IONBF, 0);
      static HvMachine m;
      if (hv_machine_init(&m, 8 << 20) != 0) return 1;
++    m.chain_stub_reference=-1; /* validate inline slots under all MMU/PAN/device/group variants */
 +    /* Exercise the actual generated diagnostic counters as well as production mode. */
 +    m.stats_interval = getenv("HV_STATS") ? atoi(getenv("HV_STATS")) : 0;
      data = aligned_alloc(16384, DATA_SIZE);
@@ -24462,10 +24510,10 @@ index 0000000..0f32367
 +}}
 diff --git a/tests/test_metal4_plan.m b/tests/test_metal4_plan.m
 new file mode 100644
-index 0000000..2b04b68
+index 0000000..185e2cd
 --- /dev/null
 +++ b/tests/test_metal4_plan.m
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,133 @@
 +#import <Foundation/Foundation.h>
 +#include "../devices/metal4_encoder.h"
 +#include <assert.h>
@@ -24500,6 +24548,33 @@ index 0000000..2b04b68
 +@implementation PlanArguments
 +- (NSUInteger)length {return 256;}
 +- (MTLGPUAddress)gpuAddress {return 0x12340000;}
++@end
++@interface PlanCapableDevice : NSObject
++@end
++@implementation PlanCapableDevice
++- (BOOL)supportsFamily:(MTLGPUFamily)family {return family==MTLGPUFamilyMetal4;}
++@end
++@interface PlanLibrary : NSObject
++@end
++@implementation PlanLibrary
++- (id)device {return [PlanCapableDevice new];}
++@end
++@interface PlanFunction : NSObject
++@end
++@implementation PlanFunction
++- (NSString *)name {return @"declared_defaults";}
++- (NSDictionary *)functionConstantsDictionary {return @{@"optional":@1};}
++- (MTLPatchType)patchType {return MTLPatchTypeNone;}
++@end
++@interface PlanPipelineSource : NSProxy {
++@public id descriptor,function;
++}
++@end
++@implementation PlanPipelineSource
++- (id)vertexFunction {return function;}
++- (id)computeFunction {return function;}
++- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {return [descriptor methodSignatureForSelector:selector];}
++- (void)forwardInvocation:(NSInvocation *)call {[call invokeWithTarget:descriptor];}
 +@end
 +static NSData *segment(unsigned info,NSArray<NSData *> *records,BOOL inclusive) {
 +    NSMutableData *d=[NSMutableData dataWithLength:8];for(NSData *r in records)[d appendData:r];
@@ -24556,6 +24631,19 @@ index 0000000..2b04b68
 +    e=[bridge renderCommandEncoderWithDescriptor:[MTLRenderPassDescriptor renderPassDescriptor]];
 +    invalid=NO;@try{[e endEncoding];}@catch(NSException *x){(void)x;invalid=YES;}
 +    assert(invalid);[e abortEncoding];assert(buffer.encoder.ends==1);
++    id fn=[PlanFunction new],library=[PlanLibrary new];hv_metal4_note_function(fn,library);
++    assert(objc_getAssociatedObject(fn,"henge.metal4.function"));
++    PlanPipelineSource *render=[PlanPipelineSource alloc];render->function=fn;render->descriptor=[MTLRenderPipelineDescriptor new];
++    MTL4RenderPipelineDescriptor *depthOnly=hv_metal4_descriptor(14,render);
++    assert(depthOnly&&depthOnly.vertexFunctionDescriptor&&!depthOnly.fragmentFunctionDescriptor&&depthOnly.rasterizationEnabled);
++    PlanPipelineSource *compute=[PlanPipelineSource alloc];compute->function=fn;
++    MTLComputePipelineDescriptor *old=[MTLComputePipelineDescriptor new];compute->descriptor=old;
++    assert(hv_metal4_descriptor(11,compute));
++    old.stageInputDescriptor=[MTLStageInputOutputDescriptor stageInputOutputDescriptor];old.stageInputDescriptor.layouts[0].stride=4;
++    assert(hv_metal4_descriptor(11,compute)); /* unused layout hints need no fallback */
++    old.stageInputDescriptor.attributes[0].format=MTLAttributeFormatFloat;
++    assert(!hv_metal4_descriptor(11,compute));
++    puts("PASS Metal4 descriptor mapping: unspecialized declared defaults, depth-only render and explicit legacy stage-input rejection");
 +    puts("PASS Metal4 pass plans: mixed render/query continuation, final store options, separate metadata, multi-pass and rejection attribution");
 +    return 0;
 +}}
@@ -25072,10 +25160,10 @@ index 0000000..2c357bc
 +            with self.assertRaises(ValueError):packaging.validate_members([member])
 +if __name__=='__main__':unittest.main()
 diff --git a/tests/test_native_touch_session.swift b/tests/test_native_touch_session.swift
-index 5249aa5..28d488e 100644
+index 5249aa5..2201ef0 100644
 --- a/tests/test_native_touch_session.swift
 +++ b/tests/test_native_touch_session.swift
-@@ -64,6 +64,51 @@ import Foundation
+@@ -64,6 +64,68 @@ import Foundation
          session.stop()
          precondition(!session.ready && hv_native_touch_status() == 0)
          precondition(NativeTouchSession(defaults: defaults).requested, "Stopping must preserve the choice")
@@ -25124,7 +25212,24 @@ index 5249aa5..28d488e 100644
 +        time += 5.1;session.poll(active:true,helperRunning:true)
 +        precondition(hv_native_touch_epoch() != stableEpoch,"Stable readiness resets retry backoff")
 +        session.stop()
++        let absent = NativeTouchSession(defaults: defaults, now: { time })
++        absent.requested=true;absent.changedRequest();absent.poll(active:true,helperRunning:true)
++        // The real no-USB setup watchdog is5seconds; this is a timeout test,
++        // not a delay added to the product's recovery path.
++        Thread.sleep(forTimeInterval:5.1)
++        absent.poll(active:true,helperRunning:true)
++        precondition(!absent.ready&&absent.status==8,"Clipboard presence must not masquerade as a running USB companion")
++        let missingEpoch=hv_native_touch_epoch();time += 60
++        absent.poll(active:true,helperRunning:true)
++        precondition(absent.status==8&&hv_native_touch_epoch()==missingEpoch,"An absent companion must not cause repeated setup loops")
++        var hello=[CChar](repeating:0,count:1024)
++        hello.withUnsafeMutableBufferPointer { precondition(hv_native_touch_next($0.baseAddress,$0.count)>0) }
++        absent.poll(active:true,helperRunning:true)
++        precondition(absent.status==1&&hv_native_touch_epoch() != missingEpoch,"Actual companion traffic restarts setup without a toggle")
++        hv_native_touch_report(hv_native_touch_epoch(),2);absent.poll(active:true,helperRunning:true)
++        precondition(absent.ready);absent.stop()
          print("native touch session: persistence, delayed helper, suspend, fallback and automatic retry passed")
++        print("PASS touch companion recovery: absent-helper readiness, no repeated setup loop, real arrival and existing runtime timeout retry")
      }
  }
 diff --git a/tests/test_native_touch_watchdog.c b/tests/test_native_touch_watchdog.c
@@ -26100,10 +26205,10 @@ index 0000000..60d7847
 +}
 diff --git a/tests/test_register_groups.c b/tests/test_register_groups.c
 new file mode 100644
-index 0000000..bac2fa0
+index 0000000..f8aee69
 --- /dev/null
 +++ b/tests/test_register_groups.c
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,36 @@
 +#include "translate.h"
 +#include <assert.h>
 +#include <stdio.h>
@@ -26125,6 +26230,8 @@ index 0000000..bac2fa0
 +    assert(selected+10<plain); /* actual emitter, not a copied cost model */
 +    const uint32_t clobber[]={0xf9400001,0xf9400402,0x910004c6,0xf9400803,0xf9400c04,0xd65f03c0};
 +    assert(hot(2,clobber,6)+8<hot(0,clobber,6)); /* two independent validated pairs survive the scratch clobber */
++    const uint32_t stack_adjust[]={0xf94003e1,0xf94007e2,0xd10043ff,0xf94003e3,0xf94007e4,0xd65f03c0};
++    assert(hot(2,stack_adjust,6)+8<hot(0,stack_adjust,6)); /* SP origin changes split, rather than poison, stack groups */
 +    const uint32_t alternating[]={0xf9400001,0xf9400402,0xf9400183,0xf9400584,0xf9400803,0xf9400c04,0xd65f03c0};
 +    assert(hot(2,alternating,7)+10<hot(0,alternating,7)); /* field groups on distinct base registers */
 +    assert(hot(2,stream+1,4)+6<hot(0,stream+1,4)); /* three-field objects also reuse the translation */
