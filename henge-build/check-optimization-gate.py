@@ -84,4 +84,15 @@ for name,checks in (
     assert feature.get('complete') and feature.get('source_commit')==validation.get('source_commit'), name+' requires exact-source proof'
     assert all(feature.get(k)=='passed' for k in checks) and feature.get('evidence'), name+' correctness checks incomplete'
 
+gpu=state.get('gpu_submission_followup',{})
+if manifest.get('gpu_submission_followup'):
+    assert gpu.get('complete') and gpu.get('source_commit')==validation.get('source_commit'), 'GPU follow-up requires exact-source integration proof'
+    for key in ('state_reuse','pipeline_bundle','metal4_submission','memory_pressure','ordering_lifetime','settings'):
+        assert gpu.get(key)=='passed_cloud', 'GPU follow-up incomplete: '+key
+    hardware=gpu.get('hardware_validation',{})
+    assert hardware.get('state') in ('passed','blocked'), 'Missing GPU execution verification state'
+    if hardware.get('state')=='blocked':
+        assert len(hardware.get('reason',''))>120 and isinstance(hardware.get('run_id'),int), 'Hardware execution blocker needs concrete runner evidence'
+    assert gpu.get('evidence') and gpu.get('rejections'), 'NX18 adaptations and technical rejections need evidence'
+
 print('PASS complete implementation gate:'  ,  manifest['audit_repairs_sha256'])

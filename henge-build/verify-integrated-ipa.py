@@ -180,6 +180,21 @@ for marker in (b'native-touch-recovery:',b'native-touch-guest-error:',b'gpu-cach
     assert marker in app_executable,'Desktop follow-up runtime missing: '+repr(marker)
 assert b'_hv_native_touch_test_time' not in app_executable,'Test clock leaked into production'
 data['desktop_memory_touch_followup']=dict(follow,runtime_markers_verified=True,test_clock_absent=True)
+gpu=state.get('gpu_submission_followup',{})
+assert gpu.get('complete') and gpu.get('source_commit')==state['final_validation']['source_commit']
+for marker in (b'metal4-first-guest:',b'metal4-fallback-counts:',b'metal4-runtime:',b'gpu-binding-cache:',b'setArgumentTable:atStages:',b'newMTL4CommandQueueWithDescriptor:error:'):
+    assert marker in app_executable,'Missing real Metal4 runtime: '+repr(marker)
+with zipfile.ZipFile(ipa) as archive:
+    base='Payload/Henge.app/HengePipelines/'
+    bundle=json.loads(archive.read(base+'index.json'))
+    assert bundle['schema']==1
+    assert {e['gpu'] for e in bundle['archives']}==set(manifest['gpu_submission_followup']['bundle_gpus'])
+    for entry in [bundle['screen_library'],*bundle['archives']]:
+        assert Path(entry['file']).name==entry['file']
+        content=archive.read(base+entry['file'])
+        assert hashlib.sha256(content).hexdigest()==entry['sha256'],'Incorrect bundled pipeline hash'
+    assert all(e['platform']=='ios' and e['os_major']==27 for e in bundle['archives'])
+data['gpu_submission_followup']=dict(gpu,runtime_markers_verified=True,pipeline_bundle_verified=True,physical_performance_verified=False)
 # Correct legacy metadata: verify the real configured default in the reconstructed source.
 assert 'as? Bool ?? true' in Path('Henge/ios/Henge/EngineTuning.swift').read_text()
 data['fastmem_default']=True
