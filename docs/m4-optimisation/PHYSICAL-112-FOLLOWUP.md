@@ -18,7 +18,7 @@ Implemented changes:
 
 Validation checkpoint:
 
-- Linux:2154 actual emitted ARM64 memory cases (Unicorn), far-chain linked/empty/exit-request/forward execution and literal isolation, GPU parser/store-option sanitizers, touch transport/watchdog sanitizers.
+- Linux:2166 actual emitted ARM64 memory cases (Unicorn), far-chain linked/empty/exit-request/forward execution and literal isolation, GPU parser/store-option sanitizers, touch transport/watchdog sanitizers.
 - Cloud required: macOS/iOS production Metal SDK compile; production Metal4 plan/adapter fixture; native JIT/MMU/grouping/eviction/lifecycle tests; paired far-chain and snapshot admission benchmarks; app typecheck/build.
 - A Paravirtual cloud GPU cannot prove physical Metal4 pixel execution. Device thermal/FPS and real guest-command coverage remain physical checks. No speedup percentage or stable60Hz claim is inferred from compilation or a microbenchmark.
 - No IPA is requested at this development checkpoint.
@@ -26,3 +26,5 @@ Validation checkpoint:
 Second checkpoint: the compact chain stub remains for caches within direct-branch reach; large-cache inline slots are forced in native MMU and ring-eviction regression fixtures. SP folding includes split high/low immediates; grouping stops across SP/base changes. Metal4 preserves unspecialized default constants and valid depth-only pipelines, while actual legacy compute stage-input layouts retain compatibility with a specific reason. Missing-helper recovery now distinguishes an initial absent companion from an interrupted previously ready companion; the existing timeout/retry test remains mandatory.
 
 The first cloud source5217932 passed focused SDK/plan/adapter checks. Its broader run caught the companion retry regression above; it is not a release proof. Native paired component medians were1.94ns vs11.24ns per deliberately far chained branch, and0.26ms vs4.39ms per4MiB high-entropy snapshot chunk with identical raw bytes. These are component timings on the cloud arm64 runner, not whole-guest speed, GPU execution, FPS, cooling or energy results. Mixed/compressible snapshot timings varied. The second checkpoint still needs exact-source cloud checks.
+
+Final development adjustment: coalesced Metal4 plans append their pass options in one owned buffer rather than repeatedly copying earlier options. Encoder exceptions retain their specific bounded fallback reason through cleanup. Packaging checks require the new guest-completion, companion-readiness, queue and snapshot markers and reject benchmark/test hooks.

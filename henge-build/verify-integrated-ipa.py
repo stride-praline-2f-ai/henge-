@@ -195,6 +195,13 @@ with zipfile.ZipFile(ipa) as archive:
         assert hashlib.sha256(content).hexdigest()==entry['sha256'],'Incorrect bundled pipeline hash'
     assert all(e['platform']=='ios' and e['os_major']==27 for e in bundle['archives'])
 data['gpu_submission_followup']=dict(gpu,runtime_markers_verified=True,pipeline_bundle_verified=True,physical_performance_verified=False)
+physical=state.get('physical_112_followup',{})
+if manifest.get('physical_112_followup'):
+    assert physical.get('complete') and physical.get('source_commit')==state['final_validation']['source_commit']
+    for marker in (b'metal4-stream-rejected:',b'guest_completed=%llu guest_errors=%llu',b'gpu-queue-latency:',b'snapshot-compression:',b'native-touch-companion: polls=',b'legacy compute stage-input layout needs compatibility'):
+        assert marker in app_executable,'Missing physical112 runtime: '+repr(marker)
+    assert b'_snapshot_force_full_compression' not in app_executable,'Snapshot benchmark hook leaked into production'
+    data['physical_112_followup']=dict(physical,runtime_markers_verified=True,physical_performance_verified=False)
 # Correct legacy metadata: verify the real configured default in the reconstructed source.
 assert 'as? Bool ?? true' in Path('Henge/ios/Henge/EngineTuning.swift').read_text()
 data['fastmem_default']=True
