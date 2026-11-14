@@ -1,14 +1,9 @@
-# Exact source validation
+# Exact-source validation
 
-Source `4e416424206f83d37b6313bd937cd7ab0dc2950d`, patch `c747862b84d5b7b7294764af9a03c1f211008698e8027aef4fbcead715fc9226`, run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43537656511.
+Source `ac3f64c4eb5c75799531e12092bf8f11752956f7`, patch `1487d10f3da4e5af6b61a02e440fa0adb2c227fd96e3a7a81bdb7c8417984889`. Full run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43606861317. Focused GPU run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43606861368.
 
-Required checks passed: native JIT/MMU/memory/input/VM lifecycle, sanitizer/concurrency/graphics checks, controls protocol and actual host/client TLS flow, owned releases/CPU gate, SDK typechecking and complete iPhoneOS Release app compile. Native PVG tests cover retained rings/read pointers/stamps/root IRQ, foreground replay and frozen teardown. Actual GPU tests verify late store actions preserve expected RGBA bytes.
+Passed: native JIT/MMU/VM/audio/input/network/storage/Link/snapshot/clipboard regressions, ASan/UBSan/targeted TSAN, production Swift/Metal SDK checks and complete iOS Release app compilation. The GPU checks compile real Metal4 fixtures, execute production queue/cache safety logic using recording objects, and execute the classic Metal binding/readback benchmark on the real cloud GPU. Two exact architecture offline archives compiled.
 
-Native input/GPU boundaries in the host/client service test are explicit spies; production services, pairing and TLS execute. Historical production controller UIKit touch, wireless pointer gestures and software keyboard executed in Simulator fixtures. New UI previews were explicitly waived by the user; current native/Swift/SDK and full app checks passed; actual guest Roblox controller recognition and physical multi-device behaviour remain unverified.
+The xcode-27 cloud runner exposes an Apple Paravirtual Metal device without MTLGPUFamilyMetal4. Real Metal4 compute/interop and half-float/gamma/cursor pixel fixtures compile but return78 METAL4_UNAVAILABLE. Recording queues validate ordering/lifetime/cache logic; they do not execute GPU shaders.
 
-Existing16KB read-span baseline measurements remain host microbenchmarks, not device watts/FPS. New Low Power changes have no invented speed/thermal result.
-
-Physical validation pending:
-- Physical Duo/M4 app-loading latency, Roblox asset arrival/FPS, temperatures and watts remain unmeasured by cloud tests.
-- Real controller/touch/gyro ergonomics, Link networks, audio interruptions and user APFS images need physical validation.
-- iOS can suspend/terminate Henge; only completed compatible persistent saves survive app exit. No VM background Runner or PiP execution grant remains.
+The repeated-binding microbenchmark measures encoding CPU time only; it is not whole-app speed, Roblox FPS, power or cooling. Historical MMU benchmark evidence remains attributed to the earlier unchanged engine source. Existing physical touch/Pencil, Magic Keyboard, controller ergonomics, iCloud Handoff, real-game resume and iOS background save deadlines remain device validation.

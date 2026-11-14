@@ -1,7 +1,7 @@
-# GPU integration checkpoint
+# Final GPU source gate
 
-0.3.11(112), branch `feature/metal4-pipeline-efficiency`, cumulative patch `5e46339e9a21d13bed8b445750064b5da194977857b8c7974d2017e4c0f8dd8d`.
+Validated source `ac3f64c4eb5c75799531e12092bf8f11752956f7`, patch `1487d10f3da4e5af6b61a02e440fa0adb2c227fd96e3a7a81bdb7c8417984889`. Run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43606861317.
 
-NX18-derived binding reuse, real Metal4 guest/display paths, exact offline bundles, queue/resource/fence safety, pressure-aware residency, nonblocking persistent cache epochs, bounded presentation and backend diagnostics are implemented. Focused tests passed. Full native/sanitizer/Swift/Metal/iOS app validation is running; release is not yet requested.
+All source changes are integrated. Exact binding reuse, GPU-specific bundles, real Metal4 guest/display submission, queue/fence/residency/lifetime rules, memory-pressure recovery, nonblocking archive epochs, bounded presentation and backend settings/diagnostics passed available cloud checks. One metadata-only child requests the final IPA. Prior engine/input/Link/storage/clipboard/Instant Resume features remain.
 
-Keep existing JIT/MMU, input/Pencil, controls, Link, clipboard, storage and Instant Resume features. Physical Metal4 execution is blocked by the cloud runner's Paravirtual GPU; do not claim device FPS or visual validation.
+Actual Metal4 shader execution and M4/Duo FPS/cooling remain physical validation; the cloud GPU is Paravirtual. See project-review/REVIEW.md for specific adaptations and safe rejections.
