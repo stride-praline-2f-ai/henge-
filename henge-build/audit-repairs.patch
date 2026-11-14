@@ -2080,7 +2080,7 @@ index 0000000..7c0cdee
 +#endif
 diff --git a/devices/metal4_encoder.h b/devices/metal4_encoder.h
 new file mode 100644
-index 0000000..aa300ec
+index 0000000..16c0674
 --- /dev/null
 +++ b/devices/metal4_encoder.h
 @@ -0,0 +1,171 @@
@@ -2089,7 +2089,7 @@ index 0000000..aa300ec
 +#include "metal4_pipeline.h"
 +#include "gpu_record_support.h"
 +
-+static BOOL hv_metal4_commands_supported(NSArray<NSData *> *commands) {
++static inline BOOL hv_metal4_commands_supported(NSArray<NSData *> *commands) {
 +    if(!commands.count)return NO;
 +    for(NSData *command in commands)if(!hv_metal4_segment_supported(command.bytes,command.length))return NO;
 +    return YES;
@@ -2257,7 +2257,7 @@ index 0000000..aa300ec
 +@end
 diff --git a/devices/metal4_pipeline.h b/devices/metal4_pipeline.h
 new file mode 100644
-index 0000000..f4eb63a
+index 0000000..bcb5fd5
 --- /dev/null
 +++ b/devices/metal4_pipeline.h
 @@ -0,0 +1,52 @@
@@ -2273,7 +2273,7 @@ index 0000000..f4eb63a
 +        objc_setAssociatedObject(function,"henge.metal4.function",d,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 +    }
 +}
-+static id hv_metal4_pipeline(id<MTL4Compiler> compiler,uint32_t tag,id descriptor,NSError **error) {
++static inline id hv_metal4_pipeline(id<MTL4Compiler> compiler,uint32_t tag,id descriptor,NSError **error) {
 +    if(!compiler)return nil;
 +    if(tag==0xb){
 +        MTLComputePipelineDescriptor *old=descriptor;
@@ -2717,10 +2717,10 @@ index 0000000..e8554dd
 +}
 diff --git a/devices/pipeline_bundle.h b/devices/pipeline_bundle.h
 new file mode 100644
-index 0000000..c9f99b3
+index 0000000..1d9ae0d
 --- /dev/null
 +++ b/devices/pipeline_bundle.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,61 @@
 +#pragma once
 +#import <Metal/Metal.h>
 +#import <Foundation/Foundation.h>
@@ -2735,6 +2735,7 @@ index 0000000..c9f99b3
 +API_AVAILABLE(macos(26.0),ios(26.0))
 +@interface HvPipelineBundle : NSObject {
 +@public NSArray<id<MTL4Archive>> *archives;
++    id<MTLLibrary> screenLibrary;
 +    uint64_t hits,misses;
 +}
 +- (instancetype)initWithDevice:(id<MTLDevice>)device directory:(NSURL *)directory;
@@ -2750,6 +2751,15 @@ index 0000000..c9f99b3
 +    NSString *platform=TARGET_OS_IPHONE?@"ios":@"macos";
 +    NSOperatingSystemVersion os=NSProcessInfo.processInfo.operatingSystemVersion;
 +    NSMutableArray *loaded=[NSMutableArray new];NSUInteger total=0;
++    NSDictionary *library=manifest[@"screen_library"];
++    if([library isKindOfClass:NSDictionary.class]&&[library[@"file"]isEqual:@"screen.metallib"]){
++        NSURL *url=[directory URLByAppendingPathComponent:@"screen.metallib"];
++        NSNumber *size=nil;[url getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
++        if(size.unsignedLongLongValue && size.unsignedLongLongValue<=(4u<<20)){
++            NSData *bytes=[NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe error:nil];
++            if([hv_bundle_sha(bytes)isEqual:library[@"sha256"]])screenLibrary=[device newLibraryWithURL:url error:nil];
++        }
++    }
 +    for(id item in manifest[@"archives"]){
 +        if(![item isKindOfClass:NSDictionary.class])continue;
 +        NSString *file=item[@"file"],*gpu=item[@"gpu"],*sha=item[@"sha256"];
@@ -3118,7 +3128,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..20afdaf 100644
+index 9073d22..ef47f00 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -4645,7 +4655,7 @@ index 9073d22..20afdaf 100644
 +        if(metal4){if(@available(macOS 26.0,iOS 26.0,*)){
 +            NSURL *folder=[NSBundle.mainBundle.resourceURL URLByAppendingPathComponent:@"HengePipelines" isDirectory:YES];
 +            if(!pipeline_bundle)pipeline_bundle=[[HvPipelineBundle alloc]initWithDevice:device directory:folder];
-+            metal4_screen=[[HvMetal4Screen alloc]initWithRuntime:metal4 device:device library:lib bundle:pipeline_bundle];
++            metal4_screen=[[HvMetal4Screen alloc]initWithRuntime:metal4 device:device library:(pipeline_bundle&&pipeline_bundle->screenLibrary?pipeline_bundle->screenLibrary:lib) bundle:pipeline_bundle];
 +            fprintf(stderr,"hengevm: metal4-display: active=%d bundle_hits=%llu bundle_misses=%llu\n",metal4_screen!=nil,pipeline_bundle?(unsigned long long)pipeline_bundle->hits:0,pipeline_bundle?(unsigned long long)pipeline_bundle->misses:0);
 +        }}
          screen_pipe = hv_screen_pipeline(device, lib, @"screen_plain", NO, &err);
@@ -19291,23 +19301,26 @@ index 5ff0b60..cbc6de6 100644
              HengeLog.log("input", "volume: \(left ? "left" : "right") tap (tap then drag)")
              setTapState(.pending, left: left)
 diff --git a/ios/project.yml b/ios/project.yml
-index a3be374..a022ef6 100644
+index a3be374..8a24387 100644
 --- a/ios/project.yml
 +++ b/ios/project.yml
-@@ -111,7 +111,7 @@ targets:
+@@ -111,15 +111,18 @@ targets:
          script: |
            set -e
            cd "$SRCROOT/.."
 -          make ios-lib build/henge-agent.gz build/henge-touch-agent.gz build/tl-samples.dmg
 +          make ios-lib build/henge-agent.gz build/tl-samples.dmg build/henge-touch-agent.tar.gz
            ./tools/build_ios_restore.sh
++          python3 tools/build_pipeline_bundle.py --out build/ios/pipeline-bundle
          basedOnDependencyAnalysis: false
      postBuildScripts:
-@@ -119,7 +119,7 @@ targets:
+       - name: Bundle the Mac helper
          # What runs inside macOS for the clipboard and shared folder (tools/henge-agent.m).
          script: |
            set -e
 -          cp "$SRCROOT/../build/henge-agent.gz" "$SRCROOT/../build/henge-touch-agent.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/"
++          mkdir -p "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/HengePipelines"
++          cp "$SRCROOT/../build/ios/pipeline-bundle/"*.mtl4a "$SRCROOT/../build/ios/pipeline-bundle/index.json" "$SRCROOT/../build/ios/pipeline-bundle/screen.metallib" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/HengePipelines/"
 +          cp "$SRCROOT/../build/henge-agent.gz" "$SRCROOT/../build/henge-touch-agent.tar.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/"
            rm -f "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"
            cp -X "$SRCROOT/../build/tl-samples.dmg" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"
@@ -23878,6 +23891,27 @@ index 0000000..441e7e2
 + assert(state);puts("Independent Metal archive API: ordinary compilation fallback succeeded");return 78;}
 + return 0;
 +}}
+diff --git a/tests/test_pipeline_bundle_plan.py b/tests/test_pipeline_bundle_plan.py
+new file mode 100644
+index 0000000..444226d
+--- /dev/null
++++ b/tests/test_pipeline_bundle_plan.py
+@@ -0,0 +1,15 @@
++import importlib.util
++from pathlib import Path
++module_path = Path(__file__).resolve().parents[1] / 'tools/build_pipeline_bundle.py'
++spec = importlib.util.spec_from_file_location('pipeline_bundle', module_path)
++module = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(module)
++plan = module.configuration('/tmp/screen.metallib')
++pipes = plan['pipeline_descriptors']['render_pipeline_descriptors']
++assert len(pipes) == 3
++assert all(p['raster_sample_count'] == 1 and p['color_attachments'][0]['pixel_format'] == 'BGRA8Unorm' for p in pipes)
++assert [p['fragment_function_descriptor'] for p in pipes] == ['fnd:screen_plain', 'fnd:screen_linear', 'fnd:screen_cursor']
++assert [p['color_attachments'][0]['blending_state'] for p in pipes] == ['Disabled', 'Disabled', 'Enabled']
++assert pipes[2]['color_attachments'][0]['destination_rgb_blend_factor'] == 'OneMinusSourceAlpha'
++assert len(plan['function_descriptors']['library_function_descriptors']) == 4
++print('PASS offline pipeline plan: exact plain/half-float/cursor shaders and premultiplied blending')
 diff --git a/tests/test_planar_registry.m b/tests/test_planar_registry.m
 index 942c4d7..ed28519 100644
 --- a/tests/test_planar_registry.m
@@ -26094,6 +26128,107 @@ index 70d7ccb..e4f9089 100755
 +grep -v 'same member name' "$OUT/archive.log" || true
 +test -s "$BUILD/libhengerestore.a"
  ls -la "$BUILD/libhengerestore.a"
+diff --git a/tools/build_pipeline_bundle.py b/tools/build_pipeline_bundle.py
+new file mode 100644
+index 0000000..0d48c5c
+--- /dev/null
++++ b/tools/build_pipeline_bundle.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""Build Henge's known display pipelines offline; never embeds guest/game data.
++
++Metal's translator validates each requested architecture/platform. Runtime opens
++only a matching architecture/OS archive and retains ordinary compilation on a
++miss. --plan-only permits deterministic configuration tests without Xcode.
++"""
++import argparse
++import hashlib
++import json
++from pathlib import Path
++import subprocess
++import tempfile
++
++
++def configuration(library):
++    names = ('screen_v', 'screen_plain', 'screen_linear', 'screen_cursor')
++    functions = [{'label': name, 'library': 'lib:screen', 'name': name} for name in names]
++    pipelines = []
++    for fragment in names[1:]:
++        cursor = fragment == 'screen_cursor'
++        color = dict(pixel_format='BGRA8Unorm', write_mask='All',
++                     blending_state='Enabled' if cursor else 'Disabled',
++                     alpha_blend_operation='Add', rgb_blend_operation='Add',
++                     source_alpha_blend_factor='One', source_rgb_blend_factor='One',
++                     destination_alpha_blend_factor='OneMinusSourceAlpha' if cursor else 'Zero',
++                     destination_rgb_blend_factor='OneMinusSourceAlpha' if cursor else 'Zero')
++        pipelines.append(dict(label=fragment, vertex_function_descriptor='fnd:screen_v',
++                              fragment_function_descriptor='fnd:' + fragment,
++                              raster_sample_count=1, color_attachments=[color]))
++    return dict(libraries=[dict(label='screen', path=str(Path(library).resolve()))],
++                function_descriptors=dict(library_function_descriptors=functions),
++                pipeline_descriptors=dict(render_pipeline_descriptors=pipelines))
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--out', required=True, type=Path)
++    parser.add_argument('--platform', choices=('ios', 'macos'), default='ios')
++    parser.add_argument('--gpu', default='applegpu_g16s,applegpu_g19p',
++                        help='Compiler architecture names; runtime still checks the actual device')
++    parser.add_argument('--os-min', default='27.0')
++    parser.add_argument('--plan-only', action='store_true')
++    args = parser.parse_args()
++    gpus = list(dict.fromkeys(args.gpu.split(',')))
++    if not gpus or any(not g.startswith('applegpu_g') or not g.replace('_', '').isalnum() for g in gpus):
++        parser.error('Expected explicit Metal GPU architecture names')
++    out = args.out.resolve(); out.mkdir(parents=True, exist_ok=True)
++    library = out / 'screen.metallib'
++    config = configuration(library)
++    (out / 'screen.mtl4-json').write_text(json.dumps(config, sort_keys=True, indent=2) + '\n')
++    if args.plan_only:
++        print('PASS offline pipeline plan:', len(config['pipeline_descriptors']['render_pipeline_descriptors']), 'pipelines;', ','.join(gpus))
++        return
++    sdk = 'iphoneos' if args.platform == 'ios' else 'macosx'
++    source = Path(__file__).resolve().parents[1] / 'devices/pvg_screen.metal'
++    tool = subprocess.check_output(['xcrun', '-sdk', sdk, 'metal-tt', '-version'], text=True, stderr=subprocess.STDOUT).strip()
++    inputs = hashlib.sha256(source.read_bytes() + json.dumps(dict(configuration=config, gpus=gpus,
++                            platform=args.platform, os=args.os_min, tool=tool), sort_keys=True).encode()).hexdigest()
++    stamp = out / 'inputs.sha256'
++    if stamp.is_file() and stamp.read_text().strip() == inputs:
++        old = json.loads((out / 'index.json').read_text())
++        files = [old['screen_library'], *old['archives']]
++        if all((out/f['file']).is_file() and hashlib.sha256((out/f['file']).read_bytes()).hexdigest() == f['sha256'] for f in files):
++            print('PASS existing exact offline pipeline bundle:', inputs)
++            return
++    with tempfile.TemporaryDirectory(prefix='henge-pipelines-', dir=out) as temporary:
++        air = Path(temporary) / 'screen.air'
++        minimum = '-mios-version-min=26.0' if args.platform == 'ios' else '-mmacosx-version-min=26.0'
++        subprocess.run(['xcrun', '-sdk', sdk, 'metal', '-std=metal4.0', minimum,
++                        '-c', str(source), '-o', str(air)], check=True)
++        subprocess.run(['xcrun', '-sdk', sdk, 'metallib', str(air), '-o', str(library)], check=True)
++        entries = []
++        for gpu in gpus:
++            path = out / (gpu + '.mtl4a')
++            partial = Path(temporary) / path.name
++            subprocess.run(['xcrun', '-sdk', sdk, 'metal-tt', '-arch', gpu,
++                            f'-{args.platform}-version-min', args.os_min,
++                            str(out/'screen.mtl4-json'), '-o', str(partial)], check=True)
++            if partial.stat().st_size < 256:
++                raise RuntimeError('Compiler produced an empty pipeline archive')
++            partial.replace(path)
++            entries.append(dict(file=path.name, gpu=gpu, platform=args.platform,
++                                os_major=int(args.os_min.split('.')[0]),
++                                sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
++    manifest = dict(schema=1, toolchain=tool, inputs_sha256=inputs,
++                    screen_library=dict(file=library.name, sha256=hashlib.sha256(library.read_bytes()).hexdigest()),
++                    archives=entries)
++    (out/'index.json').write_text(json.dumps(manifest, sort_keys=True, indent=2)+'\n')
++    stamp.write_text(inputs+'\n')
++    print('PASS compiled offline pipeline bundle:', len(entries), 'GPU architectures;', tool)
++
++
++if __name__ == '__main__':
++    main()
 diff --git a/tools/check_host_scheduling.sh b/tools/check_host_scheduling.sh
 index 509bce1..e130a02 100755
 --- a/tools/check_host_scheduling.sh
