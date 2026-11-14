@@ -1805,7 +1805,7 @@ index 0000000..7f164e0
 +#endif
 diff --git a/devices/desktop_fx.h b/devices/desktop_fx.h
 new file mode 100644
-index 0000000..c0a5480
+index 0000000..23cb2e8
 --- /dev/null
 +++ b/devices/desktop_fx.h
 @@ -0,0 +1,85 @@
@@ -1841,7 +1841,7 @@ index 0000000..c0a5480
 +    uint64_t _epoch;
 +}
 +- (instancetype)initWithDevice:(id<MTLDevice>)device;
-+- (HvDesktopFXLease *)acquireWidth:(NSUInteger)width height:(NSUInteger)height outputWidth:(NSUInteger)ow outputHeight:(NSUInteger)oh;
++- (HvDesktopFXLease *)acquireWidth:(NSUInteger)width height:(NSUInteger)height outputWidth:(NSUInteger)ow outputHeight:(NSUInteger)oh NS_RETURNS_RETAINED;
 +- (void)recycle:(HvDesktopFXFrame *)frame;
 +- (void)trim;
 +@end
@@ -3983,7 +3983,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..a1c0be9 100644
+index 9073d22..eb71343 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -4298,7 +4298,7 @@ index 9073d22..a1c0be9 100644
 +    if(@available(macOS 26.0,iOS 26.0,*))[metal4 setArchiveAdmission:!archive_pressure_suspended];
 +    BOOL allowFX=!pressure && available>=(512ull<<20);
 +    atomic_store(&display_fx_admission,allowFX);
-+    dispatch_async(presenter,^{if(@available(macOS 26.0,iOS 26.0,*))[self->metal4_screen setFXCacheAdmission:allowFX];});
++    if(desktop_fx)dispatch_async(presenter,^{if(@available(macOS 26.0,iOS 26.0,*))[self->metal4_screen setFXCacheAdmission:allowFX];});
 +    HvResourceBudget budget = hv_resource_budget_profile(available, pressure, hv_host_is_m4_16gb());
 +    [library_cache setAdmissionBytes:hv_env_flag("HV_GPU_LIBRARY_CACHE_OFF") ? 0 : (NSUInteger)budget.library_bytes
 +                            entries:budget.library_entries];
@@ -5644,7 +5644,7 @@ index 9073d22..a1c0be9 100644
          screen_pipe = hv_screen_pipeline(device, lib, @"screen_plain", NO, &err);
          linear_pipe = hv_screen_pipeline(device, lib, @"screen_linear", NO, &err);
          cursor_pipe = hv_screen_pipeline(device, lib, @"screen_cursor", YES, &err);
-@@ -2439,27 +3064,119 @@ static const uint8_t *half_to_byte(void) {
+@@ -2439,27 +3064,120 @@ static const uint8_t *half_to_byte(void) {
     refresh, so that happens on a thread of its own and never holds up the guest's GPU work:
     this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
  - (void)updatePacingPolicy {
@@ -5667,6 +5667,7 @@ index 9073d22..a1c0be9 100644
 +}
 +
 +- (CGSize)presentationSizeForWidth:(uint32_t)width height:(uint32_t)height {
++    if(!desktop_fx)return CGSizeMake(width,height);
 +    uint32_t mw=0,mh=0;hv_pvg_lite_mode(&mw,&mh);
 +    HvDesktopOutput size=hv_desktop_output(width,height,mw,mh,desktop_fx?2:1);
 +    return CGSizeMake(size.width,size.height);
@@ -5775,7 +5776,7 @@ index 9073d22..a1c0be9 100644
      [self updatePacingPolicy];
      double now = now_seconds();
      double delay = hv_pacing_delay(&frame_pacing, now, pacing_fps);
-@@ -2520,12 +3237,35 @@ static const uint8_t *half_to_byte(void) {
+@@ -2520,12 +3238,35 @@ static const uint8_t *half_to_byte(void) {
      const uint8_t *page=hv_pvg_lite_display_page_for_port(lite,1);
      uint32_t at=page ? __atomic_load_n((const uint32_t *)(page+0xe00),__ATOMIC_ACQUIRE) : UINT32_MAX;
      BOOL shown=page && at!=UINT32_MAX && (link_cursor_shown || page[0xe04]);
@@ -5812,7 +5813,7 @@ index 9073d22..a1c0be9 100644
  - (void)showOnLayer:(uint64_t)mapping {
      HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]); /* not met yet: a resumed machine's screen */
      if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
-@@ -2544,36 +3284,62 @@ static const uint8_t *half_to_byte(void) {
+@@ -2544,36 +3285,62 @@ static const uint8_t *half_to_byte(void) {
      }
      os_unfair_lock_lock(&screen_lock);
      screen_tex = surface->scanout, screen_half = half, screen_w = surface->surface_w, screen_h = surface->surface_h;
@@ -5878,7 +5879,7 @@ index 9073d22..a1c0be9 100644
          screen_dirty = NO;
          CAMetalLayer *target = layer; // retained across nextDrawable and a concurrent disconnect
          uint64_t generation = layer_generation, requests = screen_requests;
-@@ -2590,14 +3356,20 @@ static const uint8_t *half_to_byte(void) {
+@@ -2590,14 +3357,20 @@ static const uint8_t *half_to_byte(void) {
              if (changed) continue;
              return;
          }
@@ -5901,7 +5902,7 @@ index 9073d22..a1c0be9 100644
          if (!drawable) {
              os_unfair_lock_lock(&screen_lock);
              screen_dirty = YES;
-@@ -2633,9 +3405,11 @@ static const uint8_t *half_to_byte(void) {
+@@ -2633,9 +3406,11 @@ static const uint8_t *half_to_byte(void) {
          /* Something newer came during the wait? Then that is the frame to show. */
          os_unfair_lock_lock(&screen_lock);
          tex = screen_tex, half = screen_half, ctex = cursor_tex, shown = cursor_shown;
@@ -5913,7 +5914,7 @@ index 9073d22..a1c0be9 100644
          if (same_target && same_size) {
              screen_dirty = NO;
              drawable_retry_deadline = 0;
-@@ -2647,9 +3421,39 @@ static const uint8_t *half_to_byte(void) {
+@@ -2647,9 +3422,39 @@ static const uint8_t *half_to_byte(void) {
              os_unfair_lock_unlock(&screen_lock);
              continue;
          }
@@ -5954,7 +5955,7 @@ index 9073d22..a1c0be9 100644
              if (done.status == MTLCommandBufferStatusError)
                  fprintf(stderr, "hengevm: native-metal: display command failed: %s\n", done.error.description.UTF8String);
          }];
-@@ -2668,47 +3472,32 @@ static const uint8_t *half_to_byte(void) {
+@@ -2668,47 +3473,32 @@ static const uint8_t *half_to_byte(void) {
              [e setFragmentBytes:&half_mode length:sizeof half_mode atIndex:0];
          }
          [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -6013,7 +6014,7 @@ index 9073d22..a1c0be9 100644
                      self->frames++;
                  });
              }];
-@@ -2717,19 +3506,35 @@ static const uint8_t *half_to_byte(void) {
+@@ -2717,19 +3507,35 @@ static const uint8_t *half_to_byte(void) {
          // Serialize the final check and commit with set_layer: a switch that has
          // returned must not be followed by a commit to its old target.
          os_unfair_lock_lock(&screen_lock);
@@ -6056,7 +6057,7 @@ index 9073d22..a1c0be9 100644
              screen_dirty = YES;
          }
          os_unfair_lock_unlock(&screen_lock);
-@@ -2741,7 +3546,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2741,7 +3547,7 @@ static const uint8_t *half_to_byte(void) {
      if (atomic_load(&stopping)) return;
      double now = now_seconds();
      on_screen = mapping;
@@ -6065,7 +6066,7 @@ index 9073d22..a1c0be9 100644
          late = NO;
          [self showOnLayer:mapping];
          return;
-@@ -2831,16 +3636,31 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2831,16 +3637,31 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          if (proto) class_addProtocol([HvContext class], proto);
          HvReplay *r = [HvReplay new];
          r->lite = lite;
@@ -6100,7 +6101,7 @@ index 9073d22..a1c0be9 100644
          r->resource_tally = getenv("HV_PVG_TALLY") != NULL;
          r->batch_cache = getenv("HV_GPU_BATCH_CACHE") && !strcmp(getenv("HV_GPU_BATCH_CACHE"), "1");
          r->tasks = [NSMutableDictionary new];
-@@ -2848,6 +3668,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2848,6 +3669,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->surfaces = [NSMutableDictionary new];
          r->planar = [NSMutableDictionary new];
          r->complaints = [NSMutableSet new];
@@ -6125,7 +6126,7 @@ index 9073d22..a1c0be9 100644
          r->shot = getenv("HV_PVG_SHOT");
          cp_start(r);
  #if !TARGET_OS_IPHONE
-@@ -2864,6 +3702,32 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2864,6 +3703,32 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
              r->shot_timer = timer;
          }
  #endif
@@ -6158,7 +6159,7 @@ index 9073d22..a1c0be9 100644
          fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
          return (HvPvgMetal *)CFBridgingRetain(r);
      }
-@@ -2874,23 +3738,40 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
+@@ -2874,23 +3739,40 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
      @autoreleasepool {
          HvReplay *r = CFBridgingRelease(m);
          atomic_store(&r->stopping, 1);
@@ -6202,7 +6203,7 @@ index 9073d22..a1c0be9 100644
              r->lite = NULL;
              r->tasks = nil;
              r->surfaces = nil;
-@@ -2951,7 +3832,8 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
+@@ -2951,7 +3833,8 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                      /* "May be thrown away": Apple's host only marks it purgeable, and the bytes stay
                         until the system needs the memory. Here they just stay. */
                  } else if (op == 0x20 && n >= 4) {
@@ -6212,7 +6213,7 @@ index 9073d22..a1c0be9 100644
                  } else {
                      hv_pvg_lite_command(lite, cmd, len);
                      if (op == 8 && n >= 16) {
-@@ -2998,24 +3880,78 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
+@@ -2998,24 +3881,78 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
      }
      r->pacing_pending = NO; r->frame_pacing.next = 0; /* reattaching the same layer also wakes a stopped presenter */
      r->layer = l;
@@ -6292,7 +6293,7 @@ index 9073d22..a1c0be9 100644
          [r screenChanged];
          return;
      }
-@@ -3030,8 +3966,8 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
+@@ -3030,8 +3967,8 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
  void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
      HvReplay *r = (__bridge HvReplay *)m;
      dispatch_async(r->worker, ^{
@@ -6303,7 +6304,7 @@ index 9073d22..a1c0be9 100644
          HvObject *s = r->surfaces[@(mapping)];
          if(s && s->planar_entry){
              hv_planar_release_mapping(r->planar,s->planar_key,s->planar_entry);
-@@ -3096,6 +4032,10 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
+@@ -3096,6 +4033,10 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
      if (!r->frame_metrics_enabled) return;
      os_unfair_lock_lock(&r->frame_metrics_lock);
      struct HvFrameMetrics m = r->frame_metrics;
@@ -6314,7 +6315,7 @@ index 9073d22..a1c0be9 100644
      os_unfair_lock_unlock(&r->frame_metrics_lock);
      fprintf(stderr, "frame-presented: epoch=%llu frames=%llu intervals=%llu elapsed_s=%.6f average_fps=%.3f p95_ms_upper=%.3f p99_ms_upper=%.3f low1_fps_estimate=%.3f max_ms=%.3f overflow=%llu invalid=%llu (host presentation incl cursor; 0.25ms bins; not game FPS)\n",
          (unsigned long long)m.generation, (unsigned long long)m.frames, (unsigned long long)m.intervals,
-@@ -3104,6 +4044,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
+@@ -3104,6 +4045,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
          (unsigned long long)m.overflow,(unsigned long long)m.invalid);
  }
  
@@ -6324,7 +6325,7 @@ index 9073d22..a1c0be9 100644
  void hv_pvg_metal_link_connected(HvPvgMetal *m,int connected){
      if(!m)return;HvReplay *r=(__bridge HvReplay *)m;
      dispatch_async(r->worker,^{
-@@ -3117,25 +4060,46 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+@@ -3117,25 +4061,46 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
      if(atomic_exchange(&r->link_cursor_queued,1))return;
      dispatch_async(r->worker,^{atomic_store(&r->link_cursor_queued,0);if (!atomic_load(&r->stopping)) [r sendLinkMapping:r->link_mapping];});
  }
@@ -6375,7 +6376,7 @@ index 9073d22..a1c0be9 100644
              for (NSNumber *task in r->tasks) {
                  NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
                  for (NSNumber *ref in objs) {
-@@ -3143,79 +4107,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -3143,79 +4108,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
                      if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
                      if (o->parent && o->parent->heap_whole) continue;
                      if (!cb) cb = [r->queue commandBuffer];
@@ -19288,7 +19289,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..5e76caa 100644
+index f84465e..9a9fdce 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,18 @@ struct SessionView: View {
@@ -19699,7 +19700,7 @@ index f84465e..5e76caa 100644
 +                        if mac.desktopLayout == true {
 +                            let requested = mac.displaySize(in: Device.displayViewport)
 +                            if screen != requested {
-+                                Text("This Mac kept its previous \(screen.width) × \(screen.height) display. Desktop Retina will use \(requested.width) × \(requested.height) after you shut down macOS and start again. Save & Leave preserves the current display.")
++                                Text("This Mac kept its previous \(screen.width) × \(screen.height) display. The selected desktop mode will use \(requested.width) × \(requested.height) after you shut down macOS and start again. Save & Leave preserves the current display.")
 +                                    .font(.footnote).foregroundStyle(.secondary)
 +                            }
 +                        }
@@ -22500,10 +22501,10 @@ index 0000000..26b72af
 +    subprocess.run([str(path/'check')],check=True,timeout=20)
 diff --git a/tests/test_desktop_fx.m b/tests/test_desktop_fx.m
 new file mode 100644
-index 0000000..8ec5144
+index 0000000..55d2fd5
 --- /dev/null
 +++ b/tests/test_desktop_fx.m
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,138 @@
 +/* Executes the production pool and compositor against recording objects. This
 +   proves routing/lifetime/cache behavior, NOT MetalFX image quality or GPU time. */
 +#import <Foundation/Foundation.h>
@@ -22599,6 +22600,7 @@ index 0000000..8ec5144
 +static FXTexture *texture(NSUInteger w,NSUInteger h){FXTexture *t=[FXTexture new];t.width=w;t.height=h;return t;}
 +int main(void){@autoreleasepool {
 +    events=[NSMutableArray new];FXDevice *device=[FXDevice new];
++    __weak id oldFrame=nil;
 +    @autoreleasepool {
 +        HvDesktopFXPool *pool=[[HvDesktopFXPool alloc]initWithDevice:(id)device];assert(pool);
 +        HvDesktopFXLease *a=[pool acquireWidth:16 height:12 outputWidth:32 outputHeight:24];
@@ -22607,8 +22609,10 @@ index 0000000..8ec5144
 +        assert(a.frame!=b.frame&&a.frame!=c.frame&&b.frame!=c.frame);
 +        assert(![pool acquireWidth:16 height:12 outputWidth:32 outputHeight:24]);
 +        assert((a.frame->input.usage&MTLTextureUsageRenderTarget) && (a.frame->output.usage&MTLTextureUsageShaderRead));
-+        __weak id old=a.frame;[pool trim];a=nil;assert(!old);b=nil;c=nil;
++        oldFrame=a.frame;__weak id oldLease=a;
++        [pool trim];a=nil;assert(!oldLease);b=nil;c=nil;
 +    }
++    assert(!oldFrame); // strong property getters may autorelease until this drain
 +    supported=NO;assert(![[HvDesktopFXPool alloc]initWithDevice:(id)device]);supported=YES;
 +    HvDesktopFXPool *pool=[[HvDesktopFXPool alloc]initWithDevice:(id)device];failTextures=YES;
 +    assert(![pool acquireWidth:16 height:12 outputWidth:32 outputHeight:24]);failTextures=NO;
