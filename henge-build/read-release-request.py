@@ -17,7 +17,7 @@ ALLOWED={
     '.github/workflows/henge-ipa.yml','.github/workflows/henge-duo-checks.yml',
 }
 FROZEN=('henge_sha','husk_sha','patch_sha256','audit_repairs_sha256',
-        'upstream_integration','app_version','app_build','m4_target','test_diagnostics')
+        'upstream_integration','app_version','app_build','m4_target','test_diagnostics','gpu_submission_followup')
 def requested(state,parents,changed,manifest,validated,digest,metadata_safe=False):
     source=state.get('final_validation',{}).get('source_commit')
     if state.get('release_requested') is not True or state.get('final_reconciliation_complete') is not True or len(parents)!=1:return False

@@ -102,3 +102,22 @@ Current source `ed4693c827c671efbf124b68c9d0161fe73ff778`, patch `20225ad181270c
 ## Final integrated cloud gate
 
 Current source `4e416424206f83d37b6313bd937cd7ab0dc2950d`, patch `c747862b84d5b7b7294764af9a03c1f211008698e8027aef4fbcead715fc9226` passed https://github.com/stride-praline-2f-ai/henge-/actions/runs/43537656511, plus engine run `43537656482`. Includes the eight original review corrections and the desktop diagnostic/touch/JIT follow-up. This supersedes earlier pending-validation statements above. Final IPA inspection remains pending; physical performance is unmeasured.
+
+## NX18-derived Metal4 implementation (0.3.11)
+
+Source reference: kencalx/NX18 `b545929fc230dfe529aa922f6d21686e1bb69644`. Adaptations are implemented in Henge's existing PVG replay/presentation architecture. This does not replace macOS CPU/JIT/MMU execution with native Switch execution.
+
+| Technique | Henge integration |
+| --- | --- |
+| Exact state/binding reuse | Per-encoder resolved-object proofs; offsets, strides, ranges, nil bindings and encoder resets invalidate correctly. Reference path remains available. |
+| Actual Metal4 submission | Reusable allocators/argument tables, explicit residency and retained resources; complete supported guest render/compute/copy streams; both queues joined by shared events. |
+| Fence/LOD semantics | Classic head/tail fence bridge, Metal4 barriers including aliases, descriptor-derived exact sampler clamp variants. Unrepresentable commands replay the complete original stream through classic Metal. |
+| GPU-specific offline PSOs | Three known Henge display pipelines for iPad M4 `applegpu_g16g` and A20 `applegpu_g19p`; actual GPU/OS/platform and SHA256 admission checks. No Roblox/Safari shader corpus has been invented. |
+| Persistent runtime pipeline reuse | Device/OS/build-scoped archives, bounded disk/loaded caches, utility serial saves and fresh compiler/capture epochs; a blocked writer does not hold the pipeline lock. |
+| Lower frame latency | Existing damage-driven display link retained; latest dirty state coalesced, two in-flight presentations maximum, completion wakes pending work. Retina, gamma and cursor geometry preserved. |
+| Resource reuse/headroom | Existing exact planar allocation ownership retained; completed Metal4 jobs reuse tables/uniforms/allocators. Pressure drops idle jobs and archive handles without destroying active GPU resources. |
+| Observable activation | One backend setting, compatibility option, first real guest replay log, fallback reason counts, GPU duration and cache metrics under existing diagnostics. |
+
+Specific rejections: forcing `-mcpu=apple-a20` on the M4 would select the wrong ISA target and does not retarget JIT-emitted code. NX18's offline patched Horizon process model does not implement a macOS kernel/software MMU. Its off-label audio workgroup scheduling is unsuitable for VM CPU threads and grants no iOS background execution permission. A second FIFO display controller would compete with Henge's existing display-link lifecycle; bounded in-flight coalescing is integrated instead. Unrelated game shader archives cannot stand in for actual macOS guest shaders. Guest-backed framebuffer/heap identity is preserved rather than recycling live persistent content as transient memory. Unsupported tessellation/ICB/opaque-query commands retain the complete established Metal backend. These are concrete compatibility boundaries, not disabled game graphics.
+
+Cloud runner GPU: Apple Paravirtual device. It executes the classic Metal binding/readback comparison and recording-queue safety tests; it cannot execute Metal4. Actual Metal4 compute/inter-queue readback and plain/half-float/gamma/cursor pixel fixtures are compiled and report the explicit capability blocker. Physical M4/Duo gameplay, sustained FPS, energy and Metal4 visual correctness remain unverified.

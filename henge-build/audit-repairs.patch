@@ -154,7 +154,7 @@ index 81b0736..3de7ab2 100644
 +$(B)/test_register_groups: tests/test_register_groups.c $(ENGINE)
 +	$(CC) $(CFLAGS) $^ -o $@
 diff --git a/core/dispatch.c b/core/dispatch.c
-index 12bd4a9..9e6f60d 100644
+index 12bd4a9..204b2c6 100644
 --- a/core/dispatch.c
 +++ b/core/dispatch.c
 @@ -15,8 +15,17 @@
@@ -511,7 +511,7 @@ index 12bd4a9..9e6f60d 100644
          uint32_t h = (uint32_t)((b->va >> 2) ^ b->flags) & (SLOTS - 1);
          int probes = 0;
          while (top[h].n && (top[h].va != b->va || top[h].flags != b->flags) && ++probes < 64) h = (h + 1) & (SLOTS - 1);
-@@ -602,16 +743,41 @@ static void print_profile(HvMachine *m) {
+@@ -602,55 +743,89 @@ static void print_profile(HvMachine *m) {
      }
  }
  
@@ -531,8 +531,8 @@ index 12bd4a9..9e6f60d 100644
 +
  static void print_stats(HvCpu *cpu, int force) {
 -    static uint64_t last_t, start_t;
-+    static _Thread_local uint64_t last_t, start_t;
-+    static _Thread_local double last_busy;
++    static _Thread_local uint64_t last_t, start_t, last_busy_wall;
++    static _Thread_local double last_busy, seconds_per_tick;
 +    static _Thread_local int hash_diagnostics;
      /* This uses floating point, and the host FP registers hold the guest's state. */
      hv_fp_leave(cpu);
@@ -543,21 +543,34 @@ index 12bd4a9..9e6f60d 100644
      HvMachine *m = cpu->m;
      uint64_t now = mach_absolute_time();
 -    if (!start_t) start_t = last_t = now;
+-    if (!force && now - last_t < (uint64_t)m->stats_interval * 24000000ull) {
 +    if (stats_new_run || !start_t) {
 +        stats_new_run = 0;
 +        start_t = last_t = now;
 +        last = m->stats;
 +        last_busy = stats_thread_seconds();
++        last_busy_wall = mach_absolute_time();
++        mach_timebase_info_data_t timebase;
++        seconds_per_tick = mach_timebase_info(&timebase) == KERN_SUCCESS && timebase.denom
++            ? (double)timebase.numer / timebase.denom / 1e9 : 1.0 / 24e6;
 +        const char *hash = getenv("HV_STATS_HASH");
 +        hash_diagnostics = hash && !strcmp(hash, "1");
 +        hv_fp_enter(cpu);
 +        return;
 +    }
-     if (!force && now - last_t < (uint64_t)m->stats_interval * 24000000ull) {
++    if (now <= last_t || (!force && (now - last_t) * seconds_per_tick < m->stats_interval)) {
          hv_fp_enter(cpu);
          return;
-@@ -619,38 +785,36 @@ static void print_stats(HvCpu *cpu, int force) {
-     double dt = (double)(now - last_t) / 24e6;
+     }
+-    double dt = (double)(now - last_t) / 24e6;
++    double dt = (now - last_t) * seconds_per_tick;
++    /* Pair CPU time with its own wall sample BEFORE formatting or writing.
++       Sampling CPU time after fprintf counted this report's CPU work against
++       an interval ending before it, which could report >100% under log I/O
++       pressure or when a forced report follows a periodic one closely. */
++    double busy = stats_thread_seconds();
++    uint64_t busy_wall = mach_absolute_time();
++    double busy_dt = (busy_wall - last_busy_wall) * seconds_per_tick;
      HvStats *s = &m->stats;
  #define RATE(f) ((double)(s->f - last.f) / dt)
 +    fprintf(stderr, "memory-reuse: cached_read_spans=%.0f/s retired_metadata_advised=%.1fMiB (advisory reclaim after full quiescence; not executable memory)\n",
@@ -565,8 +578,9 @@ index 12bd4a9..9e6f60d 100644
      fprintf(stderr,
              "stats %5.0fs: blocks %.2fM/s, translated %.0f/s (again: va %.0f%% va+pa %.0f%%; %.0f%% of time, %.1f insns, %.1fx), slow mem %.0fK/s, mrs %.0fK/s msr %.0fK/s sys %.0fK/s, "
 -            "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), blocks held %d (%.0f MB, %llu full flushes), chained %.0f/s ijc fills %.0fK/s resets %.0f/s, el%u pc %llx\n",
+-            (double)(now - start_t) / 24e6, RATE(blocks) / 1e6, RATE(translations), 100.0 * RATE(retrans_va) / (RATE(translations) + 1e-9), 100.0 * RATE(retrans_vapa) / (RATE(translations) + 1e-9), 100.0 * (double)(s->translate_ticks - last.translate_ticks) / (double)(now - last_t), RATE(translated_insns) / (RATE(translations) + 1e-9), RATE(translated_words) / (RATE(translated_insns) + 1e-9), RATE(helper[HV_OP_MEM]) / 1e3,
 +            "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), blocks held %d (%.0f MB, %llu full flushes, %llu evictions: %.0f ms (blocks %.0f, exits %.0f, icache %.0f), %.0fK blocks dropped, %.0fK exits unchained), chained %.0f/s ijc fills %.0fK/s resets %.0f/s, el%u pc %llx\n",
-             (double)(now - start_t) / 24e6, RATE(blocks) / 1e6, RATE(translations), 100.0 * RATE(retrans_va) / (RATE(translations) + 1e-9), 100.0 * RATE(retrans_vapa) / (RATE(translations) + 1e-9), 100.0 * (double)(s->translate_ticks - last.translate_ticks) / (double)(now - last_t), RATE(translated_insns) / (RATE(translations) + 1e-9), RATE(translated_words) / (RATE(translated_insns) + 1e-9), RATE(helper[HV_OP_MEM]) / 1e3,
++            (now - start_t) * seconds_per_tick, RATE(blocks) / 1e6, RATE(translations), 100.0 * RATE(retrans_va) / (RATE(translations) + 1e-9), 100.0 * RATE(retrans_vapa) / (RATE(translations) + 1e-9), 100.0 * (double)(s->translate_ticks - last.translate_ticks) / (double)(now - last_t), RATE(translated_insns) / (RATE(translations) + 1e-9), RATE(translated_words) / (RATE(translated_insns) + 1e-9), RATE(helper[HV_OP_MEM]) / 1e3,
              RATE(helper[HV_OP_MRS]) / 1e3, RATE(helper[HV_OP_MSR]) / 1e3, RATE(helper[HV_OP_SYS]) / 1e3,
              RATE(exceptions), RATE(interrupts), RATE(tlb_flushes), RATE(fetch_walks) / 1e3, RATE(wfi),
              100.0 * (double)(s->wfi_ticks - last.wfi_ticks) / (double)(now - last_t), RATE(block_flushes), RATE(flush_smc),
@@ -585,9 +599,7 @@ index 12bd4a9..9e6f60d 100644
 -        if (thread_info(self, THREAD_BASIC_INFO, (thread_info_t)&ti, &cnt) == KERN_SUCCESS) {
 -            double busy = ti.user_time.seconds + ti.user_time.microseconds / 1e6 + ti.system_time.seconds +
 -                          ti.system_time.microseconds / 1e6;
-+        double busy = stats_thread_seconds();
-+        if (busy >= 0 && last_busy >= 0 && busy >= last_busy && dt > 0)
-             fprintf(stderr, "  cpu thread ran %.0f%% of the interval\n", 100 * (busy - last_busy) / dt);
+-            fprintf(stderr, "  cpu thread ran %.0f%% of the interval\n", 100 * (busy - last_busy) / dt);
 -            if (m->ncpus > 1) {
 -                fprintf(stderr, "  cpus:");
 -                for (int i = 0; i < m->ncpus; i++)
@@ -597,9 +609,12 @@ index 12bd4a9..9e6f60d 100644
 -                fprintf(stderr, "\n");
 -            }
 -            last_busy = busy;
++        if (busy >= 0 && last_busy >= 0 && busy >= last_busy && busy_dt > 0)
++            fprintf(stderr, "  cpu thread ran %.0f%% of the interval\n", 100 * (busy - last_busy) / busy_dt);
 +        else
 +            fprintf(stderr, "  cpu thread timing unavailable (new baseline)\n");
 +        last_busy = busy;
++        last_busy_wall = busy_wall;
 +        if (m->ncpus > 1) {
 +            fprintf(stderr, "  cpus:");
 +            for (int i = 0; i < m->ncpus; i++)
@@ -612,7 +627,7 @@ index 12bd4a9..9e6f60d 100644
          fprintf(stderr, "  whole-TLB flushes/s: TLBI all here %.0f, TLBI all shared %.0f, SCTLR %.0f, TTBR1 %.0f, TCR %.0f, MAIR %.0f, range of all %.0f, requests overflowed %.0f\n",
                  RATE(flush_why[0]), RATE(flush_why[1]), RATE(flush_why[2]), RATE(flush_why[3]), RATE(flush_why[4]), RATE(flush_why[5]),
                  RATE(flush_why[6]), RATE(flush_why[7]));
-@@ -664,7 +828,9 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -664,7 +839,9 @@ static void print_stats(HvCpu *cpu, int force) {
                      RATE(flush_checked), RATE(flush_check_entries), RATE(flush_check_bad), RATE(flush_check_af));
          fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
                  RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
@@ -623,7 +638,7 @@ index 12bd4a9..9e6f60d 100644
              uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
              uint32_t worst = 0;
              for (uint32_t h = 0; h < HV_BLOCK_HASH; h++) {
-@@ -795,7 +961,7 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -795,7 +972,7 @@ static void print_stats(HvCpu *cpu, int force) {
     jump gets a block that just wrote its own page back to the dispatcher. */
  static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
      uint32_t idx = (uint32_t)(slot - m->slots);
@@ -632,7 +647,7 @@ index 12bd4a9..9e6f60d 100644
          fprintf(stderr, "hengevm: chain slot %u site %p to rx+%llx va %llx: block gen %u now %u\n", idx, (void *)m->slot_site[idx], (unsigned long long)(b->code - m->jit.base) * 4, (unsigned long long)b->va, b->jit_gen, m->jit_gen);
      uint64_t xa = m->slot_xa[idx];
      if (xa) {
-@@ -890,7 +1056,7 @@ static void stop_the_world(HvCpu *cpu) {
+@@ -890,7 +1067,7 @@ static void stop_the_world(HvCpu *cpu) {
      pthread_mutex_lock(&m->stw_mu);
      if (__atomic_load_n(&m->flush_pending, __ATOMIC_SEQ_CST) && !m->stw_active) {
          __atomic_store_n(&m->stw_active, 1, __ATOMIC_SEQ_CST);
@@ -641,7 +656,7 @@ index 12bd4a9..9e6f60d 100644
          pthread_mutex_unlock(&m->stw_mu);
          hv_machine_kick_all(m);
          if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_FLUSH, __ATOMIC_RELAXED);
-@@ -907,7 +1073,8 @@ static void stop_the_world(HvCpu *cpu) {
+@@ -907,7 +1084,8 @@ static void stop_the_world(HvCpu *cpu) {
          }
          if (m->gen_checks) for (int i = 0; i < m->ncpus; i++) if (m->cpus[i] && m->cpus[i] != cpu && m->cpus[i]->pc_state->active) fprintf(stderr, "hengevm: flush while cpu %d is active\n", i);
          pthread_mutex_lock(&m->tr_mu);
@@ -651,7 +666,7 @@ index 12bd4a9..9e6f60d 100644
          pthread_mutex_unlock(&m->tr_mu);
          if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_RUN, __ATOMIC_RELAXED);
          pthread_mutex_lock(&m->stw_mu);
-@@ -924,8 +1091,21 @@ static void stop_the_world(HvCpu *cpu) {
+@@ -924,8 +1102,21 @@ static void stop_the_world(HvCpu *cpu) {
      }
  }
  
@@ -674,7 +689,7 @@ index 12bd4a9..9e6f60d 100644
      hv_big_lock(cpu->m);
      hv_fp_enter(cpu);
      int r = run(cpu, 0);
-@@ -1054,15 +1234,15 @@ static int run_loop(HvCpu *cpu, int one) {
+@@ -1054,15 +1245,15 @@ static int run_loop(HvCpu *cpu, int one) {
              continue;
          }
          last_fault = ~0ull;
@@ -695,7 +710,7 @@ index 12bd4a9..9e6f60d 100644
              fprintf(stderr, "hengevm: cannot translate block at %llx\n", (unsigned long long)cpu->pc);
              park(cpu);
              return HV_EXIT_UNSUPPORTED;
-@@ -1155,7 +1335,7 @@ static int run_loop(HvCpu *cpu, int one) {
+@@ -1155,7 +1346,7 @@ static int run_loop(HvCpu *cpu, int one) {
          cpu->icount++;
          m->stats.blocks++;
          if (m->stats_interval && cpu->index == 0 && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);

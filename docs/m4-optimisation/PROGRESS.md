@@ -1,8 +1,7 @@
-# Integrated source release gate
+# GPU integration checkpoint
 
-Validated source: `4e416424206f83d37b6313bd937cd7ab0dc2950d`. Patch: `c747862b84d5b7b7294764af9a03c1f211008698e8027aef4fbcead715fc9226`.
-Cloud run: https://github.com/stride-praline-2f-ai/henge-/actions/runs/43537656511.
+0.3.11(112), branch `feature/metal4-pipeline-efficiency`, cumulative patch `5e46339e9a21d13bed8b445750064b5da194977857b8c7974d2017e4c0f8dd8d`.
 
-M4 workstreams, shared Duo improvements, controls, Low Power policy and resilient local input are integrated; app Runner remains removed. Native regressions, sanitizers, actual Link host/client TLS negotiation, production Swift/Metal SDK checks, real Metal store-action tests and the complete iOS Release application compile passed.
+NX18-derived binding reuse, real Metal4 guest/display paths, exact offline bundles, queue/resource/fence safety, pressure-aware residency, nonblocking persistent cache epochs, bounded presentation and backend diagnostics are implemented. Focused tests passed. Full native/sanitizer/Swift/Metal/iOS app validation is running; release is not yet requested.
 
-The next metadata-only child requests one final IPA. Archive production and verification remain pending. Physical-device limitations are recorded in optimization-state.json; no measured cooling, core residency or Roblox-recognition claim.
+Keep existing JIT/MMU, input/Pencil, controls, Link, clipboard, storage and Instant Resume features. Physical Metal4 execution is blocked by the cloud runner's Paravirtual GPU; do not claim device FPS or visual validation.
