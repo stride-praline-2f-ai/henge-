@@ -1,0 +1,75 @@
+name: Henge focused GPU validation
+'on':
+  push:
+    branches:
+    - feature/metal4-pipeline-efficiency
+    paths:
+    - henge-build/**
+    - .github/workflows/henge-gpu-checks.yml
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: henge-gpu-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  gpu:
+    runs-on: xcode-27
+    timeout-minutes: 25
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: build-request
+        persist-credentials: false
+    - name: Load pinned inputs
+      id: inputs
+      run: "python3 - <<'PY'\nimport json, os\nfrom pathlib import Path\ndata = json.loads(Path('build-request/henge-build/manifest.json').read_text())\nwith open(os.environ['GITHUB_OUTPUT'], 'a') as f:\n    f.write('henge=' + data['henge_sha'] + '\\n')\n    f.write('husk=' + data['husk_sha'] + '\\n')\nPY\n"
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Henge
+        ref: ${{ steps.inputs.outputs.henge }}
+        path: Henge
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Husk
+        ref: ${{ steps.inputs.outputs.husk }}
+        path: Husk
+        persist-credentials: false
+    - name: Verify and apply reviewed changes
+      env:
+        CUSTOM_SOURCE_COMMIT: ${{ github.sha }}
+      run: "python3 - <<'PY'\nimport hashlib, json, os, plistlib, subprocess\nfrom pathlib import Path\nfolder = Path('build-request/henge-build')\ndata = json.loads((folder / 'manifest.json').read_text())\npatch = folder / 'henge.patch'\nassert hashlib.sha256(patch.read_bytes()).hexdigest() == data['patch_sha256']\nfor check in (['git', '-C', 'Henge', 'apply', '--check', str(patch.resolve())],\n              ['git', '-C', 'Henge', 'apply', str(patch.resolve())]):\n    subprocess.run(check, check=True)\npath = Path('Henge/ios/Henge/Info.plist')\nwith path.open('rb') as f: info = plistlib.load(f)\ninfo['HengeCustomSourceCommit'] = os.environ['CUSTOM_SOURCE_COMMIT']\ninfo['HengeUpstreamCommit'] = data['henge_sha']\ninfo['HengeCustomPullRequests'] = [14, 31, 32, 35, 36, 46, 60, 61, 63, 106]\nwith path.open('wb') as f: plistlib.dump(info, f)\nif os.environ.get('HENGE_GAME_MODE') == '1':\n    subprocess.run(['python3', 'Henge/tools/configure_gaming_experiments.py', '--info', str(path), '--game-mode'],\
+        \ check=True)\n# Do not silently change normal/personal-team signing requirements.\nfor name in ['Henge.entitlements', 'Henge.personal.entitlements']:\n    actual = Path('Henge/ios/Henge') / name\n    expected = subprocess.check_output(['git', '-C', 'Henge', 'show', data['henge_sha'] + ':ios/Henge/' + name])\n    assert actual.read_bytes() == expected\nPY\ngit -C Henge add -A\ngit -C Henge -c user.name='Henge CI' -c user.email='henge-ci@users.noreply.github.com' commit -m \"Custom Henge 0.3 from ${GITHUB_SHA}\"\n"
+    - name: Integrate pinned Henge main and reviewed device PRs
+      id: integration
+      run: bash build-request/henge-build/integrate-upstream.sh
+    - name: GPU state regressions and production Metal SDK checks
+      working-directory: Henge
+      run: 'set -euo pipefail
+
+        mkdir -p build/gpu-proof
+
+        xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined tests/test_gpu_binding_cache.c -o build/gpu-proof/test_gpu_binding_cache
+
+        build/gpu-proof/test_gpu_binding_cache
+
+        xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -fobjc-arc -Icore -Ihost -Idevices -fsyntax-only devices/pvg_metal.m
+
+        sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+
+        xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot "$sdk" -fobjc-arc -Wno-deprecated-declarations -Icore -Ihost -Idevices -fsyntax-only devices/pvg_metal.m
+
+        cp "$sdk"/System/Library/Frameworks/Metal.framework/Headers/MTL4*.h build/gpu-proof/
+
+        xcodebuild -version > build/gpu-proof/toolchain.txt
+
+        printf ''PASS GPU production SDK and binding regressions\n'' | tee build/gpu-proof/result.txt
+
+        '
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: gpu-proof-${{ github.run_id }}
+        path: Henge/build/gpu-proof/
+        retention-days: 7
