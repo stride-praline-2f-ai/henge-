@@ -174,6 +174,15 @@ data['diagnostic_symbols']={'uuid_matched':True,'uuid':image_ids[0],
     'file':symbol_file.name,'sha256':hashlib.sha256(symbol_file.read_bytes()).hexdigest()}
 data['project_review']=dict(review,runtime_markers_verified=True,test_hooks_absent=True,
     physical_touch_fps_energy_verified=False)
+follow=state.get('desktop_memory_touch_followup',{})
+assert follow.get('complete') and follow.get('source_commit')==state['final_validation']['source_commit']
+for marker in (b'native-touch-recovery:',b'native-touch-guest-error:',b'gpu-cache-budget:',b'henge: memory-layout:',b'Process headroom excludes some guest pages'):
+    assert marker in app_executable,'Desktop follow-up runtime missing: '+repr(marker)
+assert b'_hv_native_touch_test_time' not in app_executable,'Test clock leaked into production'
+data['desktop_memory_touch_followup']=dict(follow,runtime_markers_verified=True,test_clock_absent=True)
+# Correct legacy metadata: verify the real configured default in the reconstructed source.
+assert 'as? Bool ?? true' in Path('Henge/ios/Henge/EngineTuning.swift').read_text()
+data['fastmem_default']=True
 data["audit_repairs"]={"sha256":manifest["audit_repairs_sha256"],"snapshot_schema":3,"test_allocation_hook_absent":True}
 data["upstream_integration"]={
   **integration,
