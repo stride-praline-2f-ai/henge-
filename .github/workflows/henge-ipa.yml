@@ -79,6 +79,55 @@ jobs:
     - name: Integrate pinned Henge main and reviewed device PRs
       id: integration
       run: bash build-request/henge-build/integrate-upstream.sh
+    - name: Use supported macOS test-image provider cleanup
+      run: 'python3 - <<''PYAPFS''
+
+        import hashlib
+
+        from pathlib import Path
+
+        p=Path(''Henge/tests/test_disk_recovery_macos.py'')
+
+        assert hashlib.sha256(p.read_bytes()).hexdigest()==''6b471d30c3cd29469c2edb1e6223e54f425037c026fb7ad3f47c16a6f9844f76'',
+        ''Review APFS fixture adapter after source changes''
+
+        s=p.read_text()
+
+        old="        run(''hdiutil'',''detach'',''-force'',device)"
+
+        new="        # APFS creates separate synthesized media objects. Disk Arbitration can\n        # retain them
+        after volume verification even when every volume is cleanly\n        # unmounted. Eject those OWNED synthesized
+        objects before the backing image.\n        # Each operation changes device state; no sleeps, skipped assertions
+        or\n        # ignored final detach failure. Never touch a container with foreign stores.\n        for container
+        in containers(device):\n            prefix=device.removeprefix(''/dev/'')+''s''\n            stores=container.get(''PhysicalStores'',[])\n            assert
+        stores and all(v.get(''DeviceIdentifier'','''').startswith(prefix) for v in stores),container\n            reference=container[''ContainerReference'']\n            assert
+        re.fullmatch(r''(?:/dev/)?disk[0-9]+'',reference),reference\n            for volume in container.get(''Volumes'',[]):\n                info=run(''diskutil'',''info'',''-plist'',volume[''DeviceIdentifier''],plist=True)\n                assert
+        not info.get(''Mounted'') and not info.get(''MountPoint''),info\n            result=subprocess.run([''diskutil'',''eject'',''force'',reference],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)\n            errors.append(((''diskutil'',''eject'',''force'',reference),result.returncode,result.stderr.decode(errors=''replace'')))\n            if
+        not attached():break\n        if attached():\n            # Reconfirm the complete current association immediately
+        before force.\n            current=attached()\n            assert len(current)==1 and Path(current[0][''image-path'']).resolve()==expected_image.resolve(),current\n            for
+        container in containers(device):\n                for volume in container.get(''Volumes'',[]):\n                    info=run(''diskutil'',''info'',''-plist'',volume[''DeviceIdentifier''],plist=True)\n                    assert
+        not info.get(''Mounted'') and not info.get(''MountPoint''),info\n            result=subprocess.run([''diskutil'',''eject'',''force'',device],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)\n            if
+        result.returncode:\n                print(''Provider release failed after owned synthesized media eject:'',attached(),containers(device),flush=True)\n                subprocess.run([''lsof'',device],stdout=sys.stderr,stderr=sys.stderr,timeout=15)\n                raise
+        RuntimeError((''diskutil backing-image eject'',result.returncode,result.stdout,result.stderr))\n"
+
+        assert s.count(old)==1
+
+        patched=s.replace(old,new.rstrip())
+
+        compile(patched,str(p),''exec'')
+
+        # Keep the final assert-not-attached and every payload/Recovery/GPT/filesystem check.
+
+        assert patched.count(''assert not attached(),errors'')==1
+
+        p.write_text(patched)
+
+        print(''PASS macOS27 fixture adapter: owned APFS synthesized media released before backing image; all validation
+        retained'')
+
+        PYAPFS
+
+        '
     - name: Ensure Metal shader compiler
       run: "if ! xcrun --sdk macosx metal --version; then\n  xcodebuild -downloadComponent MetalToolchain\nfi\n\
         xcrun --sdk macosx metal --version\n"

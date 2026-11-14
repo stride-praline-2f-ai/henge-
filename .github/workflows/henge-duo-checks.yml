@@ -95,17 +95,35 @@ jobs:
 
         old="        run(''hdiutil'',''detach'',''-force'',device)"
 
-        new="        run(''diskutil'',''eject'',''force'',device)"
+        new="        # APFS creates separate synthesized media objects. Disk Arbitration can\n        # retain them
+        after volume verification even when every volume is cleanly\n        # unmounted. Eject those OWNED synthesized
+        objects before the backing image.\n        # Each operation changes device state; no sleeps, skipped assertions
+        or\n        # ignored final detach failure. Never touch a container with foreign stores.\n        for container
+        in containers(device):\n            prefix=device.removeprefix(''/dev/'')+''s''\n            stores=container.get(''PhysicalStores'',[])\n            assert
+        stores and all(v.get(''DeviceIdentifier'','''').startswith(prefix) for v in stores),container\n            reference=container[''ContainerReference'']\n            assert
+        re.fullmatch(r''(?:/dev/)?disk[0-9]+'',reference),reference\n            for volume in container.get(''Volumes'',[]):\n                info=run(''diskutil'',''info'',''-plist'',volume[''DeviceIdentifier''],plist=True)\n                assert
+        not info.get(''Mounted'') and not info.get(''MountPoint''),info\n            result=subprocess.run([''diskutil'',''eject'',''force'',reference],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)\n            errors.append(((''diskutil'',''eject'',''force'',reference),result.returncode,result.stderr.decode(errors=''replace'')))\n            if
+        not attached():break\n        if attached():\n            # Reconfirm the complete current association immediately
+        before force.\n            current=attached()\n            assert len(current)==1 and Path(current[0][''image-path'']).resolve()==expected_image.resolve(),current\n            for
+        container in containers(device):\n                for volume in container.get(''Volumes'',[]):\n                    info=run(''diskutil'',''info'',''-plist'',volume[''DeviceIdentifier''],plist=True)\n                    assert
+        not info.get(''Mounted'') and not info.get(''MountPoint''),info\n            result=subprocess.run([''diskutil'',''eject'',''force'',device],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)\n            if
+        result.returncode:\n                print(''Provider release failed after owned synthesized media eject:'',attached(),containers(device),flush=True)\n                subprocess.run([''lsof'',device],stdout=sys.stderr,stderr=sys.stderr,timeout=15)\n                raise
+        RuntimeError((''diskutil backing-image eject'',result.returncode,result.stdout,result.stderr))\n"
 
         assert s.count(old)==1
 
-        # Only the disposable test image, after clean unmount and ownership checks.
+        patched=s.replace(old,new.rstrip())
 
-        # Keep every payload, filesystem, Recovery UUID and GPT assertion unchanged.
+        compile(patched,str(p),''exec'')
 
-        p.write_text(s.replace(old,new))
+        # Keep the final assert-not-attached and every payload/Recovery/GPT/filesystem check.
 
-        print(''PASS macOS27 fixture adapter: supported owned-image eject; all APFS validation retained'')
+        assert patched.count(''assert not attached(),errors'')==1
+
+        p.write_text(patched)
+
+        print(''PASS macOS27 fixture adapter: owned APFS synthesized media released before backing image; all validation
+        retained'')
 
         PYAPFS
 
