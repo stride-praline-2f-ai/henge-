@@ -126,3 +126,10 @@ if physical114:
     for name in ('diagnostic_workers','metal4_metrics','idle_touch','ios_integration'):
         assert physical114.get(name)=='passed_cloud', 'Physical114 follow-up incomplete: '+name
     assert physical114.get('evidence'), 'Missing interruption/Safari follow-up evidence'
+
+physical115=state.get('physical_115_metalfx_followup')
+if physical115:
+    assert physical115.get('complete') is True and physical115.get('source_commit')==validation.get('source_commit'), 'Physical115 MetalFX follow-up needs exact-source proof'
+    for name in ('pressure_transitions','fallback_attribution','ios_integration'):
+        assert physical115.get(name)=='passed_cloud', 'Physical115 follow-up incomplete: '+name
+    assert physical115.get('evidence'), 'Missing physical MetalFX follow-up evidence'
