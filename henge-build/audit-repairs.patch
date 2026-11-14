@@ -3263,10 +3263,10 @@ index 0000000..2258d0a
 +}
 diff --git a/devices/metal4_screen.h b/devices/metal4_screen.h
 new file mode 100644
-index 0000000..40788be
+index 0000000..cb09476
 --- /dev/null
 +++ b/devices/metal4_screen.h
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,152 @@
 +#pragma once
 +#include "metal4_runtime.h"
 +#include "pipeline_bundle.h"
@@ -3347,6 +3347,9 @@ index 0000000..40788be
 +    if(_fxCacheEnabled==enabled)return;
 +    _fxCacheEnabled=enabled;
 +    if(!enabled){_cachedFX=nil;_cachedSource=nil;[_fxPool trim];}
++    // A failed compiler/pool allocation must not permanently disable FX.
++    // Retry once after real pressure recovery, without retrying every frame.
++    else if(!_fxPool)_fxUnavailableLogged=NO;
 +}
 +- (void)didCommit:(BOOL)committed {
 +    // Called on the presenter immediately after enqueue/discard, before the next
@@ -22747,10 +22750,10 @@ index 0000000..26b72af
 +    subprocess.run([str(path/'check')],check=True,timeout=20)
 diff --git a/tests/test_desktop_fx.m b/tests/test_desktop_fx.m
 new file mode 100644
-index 0000000..c0f7f0a
+index 0000000..686ffe6
 --- /dev/null
 +++ b/tests/test_desktop_fx.m
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,168 @@
 +/* Executes the production pool and compositor against recording objects. This
 +   proves routing/lifetime/cache behavior, NOT MetalFX image quality or GPU time. */
 +#import <Foundation/Foundation.h>
@@ -22758,7 +22761,8 @@ index 0000000..c0f7f0a
 +#import <MetalFX/MetalFX.h>
 +#include <assert.h>
 +static NSMutableArray<NSString *> *events;
-+static BOOL supported=YES,failTextures=NO;
++static BOOL supported=YES,failTextures=NO,failCompiler=NO;
++static NSUInteger compilerCreations;
 +@interface FXTexture : NSObject
 +@property NSUInteger width,height;
 +@property MTLPixelFormat pixelFormat;
@@ -22807,7 +22811,7 @@ index 0000000..c0f7f0a
 +@end
 +@interface FXDevice : NSObject @end
 +@implementation FXDevice
-+- (id)newCompilerWithDescriptor:(id)d error:(NSError **)error {(void)d;(void)error;return [NSObject new];}
++- (id)newCompilerWithDescriptor:(id)d error:(NSError **)error {(void)d;(void)error;compilerCreations++;return failCompiler?nil:[NSObject new];}
 +- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
 +    if(failTextures)return nil;
 +    assert(d.storageMode==MTLStorageModePrivate);
@@ -22903,9 +22907,20 @@ index 0000000..c0f7f0a
 +    assert(atomic_load(&screen->fx_resource_fallback)==1);
 +    assert(atomic_load(&screen->fx_fallback)==atomic_load(&screen->fx_pressure_fallback)+atomic_load(&screen->fx_resource_fallback)+atomic_load(&screen->fx_size_fallback));
 +    [screen didCommit:NO];[allocationFallback->keep removeAllObjects];
++    HvMetal4Screen *retryScreen=[[HvMetal4Screen alloc]initWithRuntime:(id)runtime device:(id)device library:nil bundle:nil];assert(retryScreen);
++    failCompiler=YES;[events removeAllObjects];
++    HvMetal4Job *unavailable=[retryScreen encode:source target:target half:NO mode:0 cursor:nil rect:NULL sharp:NO imageEpoch:1 upscale:YES];
++    assert(unavailable && ![events containsObject:@"FX"]);[retryScreen didCommit:NO];[unavailable->keep removeAllObjects];
++    NSUInteger attempted=compilerCreations;
++    HvMetal4Job *stillUnavailable=[retryScreen encode:source target:target half:NO mode:0 cursor:nil rect:NULL sharp:NO imageEpoch:1 upscale:YES];
++    assert(stillUnavailable && compilerCreations==attempted);[retryScreen didCommit:NO];[stillUnavailable->keep removeAllObjects];
++    failCompiler=NO;[retryScreen setFXCacheAdmission:NO];[retryScreen setFXCacheAdmission:YES];[events removeAllObjects];
++    HvMetal4Job *compilerRecovery=[retryScreen encode:source target:target half:NO mode:0 cursor:nil rect:NULL sharp:NO imageEpoch:2 upscale:YES];
++    assert(compilerRecovery && [events containsObject:@"FX"] && compilerCreations==attempted+1);[retryScreen didCommit:NO];[compilerRecovery->keep removeAllObjects];
 +    puts("PASS Desktop MetalFX production routing: Metal4 encode, low-input colour pass, post-upscale cursor, committed-image reuse and rejected-image retry (recording objects; no GPU pixel claim)");
 +    puts("PASS Desktop MetalFX resource lifetime: three distinct bounded leases, declared texture usage, in-flight pressure protection, allocation failure and recovery");
 +    puts("PASS Desktop MetalFX pressure policy: repeated disabled frames do not retrim resources; pressure and geometry fallbacks independently attributed");
++    puts("PASS Desktop MetalFX compiler recovery: failed initial pool creation retries after pressure recovery without per-frame compiler retries");
 +}}
 diff --git a/tests/test_desktop_fx_gpu.m b/tests/test_desktop_fx_gpu.m
 new file mode 100644

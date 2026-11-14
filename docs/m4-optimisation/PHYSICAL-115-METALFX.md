@@ -39,3 +39,5 @@ Recording-object tests exercise pressure fallback,100 repeated disabled calls wi
 For a controlled next comparison use a fully shut-down **8GiB guest,4vCPUs,60Hz**, keeping the chosen native Retina or optional MetalFX mode explicit and constant. Existing16GiB saved state remains compatible and is not resized silently. This is a lower-pressure comparison, not a claim that more RAM or120Hz can never help.
 
 Cloud validation for the final combined patch must pass before any IPA. This follow-up does not claim the prior iPadOS interruption's cause or steady60FPS has been established.
+
+A failed initial MetalFX compiler/pool creation previously latched the unavailable flag permanently. Recovery now permits one new attempt when pressure admission returns, without per-frame compiler retries. The regression injects initial compiler failure, checks that repeated frames do not recreate it, and verifies successful recovery.

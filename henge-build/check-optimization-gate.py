@@ -118,7 +118,6 @@ if manifest.get('desktop_metalfx'):
     assert all(fx.get(k)=='passed_cloud' for k in ('geometry','routing_lifetime','snapshot','sdk','ios_integration')), 'Desktop MetalFX correctness checks incomplete'
     assert fx.get('evidence') and fx.get('physical_pixels') in ('passed_device','pending_device_test'), 'MetalFX physical execution status missing'
 
-print('PASS complete implementation gate:'   ,  manifest['audit_repairs_sha256'])
 
 physical114=state.get('physical_114_diagnostics_followup')
 if physical114:
@@ -130,6 +129,8 @@ if physical114:
 physical115=state.get('physical_115_metalfx_followup')
 if physical115:
     assert physical115.get('complete') is True and physical115.get('source_commit')==validation.get('source_commit'), 'Physical115 MetalFX follow-up needs exact-source proof'
-    for name in ('pressure_transitions','fallback_attribution','ios_integration'):
+    for name in ('pressure_transitions','fallback_attribution','compiler_recovery','ios_integration'):
         assert physical115.get(name)=='passed_cloud', 'Physical115 follow-up incomplete: '+name
     assert physical115.get('evidence'), 'Missing physical MetalFX follow-up evidence'
+
+print('PASS complete implementation gate:', manifest['audit_repairs_sha256'])
