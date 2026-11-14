@@ -1,7 +1,5 @@
-# Exact-source desktop upscaler validation
+# Current validation
 
-Source `2af59fb62b7482009fff05752a20228c972ab16a`, patch `99eef46d4ffabebe588200238d1666892d9d881b796efe628728e662fead5129`. Full run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43647532804; focused https://github.com/stride-praline-2f-ai/henge-/actions/runs/43647532803.
+Physical114 source follow-up is pending macOS CI. Local touch watchdog ASan/UBSan passes. Linux has no Swift/macOS SDK; no local Swift/native lifecycle pass is claimed. New source invalidates the prior115 release validation. Existing115 artifact remains delivered and unchanged.
 
-Passed: native JIT/MMU/VM/audio/input/network/storage/Link/snapshot/clipboard regression suite, sanitizers/concurrency, complete iOS Release compilation, production Metal4 SDK checks, actual VirtualMac upscaler policy, legacy/native snapshot defaults, exact saved presentation scale, fixed output geometry, production MetalFX routing via recording objects, post-scale cursor ordering, epoch cache reuse/rejected-job invalidation, bounded leases and memory-pressure recovery. Real classic Metal GPU readback and existing component benchmarks remain in the focused receipt.
-
-Metal4FX GPU fixture compiled but returned78 on the unsupported Paravirtual GPU. It exercises flat encoded/linear half-float output, separate sharp cursor and cached reuse when run on supported hardware. Source-pixel reduction is mathematical, not a measured whole-app/FPS/energy gain. The mode is optional, reconstructs detail and can soften text. Native Retina and the guest Metal4 renderer remain unchanged. Existing hardware-only touch/Pencil/peripheral/Link/game-resume/iCloud/background-deadline validation remains pending physical testing. Saved memory is build-bound: shut down macOS before updating; virtual disks are retained.
+Required checks: production NativeReportPump and SessionDiagnosticCapture worker/stale-result tests under ASan; native touch idle/held watchdog; real PVG lifecycle/allocation snapshot; complete native regressions and device/Simulator SDK plus full app compile. Packaging is disabled.

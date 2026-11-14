@@ -1,5 +1,7 @@
-# Desktop MetalFX release checkpoint
+# Physical114 interruption and Safari follow-up
 
-Validated source `2af59fb62b7482009fff05752a20228c972ab16a`, patch `99eef46d4ffabebe588200238d1666892d9d881b796efe628728e662fead5129`. Full native/app run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43647532804; focused run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43647532803.
+Runtime checkpoint25ef1f0; source validation pending. New supplied logs fully analysed in PHYSICAL-114-INTERRUPTION-SAFARI.md. No proven iPadOS reset cause; both runs configured16GiB RAM and issued system pressure warnings. Previous end restored at60Hz; later cold boot120Hz.
 
-Optional same-workspace final-image MetalFX upscaler integrated; native Retina default and guest Metal4 rendering retained. Geometry, production routing/lease lifetime, cursor/cache/pressure recovery, snapshot defaults, Swift/Metal SDK and full iOS app checks passed. No actual Metal4FX pixel execution on the cloud Paravirtual GPU; upscaler visual quality and FPS/power require device testing. See DESKTOP-METALFX.md. Final IPA verification pending.
+Implemented off-main bounded diagnostic sampling/report coalescing, separate Metal4 GPU/allocation accounting, contact-aware idle touch watchdog and physical-RAM clarity. Local native touch ASan/UBSan passed. New production Swift worker/stale completion tests are in both focused GPU and full host checks. Full native/app CI next; release_requested=false. Do not package or reuse115 validation as proof of the new source.
+
+Next: inspect focused worker test and full native/app results, fix actual failures, record exact-source cloud evidence. Larger code-cache pool/unbounded GPU jobs and unsafe TLB shortcuts are not justified by these logs. Keep current MetalFX and all earlier input/snapshot improvements.

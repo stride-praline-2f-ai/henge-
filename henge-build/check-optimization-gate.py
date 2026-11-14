@@ -119,3 +119,10 @@ if manifest.get('desktop_metalfx'):
     assert fx.get('evidence') and fx.get('physical_pixels') in ('passed_device','pending_device_test'), 'MetalFX physical execution status missing'
 
 print('PASS complete implementation gate:'   ,  manifest['audit_repairs_sha256'])
+
+physical114=state.get('physical_114_diagnostics_followup')
+if physical114:
+    assert physical114.get('complete') is True and physical114.get('source_commit')==validation.get('source_commit'), 'Physical114 diagnostic/idle touch follow-up needs exact-source proof'
+    for name in ('diagnostic_workers','metal4_metrics','idle_touch','ios_integration'):
+        assert physical114.get(name)=='passed_cloud', 'Physical114 follow-up incomplete: '+name
+    assert physical114.get('evidence'), 'Missing interruption/Safari follow-up evidence'

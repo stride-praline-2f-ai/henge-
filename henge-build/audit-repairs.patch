@@ -3752,7 +3752,7 @@ index 4deff97..d0ff98b 100644
  #endif
  #endif
 diff --git a/devices/pvg_lite.c b/devices/pvg_lite.c
-index 9f6ebcb..89b0892 100644
+index 9f6ebcb..203b5ab 100644
 --- a/devices/pvg_lite.c
 +++ b/devices/pvg_lite.c
 @@ -169,6 +169,10 @@ int hv_pvg_lite_set_link_mode(uint32_t w,uint32_t h,uint32_t mmw,uint32_t mmh,ui
@@ -3766,7 +3766,7 @@ index 9f6ebcb..89b0892 100644
  uint8_t *hv_pvg_lite_display_page_for_port(HvPvgLite *p,uint32_t port){
      if(!p||port>=p->display_count)return NULL;
      uint64_t pa=__atomic_load_n(&p->displays[port].page,__ATOMIC_ACQUIRE);return pa ? hv_phys_ptr(p->m,pa,0x4000) : NULL;
-@@ -199,9 +203,25 @@ void hv_pvg_lite_apply_link_connected(HvPvgLite *p,int connected){
+@@ -199,9 +203,30 @@ void hv_pvg_lite_apply_link_connected(HvPvgLite *p,int connected){
      if(d){hv_pvg_display_publish(&p->displays[1],d);__atomic_fetch_or(&p->display_pending,2,__ATOMIC_ACQ_REL);hv_gicv3_pend(p->gic,p->gfx_irq);}
      fprintf(stderr,"henge-link: port=1 connected=%d mode-change=%u\n",!!connected,p->displays[1].sequence);
  }
@@ -3789,10 +3789,15 @@ index 9f6ebcb..89b0892 100644
 +    HvPvgMetal *metal=p ? atomic_load_explicit(&p->metal,memory_order_acquire):NULL;
 +    return metal ? hv_pvg_metal_capture_timing(metal,capture,out):0;
 +}
++int hv_pvg_lite_gpu_snapshot(HvPvgLite *p,uint64_t out[4]) {
++    HvPvgMetal *metal=p?p->metal:NULL;
++    return hv_pvg_metal_gpu_snapshot(metal,out);
++}
++
  
  static int task_read(HvPvgLite *p, uint32_t task, uint64_t off, void *to, uint32_t n);
  static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args) {
-@@ -274,6 +294,7 @@ static uint8_t *task_ptr(HvPvgLite *p, uint32_t task, uint64_t off, uint32_t *av
+@@ -274,6 +299,7 @@ static uint8_t *task_ptr(HvPvgLite *p, uint32_t task, uint64_t off, uint32_t *av
      uint32_t page = root[0], depth = root[1];
      if (depth < 1 || depth > 3) return NULL;
      uint64_t vpn = off >> 14;
@@ -3800,7 +3805,7 @@ index 9f6ebcb..89b0892 100644
      for (int level = (int)depth - 1; level >= 0; level--) {
          uint32_t *t = page ? hv_phys_ptr(p->m, (uint64_t)page << 14, 0x4000) : NULL;
          if (!t) return NULL;
-@@ -286,14 +307,15 @@ static uint8_t *task_ptr(HvPvgLite *p, uint32_t task, uint64_t off, uint32_t *av
+@@ -286,14 +312,15 @@ static uint8_t *task_ptr(HvPvgLite *p, uint32_t task, uint64_t off, uint32_t *av
  }
  
  static int task_read(HvPvgLite *p, uint32_t task, uint64_t off, void *to, uint32_t n) {
@@ -3818,7 +3823,7 @@ index 9f6ebcb..89b0892 100644
      }
      return 0;
  }
-@@ -309,6 +331,7 @@ uint32_t hv_pvg_lite_task_page(HvPvgLite *p, uint32_t task, uint64_t offset) {
+@@ -309,6 +336,7 @@ uint32_t hv_pvg_lite_task_page(HvPvgLite *p, uint32_t task, uint64_t offset) {
      uint32_t page = root[0], depth = root[1];
      if (depth < 1 || depth > 3) return 0;
      uint64_t vpn = offset >> 14;
@@ -3826,7 +3831,7 @@ index 9f6ebcb..89b0892 100644
      for (int level = (int)depth - 1; level >= 0; level--) {
          uint32_t *t = page ? hv_phys_ptr(p->m, (uint64_t)page << 14, 0x4000) : NULL;
          if (!t) return 0;
-@@ -325,6 +348,9 @@ void hv_pvg_lite_task_pages(HvPvgLite *p, uint32_t task, uint64_t first, uint64_
+@@ -325,6 +353,9 @@ void hv_pvg_lite_task_pages(HvPvgLite *p, uint32_t task, uint64_t first, uint64_
      if (!root) return;
      uint32_t top = root[0], depth = root[1];
      if (depth < 1 || depth > 3) return;
@@ -3836,7 +3841,7 @@ index 9f6ebcb..89b0892 100644
      for (uint64_t i = 0; i < n;) {
          uint64_t vpn = first + i;
          uint32_t page = top;
-@@ -591,6 +617,7 @@ static void ensure_metal(HvPvgLite *p) {
+@@ -591,6 +622,7 @@ static void ensure_metal(HvPvgLite *p) {
  }
  
  static void do_channel(HvPvgLite *p, uint32_t ch) {
@@ -3844,7 +3849,7 @@ index 9f6ebcb..89b0892 100644
      uint64_t root = (uint64_t)reg(p, 0x101c) << 14, buf = (uint64_t)reg(p, 0x1030) << 14;
      if (!root || !buf || !ch) return;
      uint32_t *rec = hv_phys_ptr(p->m, root + 0x400 + 0x14 * (ch - 1), 0x14);
-@@ -729,6 +756,7 @@ static void vblank(HvPvgLite *p) {
+@@ -729,6 +761,7 @@ static void vblank(HvPvgLite *p) {
  
  void hv_pvg_lite_poll(HvPvgLite *p) {
      if (!p) return;
@@ -3852,7 +3857,7 @@ index 9f6ebcb..89b0892 100644
      vblank(p);
      uint32_t chans = p->chan_pending;
      if (chans) {
-@@ -744,7 +772,7 @@ static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
+@@ -744,7 +777,7 @@ static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
      uint64_t v = 0;
      switch (off) {
      case 0x100c:
@@ -3861,7 +3866,7 @@ index 9f6ebcb..89b0892 100644
          v = p->root_rp;
          break;
      case 0x1018:
-@@ -764,6 +792,7 @@ static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+@@ -764,6 +797,7 @@ static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
      HvPvgLite *p = opaque;
      (void)size;
      if (off >= 0x1000 && off < 0x2000) p->regs[(off - 0x1000) / 4] = (uint32_t)v;
@@ -3869,7 +3874,7 @@ index 9f6ebcb..89b0892 100644
      /* Doorbells are answered here, on the CPU that rang: no waiting for CPU 0 to come by. */
      if (off == 0x1008) {
          do_root(p);
-@@ -878,9 +907,9 @@ int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
+@@ -878,9 +912,9 @@ int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
  }
  
  /* CPUs stopped: the GPU's queued work done, and what only it holds copied into guest memory. */
@@ -3881,7 +3886,7 @@ index 9f6ebcb..89b0892 100644
  }
  
  size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
-@@ -889,11 +918,11 @@ size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
+@@ -889,11 +923,11 @@ size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
  }
  
  /* After hv_pvg_lite_set_state: the screen and the pointer as they were, before the guest draws again. */
@@ -3897,7 +3902,7 @@ index 9f6ebcb..89b0892 100644
  
  /* Debugging (the Mac runner's devstate): each channel's ring and stamps, to tell work never taken from work never
 diff --git a/devices/pvg_lite.h b/devices/pvg_lite.h
-index 0f68eae..39f599b 100644
+index 0f68eae..be5a204 100644
 --- a/devices/pvg_lite.h
 +++ b/devices/pvg_lite.h
 @@ -27,6 +27,7 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t channel, uint3
@@ -3908,7 +3913,7 @@ index 0f68eae..39f599b 100644
  int hv_pvg_lite_task_read(HvPvgLite *p, uint32_t task, uint64_t offset, void *to, uint32_t length);
  uint32_t hv_pvg_lite_task_page(HvPvgLite *p, uint32_t task, uint64_t offset);
  uint8_t *hv_pvg_lite_page(HvPvgLite *p, uint32_t guest_page);
-@@ -38,8 +39,17 @@ int hv_pvg_lite_old_driver(HvPvgLite *p);
+@@ -38,8 +39,22 @@ int hv_pvg_lite_old_driver(HvPvgLite *p);
  const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint32_t mapping);
  void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping);
  void hv_pvg_metal_cursor_moved(HvPvgMetal *m);
@@ -3924,10 +3929,15 @@ index 0f68eae..39f599b 100644
 +   Returns 0 no renderer, 1 renderer/timing off, 2 timing active. No GPU work. */
 +int hv_pvg_lite_capture_timing(HvPvgLite *p,int capture,uint64_t out[4]);
 +int hv_pvg_metal_capture_timing(HvPvgMetal *m,int capture,uint64_t out[4]);
++/* out: allocated Metal bytes, Metal4 completed buffers, duration ns, max ns.
++   0 absent,1 Metal allocation available,2 Metal4 timing also available. Durations
++   overlap and include presentation; do not add them to classic time/utilization. */
++int hv_pvg_lite_gpu_snapshot(HvPvgLite *p,uint64_t out[4]);
++int hv_pvg_metal_gpu_snapshot(HvPvgMetal *m,uint64_t out[4]);
  uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m);
  void hv_pvg_metal_log_metrics(HvPvgMetal *m);
  void hv_pvg_lite_log_metrics(HvPvgLite *p);
-@@ -54,7 +64,11 @@ uint8_t *hv_pvg_lite_display_page_for_port(HvPvgLite *p, uint32_t port);
+@@ -54,7 +69,11 @@ uint8_t *hv_pvg_lite_display_page_for_port(HvPvgLite *p, uint32_t port);
  void hv_pvg_lite_link_connected(HvPvgLite *p, int connected);
  void hv_pvg_lite_apply_link_connected(HvPvgLite *p, int connected);
  void hv_pvg_metal_link_connected(HvPvgMetal *m, int connected);
@@ -3939,7 +3949,7 @@ index 0f68eae..39f599b 100644
  void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *command, uint32_t length);
  void hv_pvg_lite_complete(HvPvgLite *p, uint32_t channel, uint32_t stamp);
  
-@@ -67,18 +81,20 @@ void hv_pvg_lite_set_mode(uint32_t width, uint32_t height);
+@@ -67,18 +86,20 @@ void hv_pvg_lite_set_mode(uint32_t width, uint32_t height);
  int hv_pvg_lite_set_link_mode(uint32_t width, uint32_t height, uint32_t width_mm, uint32_t height_mm, uint32_t hz);
  /* The display's one mode. A scaled resolution chosen in macOS draws smaller surfaces for the same mode. */
  void hv_pvg_lite_mode(uint32_t *width, uint32_t *height);
@@ -3983,7 +3993,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..eb71343 100644
+index 9073d22..3849c8f 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -4191,7 +4201,7 @@ index 9073d22..eb71343 100644
      double drawable_retry_deadline; /* at most two seconds of retrying an unavailable target */
      uint32_t screen_w, screen_h;
      id<MTLBuffer> test_readback; /* HV_PVG_GPU_TEST: the drawable's pixels for screenshots */
-@@ -227,12 +323,39 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -227,13 +323,40 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
  - (void)complain:(NSString *)what;
  - (HvObject *)object:(uint32_t)ref task:(uint32_t)task;
  - (void)drawCursor;
@@ -4216,8 +4226,8 @@ index 9073d22..eb71343 100644
 +- (void)requestDisplayPulse;
 +- (void)displayPulse:(CAMetalDisplayLink *)link update:(CAMetalDisplayLinkUpdate *)update;
 +#endif
-+@end
-+
+ @end
+ 
 +#if TARGET_OS_IPHONE
 +@interface HvDisplayPulse : NSObject <CAMetalDisplayLinkDelegate>
 +@property(nonatomic, weak) HvReplay *owner;
@@ -4227,11 +4237,12 @@ index 9073d22..eb71343 100644
 +    HvReplay *owner=self.owner;
 +    if(owner)[owner displayPulse:link update:update];else link.paused=YES;
 +}
- @end
++@end
 +#endif
- 
++
  /* What Metal asks while it reads a serialized pipeline. */
  @interface HvContext : NSObject {
+ @public
 @@ -256,9 +379,9 @@ static NSUInteger pixel_bytes(MTLPixelFormat f) {
      case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
      case MTLPixelFormatRGBA8Snorm: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
@@ -5515,8 +5526,9 @@ index 9073d22..eb71343 100644
          if (!t0) t0 = now_seconds();
          fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, commit/wait CPU time %.2f s\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time);
          encode_time = gpu_wait_time = 0;
-         fprintf(stderr, "hengevm: gpu-execution: enabled=%d completed=%llu duration_ms=%.2f max_ms=%.2f unavailable=%llu (cumulative GPU execution; overlapping buffers can overlap in time)\n",
+-        fprintf(stderr, "hengevm: gpu-execution: enabled=%d completed=%llu duration_ms=%.2f max_ms=%.2f unavailable=%llu (cumulative GPU execution; overlapping buffers can overlap in time)\n",
 -                gpu_timing, (unsigned long long)atomic_load_explicit(&gpu_completed, memory_order_relaxed),
++        fprintf(stderr, "hengevm: gpu-execution: enabled=%d completed=%llu duration_ms=%.2f max_ms=%.2f unavailable=%llu (classic command buffers only; Metal4 timing is separate; overlapping durations are not utilization)\n",
 +                gpu_timing || capture, (unsigned long long)atomic_load_explicit(&gpu_completed, memory_order_relaxed),
                  atomic_load_explicit(&gpu_duration_ns, memory_order_relaxed) / 1e6,
                  atomic_load_explicit(&gpu_max_ns, memory_order_relaxed) / 1e6,
@@ -6213,7 +6225,7 @@ index 9073d22..eb71343 100644
                  } else {
                      hv_pvg_lite_command(lite, cmd, len);
                      if (op == 8 && n >= 16) {
-@@ -2998,24 +3881,78 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
+@@ -2998,24 +3881,96 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
      }
      r->pacing_pending = NO; r->frame_pacing.next = 0; /* reattaching the same layer also wakes a stopped presenter */
      r->layer = l;
@@ -6261,6 +6273,24 @@ index 9073d22..eb71343 100644
      return m ? ((__bridge HvReplay *)m)->gpu_frames : 0;
  }
  
++int hv_pvg_metal_gpu_snapshot(HvPvgMetal *m,uint64_t out[4]) {
++    if(!out)return 0;
++    memset(out,0,4*sizeof *out);
++    if(!m)return 0;
++    HvReplay *r=(__bridge HvReplay *)m;
++    out[0]=r->device.currentAllocatedSize;
++    if(@available(macOS 26.0,iOS 26.0,*)){
++        HvMetal4Runtime *runtime=r->metal4;
++        if(runtime){
++            out[1]=atomic_load_explicit(&runtime->completed,memory_order_relaxed);
++            out[2]=atomic_load_explicit(&runtime->gpu_duration_ns,memory_order_relaxed);
++            out[3]=atomic_load_explicit(&runtime->gpu_max_ns,memory_order_relaxed);
++            return 2;
++        }
++    }
++    return 1;
++}
++
 +int hv_pvg_metal_capture_timing(HvPvgMetal *m,int capture,uint64_t out[4]) {
 +    if (!m) return 0;
 +    HvReplay *r=(__bridge HvReplay *)m;
@@ -6293,7 +6323,7 @@ index 9073d22..eb71343 100644
          [r screenChanged];
          return;
      }
-@@ -3030,8 +3967,8 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
+@@ -3030,8 +3985,8 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
  void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
      HvReplay *r = (__bridge HvReplay *)m;
      dispatch_async(r->worker, ^{
@@ -6304,7 +6334,7 @@ index 9073d22..eb71343 100644
          HvObject *s = r->surfaces[@(mapping)];
          if(s && s->planar_entry){
              hv_planar_release_mapping(r->planar,s->planar_key,s->planar_entry);
-@@ -3096,6 +4033,10 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
+@@ -3096,6 +4051,10 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
      if (!r->frame_metrics_enabled) return;
      os_unfair_lock_lock(&r->frame_metrics_lock);
      struct HvFrameMetrics m = r->frame_metrics;
@@ -6315,7 +6345,7 @@ index 9073d22..eb71343 100644
      os_unfair_lock_unlock(&r->frame_metrics_lock);
      fprintf(stderr, "frame-presented: epoch=%llu frames=%llu intervals=%llu elapsed_s=%.6f average_fps=%.3f p95_ms_upper=%.3f p99_ms_upper=%.3f low1_fps_estimate=%.3f max_ms=%.3f overflow=%llu invalid=%llu (host presentation incl cursor; 0.25ms bins; not game FPS)\n",
          (unsigned long long)m.generation, (unsigned long long)m.frames, (unsigned long long)m.intervals,
-@@ -3104,6 +4045,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
+@@ -3104,6 +4063,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
          (unsigned long long)m.overflow,(unsigned long long)m.invalid);
  }
  
@@ -6325,7 +6355,7 @@ index 9073d22..eb71343 100644
  void hv_pvg_metal_link_connected(HvPvgMetal *m,int connected){
      if(!m)return;HvReplay *r=(__bridge HvReplay *)m;
      dispatch_async(r->worker,^{
-@@ -3117,25 +4061,46 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+@@ -3117,25 +4079,46 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
      if(atomic_exchange(&r->link_cursor_queued,1))return;
      dispatch_async(r->worker,^{atomic_store(&r->link_cursor_queued,0);if (!atomic_load(&r->stopping)) [r sendLinkMapping:r->link_mapping];});
  }
@@ -6376,7 +6406,7 @@ index 9073d22..eb71343 100644
              for (NSNumber *task in r->tasks) {
                  NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
                  for (NSNumber *ref in objs) {
-@@ -3143,79 +4108,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -3143,79 +4126,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
                      if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
                      if (o->parent && o->parent->heap_whole) continue;
                      if (!cb) cb = [r->queue commandBuffer];
@@ -8067,6 +8097,71 @@ index 0000000..bc754d0
 +Root disk209255 requests:224us average service,177us average queue,1.18s total flush time; no general flush bottleneck demonstrated. No reported GPU command error, native exception, audio failure or crash; stop was by host. Native USB touch was disabled with no companion polls, so this run cannot validate Pencil/touch recovery. Henge Link was disconnected.
 +
 +Cloud geometry, SDK and app checks remain required before the next IPA. Physical full-screen layout, active-interaction60Hz and Duo/Pencil remain device validation.
+diff --git a/docs/m4-optimisation/PHYSICAL-114-INTERRUPTION-SAFARI.md b/docs/m4-optimisation/PHYSICAL-114-INTERRUPTION-SAFARI.md
+new file mode 100644
+index 0000000..80bd411
+--- /dev/null
++++ b/docs/m4-optimisation/PHYSICAL-114-INTERRUPTION-SAFARI.md
+@@ -0,0 +1,59 @@
++# Henge 0.3.13 (114): interrupted Roblox launch and Safari smoothness
++
++## Scope and limits
++
++All five supplied files were scanned in full; aggregate captures were separated by launch PID, VM generation, timing epoch and pause/restore boundaries. Native files are completely mirrored in the corresponding app files (zero missing native lines); their counters are not added twice. The exact 114 symbol file was used for native PC attribution. These logs precede MetalFX build115 and do not test that upscaler.
++
++Device: iPad16,5 M4, four performance/six efficiency cores, 15,416MiB reported physical RAM. Both runs use four guest vCPUs, **16,384MiB guest RAM**, a1,536MiB JIT cache and native Desktop Retina2560x1920. Low Power Mode is off in the captured samples.
++
++## Interruption: what is and is not established
++
++The previous app launch (PID11196) contains two VM generations. Generation1 starts cold, completes several pause/continue cycles and completes Save & Leave at app uptime3084.882s. Generation2 restores that snapshot at3145.141s and is running at3148.145s. Its30-second diagnostic capture ends3192.862s. It pauses at3224.018s, continues3235.900s and has a last stamped UI event3337.059s, followed by native output and an abrupt end. **At least144seconds at the end are outside detailed capture.**
++
++There is no recorded native crash-handler signal, guest panic, GPU command error or normal shutdown at the final end. The user's description of a soft iPad shutdown is compatible with a system interruption, but these app logs cannot identify jetsam, a graphics-driver/system fault or an iPadOS restart. A low next-launch PID is not a crash diagnosis. No reset cause is asserted.
++
++The later launch (PID560) cold-boots macOS at220.857s, and completes Save & Leave at671.609s. It does not crash in the supplied log. Therefore this is **restored vs cold boot**, not simply first vs second shader load. The restored previous guest runs at60Hz; the later cold boot uses120Hz. Different durations, state and workload prevent a controlled performance or stability comparison.
++
++## Memory pressure is a concrete risk
++
++Previous launch:10 system memory-pressure warnings, including one during generation2 at3152.228s. Current launch:4 warnings, two while running and two during snapshot saving. A16GiB guest exceeds the device's reported physical RAM before iPadOS, JIT and GPU allocations. Guest pages excluded from process footprint still occupy shared physical memory. The approximately17GiB process allowance is not additional physical memory.
++
++This is evidence of pressure, not proof that pressure caused the final interruption. Keep saved state intact; test a fully shut-down guest at **8GiB RAM,4vCPUs,60Hz, native Retina unchanged** to create a lower-pressure comparison. RAM/guest refresh changes do not rewrite an existing snapshot's hardware configuration.120Hz remains available.
++
++Current snapshot:16GiB address space,22.40s elapsed,22.13s compression,2.04s writing overlapped,20.35s waiting for compression, about5,614MB output. Eight compression workers were admitted from process headroom. This save is predominantly compression work, not evidence of slow SSD throughput. No unsafe live RAM shrink or forced guest memory reclaim is introduced.
++
++## GPU is being used
++
++Current guest Metal4 counters:293,691 submitted,293,676 completed, zero reported guest errors.51,738 fallback decisions include26,941 unsupported records and24,797 pool/admission fallbacks. These fallbacks preserve the classic Metal path; they do not imply software rasterization or unused GPU. Increasing the submission pool without bounds would risk more queued frames and resource retention.
++
++The old capture's replay_gpu_ms field measured **classic Metal command buffers only**. Current cumulative classic time is13,838.34ms, while Metal4 reports1,136,817.50ms for guest replay plus presentation. Commands overlap; neither sum divided by wall time is GPU utilization. A misleadingly small classic capture value must not be read as evidence that Roblox is CPU-rendered.
++
++Metal4 compiler calls:189 attempts,6,398ms total,822ms worst. Classic pipeline archives:687hits/45compiles,2,693ms compilation total. These are host compiler-call elapsed times, not GPU rendering duration or every asset's loading time. Warm caches can help later, but this pair does not prove why the second game launch succeeded.
++
++Current queue commit-to-start samples average approximately5.29ms, maximum53.66ms. These are overlapping command lifetimes, not whole-display frame latency or utilization.
++
++## CPU/JIT and interaction
++
++Current capture median process CPU is4.20 core equivalents (includes every process thread, not4.20 guest vCPUs).77.18% of sampled busy vCPU PCs are generated JIT code. The current PID's21,742 JIT-word samples contain three software-TLB loads at23.36% combined (12.73%,5.74%,4.89%). That fraction is sampled JIT PCs, not whole-app time. Existing grouped accesses, permissions, invalidation and kernel-cache fallbacks remain essential; blindly enabling addend preload or bypassing checks is not justified.
++
++Current:17.40million translations,8.98million approximate retranslations,22 segment evictions,zero full resets. Cumulative eviction time is2,925ms:1,012ms block maintenance,1,696ms exit repair,218ms instruction-cache work. About133ms per eviction on average is a credible hitch source. Previous generation1 has101evictions and12,511ms cumulative eviction time. The retained ring avoids complete flush storms but its global descriptor/exit maintenance is still costly. This follow-up does not claim those costs have been eliminated.
++
++During current input-active intervals the host presents about45.62/s,53.64/s,29.15/s and18.74/s in selected10-second captures; the last is after serious thermal state. These are host updates including cursor, not game FPS. They confirm uneven interaction but cannot identify Safari's exact share: no foreground-app, URL or WebKit request/layout timing is logged. Whole-run frame histograms include idle/pause gaps and overflow buckets; zero histogram bounds are not0FPS.
++
++Root disk:152,157measured requests, mean205us service and116us queue time;113flushes total766ms, maximum service54.7ms. Host DNS answered189requests, zero fallback/timeouts. Neither result measures remote HTTP transfer, JavaScript execution or guest asset decompression. There is no evidence here to disable flush safety, DNS handling or force an unbounded disk cache.
++
++The current word file also retains an older PID9561; it is excluded. One previous-PID dump has180header samples but617word records and is excluded from exact previous-run ratios. The current PID's16windows agree exactly with their headers.
++
++## Implemented source fixes
++
++1. Native diagnostic reports share one coalescing utility worker. The previous maintenance path called native logging on the main actor while capture separately requested the same report. Native device locks, thread accounting and formatting must not block touch/display-link callbacks or run duplicate reports.
++2. Native observation/resource sampling runs on one bounded utility queue. Main-actor admission allows one outstanding read; stop/restart revisions reject stale results. A delayed background result cannot re-enable timing or mix VM generations. No new statistics timer is introduced.
++3. GPU snapshots expose existing Metal4 completion/duration counters separately from classic counters and include Metal allocated bytes plus physical RAM. No new GPU completion callbacks or per-frame instrumentation are added. Durations are explicitly scoped and never labelled utilization.
++4. The native-touch watchdog checks sender age only with held, queued or encoded contacts. Idle UI heartbeat intentionally stops; treating it as a frozen UI generated127 false-stall messages in the previous log. Held-contact and helper-death cancellation remain bounded and tested.
++5. Settings and session startup distinguish physical RAM from process allowance and warn when guest RAM meets/exceeds physical RAM. Saved configurations and user RAM preferences are not silently overwritten.
++
++These address observed avoidable work and diagnostic correctness. They do not establish a fixed iPadOS interruption, steady60FPS, faster WebKit page loads or lower watts. Release packaging remains blocked until source validation completes; no new IPA is requested for this development checkpoint.
++
++## Validation checkpoint
++
++Local ASan/UBSan native-touch watchdog passes, including long idle with immediate next contact and retained held-contact timeout. Local Swift/native lifecycle execution is unavailable in this Linux workspace (no swiftc or macOS lifecycle binary); those checks are delegated to the existing macOS workflow. Cloud tests are required for production Swift asynchronous capture/coalescing, full native Metal lifecycle and device/Simulator SDK/app compilation. Their results are recorded in the repository continuation state after execution.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
 index 0000000..a55c4c4
@@ -11353,7 +11448,7 @@ index eeabe42..7035b1a 100644
            uint32_t seen = 0; uint64_t distinct = 0; (void)seen;
            uint64_t best[4] = {0}; uint32_t bestn[4] = {0};
 diff --git a/host/native_touch.c b/host/native_touch.c
-index 504e669..b660f7f 100644
+index 504e669..8d43789 100644
 --- a/host/native_touch.c
 +++ b/host/native_touch.c
 @@ -1,4 +1,5 @@
@@ -11362,7 +11457,7 @@ index 504e669..b660f7f 100644
  #include <math.h>
  #include <pthread.h>
  #include <stdio.h>
-@@ -7,29 +8,102 @@
+@@ -7,29 +8,104 @@
  
  #define QUEUE_SIZE 64
  #define MAX_CONTACTS 5
@@ -11412,7 +11507,9 @@ index 504e669..b660f7f 100644
      double t = now();
 -    if (enabled && ((status == HV_TOUCH_READY && (t-last_helper > 0.7 || t-last_sender > 0.7)) ||
 -                    (status == HV_TOUCH_WAITING && t-started > 5))) {
-+    if(enabled && host_encoded && status==HV_TOUCH_READY && t-last_sender>.7 && !sender_expired) {
++    if(enabled && host_encoded && status==HV_TOUCH_READY &&
++       (current.count || queued || hv_touch_down_mask(&encoder)) &&
++       t-last_sender>.7 && !sender_expired) {
 +        // A UI stall releases contacts, not the mapped USB display. The UIKit
 +        // surface fences resting contacts when its heartbeat resumes.
 +        sender_expired=1;cancel_pending=1;queued=0;memset(&current,0,sizeof current);
@@ -11470,7 +11567,7 @@ index 504e669..b660f7f 100644
  uint32_t hv_native_touch_enable(int on) {
      pthread_mutex_lock(&mutex);
      if (enabled != !!on || (!on && status != HV_TOUCH_OFF)) { enabled = !!on; reset_locked(); }
-@@ -43,7 +117,18 @@ uint32_t hv_native_touch_epoch(void) {
+@@ -43,7 +119,18 @@ uint32_t hv_native_touch_epoch(void) {
      pthread_mutex_lock(&mutex); uint32_t value = epoch; pthread_mutex_unlock(&mutex); return value;
  }
  int hv_native_touch_status(void) {
@@ -11490,7 +11587,7 @@ index 504e669..b660f7f 100644
  }
  int hv_native_touch_submit(uint32_t generation, const uint8_t *ids, const double *x, const double *y, size_t count) {
      if (count > MAX_CONTACTS || (count && (!ids || !x || !y))) return 0;
-@@ -54,40 +139,142 @@ int hv_native_touch_submit(uint32_t generation, const uint8_t *ids, const double
+@@ -54,40 +141,142 @@ int hv_native_touch_submit(uint32_t generation, const uint8_t *ids, const double
          frame.ids[i] = ids[i]; frame.x[i] = x[i]; frame.y[i] = y[i];
      }
      pthread_mutex_lock(&mutex); expire_locked();
@@ -17386,7 +17483,7 @@ index c0f52d6..0d81556 100644
                          .frame(maxWidth: .infinity, alignment: .leading)
                          .padding(.horizontal, 4).padding(.bottom, 12)
 diff --git a/ios/Henge/MacSettingsView.swift b/ios/Henge/MacSettingsView.swift
-index 800c854..a56eef2 100644
+index 800c854..517c154 100644
 --- a/ios/Henge/MacSettingsView.swift
 +++ b/ios/Henge/MacSettingsView.swift
 @@ -5,8 +5,10 @@ struct MacSettingsView: View {
@@ -17430,7 +17527,7 @@ index 800c854..a56eef2 100644
                              .font(.system(size: 13)).foregroundStyle(Desk.dim)
                      }
                      .padding(17)
-@@ -47,20 +57,30 @@ struct MacSettingsView: View {
+@@ -47,20 +57,33 @@ struct MacSettingsView: View {
                      HStack(alignment: .firstTextBaseline) {
                          Text("\(mac.ramMB / 1024) GB").font(.system(size: 26, weight: .bold))
                          Spacer()
@@ -17438,7 +17535,10 @@ index 800c854..a56eef2 100644
 +                        Text("Guest virtual memory")
                              .font(.system(size: 13)).foregroundStyle(Desk.dim).multilineTextAlignment(.trailing)
                      }
-+                    if M4Performance.enabled && mac.ramMB > 8192 {
++                    if UInt64(mac.ramMB) << 20 >= ProcessInfo.processInfo.physicalMemory {
++                        Text("The guest's configured RAM equals or exceeds this device's physical RAM (\(ByteText.string(ProcessInfo.processInfo.physicalMemory))). iPadOS, JIT and graphics share the same memory. A larger process allowance or footprint exclusion does not add physical RAM. Use the 8 GB comparison preset after a full shutdown when testing pressure or freezing; saved sessions keep their original RAM.")
++                            .font(.footnote).foregroundStyle(.orange)
++                    } else if M4Performance.enabled && mac.ramMB > 8192 {
 +                        Text("This Mac uses more than the 8 GB comparison baseline. Excluded guest pages still use physical RAM shared with iPadOS and graphics. Compare 8 GB after shutdown if memory-pressure warnings occur; saved Macs keep their chosen RAM.")
 +                            .font(.footnote).foregroundStyle(.secondary).padding(.horizontal,17)
 +                    }
@@ -17463,7 +17563,7 @@ index 800c854..a56eef2 100644
                      HStack {
                          Text("CPUs").font(.system(size: 16))
                          Spacer()
-@@ -75,6 +95,7 @@ struct MacSettingsView: View {
+@@ -75,6 +98,7 @@ struct MacSettingsView: View {
                      DeskHeading("Screen")
                      VStack(alignment: .leading, spacing: 12) {
                          Picker("Screen", selection: Binding(get: {
@@ -17471,7 +17571,7 @@ index 800c854..a56eef2 100644
                              if mac.isRetina { return "retina" }
                              if mac.fitsDeviceScreen { return "fit" }
                              if mac.screen.width == Device.performanceScreen.width,
-@@ -82,24 +103,39 @@ struct MacSettingsView: View {
+@@ -82,24 +106,39 @@ struct MacSettingsView: View {
                              if mac.screen.width == 1920, mac.screen.height == 1080 { return "wide" }
                              return "fit"
                          }, set: { choice in
@@ -17515,7 +17615,7 @@ index 800c854..a56eef2 100644
                          if Device.largeScreen {
                              Toggle("Fill the whole screen", isOn: Binding(get: { mac.fillScreen ?? true }, set: { value in
                                  mac.fillScreen = value
-@@ -125,6 +161,7 @@ struct MacSettingsView: View {
+@@ -125,6 +164,7 @@ struct MacSettingsView: View {
                          Text("of \(ByteText.string(UInt64(max(mac.diskBytes, 0))))").font(.system(size: 16)).foregroundStyle(Desk.dim)
                      }
                      DeskBar(fraction: Double(mac.bytesUsed) / Double(max(mac.diskBytes, 1)))
@@ -17523,7 +17623,7 @@ index 800c854..a56eef2 100644
                  }
                  .padding(17)
                  .deskCard()
-@@ -139,6 +176,7 @@ struct MacSettingsView: View {
+@@ -139,6 +179,7 @@ struct MacSettingsView: View {
          .background(Desk.page)
          .navigationTitle(mac.name)
          .navigationBarTitleDisplayMode(.inline)
@@ -17531,7 +17631,7 @@ index 800c854..a56eef2 100644
          .onDisappear(perform: save)
          .fileMover(isPresented: $movingExport, file: machines.lastExport) { result in
              switch result {
-@@ -146,6 +184,7 @@ struct MacSettingsView: View {
+@@ -146,6 +187,7 @@ struct MacSettingsView: View {
              case .failure(let error): machines.lastError = error.localizedDescription
              }
          }
@@ -17540,7 +17640,7 @@ index 800c854..a56eef2 100644
              Button("Delete", role: .destructive) {
                  machines.delete(mac.id)
 diff --git a/ios/Henge/Machines.swift b/ios/Henge/Machines.swift
-index 29c8b3b..f4cba88 100644
+index 29c8b3b..1cf7b46 100644
 --- a/ios/Henge/Machines.swift
 +++ b/ios/Henge/Machines.swift
 @@ -3,7 +3,7 @@ import UIKit
@@ -17600,7 +17700,18 @@ index 29c8b3b..f4cba88 100644
  enum GuestMemory {
      /// Points the engine at the file (it is unlinked as soon as it is open) and returns the size that fits.
      static func prepare(_ mac: VirtualMac) -> UInt64 {
-@@ -90,7 +108,7 @@ final class Machines: ObservableObject {
+@@ -68,6 +86,10 @@ enum GuestMemory {
+         let reach = henge_largest_mapping_mb()
+         let ram = min(UInt64(mac.ramMB), room, reach > 512 ? reach - 512 : 0) / 512 * 512
+         HengeLog.log("session", "guest RAM \(ram) MB (asked \(mac.ramMB), disk room \(room), largest mapping \(reach))")
++        let physicalMB=ProcessInfo.processInfo.physicalMemory >> 20
++        if ram>=physicalMB {
++            HengeLog.log("memory","Guest allocation \(ram) MiB meets/exceeds device physical \(physicalMB) MiB. Process allowance is separate; iOS/JIT/Metal share physical RAM. Explicit user RAM retained; no silent resizing of saved state.")
++        }
+         return ram
+     }
+ }
+@@ -90,7 +112,7 @@ final class Machines: ObservableObject {
  
      /// The files an exported machine folder holds; its disk is disk.img, or disk.img.hvsparse (tools/export_ios.sh packs it).
      static let required = ["AVPBooter.vmapple2.bin", "auxiliary.bin", "machine.json"]
@@ -17609,7 +17720,7 @@ index 29c8b3b..f4cba88 100644
  
      nonisolated static func hasDisk(_ folder: URL) -> Bool {
          let fm = FileManager.default
-@@ -236,7 +254,7 @@ final class Machines: ObservableObject {
+@@ -236,7 +258,7 @@ final class Machines: ObservableObject {
      /// in Documents/Exports, which the Files app can reach. Deleting Henge deletes that folder too,
      /// so it has to be moved out of Henge before a reinstall that replaces the app's data.
      func export(_ mac: VirtualMac) {
@@ -17618,7 +17729,7 @@ index 29c8b3b..f4cba88 100644
          exporting = mac.name
          exported = 0
          lastExport = nil
-@@ -323,6 +341,7 @@ final class Machines: ObservableObject {
+@@ -323,6 +345,7 @@ final class Machines: ObservableObject {
      }
  
      func delete(_ id: UUID) {
@@ -17627,7 +17738,7 @@ index 29c8b3b..f4cba88 100644
          all.removeAll { $0.id == id }
          save()
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..9a9f5cd 100644
+index 34d6a98..752b845 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
 @@ -3,7 +3,9 @@
@@ -18142,7 +18253,7 @@ index 34d6a98..9a9f5cd 100644
      HvBootDisplay d;
      int result = -1;
      if (hv_vm_boot_display(&d) == 0) {
-@@ -509,3 +745,112 @@ uint64_t henge_largest_mapping_mb(void) {
+@@ -509,3 +745,118 @@ uint64_t henge_largest_mapping_mb(void) {
      }
      return 0;
  }
@@ -18217,6 +18328,12 @@ index 34d6a98..9a9f5cd 100644
 +        if (hv_pvg_lite_capture_timing(hv_vm_board()->pvg,-1,gpu)==2) out->available|=16;
 +        out->replay_gpu_completed=gpu[0];out->replay_gpu_ns=gpu[1];
 +        out->replay_gpu_max_ns=gpu[2];out->replay_gpu_unavailable=gpu[3];
++        int gpu_scope=hv_pvg_lite_gpu_snapshot(hv_vm_board()->pvg,gpu);
++        if(gpu_scope>=1){out->available|=64;out->metal_allocated=gpu[0];}
++        if(gpu_scope>=2){
++            out->available|=32;out->metal4_gpu_completed=gpu[1];
++            out->metal4_gpu_ns=gpu[2];out->metal4_gpu_max_ns=gpu[3];
++        }
 +        HvVirtioInput *mouse=hv_vm_board()->mouse;
 +        if(mouse) {
 +            pthread_mutex_lock(&mouse->mu);
@@ -18256,7 +18373,7 @@ index 34d6a98..9a9f5cd 100644
 +    hv_vm_release_input_source(source);pthread_rwlock_unlock(&api_lock);
 +}
 diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
-index b8c41fa..5dbe293 100644
+index b8c41fa..e5d78e5 100644
 --- a/ios/Henge/Native/henge-vm.h
 +++ b/ios/Henge/Native/henge-vm.h
 @@ -4,6 +4,7 @@
@@ -18317,7 +18434,7 @@ index b8c41fa..5dbe293 100644
  /* Testing: sets a translation knob (core/machine.h) in the running machine; nonzero if it exists. */
  int henge_vm_knob(const char *name, int value);
  /* The memory balloon (only with HV_BALLOON set before boot): asks the guest to hand over target_mb (when >= 0)
-@@ -62,6 +86,43 @@ int henge_vm_knob(const char *name, int value);
+@@ -62,6 +86,44 @@ int henge_vm_knob(const char *name, int value);
  long henge_vm_balloon(long target_mb);
  
  /* Progress, for the session screen. */
@@ -18338,10 +18455,11 @@ index b8c41fa..5dbe293 100644
 +    uint64_t gamepad_delivered, gamepad_coalesced, gamepad_overflow;
 +    uint64_t mouse_delivered, mouse_dropped, mouse_queued;
 +    uint64_t replay_gpu_completed, replay_gpu_ns, replay_gpu_max_ns, replay_gpu_unavailable;
++    uint64_t metal_allocated, metal4_gpu_completed, metal4_gpu_ns, metal4_gpu_max_ns;
 +    uint64_t disk[2][6];
 +    int disk_timing_enabled[2];
 +    int detailed_counters;
-+    unsigned available; /* bits: 0 CPU, 1 memory, 2 headroom, 3 VM, 4 replay GPU timing */
++    unsigned available; /* bits: 0 CPU, 1 memory, 2 headroom, 3 VM, 4 classic replay timing, 5 Metal4 timing, 6 Metal allocation */
 +    uint64_t generation, epoch;
 +    int state;
 +} HengeVmResources;
@@ -18361,7 +18479,7 @@ index b8c41fa..5dbe293 100644
  void henge_vm_log_cache(void);           /* optional per-CPU cache-use diagnostics */
  uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
  uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
-@@ -74,6 +135,9 @@ int henge_vm_guest_el0(void);              /* any CPU running user code right no
+@@ -74,6 +136,9 @@ int henge_vm_guest_el0(void);              /* any CPU running user code right no
     henge_share_take_clipboard returns what the guest copied, once: a malloc'd string, or NULL. */
  void henge_vm_share(const char *folder, const char *socket_path, const char *agent);
  void henge_share_set_clipboard(const char *text);
@@ -18371,7 +18489,7 @@ index b8c41fa..5dbe293 100644
  char *henge_share_take_clipboard(void);
  long henge_share_agent_seen(void);
  
-@@ -82,7 +146,12 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
+@@ -82,7 +147,12 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
  /* The panel's physical size; 0, 0 for the default (a ~122 ppi, 1x screen). Before boot. */
  void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm);
  int henge_vm_set_link_display(uint32_t width, uint32_t height, uint32_t width_mm, uint32_t height_mm, uint32_t hz);
@@ -18384,6 +18502,34 @@ index b8c41fa..5dbe293 100644
  void henge_vm_key(uint16_t code, int down);
  void henge_vm_key_hid(uint8_t usage, int down); /* a hardware keyboard: iOS gives each key's HID usage */
  void henge_vm_mouse_move(int dx, int dy);
+diff --git a/ios/Henge/NativeReportPump.swift b/ios/Henge/NativeReportPump.swift
+new file mode 100644
+index 0000000..b1ae759
+--- /dev/null
++++ b/ios/Henge/NativeReportPump.swift
+@@ -0,0 +1,22 @@
++import Foundation
++
++/// The UI only enqueues. One utility worker owns native log formatting/locks;
++/// simultaneous capture and maintenance requests share one outstanding report.
++@MainActor
++final class NativeReportPump {
++    private let queue = DispatchQueue(label: "henge.diagnostics.reports", qos: .utility)
++    private let work: @Sendable () -> Void
++    private var pending = false
++
++    init(work: @escaping @Sendable () -> Void) { self.work = work }
++
++    func request() {
++        guard !pending else { return }
++        pending = true
++        let work = self.work
++        queue.async { [weak self] in
++            work()
++            Task { @MainActor in self?.pending = false }
++        }
++    }
++}
 diff --git a/ios/Henge/NativeTouchSession.swift b/ios/Henge/NativeTouchSession.swift
 index 25e7bad..ca03293 100644
 --- a/ios/Henge/NativeTouchSession.swift
@@ -19117,10 +19263,10 @@ index 0000000..1b65c83
 +}
 diff --git a/ios/Henge/SessionDiagnosticCapture.swift b/ios/Henge/SessionDiagnosticCapture.swift
 new file mode 100644
-index 0000000..4badd0e
+index 0000000..ce00563
 --- /dev/null
 +++ b/ios/Henge/SessionDiagnosticCapture.swift
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,129 @@
 +import Foundation
 +import Combine
 +
@@ -19133,22 +19279,28 @@ index 0000000..4badd0e
 +    private(set) var nextDeadline: Double?
 +    private var previous: (Double,HengeVmCounters,HengeVmResources)?
 +    private(set) var continuous = false
-+    private let reportQueue=DispatchQueue(label:"henge.diagnostics.reports",qos:.utility)
-+    private var reportPending=false
++    private let reports = NativeReportPump { henge_vm_log_cache() }
++    private let samplingQueue = DispatchQueue(label:"henge.diagnostics.sample",qos:.utility)
++    private var sampleRevision: UInt64 = 0
++    private var samplePending: UInt64?
++
++    func requestNativeReport() { reports.request() }
 +    func begin(continuous: Bool = false) {
 +        if active {
 +            if continuous { self.continuous=true;end = .infinity }
 +            return
 +        }
 +        let now = ProcessInfo.processInfo.systemUptime
++        sampleRevision &+= 1
 +        self.continuous=continuous
 +        active = true; end = continuous ? .infinity : now+30; nextDeadline = now; previous = nil
 +        henge_vm_capture_timing(1)
-+        HengeLog.log("capture", continuous ? "BEGIN continuous; aggregate process CPU, VM/JIT/memory/network/presentation; instrumentation overhead enabled for testing" : "BEGIN 30s; aggregate process CPU, VM/JIT/memory/network/presentation; replay GPU buffer durations may overlap and exclude other GPU users; no per-access counters enabled")
++        HengeLog.log("capture", continuous ? "BEGIN continuous; aggregate process CPU, VM/JIT/memory/network/presentation; GPU durations are overlapping per-backend lifetimes, not utilization; instrumentation overhead enabled for testing" : "BEGIN 30s; aggregate process CPU, VM/JIT/memory/network/presentation; classic/Metal4 GPU buffer durations may overlap and exclude other GPU users; no per-access counters enabled")
 +        if continuous { HengeLog.log("capture","Continuous test diagnostics: entire visible session; stage timings and 50Hz hot-code sampling; instrumentation affects timing; pause/background boundaries are recorded") }
 +    }
 +    func stop() {
 +        guard active else { return }
++        sampleRevision &+= 1
 +        active = false; continuous = false; nextDeadline = nil; previous = nil
 +        henge_vm_capture_timing(0)
 +        HengeLog.log("capture","END; share henge.log and henge-native.log; host presentation is not game FPS; no temperature/watts measurement")
@@ -19162,16 +19314,39 @@ index 0000000..4badd0e
 +        guard active else { return }
 +        let now = ProcessInfo.processInfo.systemUptime
 +        guard now >= (nextDeadline ?? now) else { return }
-+        var observation = HengeVmObservation()
-+        guard henge_vm_try_observation(&observation) != 0 else {
++        guard samplePending == nil else {
++            // A delayed worker cannot leave a past deadline spinning the UI.
++            if now>=end { stop() } else { nextDeadline=now+(continuous ? 10 : 5) }
++            return
++        }
++        let revision = sampleRevision
++        samplePending = revision
++        nextDeadline = now+(continuous ? 10 : 5)
++        // Resource reads include input-device mutexes and kernel accounting.
++        // Never hold the main actor/display-link callbacks behind that work.
++        samplingQueue.async { [weak self] in
++            var observation = HengeVmObservation()
++            let observed = henge_vm_try_observation(&observation) != 0
++            var resources = HengeVmResources()
++            if observed { henge_vm_resources(&resources) }
++            let sampledAt = ProcessInfo.processInfo.systemUptime
++            Task { @MainActor in
++                self?.acceptSample(revision:revision, observed:observed,
++                                   observation:observation, resources:resources, now:sampledAt)
++            }
++        }
++    }
++
++    private func acceptSample(revision: UInt64, observed: Bool, observation: HengeVmObservation,
++                              resources: HengeVmResources, now: TimeInterval) {
++        if samplePending == revision { samplePending = nil }
++        guard active, revision == sampleRevision else { return }
++        guard observed else {
 +            previous=nil;nextDeadline=min(end,now+5)
 +            if now>=end { stop() }
 +            return
 +        }
 +        let vm = observation.counters
-+        var resources = HengeVmResources()
-+        henge_vm_capture_timing(1) // also handles a newly created replay during this capture
-+        henge_vm_resources(&resources)
 +        guard vm.generation==resources.generation, vm.epoch==resources.epoch, vm.state==resources.state else {
 +            previous = nil; nextDeadline = min(end,now+5)
 +            HengeLog.log("capture","Lifecycle changed during sample; mixed VM statistics discarded")
@@ -19189,8 +19364,15 @@ index 0000000..4badd0e
 +                rates += String(format:" blocks_s=%.0f host_presentations_s=%.2f tx=%llu rx=%llu",Double(vm.blocks-oldVM.blocks)/seconds,Double(vm.gpu_frames-oldVM.gpu_frames)/seconds,vm.tx-oldVM.tx,vm.rx-oldVM.rx)
 +                if old.available & 16 != 0, resources.available & 16 != 0, resources.replay_gpu_ns>=old.replay_gpu_ns,
 +                   resources.replay_gpu_completed>=old.replay_gpu_completed, resources.replay_gpu_unavailable>=old.replay_gpu_unavailable {
-+                    rates += String(format:" replay_gpu_ms=%.3f replay_gpu_commands=%llu gpu_timing_unavailable=%llu",Double(resources.replay_gpu_ns-old.replay_gpu_ns)/1_000_000,resources.replay_gpu_completed-old.replay_gpu_completed,resources.replay_gpu_unavailable-old.replay_gpu_unavailable)
++                    rates += String(format:" replay_gpu_ms=%.3f replay_gpu_commands=%llu gpu_timing_unavailable=%llu replay_gpu_scope=classic_only",Double(resources.replay_gpu_ns-old.replay_gpu_ns)/1_000_000,resources.replay_gpu_completed-old.replay_gpu_completed,resources.replay_gpu_unavailable-old.replay_gpu_unavailable)
 +                } else { rates += " replay_gpu_timing=unavailable_or_new_baseline" }
++                if old.available & 32 != 0, resources.available & 32 != 0,
++                   resources.metal4_gpu_ns >= old.metal4_gpu_ns,
++                   resources.metal4_gpu_completed >= old.metal4_gpu_completed {
++                    rates += String(format:" metal4_gpu_ms=%.3f metal4_gpu_commands=%llu metal4_scope=guest_plus_presentation",
++                                    Double(resources.metal4_gpu_ns-old.metal4_gpu_ns)/1_000_000,
++                                    resources.metal4_gpu_completed-old.metal4_gpu_completed)
++                } else { rates += " metal4_gpu_timing=unavailable_or_new_baseline" }
 +            } else { rates += " vm_rates=new_epoch" }
 +        }
 +        if previous == nil || now-(previous?.0 ?? now)>=0.25 { previous = (now,vm,resources) }
@@ -19198,7 +19380,7 @@ index 0000000..4badd0e
 +        let thermal = ProcessInfo.processInfo.thermalState.rawValue
 +        let hz = getenv("HV_HZ").map { String(cString:$0) } ?? "unknown"
 +        let policy = getenv("HV_CPU_POLICY").map { String(cString:$0) } ?? "unknown"
-+        HengeLog.log("capture", "\(rates) state=\(vm.state) generation=\(vm.generation) epoch=\(vm.epoch) lpm=\(power) thermal=\(thermal) guest_hz=\(hz) cpu_policy=\(policy) available_bits=\(resources.available) footprint=\(resources.footprint) resident=\(resources.resident) headroom=\(resources.headroom) jit_used=\(resources.jit_used) jit_capacity=\(resources.jit_capacity) translations=\(resources.translations) resets=\(resources.full_flushes) pad_delivered=\(resources.gamepad_delivered) pad_coalesced=\(resources.gamepad_coalesced) pad_overflow=\(resources.gamepad_overflow) detailed_counters=\(resources.detailed_counters)")
++        HengeLog.log("capture", "\(rates) state=\(vm.state) generation=\(vm.generation) epoch=\(vm.epoch) lpm=\(power) thermal=\(thermal) guest_hz=\(hz) cpu_policy=\(policy) available_bits=\(resources.available) footprint=\(resources.footprint) resident=\(resources.resident) headroom=\(resources.headroom) metal_allocated=\(resources.metal_allocated) physical_ram=\(ProcessInfo.processInfo.physicalMemory) jit_used=\(resources.jit_used) jit_capacity=\(resources.jit_capacity) translations=\(resources.translations) resets=\(resources.full_flushes) pad_delivered=\(resources.gamepad_delivered) pad_coalesced=\(resources.gamepad_coalesced) pad_overflow=\(resources.gamepad_overflow) detailed_counters=\(resources.detailed_counters)")
 +        HengeLog.log("capture-input", "\(HardwareMouse.shared.scrollDiagnostics) mouse_delivered=\(resources.mouse_delivered) mouse_dropped=\(resources.mouse_dropped) mouse_queued=\(resources.mouse_queued) pointer_wanted=\(PointerLock.wanted) owner=\(LocalPointerInput.ownership.owner)")
 +        HengeLog.log("capture-touch", NativeTouchSurface.diagnostics)
 +        let root=resources.disk.0,aux=resources.disk.1
@@ -19209,13 +19391,7 @@ index 0000000..4badd0e
 +        // frame-presented p95/p99 include cursor and idle intervals, not game FPS.
 +        // Existing cumulative wait/idle/cache reports, only during this capture.
 +        // Disabled per-access diagnostics remain explicitly unavailable.
-+        if !reportPending {
-+            reportPending=true
-+            reportQueue.async { [weak self] in
-+                henge_vm_log_cache()
-+                Task { @MainActor in self?.reportPending=false }
-+            }
-+        }
++        requestNativeReport()
 +        nextDeadline = min(end,now+(continuous ? 10 : 5))
 +        if now>=end { stop() }
 +    }
@@ -19297,7 +19473,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..9a9fdce 100644
+index f84465e..92a1bbf 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,18 @@ struct SessionView: View {
@@ -19949,6 +20125,7 @@ index f84465e..9a9fdce 100644
 -                let gpuFrames = henge_vm_gpu_frames()
 -                HengeLog.log("perf", "guest elapsed \(Int(now.timeIntervalSince(started)))s, blocks/s \(String(format: "%.0f", statistics.blocksPerSecond)), GPU frames/10s \(gpuFrames &- lastGPUFrames), "
 -                             + "network tx \(henge_vm_net_frames(1)), rx \(henge_vm_net_frames(0)), dns \(henge_vm_dns(0)) answered \(henge_vm_dns(2)) unanswered, thermal \(Self.thermalLabel(heat))")
+-                henge_vm_log_cache()
 +            if uptime >= nextDiagnostics && EngineTuning.diagnosticsEnabled {
 +                nextDiagnostics = uptime + 10
 +                let frameInterval = gpuCounter.sample(count: counters.gpu_frames, time: uptime, epoch: counters.epoch)
@@ -19957,7 +20134,7 @@ index f84465e..9a9fdce 100644
 +                } ?? "GPU frames unavailable (new run baseline)"
 +                HengeLog.log("perf", "session wall elapsed \(Int(uptime - wallStart))s, run epoch \(counters.epoch), blocks/s \(String(format: "%.0f", statistics.blocksPerSecond)), \(frameText), "
 +                             + "network tx \(counters.tx), rx \(counters.rx), dns answered \(henge_vm_dns(0)) fallback \(henge_vm_dns(1)) timed-out \(henge_vm_dns(2)), thermal \(Self.thermalLabel(heat))")
-                 henge_vm_log_cache()
++                diagnosticCapture.requestNativeReport()
                  HengeLog.log("input", HardwareMouse.shared.scrollDiagnostics)
 -                lastGPUFrames = gpuFrames
                  JITBootstrap.releaseLingeringDebugger()
@@ -20073,7 +20250,7 @@ index 0000000..75768bd
 +    }
 +}
 diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
-index e1693b0..d3fad74 100644
+index e1693b0..62e4c8b 100644
 --- a/ios/Henge/SettingsView.swift
 +++ b/ios/Henge/SettingsView.swift
 @@ -9,19 +9,17 @@ struct SettingsView: View {
@@ -20124,9 +20301,11 @@ index e1693b0..d3fad74 100644
  
      var body: some View {
          NavigationStack {
-@@ -63,14 +77,17 @@ struct SettingsView: View {
+@@ -62,15 +76,19 @@ struct SettingsView: View {
+                 }
                  .listRowBackground(Desk.card)
                  Section("Memory") {
++                    LabeledContent("Device physical RAM", value: ByteText.string(ProcessInfo.processInfo.physicalMemory))
                      LabeledContent("Extra memory", value: Entitlements.increasedMemory ? "On" : "Off")
 -                    LabeledContent("Henge's limit", value: ByteText.string(UInt64(Entitlements.memoryLimitAtLaunch)))
 -                    LabeledContent("Free for Henge", value: ByteText.string(UInt64(henge_available_memory())))
@@ -20147,7 +20326,7 @@ index e1693b0..d3fad74 100644
                  Section("On-screen trackpad") {
                      VStack(alignment: .leading, spacing: 4) {
                          Text("Scroll speed")
-@@ -96,9 +113,6 @@ struct SettingsView: View {
+@@ -96,9 +114,6 @@ struct SettingsView: View {
                              Slider(value: $scrollSpeed, in: HardwareScroll.minimumSpeed...HardwareScroll.maximumSpeed)
                              Button("Reset hardware scroll speed") { scrollSpeed = HardwareScroll.defaultSpeed }
                          }
@@ -20157,7 +20336,7 @@ index e1693b0..d3fad74 100644
                          Text("A Magic Keyboard or a Bluetooth mouse moves the Mac's pointer. Pointer speed changes apply the next time a Mac starts; scroll speed changes apply immediately.")
                              .font(.footnote).foregroundStyle(.secondary)
                      }
-@@ -126,81 +140,52 @@ struct SettingsView: View {
+@@ -126,81 +141,52 @@ struct SettingsView: View {
                      .listRowBackground(Desk.card)
                  }
                  Section("Performance") {
@@ -20263,7 +20442,7 @@ index e1693b0..d3fad74 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  .listRowBackground(Desk.card)
-@@ -223,4 +208,52 @@ struct SettingsView: View {
+@@ -223,4 +209,52 @@ struct SettingsView: View {
              .navigationTitle("Settings")
          }
      }
@@ -22723,6 +22902,94 @@ index 0000000..85c5b38
 +    s=hv_desktop_output(2560,1920,UINT_MAX,UINT_MAX,2);
 +    assert(s.width==2560&&s.height==1920); // no multiplication overflow
 +    puts("PASS Desktop MetalFX geometry: fixed 2560x1920 canvas, Duo aspect, scaled surfaces and overflow guards");
++}
+diff --git a/tests/test_diagnostic_capture.swift b/tests/test_diagnostic_capture.swift
+new file mode 100644
+index 0000000..ae049cc
+--- /dev/null
++++ b/tests/test_diagnostic_capture.swift
+@@ -0,0 +1,82 @@
++import Foundation
++
++private final class CaptureState: @unchecked Sendable {
++    let lock=NSLock(), release=DispatchSemaphore(value:0)
++    private var reads=0
++    var logs:[String]=[]
++    var timing:[Int32]=[]
++    func read(_ output:inout HengeVmResources) {
++        precondition(!Thread.isMainThread)
++        lock.lock();reads+=1;let n=reads;lock.unlock()
++        if n==1 {precondition(release.wait(timeout:.now()+5) == .success)}
++        output.generation=1;output.epoch=1;output.state=1;output.available=127
++        output.process_cpu_us=UInt64(n)*1_000_000;output.replay_gpu_ns=UInt64(n)*1_000_000
++        output.replay_gpu_completed=UInt64(n);output.metal4_gpu_ns=UInt64(n)*10_000_000
++        output.metal4_gpu_completed=UInt64(n);output.metal_allocated=123456
++    }
++    var count:Int {lock.lock();defer{lock.unlock()};return reads}
++}
++private let fixture=CaptureState()
++struct HengeVmCounters {var generation:UInt64=0,epoch:UInt64=0,blocks:UInt64=0,gpu_frames:UInt64=0,tx:UInt64=0,rx:UInt64=0;var state:Int32=0}
++struct HengeVmObservation {var counters=HengeVmCounters();var cpus_on:Int32=0,guest_el0:Int32=0}
++struct HengeVmResources {
++    var process_cpu_us:UInt64=0,footprint:UInt64=0,resident:UInt64=0,headroom:UInt64=0,jit_used:UInt64=0,jit_capacity:UInt64=0,translations:UInt64=0,full_flushes:UInt64=0
++    var gamepad_delivered:UInt64=0,gamepad_coalesced:UInt64=0,gamepad_overflow:UInt64=0
++    var mouse_delivered:UInt64=0,mouse_dropped:UInt64=0,mouse_queued:UInt64=0
++    var replay_gpu_completed:UInt64=0,replay_gpu_ns:UInt64=0,replay_gpu_max_ns:UInt64=0,replay_gpu_unavailable:UInt64=0
++    var metal_allocated:UInt64=0,metal4_gpu_completed:UInt64=0,metal4_gpu_ns:UInt64=0,metal4_gpu_max_ns:UInt64=0
++    var disk=((UInt64(0),UInt64(0),UInt64(0),UInt64(0),UInt64(0),UInt64(0)),(UInt64(0),UInt64(0),UInt64(0),UInt64(0),UInt64(0),UInt64(0)))
++    var disk_timing_enabled=(Int32(0),Int32(0));var detailed_counters:Int32=0
++    var available:UInt32=0,generation:UInt64=0,epoch:UInt64=0;var state:Int32=0
++}
++func henge_vm_capture_timing(_ on:Int32){fixture.timing.append(on)}
++func henge_vm_try_observation(_ out:inout HengeVmObservation)->Int32 {
++    precondition(!Thread.isMainThread)
++    out.counters.generation=1;out.counters.epoch=1;out.counters.state=1;return 1
++}
++func henge_vm_resources(_ out:inout HengeVmResources){fixture.read(&out)}
++func henge_vm_log_cache(){precondition(!Thread.isMainThread)}
++enum HengeLog {static func log(_ tag:String,_ message:String){fixture.logs.append(tag+":"+message)}}
++struct HardwareMouse {static let shared=HardwareMouse();let scrollDiagnostics="wheel callbacks=0"}
++enum NativeTouchSurface {static let diagnostics="touch idle"}
++enum LocalPointerInput {struct Owner {let owner="none"};static let ownership=Owner()}
++enum PointerLock {static let wanted=false}
++enum EngineTuning {static let refreshKey="henge.test.capture.refresh"}
++struct LinkHostService {static let shared=LinkHostService();let connected=false,controlOnly=false}
++@main struct Check {
++    @MainActor static func until(_ predicate:()->Bool) async {
++        for _ in 0..<2000 {
++            if predicate() {return}
++            try? await Task.sleep(nanoseconds:1_000_000)
++        }
++        preconditionFailure("Diagnostic capture completion timed out")
++    }
++    @MainActor static func main() async {
++        let capture=SessionDiagnosticCapture()
++        capture.begin(continuous:true);capture.sample()
++        await until {fixture.count==1}
++        precondition(fixture.count==1)
++        // A blocked native mutex cannot block the main actor or enqueue 100
++        // reads. Stop/start invalidates the result, not the native VM memory.
++        for _ in 0..<100 {capture.event("input");capture.sample()}
++        precondition(fixture.count==1)
++        var uiRan=false;await Task { @MainActor in uiRan=true }.value;precondition(uiRan)
++        capture.stop();capture.begin(continuous:true)
++        capture.sample();precondition(fixture.count==1)
++        fixture.release.signal()
++        // A fresh request is admitted only after the stale completion has been
++        // rejected. Verify the emitted baseline belongs to native read 2.
++        await until {capture.event("fresh");capture.sample();return fixture.count==2}
++        await until {fixture.logs.contains{$0.contains("metal_allocated=123456")}}
++        precondition(fixture.logs.filter{$0.contains("state=1 generation=1")}.count==1)
++        // The stale background read must not turn capture timing back on.
++        precondition(fixture.timing==[1,0,1])
++        precondition(fixture.logs.contains{$0.contains("metal_allocated=123456")})
++        // The second accepted sample provides interval deltas, kept separate.
++        try? await Task.sleep(nanoseconds:300_000_000)
++        capture.event("fresh2");capture.sample()
++        await until {fixture.logs.contains{$0.contains("replay_gpu_scope=classic_only") && $0.contains("metal4_gpu_ms=10.000")}}
++        capture.stop();precondition(fixture.timing==[1,0,1,0])
++        print("PASS production capture: off-main native reads, bounded admission, stale stop/restart rejection, no timing resurrection and separate classic/Metal4 deltas")
++    }
 +}
 diff --git a/tests/test_disk_recovery_macos.py b/tests/test_disk_recovery_macos.py
 new file mode 100644
@@ -25609,6 +25876,47 @@ index 3f46cf5..d231f2a 100644
      /* 4 KB granule, 39-bit TTBR0 (levels 1-3): pages, 2 MB and 1 GB blocks. */
      pt_next = 2 * 65536;
      uint64_t r4 = alloc_table();
+diff --git a/tests/test_native_report_pump.swift b/tests/test_native_report_pump.swift
+new file mode 100644
+index 0000000..949fca4
+--- /dev/null
++++ b/tests/test_native_report_pump.swift
+@@ -0,0 +1,35 @@
++import Foundation
++
++private final class State: @unchecked Sendable {
++    let lock=NSLock(), entered=DispatchSemaphore(value:0), release=DispatchSemaphore(value:0)
++    private var calls=0
++    func work() {
++        precondition(!Thread.isMainThread)
++        lock.lock();calls+=1;lock.unlock()
++        entered.signal();precondition(release.wait(timeout:.now()+5) == .success)
++    }
++    var count:Int {lock.lock();defer{lock.unlock()};return calls}
++}
++@main struct Check {
++    @MainActor static func main() async {
++        let state=State(),pump=NativeReportPump(work:{state.work()})
++        pump.request()
++        // This main-actor task completes while native reporting remains blocked.
++        for _ in 0..<100 {pump.request()}
++        for _ in 0..<1000 where state.count==0 {try? await Task.sleep(nanoseconds:1_000_000)}
++        precondition(state.count==1)
++        var uiRan=false
++        await Task { @MainActor in uiRan=true }.value
++        precondition(uiRan && state.count==1)
++        state.release.signal()
++        // Let the completion hop clear admission, without assuming a sleep is
++        // enough to prove completion. Re-request until a second work item starts.
++        for _ in 0..<1000 {
++            await Task.yield();pump.request()
++            if state.count==2 {break}
++            try? await Task.sleep(nanoseconds:1_000_000)
++        }
++        precondition(state.count==2);state.release.signal()
++        print("PASS native diagnostic reports: one utility worker, duplicate coalescing, main-actor responsiveness and later readmission")
++    }
++}
 diff --git a/tests/test_native_touch.c b/tests/test_native_touch.c
 index 1766e60..6b6c7af 100644
 --- a/tests/test_native_touch.c
@@ -25959,10 +26267,10 @@ index 5249aa5..2201ef0 100644
  }
 diff --git a/tests/test_native_touch_watchdog.c b/tests/test_native_touch_watchdog.c
 new file mode 100644
-index 0000000..6f7fda1
+index 0000000..4ff7675
 --- /dev/null
 +++ b/tests/test_native_touch_watchdog.c
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,50 @@
 +#include "native_touch.h"
 +#include <assert.h>
 +#include <stdio.h>
@@ -25971,7 +26279,22 @@ index 0000000..6f7fda1
 +static int connect_usb(void *p,int on){USB*u=p;if(u->connected&&!on)u->disconnects++;u->connected=on;return 1;}
 +static int connected(void*p){return ((USB*)p)->connected;}
 +static int report(void*p,const uint8_t*v){USB*u=p;assert(u->connected);u->reports++;memcpy(u->last,v,32);return 1;}
++static void idle_has_no_stall(void) {
++ USB u={0};HvNativeTouchUSB usb={.context=&u,.connect=connect_usb,.connected=connected,.report=report,.mapped=connected};
++ hv_native_touch_test_time(50);hv_native_touch_set_usb(&usb);uint32_t e=hv_native_touch_enable(1);
++ assert(hv_native_touch_usb_connect(e,1));assert(hv_native_touch_usb_host_encoding(e));hv_native_touch_report(e,HV_TOUCH_READY);
++ assert(hv_native_touch_status()==HV_TOUCH_READY);
++ int before=u.reports;
++ for(double t=50.25;t<55;t+=.25){hv_native_touch_test_time(t);hv_native_touch_report(e,HV_TOUCH_READY);assert(hv_native_touch_status()==HV_TOUCH_READY);}
++ assert(u.reports==before && u.connected && !u.disconnects);
++ uint8_t id=3;double x=.2,y=.4;
++ assert(hv_native_touch_submit(e,&id,&x,&y,1));
++ assert(u.reports==before+1 && u.last[1]==3 && u.last[31]==1);
++ hv_native_touch_enable(0);hv_native_touch_set_usb(NULL);
++ puts("PASS touch idle watchdog: no idle cancellation/wakeup, first contact immediate after long idle; held-contact timeout retained");
++}
 +int main(void){
++ idle_has_no_stall();
 + USB u={0};HvNativeTouchUSB usb={.context=&u,.connect=connect_usb,.connected=connected,.report=report,.mapped=connected};
 + hv_native_touch_test_time(100);hv_native_touch_set_usb(&usb);uint32_t e=hv_native_touch_enable(1);
 + hv_native_touch_test_time(106);assert(hv_native_touch_status()==HV_TOUCH_WAITING); // no enumeration storm after5s
@@ -26370,7 +26693,7 @@ index 553c4b6..64d0cb9 100644
 + puts("iOS profiler lifecycle: off/on/off/on, port reuse across 24 threads, idempotent registration, duration, invalid interval, stopped session sleep and restart passed");
  }
 diff --git a/tests/test_pvg_lifecycle.m b/tests/test_pvg_lifecycle.m
-index 81cdb83..e75cbc5 100644
+index 81cdb83..57d8fc0 100644
 --- a/tests/test_pvg_lifecycle.m
 +++ b/tests/test_pvg_lifecycle.m
 @@ -1,9 +1,16 @@
@@ -26660,7 +26983,7 @@ index 81cdb83..e75cbc5 100644
      for (int cycle = 0; cycle < 6; cycle++) @autoreleasepool {
          HvCfgParams cfg = {.nr_cpus = 2};
          if (hv_machine_init(&machine, 4 << 20) ||
-@@ -20,19 +287,65 @@ int main(void) {
+@@ -20,19 +287,72 @@ int main(void) {
          hv_vmapple_reset_cpu(&board);
          HvPvgMetal *metal = hv_pvg_metal_create(board.pvg);
          if (!metal) { fprintf(stderr, "Metal replay unavailable; lifecycle test cannot run\n"); return 1; }
@@ -26670,7 +26993,14 @@ index 81cdb83..e75cbc5 100644
 +        cachePressure(metal);
          CAMetalLayer *layer = [CAMetalLayer layer];
          hv_pvg_metal_set_layer(metal, (__bridge void *)layer);
-+        uint64_t timing[4]={0};assert(hv_pvg_metal_capture_timing(metal,1,timing)==2);
++        uint64_t timing[4]={0},snapshot[4]={1,2,3,4};
++        assert(hv_pvg_metal_gpu_snapshot(NULL,snapshot)==0);
++        assert(!snapshot[0]&&!snapshot[1]&&!snapshot[2]&&!snapshot[3]);
++        int scope=hv_pvg_metal_gpu_snapshot(metal,snapshot);assert(scope>=1);
++        id<MTLDevice> captureDevice=[(__bridge id)metal valueForKey:@"device"];
++        assert(snapshot[0]==captureDevice.currentAllocatedSize);
++        if(scope==1)assert(!snapshot[1]&&!snapshot[2]&&!snapshot[3]);
++        assert(hv_pvg_metal_capture_timing(metal,1,timing)==2);
          for (int i = 0; i < 64; i++) {
              uint32_t *cmd = calloc(6, sizeof *cmd);
              cmd[0] = 0x43; cmd[1] = 24; cmd[2] = i + 1;
@@ -28644,7 +28974,7 @@ index 0000000..e1f8457
 +if __name__ == '__main__':
 +    main()
 diff --git a/tools/check_host_scheduling.sh b/tools/check_host_scheduling.sh
-index 509bce1..d116f1d 100755
+index 509bce1..9e99fb0 100755
 --- a/tools/check_host_scheduling.sh
 +++ b/tools/check_host_scheduling.sh
 @@ -2,6 +2,28 @@
@@ -28686,10 +29016,14 @@ index 509bce1..d116f1d 100755
  "$task_out/test_scheduling"
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O2 -Ihost -c host/scheduling.c -o "$task_out/scheduling.o"
  swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h \
-@@ -16,6 +41,14 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
+@@ -16,6 +41,18 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
  "$task_out/test_host_bridge"
  swiftc -parse-as-library -swift-version 5 ios/Henge/SessionStatistics.swift tests/test_session_statistics.swift -o "$task_out/test_session_statistics"
  "$task_out/test_session_statistics"
++swiftc -parse-as-library -swift-version 5 -sanitize=address ios/Henge/NativeReportPump.swift tests/test_native_report_pump.swift -o "$task_out/test_native_report_pump"
++"$task_out/test_native_report_pump"
++swiftc -parse-as-library -swift-version 5 -sanitize=address ios/Henge/NativeReportPump.swift ios/Henge/SessionDiagnosticCapture.swift tests/test_diagnostic_capture.swift -o "$task_out/test_diagnostic_capture"
++"$task_out/test_diagnostic_capture"
 +swiftc -parse-as-library -swift-version 5 -sanitize=address ios/Henge/SessionWakeups.swift tests/test_session_wakeups.swift -o "$task_out/test_session_wakeups"
 +"$task_out/test_session_wakeups"
 +swiftc -parse-as-library -swift-version 5 ios/Henge/EngineTuning.swift ios/Henge/GuestScreenSize.swift ios/Henge/M4Performance.swift tests/test_m4_defaults.swift -o "$task_out/test_m4_defaults"
@@ -28701,7 +29035,7 @@ index 509bce1..d116f1d 100755
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -DHV_PROF_TEST -Icore -Ihost -Idevices \
      host/prof_ios.c host/scheduling.c tests/test_prof_ios.c -o "$task_out/test_prof_ios"
  "$task_out/test_prof_ios"
-@@ -25,18 +58,24 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=addres
+@@ -25,18 +62,24 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=addres
  xcrun --sdk macosx clang -fobjc-arc -std=c11 -Wall -Wextra -Werror -O2 -Idevices \
      tests/test_display_settings.m -framework Foundation -o "$task_out/test_display_settings"
  "$task_out/test_display_settings"
