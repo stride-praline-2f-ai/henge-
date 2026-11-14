@@ -1126,6 +1126,27 @@ index bfbac5e..80e65ef 100644
          } else {
              for (uint32_t off = 0; off < chunk && !rc; off += 8) { /* MMIO: at most 8 bytes at a time */
                  uint32_t piece = chunk - off < 8 ? chunk - off : 8;
+diff --git a/core/mmu.c b/core/mmu.c
+index dc7cabd..3c589c4 100644
+--- a/core/mmu.c
++++ b/core/mmu.c
+@@ -581,13 +581,13 @@ static void write_hint(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code) {
+     if (!(old & HV_WHINT_MANY)) {
+         /* Up to three entries: this one, in a free place or one whose entry maps
+            something else by now; beyond that the protector scans. */
+-        int have = 0, place = -1;
++        int place = -1;
+         for (int k = 0; k < 3; k++) {
+             uint64_t c = old >> (16 * k) & 0xffff;
+-            if (c == mine) have = 1;
++            if (c == mine) return; /* existing hint already publishes this slot; caller still fences/checks code_pages */
+             else if (place < 0 && (!c || !maps_writable(&cpu->tlb[0] + (c - 1), host_page))) place = k;
+         }
+-        if (!have) now = place >= 0 ? (old & ~(0xffffull << (16 * place))) | mine << (16 * place) : HV_WHINT_MANY;
++        now = place >= 0 ? (old & ~(0xffffull << (16 * place))) | mine << (16 * place) : HV_WHINT_MANY;
+         if (now != old) __atomic_store_n(hint, now, __ATOMIC_RELAXED);
+     }
+ }
 diff --git a/core/mmu.h b/core/mmu.h
 index 3a4ee8f..89ad6ac 100644
 --- a/core/mmu.h
@@ -19627,10 +19648,10 @@ index bd64ae5..3bb545e 100644
  }
 diff --git a/tests/test_disk_recovery_macos.py b/tests/test_disk_recovery_macos.py
 new file mode 100644
-index 0000000..d22b941
+index 0000000..b9fb853
 --- /dev/null
 +++ b/tests/test_disk_recovery_macos.py
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,158 @@
 +"""Real APFS integration on an isolated disposable raw image, never the host disk.
 +The Recovery container has real APFS data but no bootable Recovery OS: boot policy
 +and firmware recovery remain physical-guest validation, not claims of this test.
@@ -19660,7 +19681,7 @@ index 0000000..d22b941
 +    return plistlib.loads(result.stdout) if plist else result.stdout.decode(errors='replace')
 +
 +def attach(image):
-+    info=run('hdiutil','attach','-imagekey','diskimage-class=CRawDiskImage','-nomount','-plist',str(image),plist=True)
++    info=run('hdiutil','attach','-imagekey','diskimage-class=CRawDiskImage','-nomount','-nobrowse','-plist',str(image),plist=True)
 +    entities=info['system-entities']
 +    devices=[v['dev-entry'] for v in entities if re.fullmatch(r'/dev/disk[0-9]+',v.get('dev-entry','')) and v.get('content-hint')=='GUID_partition_scheme']
 +    if not devices:
@@ -19675,17 +19696,41 @@ index 0000000..d22b941
 +    assert len(owned)==1 and any(v.get('dev-entry')==device for v in owned[0]['system-entities'])
 +    return device
 +
-+def detach(device):
-+    # These mounted test volumes can be held briefly by Disk Arbitration or
-+    # Spotlight. Ask the filesystem to unmount before ejecting our owned image;
-+    # never force-detach before the offline integrity checks.
++def detach(device,expected_image):
++    # Resolve only containers whose physical stores belong to this disposable
++    # image. APFS uses synthesized devices: unmounting just the backing disk
++    # can leave those volumes open in Disk Arbitration.
++    owned=containers(device)
++    for container in owned:
++        run('diskutil','unmountDisk',container['ContainerReference'])
 +    run('diskutil','unmountDisk',device)
-+    # CRawDiskImage is owned by the disk-image server, not a removable disk.
-+    # diskutil eject can fail after successful unmount; detach through its
-+    # provider, still without force, before allowing any offline modification.
-+    run('hdiutil','detach',device)
-+    images=run('hdiutil','info','-plist',plist=True)['images']
-+    assert not any(any(e.get('dev-entry')==device for e in v['system-entities']) for v in images)
++    for container in owned:
++        for volume in container.get('Volumes',[]):
++            info=run('diskutil','info','-plist',volume['DeviceIdentifier'],plist=True)
++            assert not info.get('Mounted') and not info.get('MountPoint'),info
++    def attached():
++        images=run('hdiutil','info','-plist',plist=True)['images']
++        return [v for v in images if any(e.get('dev-entry')==device for e in v['system-entities'])]
++    image_owner=attached()
++    assert len(image_owner)==1 and Path(image_owner[0]['image-path']).resolve()==expected_image.resolve()
++    errors=[]
++    for command in [('diskutil','eject',device),('hdiutil','detach',device)]:
++        result=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)
++        if not attached():break
++        errors.append((command,result.returncode,result.stderr.decode(errors='replace')))
++    else:
++        # Both public eject interfaces can leave an image-provider handle busy
++        # after a *successful clean filesystem unmount*. Only then close our
++        # provider forcibly; never force a mounted filesystem or another image.
++        current=attached()
++        assert len(current)==1 and current[0]['image-path']==image_owner[0]['image-path'],current
++        for container in containers(device):
++            for volume in container.get('Volumes',[]):
++                info=run('diskutil','info','-plist',volume['DeviceIdentifier'],plist=True)
++                assert not info.get('Mounted') and not info.get('MountPoint'),info
++        print('Cleanly unmounted disposable APFS image retained by provider; closing verified owned handle:',errors,flush=True)
++        run('hdiutil','detach','-force',device)
++    assert not attached(),errors
 +
 +def containers(device):
 +    prefix=device.removeprefix('/dev/')+'s'
@@ -19701,7 +19746,9 @@ index 0000000..d22b941
 +    identifier=volume['DeviceIdentifier'];run('diskutil','mount',identifier)
 +    info=run('diskutil','info','-plist',identifier,plist=True)
 +    assert info['VolumeName']==name and info['MountPoint'].startswith('/Volumes/')
-+    return Path(info['MountPoint'])
++    path=Path(info['MountPoint'])
++    (path/'.metadata_never_index').touch(exist_ok=True)
++    return path
 +
 +def mark_recovery(image):
 +    # Offline GPT-only type update models the real trailing Recovery partition.
@@ -19737,7 +19784,7 @@ index 0000000..d22b941
 +        for volume,name in [(main_vol,main_name),(recovery_vol,recovery_name)]:
 +            path=mounted(volume,name)/'henge-verification.bin'
 +            with path.open('wb') as f:f.write(payload);f.flush();os.fsync(f.fileno())
-+        detach(device);device=None
++        detach(device,image);device=None
 +        recovery_identity=mark_recovery(image)
 +        run(str(DRIVER),str(image),str(2<<30))
 +        inspect=list(map(int,run(str(DRIVER),str(image),'inspect').split()))
@@ -19753,7 +19800,7 @@ index 0000000..d22b941
 +        for volume,name in [(main_vol,main_name),(recovery_vol,recovery_name)]:
 +            assert (mounted(volume,name)/'henge-verification.bin').read_bytes()==payload
 +            run('diskutil','verifyVolume',volume['DeviceIdentifier'])
-+        detach(device);device=None
++        detach(device,image);device=None
 +        with image.open('rb') as f:
 +            f.seek(512);h=f.read(512);count,stride=struct.unpack_from('<II',h,80)
 +            f.seek(struct.unpack_from('<Q',h,72)[0]*512);entries=f.read(count*stride)
@@ -22131,7 +22178,7 @@ index 0000000..2c357bc
 +            with self.assertRaises(ValueError):packaging.validate_members([member])
 +if __name__=='__main__':unittest.main()
 diff --git a/tests/test_native_touch_session.swift b/tests/test_native_touch_session.swift
-index 5249aa5..a3c176e 100644
+index 5249aa5..28d488e 100644
 --- a/tests/test_native_touch_session.swift
 +++ b/tests/test_native_touch_session.swift
 @@ -64,6 +64,51 @@ import Foundation
@@ -22170,7 +22217,7 @@ index 5249aa5..a3c176e 100644
 +            precondition(hv_native_touch_epoch()==failedEpoch,"Repeated failures must back off")
 +            time += 0.2
 +            session.poll(active:true,helperRunning:true)
-+            precondition(hv_native_touch_epoch()!=failedEpoch,"Bounded retry must still recover")
++            precondition(hv_native_touch_epoch() != failedEpoch,"Bounded retry must still recover")
 +        }
 +        hv_native_touch_report(hv_native_touch_epoch(),2)
 +        session.poll(active:true,helperRunning:true)
@@ -22181,7 +22228,7 @@ index 5249aa5..a3c176e 100644
 +        session.poll(active:true,helperRunning:true)
 +        let stableEpoch=hv_native_touch_epoch()
 +        time += 5.1;session.poll(active:true,helperRunning:true)
-+        precondition(hv_native_touch_epoch()!=stableEpoch,"Stable readiness resets retry backoff")
++        precondition(hv_native_touch_epoch() != stableEpoch,"Stable readiness resets retry backoff")
 +        session.stop()
          print("native touch session: persistence, delayed helper, suspend, fallback and automatic retry passed")
      }
@@ -24471,6 +24518,49 @@ index a13a70d..a016570 100644
      }
      hv_vm_destroy();
      atomic_store(&reader_done, 1);
+diff --git a/tests/test_write_hint.py b/tests/test_write_hint.py
+new file mode 100644
+index 0000000..03bfa77
+--- /dev/null
++++ b/tests/test_write_hint.py
+@@ -0,0 +1,37 @@
++"""Execute the production write-hint function with counted TLB probes."""
++from pathlib import Path
++import subprocess,tempfile
++root=Path(__file__).resolve().parents[1]
++source=(root/'core/mmu.c').read_text()
++start=source.index('static void write_hint(');opening=source.index('{',start);depth=1;end=opening+1
++while depth:
++ depth+=(source[end]=='{')-(source[end]=='}');end+=1
++function=source[start:end]
++fixture=r'''
++#include <stdint.h>
++#include <assert.h>
++#include <stdio.h>
++#define HV_TLB_PAGE_BITS 14
++#define HV_WHINT_MANY (1ull<<63)
++typedef struct { int writable; } HvTlbEntry;
++typedef struct { int index; HvTlbEntry tlb[32]; } HvCpu;
++typedef struct { uint64_t *whint,npages; uint8_t *host; } HvRam;
++static int probes;
++static int maps_writable(const HvTlbEntry *e,const uint8_t *p){(void)p;probes++;return e->writable;}
++'''+function+r'''
++int main(void){
++ uint64_t hint=1ull|(2ull<<16)|(3ull<<32);uint8_t page[16384];HvCpu c={0};HvRam r={&hint,1,page};
++ c.tlb[0].writable=c.tlb[1].writable=c.tlb[2].writable=1;
++ uint64_t before=hint;write_hint(&c,&r,0,0);assert(hint==before&&probes==0);
++ write_hint(&c,&r,0,1);assert(hint==before&&probes==1);
++ hint=0;probes=0;write_hint(&c,&r,0,3);assert(hint==4&&probes==0);
++ hint=before;write_hint(&c,&r,0,3);assert(hint==HV_WHINT_MANY);
++ hint=HV_WHINT_MANY;probes=0;write_hint(&c,&r,0,5);assert(hint==HV_WHINT_MANY&&probes==0);
++ hint=before;c.tlb[1].writable=0;write_hint(&c,&r,0,4);assert(((hint>>16)&0xffff)==5);
++ puts("PASS write hint: production duplicate-slot early return, occupied hints, stale replacement, overflow and no extra TLB probes");
++}
++'''
++with tempfile.TemporaryDirectory(prefix='henge-hint-') as d:
++ p=Path(d);(p/'test.c').write_text(fixture)
++ subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O1','-g','-fsanitize=address,undefined',str(p/'test.c'),'-o',str(p/'test')],check=True)
++ subprocess.run([str(p/'test')],check=True)
 diff --git a/tests/test_xhci_slots.c b/tests/test_xhci_slots.c
 index 41c2faa..66454b4 100644
 --- a/tests/test_xhci_slots.c
@@ -24615,10 +24705,10 @@ index 70d7ccb..e4f9089 100755
 +test -s "$BUILD/libhengerestore.a"
  ls -la "$BUILD/libhengerestore.a"
 diff --git a/tools/check_host_scheduling.sh b/tools/check_host_scheduling.sh
-index 509bce1..3d25b65 100755
+index 509bce1..25846d7 100755
 --- a/tools/check_host_scheduling.sh
 +++ b/tools/check_host_scheduling.sh
-@@ -2,6 +2,26 @@
+@@ -2,6 +2,27 @@
  # Native tests + iPhoneOS SDK type checking. Does not build an app or IPA.
  set -euo pipefail
  cd "$(dirname "$0")/.."
@@ -24630,6 +24720,7 @@ index 509bce1..3d25b65 100755
 +cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread -DHV_NATIVE_TOUCH_TEST_CLOCK -Ihost tests/test_native_touch_watchdog.c host/native_touch.c -o /tmp/henge-touch-watchdog
 +/tmp/henge-touch-watchdog
 +/tmp/henge-native-touch-host
++python3 tests/test_write_hint.py
 +python3 tests/test_restore_archive.py
 +python3 tests/test_clipboard_notify.py
 +xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined tests/test_sharing_agent.m -framework AppKit -o /tmp/henge-test-sharing-agent
@@ -24645,7 +24736,7 @@ index 509bce1..3d25b65 100755
  mkdir -p build/scheduling-check
  task_out="$PWD/build/scheduling-check"
  exec > >(tee "$task_out/checks.log") 2>&1
-@@ -9,6 +29,9 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
+@@ -9,6 +30,9 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
  set -x
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread -Ihost \
      host/scheduling.c tests/test_scheduling.c -o "$task_out/test_scheduling"
@@ -24655,7 +24746,7 @@ index 509bce1..3d25b65 100755
  "$task_out/test_scheduling"
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O2 -Ihost -c host/scheduling.c -o "$task_out/scheduling.o"
  swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h \
-@@ -16,6 +39,14 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
+@@ -16,6 +40,14 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
  "$task_out/test_host_bridge"
  swiftc -parse-as-library -swift-version 5 ios/Henge/SessionStatistics.swift tests/test_session_statistics.swift -o "$task_out/test_session_statistics"
  "$task_out/test_session_statistics"
@@ -24670,7 +24761,7 @@ index 509bce1..3d25b65 100755
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -DHV_PROF_TEST -Icore -Ihost -Idevices \
      host/prof_ios.c host/scheduling.c tests/test_prof_ios.c -o "$task_out/test_prof_ios"
  "$task_out/test_prof_ios"
-@@ -25,9 +56,15 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=addres
+@@ -25,9 +57,15 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=addres
  xcrun --sdk macosx clang -fobjc-arc -std=c11 -Wall -Wextra -Werror -O2 -Idevices \
      tests/test_display_settings.m -framework Foundation -o "$task_out/test_display_settings"
  "$task_out/test_display_settings"
