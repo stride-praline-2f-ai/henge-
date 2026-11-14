@@ -8964,7 +8964,7 @@ index eeabe42..7035b1a 100644
            uint32_t seen = 0; uint64_t distinct = 0; (void)seen;
            uint64_t best[4] = {0}; uint32_t bestn[4] = {0};
 diff --git a/host/native_touch.c b/host/native_touch.c
-index 504e669..4c4b812 100644
+index 504e669..e2dfe3a 100644
 --- a/host/native_touch.c
 +++ b/host/native_touch.c
 @@ -1,4 +1,5 @@
@@ -9079,16 +9079,21 @@ index 504e669..4c4b812 100644
  uint32_t hv_native_touch_enable(int on) {
      pthread_mutex_lock(&mutex);
      if (enabled != !!on || (!on && status != HV_TOUCH_OFF)) { enabled = !!on; reset_locked(); }
-@@ -43,7 +115,7 @@ uint32_t hv_native_touch_epoch(void) {
+@@ -43,7 +115,12 @@ uint32_t hv_native_touch_epoch(void) {
      pthread_mutex_lock(&mutex); uint32_t value = epoch; pthread_mutex_unlock(&mutex); return value;
  }
  int hv_native_touch_status(void) {
 -    pthread_mutex_lock(&mutex); expire_locked(); int value = status; pthread_mutex_unlock(&mutex); return value;
 +    pthread_mutex_lock(&mutex); expire_locked(); encode_locked(); int value = helper_stalled && status==HV_TOUCH_READY ? HV_TOUCH_STALLED : status; pthread_mutex_unlock(&mutex); return value;
++}
++int hv_native_touch_direct_mapping(void) {
++    pthread_mutex_lock(&mutex);expire_locked();
++    int value=enabled && host_encoded && usb.connected && usb.connected(usb.context);
++    pthread_mutex_unlock(&mutex);return value;
  }
  int hv_native_touch_submit(uint32_t generation, const uint8_t *ids, const double *x, const double *y, size_t count) {
      if (count > MAX_CONTACTS || (count && (!ids || !x || !y))) return 0;
-@@ -54,40 +126,141 @@ int hv_native_touch_submit(uint32_t generation, const uint8_t *ids, const double
+@@ -54,40 +131,141 @@ int hv_native_touch_submit(uint32_t generation, const uint8_t *ids, const double
          frame.ids[i] = ids[i]; frame.x[i] = x[i]; frame.y[i] = y[i];
      }
      pthread_mutex_lock(&mutex); expire_locked();
@@ -9241,10 +9246,10 @@ index 504e669..4c4b812 100644
 +    pthread_mutex_unlock(&mutex);return accepted;
 +}
 diff --git a/host/native_touch.h b/host/native_touch.h
-index 4072159..b613d06 100644
+index 4072159..e0b9572 100644
 --- a/host/native_touch.h
 +++ b/host/native_touch.h
-@@ -4,13 +4,37 @@
+@@ -4,13 +4,38 @@
  #include <stdint.h>
  /* Prototype protocol v1. Contacts are normalized to the guest display, not the host view. */
  enum { HV_TOUCH_OFF, HV_TOUCH_WAITING, HV_TOUCH_READY, HV_TOUCH_VERSION,
@@ -9254,6 +9259,7 @@ index 4072159..b613d06 100644
  uint32_t hv_native_touch_epoch(void);
  uint32_t hv_native_touch_reset(void);
  int hv_native_touch_status(void);
++int hv_native_touch_direct_mapping(void);
 +/* Release contacts without disconnecting/remapping the USB display. */
 +void hv_native_touch_cancel(uint32_t epoch);
 +int hv_native_touch_usb_host_encoding(uint32_t epoch);
@@ -15853,7 +15859,7 @@ index b8c41fa..5dbe293 100644
  void henge_vm_key_hid(uint8_t usage, int down); /* a hardware keyboard: iOS gives each key's HID usage */
  void henge_vm_mouse_move(int dx, int dy);
 diff --git a/ios/Henge/NativeTouchSession.swift b/ios/Henge/NativeTouchSession.swift
-index 25e7bad..dba2060 100644
+index 25e7bad..f64b4bd 100644
 --- a/ios/Henge/NativeTouchSession.swift
 +++ b/ios/Henge/NativeTouchSession.swift
 @@ -15,6 +15,21 @@ final class NativeTouchSession {
@@ -15878,7 +15884,19 @@ index 25e7bad..dba2060 100644
  
      init(defaults: UserDefaults = .standard,
           now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
-@@ -54,9 +69,17 @@ final class NativeTouchSession {
+@@ -38,6 +53,11 @@ final class NativeTouchSession {
+         wasActive = true
+         // Booting the guest can take much longer than the negotiation timeout.
+         guard helperRunning else {
++            // Sharing presence bootstraps setup. Once direct USB is mapped,
++            // its epoch/liveness watchdog is authoritative through a short stall.
++            if attempted && hv_native_touch_direct_mapping() != 0 {
++                status=hv_native_touch_status();ready=status==2;return
++            }
+             if attempted { stop() }
+             wasActive = true
+             status = 1
+@@ -54,9 +74,17 @@ final class NativeTouchSession {
          }
          status = hv_native_touch_status()
          ready = status == 2
@@ -15899,7 +15917,7 @@ index 25e7bad..dba2060 100644
      }
  
      func stop() {
-@@ -65,5 +88,6 @@ final class NativeTouchSession {
+@@ -65,5 +93,6 @@ final class NativeTouchSession {
          attempted = false
          wasActive = false
          retryAfter = nil
@@ -16709,7 +16727,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..e439006 100644
+index f84465e..61a5d75 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,18 @@ struct SessionView: View {
@@ -16819,7 +16837,7 @@ index f84465e..e439006 100644
              HardwareMouse.shared.setAcceptsInput(phase == .active && !pointerNeeded)
              guard phase != .active else {
                  display.refresh()
-@@ -211,13 +243,76 @@ struct SessionView: View {
+@@ -211,13 +243,78 @@ struct SessionView: View {
                  return
              }
              nativeTouch.stop()
@@ -16873,7 +16891,9 @@ index f84465e..e439006 100644
 +        .sheet(isPresented:$showGamepadSettings) { GamepadSettings() }
 +        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
 +            diagnosticCapture.event("memory_warning"); wakeups.signal()
-+            HengeLog.log("memory","System pressure warning; guest RAM \(mac.ramMB) MiB. Process headroom excludes some guest pages; physical memory remains shared. Compare the 8 GiB baseline after shutdown; no live RAM change.")
++            var allocation=HengeGuestMemoryStatus()
++            henge_vm_guest_memory(&allocation)
++            HengeLog.log("memory","System pressure warning; actual_guest_bytes=\(allocation.bytes) memory_state=\(allocation.state) requested_guest_mib=\(mac.ramMB). Process headroom excludes some guest pages; physical memory remains shared. Compare the 8 GiB baseline after shutdown; no live RAM change.")
 +            henge_vm_trim_memory()
 +            LinkHostService.shared.trimMemory()
 +            HengeLog.logFootprint("memory-warning")
@@ -16898,7 +16918,7 @@ index f84465e..e439006 100644
              if showing {
                  refreshDetails()
                  HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll()
-@@ -228,35 +323,45 @@ struct SessionView: View {
+@@ -228,35 +325,45 @@ struct SessionView: View {
          }
          .onAppear {
              UIApplication.shared.isIdleTimerDisabled = true
@@ -16960,7 +16980,7 @@ index f84465e..e439006 100644
  
      // A fold/rotation after boot must fit the mode the guest actually received,
      // rather than stretch it by recalculating only the host view's aspect.
-@@ -411,6 +516,9 @@ struct SessionView: View {
+@@ -411,6 +518,9 @@ struct SessionView: View {
          .labelStyle(.iconOnly)
          .buttonBorderShape(.circle)
          .tint(Desk.raised)
@@ -16970,7 +16990,7 @@ index f84465e..e439006 100644
      }
  
      /// An iPhone's large screen: an iPhone Duo unfolded, regular both ways.
-@@ -485,6 +593,32 @@ struct SessionView: View {
+@@ -485,6 +595,32 @@ struct SessionView: View {
      /// The controls a column has too.
      @ViewBuilder private var floatingTools: some View {
          tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
@@ -17003,7 +17023,7 @@ index f84465e..e439006 100644
          pasteTool
          tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
          tool("info.circle", "Details", tint: .white) { showDetails = true }
-@@ -513,12 +647,19 @@ struct SessionView: View {
+@@ -513,12 +649,19 @@ struct SessionView: View {
      }
  
      /// Keeps the pointer in view: the view moves when the pointer nears its edge.
@@ -17024,7 +17044,7 @@ index f84465e..e439006 100644
              }
              if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / displayAspect)) { map = UIImage(cgImage: image) }
              tick += 1
-@@ -541,10 +682,70 @@ struct SessionView: View {
+@@ -541,10 +684,70 @@ struct SessionView: View {
  
      // MARK: Status
  
@@ -17095,7 +17115,7 @@ index f84465e..e439006 100644
              Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
          }
          .padding(18)
-@@ -577,12 +778,13 @@ struct SessionView: View {
+@@ -577,12 +780,13 @@ struct SessionView: View {
          NavigationStack {
              List {
                  Section(phase) {
@@ -17110,7 +17130,7 @@ index f84465e..e439006 100644
                  Section("Display") {
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
-@@ -599,6 +801,7 @@ struct SessionView: View {
+@@ -599,6 +803,7 @@ struct SessionView: View {
                  }
                  Section("Pointer") {
                      Picker("Size", selection: $cursorScale) {
@@ -17118,7 +17138,7 @@ index f84465e..e439006 100644
                          Text("1×").tag(1)
                          Text("2×").tag(2)
                          Text("3×").tag(3)
-@@ -608,7 +811,7 @@ struct SessionView: View {
+@@ -608,7 +813,7 @@ struct SessionView: View {
                      LabeledContent("Magic Keyboard / mouse scroll speed", value: String(format: "%.2f×", scrollSpeed))
                      Slider(value: $scrollSpeed, in: HardwareScroll.minimumSpeed...HardwareScroll.maximumSpeed)
                      Button("Reset hardware scroll speed") { scrollSpeed = HardwareScroll.defaultSpeed }
@@ -17127,7 +17147,7 @@ index f84465e..e439006 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  Section("Touch input") {
-@@ -618,16 +821,17 @@ struct SessionView: View {
+@@ -618,16 +823,17 @@ struct SessionView: View {
                          Text("Enable Guest sharing in Henge Settings and reopen Henge to use native touch.")
                              .font(.footnote).foregroundStyle(.secondary)
                      }
@@ -17152,7 +17172,7 @@ index f84465e..e439006 100644
                      }
                      Button("Type the Helper Update Command") {
                          showDetails = false
-@@ -640,8 +844,11 @@ struct SessionView: View {
+@@ -640,8 +846,11 @@ struct SessionView: View {
                  }
                  Section("Sharing") {
                      LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
@@ -17166,7 +17186,7 @@ index f84465e..e439006 100644
                              showDetails = false
                              Task {
                                  try? await Task.sleep(nanoseconds: 600_000_000)
-@@ -680,6 +887,8 @@ struct SessionView: View {
+@@ -680,6 +889,8 @@ struct SessionView: View {
      }
  
      private func run(viewport: CGSize) async {
@@ -17175,7 +17195,7 @@ index f84465e..e439006 100644
          error = nil
          state = 0
          userCode = false
-@@ -693,65 +902,109 @@ struct SessionView: View {
+@@ -693,65 +904,109 @@ struct SessionView: View {
          zoomCentre = CGPoint(x: 0.5, y: 0.5)
          map = nil
          showWallpaperTip = false
@@ -17330,7 +17350,7 @@ index f84465e..e439006 100644
              if state == 2 {
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
-@@ -769,38 +1022,58 @@ struct SessionView: View {
+@@ -769,38 +1024,58 @@ struct SessionView: View {
                  }
                  break
              }
@@ -22168,10 +22188,10 @@ index 5249aa5..a3c176e 100644
  }
 diff --git a/tests/test_native_touch_watchdog.c b/tests/test_native_touch_watchdog.c
 new file mode 100644
-index 0000000..cd4b1e0
+index 0000000..bb0c3b5
 --- /dev/null
 +++ b/tests/test_native_touch_watchdog.c
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,32 @@
 +#include "native_touch.h"
 +#include <assert.h>
 +#include <stdio.h>
@@ -22187,16 +22207,21 @@ index 0000000..cd4b1e0
 + hv_native_touch_test_time(110);assert(hv_native_touch_usb_connect(e,1));assert(hv_native_touch_usb_host_encoding(e));hv_native_touch_report(e,HV_TOUCH_READY);
 + uint8_t id=1;double x=.2,y=.3;assert(hv_native_touch_submit(e,&id,&x,&y,1));assert(u.last[31]);
 + for(double t=110.5;t<112.6;t+=0.5){hv_native_touch_test_time(t);assert(hv_native_touch_submit(e,&id,&x,&y,1));}
-+ hv_native_touch_test_time(112.6);assert(hv_native_touch_status()==HV_TOUCH_STALLED);assert(u.connected&&!(u.last[1]&1)&&!u.disconnects&&hv_native_touch_epoch()==e);
++ hv_native_touch_test_time(112.6);assert(hv_native_touch_status()==HV_TOUCH_STALLED);assert(hv_native_touch_direct_mapping());assert(u.connected&&!(u.last[1]&1)&&!u.disconnects&&hv_native_touch_epoch()==e);
 + hv_native_touch_test_time(112.7);assert(hv_native_touch_status()==HV_TOUCH_STALLED);assert(!u.last[31]);
 + assert(!hv_native_touch_submit(e,&id,&x,&y,1));hv_native_touch_report(e-1,HV_TOUCH_READY);assert(hv_native_touch_status()==HV_TOUCH_STALLED);
 + hv_native_touch_report(e,HV_TOUCH_READY);assert(hv_native_touch_status()==HV_TOUCH_READY);assert(!hv_native_touch_submit(e,&id,&x,&y,1));
 + assert(hv_native_touch_submit(e,NULL,NULL,NULL,0));assert(hv_native_touch_submit(e,&id,&x,&y,1));
-+ hv_native_touch_test_time(143);assert(hv_native_touch_status()==HV_TOUCH_TIMEOUT);assert(!u.connected&&u.disconnects==1&&hv_native_touch_epoch()!=e);
++ hv_native_touch_test_time(143);assert(hv_native_touch_status()==HV_TOUCH_TIMEOUT);assert(!hv_native_touch_direct_mapping());assert(!u.connected&&u.disconnects==1&&hv_native_touch_epoch()!=e);
 + e=hv_native_touch_enable(1);hv_native_touch_test_time(174);assert(hv_native_touch_status()==HV_TOUCH_TIMEOUT);
 + e=hv_native_touch_enable(1);hv_native_touch_progress(e,3);hv_native_touch_failure(e-1,3,-1001);assert(hv_native_touch_status()==HV_TOUCH_WAITING);
 + hv_native_touch_failure(e,3,-1001);assert(hv_native_touch_status()==HV_TOUCH_DEVICE);
-+ hv_native_touch_enable(0);hv_native_touch_set_usb(NULL);
++ hv_native_touch_test_time(200);e=hv_native_touch_enable(1);
++ assert(hv_native_touch_usb_connect(e,1));assert(hv_native_touch_usb_host_encoding(e));hv_native_touch_report(e,HV_TOUCH_READY);
++ hv_native_touch_test_time(203);assert(hv_native_touch_status()==HV_TOUCH_STALLED);
++ hv_native_touch_enable(0);hv_native_touch_report(e,HV_TOUCH_READY);
++ assert(hv_native_touch_status()==HV_TOUCH_OFF && !u.connected && !hv_native_touch_direct_mapping());
++ hv_native_touch_set_usb(NULL);
 + puts("PASS touch watchdog: mapping-preserving grace, neutral boundary, stale epoch rejection, bounded setup/dead-helper timeout and guest failure details");
 +}
 diff --git a/tests/test_optimization_primitives.c b/tests/test_optimization_primitives.c
@@ -24999,7 +25024,7 @@ index 62cdaee..d1ead46 100644
      return 0;
  }
 diff --git a/tools/henge-touch-agent.swift b/tools/henge-touch-agent.swift
-index a06b082..5cbe820 100644
+index a06b082..d064760 100644
 --- a/tools/henge-touch-agent.swift
 +++ b/tools/henge-touch-agent.swift
 @@ -2,10 +2,15 @@ import AppKit
@@ -25148,7 +25173,7 @@ index a06b082..5cbe820 100644
 +    var device:SystemNativeTouchDevice? {
 +        didSet {
 +            watchdog?.cancel();watchdog=nil
-+            guard let device else { return }
++            guard let device, !device.hasDirectMapping else { return }
 +            // No periodic watchdog when touch is disabled. An active device
 +            // still releases contacts if a network request stops completing.
 +            watchdog=Task { @MainActor [weak self,weak device] in
