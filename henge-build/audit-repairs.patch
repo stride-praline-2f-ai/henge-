@@ -22905,10 +22905,10 @@ index 0000000..85c5b38
 +}
 diff --git a/tests/test_diagnostic_capture.swift b/tests/test_diagnostic_capture.swift
 new file mode 100644
-index 0000000..ae049cc
+index 0000000..f3ca503
 --- /dev/null
 +++ b/tests/test_diagnostic_capture.swift
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,87 @@
 +import Foundation
 +
 +private final class CaptureState: @unchecked Sendable {
@@ -22955,17 +22955,17 @@ index 0000000..ae049cc
 +enum EngineTuning {static let refreshKey="henge.test.capture.refresh"}
 +struct LinkHostService {static let shared=LinkHostService();let connected=false,controlOnly=false}
 +@main struct Check {
-+    @MainActor static func until(_ predicate:()->Bool) async {
++    @MainActor static func until(_ stage:String,_ predicate:()->Bool) async {
 +        for _ in 0..<2000 {
 +            if predicate() {return}
 +            try? await Task.sleep(nanoseconds:1_000_000)
 +        }
-+        preconditionFailure("Diagnostic capture completion timed out")
++        preconditionFailure("Diagnostic capture timed out: \(stage); reads=\(fixture.count); timing=\(fixture.timing); logs=\(fixture.logs.suffix(8))")
 +    }
 +    @MainActor static func main() async {
 +        let capture=SessionDiagnosticCapture()
 +        capture.begin(continuous:true);capture.sample()
-+        await until {fixture.count==1}
++        await until("first off-main read") {fixture.count==1}
 +        precondition(fixture.count==1)
 +        // A blocked native mutex cannot block the main actor or enqueue 100
 +        // reads. Stop/start invalidates the result, not the native VM memory.
@@ -22977,8 +22977,13 @@ index 0000000..ae049cc
 +        fixture.release.signal()
 +        // A fresh request is admitted only after the stale completion has been
 +        // rejected. Verify the emitted baseline belongs to native read 2.
-+        await until {capture.event("fresh");capture.sample();return fixture.count==2}
-+        await until {fixture.logs.contains{$0.contains("metal_allocated=123456")}}
++        await until("fresh baseline after stale rejection") {
++            // Stop issuing work once read 2 enters. Otherwise a completed
++            // read 2 can admit read 3 before this polling task checks count.
++            if fixture.count<2 {capture.event("fresh");capture.sample()}
++            return fixture.logs.contains{$0.contains("metal_allocated=123456")}
++        }
++        precondition(fixture.count==2)
 +        precondition(fixture.logs.filter{$0.contains("state=1 generation=1")}.count==1)
 +        // The stale background read must not turn capture timing back on.
 +        precondition(fixture.timing==[1,0,1])
@@ -22986,7 +22991,7 @@ index 0000000..ae049cc
 +        // The second accepted sample provides interval deltas, kept separate.
 +        try? await Task.sleep(nanoseconds:300_000_000)
 +        capture.event("fresh2");capture.sample()
-+        await until {fixture.logs.contains{$0.contains("replay_gpu_scope=classic_only") && $0.contains("metal4_gpu_ms=10.000")}}
++        await until("separate backend interval deltas") {fixture.logs.contains{$0.contains("replay_gpu_scope=classic_only") && $0.contains("metal4_gpu_ms=10.000")}}
 +        capture.stop();precondition(fixture.timing==[1,0,1,0])
 +        print("PASS production capture: off-main native reads, bounded admission, stale stop/restart rejection, no timing resurrection and separate classic/Metal4 deltas")
 +    }
