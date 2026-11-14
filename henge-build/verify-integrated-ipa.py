@@ -208,6 +208,13 @@ if manifest.get('desktop_retina_followup'):
     for marker in (b'metal4-pipeline-timing:',b'Current guest pixels',b'Save & Leave preserves the current display.'):
         assert marker in app_executable,'Missing Desktop Retina follow-up: '+repr(marker)
     data['desktop_retina_followup']=dict(desktop,runtime_markers_verified=True)
+if manifest.get('desktop_metalfx'):
+    fx=state.get('desktop_metalfx',{})
+    assert fx.get('complete') and fx.get('source_commit')==state['final_validation']['source_commit']
+    for marker in (b'desktop-metalfx:',b'MetalFX output target',b'newSpatialScalerWithDevice:compiler:',b'encodeToCommandBuffer:'):
+        assert marker in app_executable,'Missing desktop upscaler activation: '+repr(marker)
+    assert b'MetalFX.framework/MetalFX' in app_executable,'MetalFX framework not linked'
+    data['desktop_metalfx']=dict(fx,runtime_markers_verified=True,physical_performance_verified=False)
 # Correct legacy metadata: verify the real configured default in the reconstructed source.
 assert 'as? Bool ?? true' in Path('Henge/ios/Henge/EngineTuning.swift').read_text()
 data['fastmem_default']=True

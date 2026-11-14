@@ -112,4 +112,10 @@ if manifest.get('desktop_retina_followup'):
     assert desktop.get('geometry')=='passed_cloud' and desktop.get('ios_integration')=='passed_cloud' and desktop.get('metal_sdk')=='passed_cloud', 'Desktop Retina/diagnostic checks incomplete'
     assert desktop.get('evidence'), 'Missing executed Desktop Retina proof'
 
-print('PASS complete implementation gate:'  ,  manifest['audit_repairs_sha256'])
+if manifest.get('desktop_metalfx'):
+    fx=state.get('desktop_metalfx',{})
+    assert fx.get('complete') is True and fx.get('source_commit')==validation.get('source_commit'), 'Desktop MetalFX needs exact-source validation'
+    assert all(fx.get(k)=='passed_cloud' for k in ('geometry','routing_lifetime','snapshot','sdk','ios_integration')), 'Desktop MetalFX correctness checks incomplete'
+    assert fx.get('evidence') and fx.get('physical_pixels') in ('passed_device','pending_device_test'), 'MetalFX physical execution status missing'
+
+print('PASS complete implementation gate:'   ,  manifest['audit_repairs_sha256'])

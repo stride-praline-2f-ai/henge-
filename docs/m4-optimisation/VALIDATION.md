@@ -1,3 +1,7 @@
+# Current development: validation pending
+
+Desktop MetalFX source is newer than the historical proof below. No IPA is requested until new exact-source checks pass.
+
 # Exact-source validation
 
 Source `c3cb95e66b7a89756c54a961b0eb52734aa4f881`, patch `6588d7d46095820710e586c256378bcfcf07d3e4cae3cdc066879e70e4e5bbb9`. Full run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43640905062. Focused GPU run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43640905054.
