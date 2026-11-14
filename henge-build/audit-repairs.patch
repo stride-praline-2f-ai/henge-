@@ -24288,6 +24288,37 @@ index 0000000..425a58c
 +    memset(p,0xa5,page*4); assert(((uint8_t *)p)[page*2]==0xa5); free(p);
 +    puts("PASS TLB span permissions/bounds, exact cursor damage, retired-page boundaries and reuse");
 +}
+diff --git a/tests/test_pacing_scheduler.py b/tests/test_pacing_scheduler.py
+index bc1a32a..474d380 100644
+--- a/tests/test_pacing_scheduler.py
++++ b/tests/test_pacing_scheduler.py
+@@ -15,11 +15,13 @@ pre=r'''
+ #include <unistd.h>
+ #include <time.h>
+ #include <assert.h>
++#include <stdatomic.h>
+ #include "frame_pacing.h"
+ static double now_seconds(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC)*1e-9; }
+ @interface Harness:NSObject { @public
+  os_unfair_lock screen_lock; id layer, screen_tex;
+- BOOL presenter_running, drawable_retry_pending, pacing_pending;
++ BOOL presenter_running, drawable_retry_pending, pacing_pending,display_driven,display_quiesced;
++ _Atomic int stopping; _Atomic unsigned presentation_inflight;
+  double drawable_retry_cooldown, drawable_retry_deadline;
+  uint64_t layer_generation, screen_requests;
+  dispatch_queue_t presenter; HvFramePacing frame_pacing; int pacing_fps;
+@@ -58,6 +60,11 @@ int main(void) { @autoreleasepool {
+  dispatch_sync(h->presenter,^{});assert(h->draws==1);
+  kick(h);assert(dispatch_semaphore_wait(h->delivered,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC))==0);
+  dispatch_sync(h->presenter,^{});assert(h->draws==2);
++ atomic_store(&h->presentation_inflight,2);kick(h);
++ assert(dispatch_semaphore_wait(h->delivered,dispatch_time(DISPATCH_TIME_NOW,100*NSEC_PER_MSEC))!=0);
++ atomic_store(&h->presentation_inflight,1);kick(h);
++ assert(!dispatch_semaphore_wait(h->delivered,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC)));
++ dispatch_sync(h->presenter,^{});assert(h->draws==3);
+  puts("production presenter scheduler: 1000 events coalesced, final frame retained, no idle timer, stale target cancellation and reconnect passed");
+ } }
+ '''
 diff --git a/tests/test_physical_mouse_buttons.swift b/tests/test_physical_mouse_buttons.swift
 index d0f1589..b089e1f 100644
 --- a/tests/test_physical_mouse_buttons.swift
@@ -26832,10 +26863,10 @@ index 0000000..e1f8457
 +if __name__ == '__main__':
 +    main()
 diff --git a/tools/check_host_scheduling.sh b/tools/check_host_scheduling.sh
-index 509bce1..629e127 100755
+index 509bce1..988363d 100755
 --- a/tools/check_host_scheduling.sh
 +++ b/tools/check_host_scheduling.sh
-@@ -2,6 +2,27 @@
+@@ -2,6 +2,28 @@
  # Native tests + iPhoneOS SDK type checking. Does not build an app or IPA.
  set -euo pipefail
  cd "$(dirname "$0")/.."
@@ -26855,6 +26886,7 @@ index 509bce1..629e127 100755
 +swiftc -parse-as-library -swift-version 5 ios/Henge/ClipboardDelivery.swift tests/test_clipboard_delivery.swift -o /tmp/henge-test-clipboard-delivery
 +/tmp/henge-test-clipboard-delivery
 +python3 tests/test_display_pulses.py
++python3 tests/test_pacing_scheduler.py
 +make build/test_pvg_task_memory
 +build/test_pvg_task_memory
 +mkdir -p build
@@ -26863,7 +26895,7 @@ index 509bce1..629e127 100755
  mkdir -p build/scheduling-check
  task_out="$PWD/build/scheduling-check"
  exec > >(tee "$task_out/checks.log") 2>&1
-@@ -9,6 +30,9 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
+@@ -9,6 +31,9 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
  set -x
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread -Ihost \
      host/scheduling.c tests/test_scheduling.c -o "$task_out/test_scheduling"
@@ -26873,7 +26905,7 @@ index 509bce1..629e127 100755
  "$task_out/test_scheduling"
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O2 -Ihost -c host/scheduling.c -o "$task_out/scheduling.o"
  swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h \
-@@ -16,6 +40,14 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
+@@ -16,6 +41,14 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
  "$task_out/test_host_bridge"
  swiftc -parse-as-library -swift-version 5 ios/Henge/SessionStatistics.swift tests/test_session_statistics.swift -o "$task_out/test_session_statistics"
  "$task_out/test_session_statistics"
@@ -26888,7 +26920,7 @@ index 509bce1..629e127 100755
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -DHV_PROF_TEST -Icore -Ihost -Idevices \
      host/prof_ios.c host/scheduling.c tests/test_prof_ios.c -o "$task_out/test_prof_ios"
  "$task_out/test_prof_ios"
-@@ -25,9 +57,24 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=addres
+@@ -25,9 +58,24 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=addres
  xcrun --sdk macosx clang -fobjc-arc -std=c11 -Wall -Wextra -Werror -O2 -Idevices \
      tests/test_display_settings.m -framework Foundation -o "$task_out/test_display_settings"
  "$task_out/test_display_settings"
