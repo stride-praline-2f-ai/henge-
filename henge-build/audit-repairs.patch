@@ -2808,10 +2808,10 @@ index 0000000..b12dd17
 +}
 diff --git a/devices/metal4_runtime.h b/devices/metal4_runtime.h
 new file mode 100644
-index 0000000..afbb50f
+index 0000000..2258d0a
 --- /dev/null
 +++ b/devices/metal4_runtime.h
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,332 @@
 +#pragma once
 +/* Supported Metal 4 submission, shared by guest replay and native presentation.
 + * Classic/Metal4 queues are joined with a shared event in BOTH directions.
@@ -2822,6 +2822,7 @@ index 0000000..afbb50f
 +#include <stdatomic.h>
 +#include <stdbool.h>
 +#include <math.h>
++#include <time.h>
 +#include "pipeline_bundle.h"
 +
 +API_AVAILABLE(macos(26.0),ios(26.0))
@@ -2863,6 +2864,7 @@ index 0000000..afbb50f
 +@public
 +    _Atomic uint64_t submitted, completed, failed, unavailable;
 +    _Atomic uint64_t pipeline_cache_hits,pipeline_cache_misses,pipeline_cache_writes;
++    _Atomic uint64_t pipeline_compile_ns,pipeline_compile_max_ns;
 +    _Atomic uint64_t gpu_duration_ns,gpu_max_ns;
 +}
 +@property(nonatomic,readonly) id<MTL4Compiler> compiler;
@@ -2988,8 +2990,15 @@ index 0000000..afbb50f
 +    else{
 +        atomic_fetch_add(&pipeline_cache_misses,1);if(bundle)bundle->misses++;
 +        NSError *error=nil;
++        struct timespec compileStart={0},compileEnd={0};
++        clock_gettime(CLOCK_MONOTONIC,&compileStart);
 +        if(tag==0xe)state=[_compiler newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
 +        else state=[_compiler newComputePipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
++        clock_gettime(CLOCK_MONOTONIC,&compileEnd);
++        uint64_t elapsed=(uint64_t)((int64_t)(compileEnd.tv_sec-compileStart.tv_sec)*1000000000ll+compileEnd.tv_nsec-compileStart.tv_nsec);
++        atomic_fetch_add(&pipeline_compile_ns,elapsed);
++        uint64_t peak=atomic_load(&pipeline_compile_max_ns);
++        while(elapsed>peak&&!atomic_compare_exchange_weak(&pipeline_compile_max_ns,&peak,elapsed)){}
 +        if(state&&_cacheAdmission&&_capture){
 +            _pendingPipelines++;
 +            if(_pendingPipelines>=128&&!_urgentSaveScheduled){
@@ -3786,7 +3795,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..3997f52 100644
+index 9073d22..35c1709 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -5297,7 +5306,7 @@ index 9073d22..3997f52 100644
          }
          [back endEncoding];
      }
-@@ -2263,30 +2829,59 @@ typedef struct {
+@@ -2263,30 +2829,60 @@ typedef struct {
      [self commit:cb channel:ch stamp:stamp complete:YES];
      double t2 = now_seconds();
      encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
@@ -5325,6 +5334,7 @@ index 9073d22..3997f52 100644
 +        if(metal4)fprintf(stderr,"hengevm: metal4-rejection-detail: header=%llu record=%llu encoder=%llu tag=%llu payload=%llu empty=%llu last_reason=%u type=%u tag_id=%u offset=%zu bytes=%zu (bounded counters, no shader/resource contents)\n",(unsigned long long)metal4_reject_reasons[HV_GPU_HEADER],(unsigned long long)metal4_reject_reasons[HV_GPU_RECORD],(unsigned long long)metal4_reject_reasons[HV_GPU_ENCODER],(unsigned long long)metal4_reject_reasons[HV_GPU_TAG],(unsigned long long)metal4_reject_reasons[HV_GPU_PAYLOAD],(unsigned long long)metal4_reject_reasons[HV_GPU_EMPTY],metal4_last_reject.reason,metal4_last_reject.type,metal4_last_reject.tag,metal4_last_reject.offset,metal4_last_reject.available);
 +        if(metal4)fprintf(stderr,"hengevm: metal4-fallback-counts: unsupported_stream=%llu encoder_pipeline=%llu pool_or_disabled=%llu bridge_allocation=%llu (encoder-run compatibility; unrelated supported work stays on Metal4)\n",(unsigned long long)metal4_unsupported,(unsigned long long)metal4_encoder_rejected,(unsigned long long)metal4_job_missed,(unsigned long long)metal4_bridge_rejected);
 +        if(metal4)fprintf(stderr,"hengevm: metal4-runtime: GPU_ms=%.2f max_ms=%.2f pipeline_hits=%llu pipeline_compiles=%llu archive_writes=%llu presentation_backpressure=%llu (GPU replay and display combined; CPU emulation stays on CPU)\n",atomic_load(&m4->gpu_duration_ns)/1e6,atomic_load(&m4->gpu_max_ns)/1e6,(unsigned long long)atomic_load(&m4->pipeline_cache_hits),(unsigned long long)atomic_load(&m4->pipeline_cache_misses),(unsigned long long)atomic_load(&m4->pipeline_cache_writes),(unsigned long long)atomic_load(&presentation_backpressure));
++        if(metal4)fprintf(stderr,"hengevm: metal4-pipeline-timing: compile_attempts=%llu compile_ms=%.2f max_ms=%.2f (host elapsed time inside compiler calls; excludes archive lookup and GPU execution; no draw-time sampling)\n",(unsigned long long)atomic_load(&m4->pipeline_cache_misses),atomic_load(&m4->pipeline_compile_ns)/1e6,atomic_load(&m4->pipeline_compile_max_ns)/1e6);
 +        }
 +        fprintf(stderr,"hengevm: gpu-binding-cache: enabled=%d attempts=%llu skipped=%llu (exact resolved objects; per-encoder state; no guest commands dropped)\n",!bindings.disabled,(unsigned long long)bindings.attempts,(unsigned long long)bindings.skipped);
          fprintf(stderr, "hengevm: gpu-batch-cache: enabled=%d object_hits=%llu object_reads=%llu page_hits=%llu page_checks=%llu (immutable objects and exact task/command epochs)\n",
@@ -5361,7 +5371,7 @@ index 9073d22..3997f52 100644
      }
      return YES;
  }
-@@ -2319,14 +2914,27 @@ static const uint8_t *half_to_byte(void) {
+@@ -2319,14 +2915,27 @@ static const uint8_t *half_to_byte(void) {
      memcpy(&hx, (const uint8_t *)a + 0x24, 2), memcpy(&hy, (const uint8_t *)a + 0x26, 2);
      if (!w || !h || w > 512 || h > 512 || stride < (uint64_t)w * 4 || stride > 8192) return;
      uint8_t *bits = malloc((size_t)stride * h);
@@ -5389,7 +5399,7 @@ index 9073d22..3997f52 100644
      [glyph replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
      if (a[0] == 1) {
          link_cursor=glyph;link_cw=w;link_ch=h;link_hx=hx;link_hy=hy;
-@@ -2336,21 +2944,22 @@ static const uint8_t *half_to_byte(void) {
+@@ -2336,21 +2945,22 @@ static const uint8_t *half_to_byte(void) {
      os_unfair_lock_lock(&screen_lock);
      cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
      cursor_tex = glyph;
@@ -5415,7 +5425,7 @@ index 9073d22..3997f52 100644
          [self screenChanged];
          return;
      }
-@@ -2368,7 +2977,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2368,7 +2978,7 @@ static const uint8_t *half_to_byte(void) {
      }
      if (where == 0xffffffff) return;
      /* Bigger than the guest draws it. The hot spot stays where it points. */
@@ -5424,7 +5434,7 @@ index 9073d22..3997f52 100644
      /* The pointer's place is in the display mode's pixels; a scaled resolution's frame is smaller than the mode. */
      uint32_t mw = w, mh = h;
      hv_pvg_lite_mode(&mw, &mh);
-@@ -2405,6 +3014,13 @@ static const uint8_t *half_to_byte(void) {
+@@ -2405,6 +3015,13 @@ static const uint8_t *half_to_byte(void) {
              && [lib newFunctionWithName:@"screen_cursor"];
          if (!bundled) lib = [device newLibraryWithSource:screen_shaders options:nil error:&err];
          if (!lib) { [self complain:[NSString stringWithFormat:@"screen shaders: %@", err.localizedDescription]]; return NO; }
@@ -5438,7 +5448,7 @@ index 9073d22..3997f52 100644
          screen_pipe = hv_screen_pipeline(device, lib, @"screen_plain", NO, &err);
          linear_pipe = hv_screen_pipeline(device, lib, @"screen_linear", NO, &err);
          cursor_pipe = hv_screen_pipeline(device, lib, @"screen_cursor", YES, &err);
-@@ -2439,27 +3055,112 @@ static const uint8_t *half_to_byte(void) {
+@@ -2439,27 +3056,112 @@ static const uint8_t *half_to_byte(void) {
     refresh, so that happens on a thread of its own and never holds up the guest's GPU work:
     this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
  - (void)updatePacingPolicy {
@@ -5562,7 +5572,7 @@ index 9073d22..3997f52 100644
      [self updatePacingPolicy];
      double now = now_seconds();
      double delay = hv_pacing_delay(&frame_pacing, now, pacing_fps);
-@@ -2520,12 +3221,35 @@ static const uint8_t *half_to_byte(void) {
+@@ -2520,12 +3222,35 @@ static const uint8_t *half_to_byte(void) {
      const uint8_t *page=hv_pvg_lite_display_page_for_port(lite,1);
      uint32_t at=page ? __atomic_load_n((const uint32_t *)(page+0xe00),__ATOMIC_ACQUIRE) : UINT32_MAX;
      BOOL shown=page && at!=UINT32_MAX && (link_cursor_shown || page[0xe04]);
@@ -5599,7 +5609,7 @@ index 9073d22..3997f52 100644
  - (void)showOnLayer:(uint64_t)mapping {
      HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]); /* not met yet: a resumed machine's screen */
      if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
-@@ -2547,33 +3271,58 @@ static const uint8_t *half_to_byte(void) {
+@@ -2547,33 +3272,58 @@ static const uint8_t *half_to_byte(void) {
      screen_dirty = YES;
      [self kickPresenter:YES];
      os_unfair_lock_unlock(&screen_lock);
@@ -5661,7 +5671,7 @@ index 9073d22..3997f52 100644
          screen_dirty = NO;
          CAMetalLayer *target = layer; // retained across nextDrawable and a concurrent disconnect
          uint64_t generation = layer_generation, requests = screen_requests;
-@@ -2597,7 +3346,12 @@ static const uint8_t *half_to_byte(void) {
+@@ -2597,7 +3347,12 @@ static const uint8_t *half_to_byte(void) {
              target.drawableSize = want;
              [CATransaction commit];
          }
@@ -5675,7 +5685,7 @@ index 9073d22..3997f52 100644
          if (!drawable) {
              os_unfair_lock_lock(&screen_lock);
              screen_dirty = YES;
-@@ -2636,6 +3390,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2636,6 +3391,7 @@ static const uint8_t *half_to_byte(void) {
          cw0 = cursor_w, ch0 = cursor_h, hx = cursor_hot_x, hy = cursor_hot_y;
          BOOL same_target = layer_generation == generation && layer == target;
          BOOL same_size = screen_w == W && screen_h == H;
@@ -5683,7 +5693,7 @@ index 9073d22..3997f52 100644
          if (same_target && same_size) {
              screen_dirty = NO;
              drawable_retry_deadline = 0;
-@@ -2647,9 +3402,39 @@ static const uint8_t *half_to_byte(void) {
+@@ -2647,9 +3403,39 @@ static const uint8_t *half_to_byte(void) {
              os_unfair_lock_unlock(&screen_lock);
              continue;
          }
@@ -5724,7 +5734,7 @@ index 9073d22..3997f52 100644
              if (done.status == MTLCommandBufferStatusError)
                  fprintf(stderr, "hengevm: native-metal: display command failed: %s\n", done.error.description.UTF8String);
          }];
-@@ -2668,30 +3453,15 @@ static const uint8_t *half_to_byte(void) {
+@@ -2668,30 +3454,15 @@ static const uint8_t *half_to_byte(void) {
              [e setFragmentBytes:&half_mode length:sizeof half_mode atIndex:0];
          }
          [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -5759,7 +5769,7 @@ index 9073d22..3997f52 100644
          if (cp.on) cp_capture_post(self, drawable.texture, W, H, cb);
  #if !TARGET_OS_IPHONE
          if (getenv("HV_PVG_GPU_TEST")) { /* the same pixels for a screenshot: this is the path a phone runs */
-@@ -2717,19 +3487,34 @@ static const uint8_t *half_to_byte(void) {
+@@ -2717,19 +3488,34 @@ static const uint8_t *half_to_byte(void) {
          // Serialize the final check and commit with set_layer: a switch that has
          // returned must not be followed by a commit to its old target.
          os_unfair_lock_lock(&screen_lock);
@@ -5801,7 +5811,7 @@ index 9073d22..3997f52 100644
              screen_dirty = YES;
          }
          os_unfair_lock_unlock(&screen_lock);
-@@ -2741,7 +3526,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2741,7 +3527,7 @@ static const uint8_t *half_to_byte(void) {
      if (atomic_load(&stopping)) return;
      double now = now_seconds();
      on_screen = mapping;
@@ -5810,7 +5820,7 @@ index 9073d22..3997f52 100644
          late = NO;
          [self showOnLayer:mapping];
          return;
-@@ -2834,13 +3619,26 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2834,13 +3620,26 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->completions = dispatch_group_create();
          r->device = dev;
          r->queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
@@ -5840,7 +5850,7 @@ index 9073d22..3997f52 100644
          r->resource_tally = getenv("HV_PVG_TALLY") != NULL;
          r->batch_cache = getenv("HV_GPU_BATCH_CACHE") && !strcmp(getenv("HV_GPU_BATCH_CACHE"), "1");
          r->tasks = [NSMutableDictionary new];
-@@ -2848,6 +3646,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2848,6 +3647,24 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          r->surfaces = [NSMutableDictionary new];
          r->planar = [NSMutableDictionary new];
          r->complaints = [NSMutableSet new];
@@ -5865,7 +5875,7 @@ index 9073d22..3997f52 100644
          r->shot = getenv("HV_PVG_SHOT");
          cp_start(r);
  #if !TARGET_OS_IPHONE
-@@ -2864,6 +3680,32 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2864,6 +3681,32 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
              r->shot_timer = timer;
          }
  #endif
@@ -5898,7 +5908,7 @@ index 9073d22..3997f52 100644
          fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
          return (HvPvgMetal *)CFBridgingRetain(r);
      }
-@@ -2874,23 +3716,40 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
+@@ -2874,23 +3717,40 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
      @autoreleasepool {
          HvReplay *r = CFBridgingRelease(m);
          atomic_store(&r->stopping, 1);
@@ -5942,7 +5952,7 @@ index 9073d22..3997f52 100644
              r->lite = NULL;
              r->tasks = nil;
              r->surfaces = nil;
-@@ -2951,7 +3810,8 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
+@@ -2951,7 +3811,8 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                      /* "May be thrown away": Apple's host only marks it purgeable, and the bytes stay
                         until the system needs the memory. Here they just stay. */
                  } else if (op == 0x20 && n >= 4) {
@@ -5952,7 +5962,7 @@ index 9073d22..3997f52 100644
                  } else {
                      hv_pvg_lite_command(lite, cmd, len);
                      if (op == 8 && n >= 16) {
-@@ -2998,24 +3858,78 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
+@@ -2998,24 +3859,78 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
      }
      r->pacing_pending = NO; r->frame_pacing.next = 0; /* reattaching the same layer also wakes a stopped presenter */
      r->layer = l;
@@ -6032,7 +6042,7 @@ index 9073d22..3997f52 100644
          [r screenChanged];
          return;
      }
-@@ -3030,8 +3944,8 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
+@@ -3030,8 +3945,8 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
  void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
      HvReplay *r = (__bridge HvReplay *)m;
      dispatch_async(r->worker, ^{
@@ -6043,7 +6053,7 @@ index 9073d22..3997f52 100644
          HvObject *s = r->surfaces[@(mapping)];
          if(s && s->planar_entry){
              hv_planar_release_mapping(r->planar,s->planar_key,s->planar_entry);
-@@ -3104,6 +4018,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
+@@ -3104,6 +4019,9 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
          (unsigned long long)m.overflow,(unsigned long long)m.invalid);
  }
  
@@ -6053,7 +6063,7 @@ index 9073d22..3997f52 100644
  void hv_pvg_metal_link_connected(HvPvgMetal *m,int connected){
      if(!m)return;HvReplay *r=(__bridge HvReplay *)m;
      dispatch_async(r->worker,^{
-@@ -3117,25 +4034,46 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+@@ -3117,25 +4035,46 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
      if(atomic_exchange(&r->link_cursor_queued,1))return;
      dispatch_async(r->worker,^{atomic_store(&r->link_cursor_queued,0);if (!atomic_load(&r->stopping)) [r sendLinkMapping:r->link_mapping];});
  }
@@ -6104,7 +6114,7 @@ index 9073d22..3997f52 100644
              for (NSNumber *task in r->tasks) {
                  NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
                  for (NSNumber *ref in objs) {
-@@ -3143,79 +4081,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -3143,79 +4082,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
                      if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
                      if (o->parent && o->parent->heap_whole) continue;
                      if (!cb) cb = [r->queue commandBuffer];
@@ -7764,6 +7774,37 @@ index 0000000..6e31de0
 +The first cloud source5217932 passed focused SDK/plan/adapter checks. Its broader run caught the companion retry regression above; it is not a release proof. Native paired component medians were1.94ns vs11.24ns per deliberately far chained branch, and0.26ms vs4.39ms per4MiB high-entropy snapshot chunk with identical raw bytes. These are component timings on the cloud arm64 runner, not whole-guest speed, GPU execution, FPS, cooling or energy results. Mixed/compressible snapshot timings varied. The second checkpoint still needs exact-source cloud checks.
 +
 +Final development adjustment: coalesced Metal4 plans append their pass options in one owned buffer rather than repeatedly copying earlier options. Encoder exceptions retain their specific bounded fallback reason through cleanup. Packaging checks require the new guest-completion, companion-readiness, queue and snapshot markers and reject benchmark/test hooks.
+diff --git a/docs/m4-optimisation/PHYSICAL-113-RETINA.md b/docs/m4-optimisation/PHYSICAL-113-RETINA.md
+new file mode 100644
+index 0000000..bc754d0
+--- /dev/null
++++ b/docs/m4-optimisation/PHYSICAL-113-RETINA.md
+@@ -0,0 +1,25 @@
++# Physical113 M4 follow-up
++
++Build0.3.12(113), sourcea59ac18, iPad16,5,4 vCPUs,16GiB guest RAM,60Hz. All three files were scanned; henge.log mirrors native output, so their counters are not added. Machine generations are separated: the short restored generation must not replace the long first session's totals.
++
++The guest started in an1181x756.5-point window with2560x1640 Retina. Instant Resume preserved that geometry. Restoring in a1376x1032-point full-screen window draws881.5 points high, leaving75.25-point bars above/below—70 pixels in the1280x960 screenshot. This is aspect preservation, not a black-texture/GPU failure.
++
++Implemented: Desktop Retina uses the iPad panel shape even at windowed startup; Fit stays window-aware; Duo follows the actual viewport. Existing saved/live state is preserved. Details shows current guest pixels and explains mismatches and cold-start application. New direct Metal4 compiler timing fills the missing cold-shader timing measurement without a draw-time sampler.
++
++Confirmed physical guest Metal4:319065 completed runs, zero guest errors;70239 compatibility runs (55783 unsupported-tag units,14456 pool/admission misses). The82% run share is neither a draw share nor GPU utilisation. Tags161,164 and219 are observed; their individual frequencies are not logged. Tile API mapping is technically feasible and needs semantic/ordering tests; unsupported units continue using the actual classic GPU. Do not discard these operations or enlarge the queue blindly.
++
++Thermal category stayed0 (Normal), including the long later LPM-off period. This is encouraging observational evidence, not a controlled watts/FPS comparison. At16GiB guest RAM, system memory warnings occurred at841.07s and918.96s despite ample process headroom: excluded guest pages still occupy unified memory. Recommend comparing4 vCPUs/8GiB after a real shutdown; do not resize live/saved RAM automatically.
++
++CPU:46822 vCPU sampler observations;76.2% of busy samples in generated code.30626 JIT word samples,27 dumps, zero lost. Three ordinary TLB loads account for22.09%. MOV x6,SP fell from5.20% to0.137%; the selected LR spill fell from3.77% to0.320%. Expected folded-address/slot-load words appear. Different workloads prevent treating those sample-share changes as whole-app speedup percentages. Kernel fastmem's eligible hit rate is90.40%; it does not replace EL0 TLB checks.
++
++The long generation generated31.48M translations with68.43% approximate retranslations;46 partial evictions, zero full resets. Evictions took4.486s total. CPU/dispatch/MMU reuse remains relevant; blocks/s is not an FPS counter.
++
++Classic pipeline cache started with zero indexed persisted PSOs:591 hits,955 compiles,29.03s total compiling,worst1.412s. Metal4 compiled809 pipelines,74 archive hits,44 archive writes; direct compile latency was missing and is now instrumented. The cause of the initially empty cache is not established. Retaining a warmed installation matters; do not clear caches as a performance fix.
++
++Host presentation intervals average30.70/s across all recorded image epochs, including idle/cursor activity. The long epochs have p95 around50ms,p99 around133–150ms. This is not game FPS or proof of uniform60Hz. Long unchanged-image gaps can be legitimate; the31s maximum alone does not prove a frozen guest. Presentation backpressure remained zero. Classic queue-start latency averages2.74ms,worst305.61ms; peak65 overlapping in-flight buffers. Overlapping durations are not GPU utilisation.
++
++Persistent save:16GiB,5935MB output,28.49s total;28.47s compression alongside1.60s writing. Only seven high-entropy chunks (28.7MB) skipped full compression, so the new fast admission path cannot materially shorten this particular mostly compressible save. Restore completed in3.73s. Do not compare its total save time directly with the earlier12GiB capture.
++
++Root disk209255 requests:224us average service,177us average queue,1.18s total flush time; no general flush bottleneck demonstrated. No reported GPU command error, native exception, audio failure or crash; stop was by host. Native USB touch was disabled with no companion polls, so this run cannot validate Pencil/touch recovery. Henge Link was disconnected.
++
++Cloud geometry, SDK and app checks remain required before the next IPA. Physical full-screen layout, active-interaction60Hz and Duo/Pencil remain device validation.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
 index 0000000..a55c4c4
@@ -15056,22 +15097,27 @@ index 55b204a..86d0e29 100644
  
      private typealias CreateFromSelf = @convention(c) (CFAllocator?) -> CFTypeRef?
 diff --git a/ios/Henge/GuestScreenSize.swift b/ios/Henge/GuestScreenSize.swift
-index a0a1e92..6a36fce 100644
+index a0a1e92..ec7537b 100644
 --- a/ios/Henge/GuestScreenSize.swift
 +++ b/ios/Henge/GuestScreenSize.swift
-@@ -21,6 +21,20 @@ struct GuestScreenSize: Equatable {
+@@ -21,6 +21,25 @@ struct GuestScreenSize: Equatable {
          return Self(width: 1920, height: max(1080, Int((1920 * (short / long)).rounded())))
      }
  
 +    /// Reference desktop composition: 1280 logical points across, rendered at
-+    /// 2x. Match the actual viewport, never stretch a 4:3 image onto Duo.
++    /// 2x. An iPad can supply its panel so a temporary Stage Manager window
++    /// cannot become the persistent desktop shape. Duo keeps its own viewport.
 +    /// Explicit alternative to native-panel Retina, not an automatic downgrade.
-+    static func desktopRetina(in viewport: CGSize) -> Self {
-+        guard viewport.width.isFinite, viewport.height.isFinite,
-+              viewport.width > 0, viewport.height > 0 else {
++    static func desktopRetina(in viewport: CGSize, panel: CGSize? = nil) -> Self {
++        let area: CGSize
++        if let panel, panel.width.isFinite, panel.height.isFinite,
++           panel.width > 0, panel.height > 0 { area = panel }
++        else { area = viewport }
++        guard area.width.isFinite, area.height.isFinite,
++              area.width > 0, area.height > 0 else {
 +            return Self(width: 2560, height: 1920)
 +        }
-+        let ratio = min(viewport.width, viewport.height) / max(viewport.width, viewport.height)
++        let ratio = min(area.width, area.height) / max(area.width, area.height)
 +        // Even height keeps the logical 2x backing integral, within one pixel
 +        // of the requested aspect. Width stays 2560 in folded/inner orientations.
 +        return Self(width: 2560, height: max(2, Int((1280 * ratio).rounded()) * 2))
@@ -15081,10 +15127,23 @@ index a0a1e92..6a36fce 100644
          if let selected { return selected }
          // Older Fit profiles only stored this size convention. Explicit new
 diff --git a/ios/Henge/Hardware.swift b/ios/Henge/Hardware.swift
-index af0bc1b..c4205d4 100644
+index af0bc1b..26237e0 100644
 --- a/ios/Henge/Hardware.swift
 +++ b/ios/Henge/Hardware.swift
-@@ -123,7 +123,11 @@ enum HardwareKeys {
+@@ -44,6 +44,12 @@ enum Device {
+         return windows.first(where: \.isKeyWindow)?.bounds.size ?? UIScreen.main.bounds.size
+     }
+ 
++    /// Desktop preserves the iPad panel's composition across window changes.
++    /// Fit remains window-aware, and Duo uses the current inner/outer viewport.
++    static func desktopRetina(in viewport: CGSize) -> GuestScreenSize {
++        GuestScreenSize.desktopRetina(in: viewport, panel: isPad ? screenSize : nil)
++    }
++
+     /// Preserve the iPad's shape while reducing the virtual GPU's pixel work.
+     static var performanceScreen: (width: Int, height: Int) {
+         let fit = fittingScreen
+@@ -123,7 +129,11 @@ enum HardwareKeys {
                  continue
              }
              let usage = UInt8(raw)
@@ -15097,7 +15156,7 @@ index af0bc1b..c4205d4 100644
              if usage < 0xe0 { lastKey = CACurrentMediaTime() }
              if down {
                  held.insert(usage)
-@@ -138,7 +142,7 @@ enum HardwareKeys {
+@@ -138,7 +148,7 @@ enum HardwareKeys {
      /// iPadOS can keep a key's release when it takes over, as it does for ⌘-Tab: the Mac must not
      /// go on thinking the key is down.
      static func releaseAll() {
@@ -15106,7 +15165,7 @@ index af0bc1b..c4205d4 100644
          held.removeAll()
      }
  }
-@@ -147,17 +151,23 @@ enum HardwareKeys {
+@@ -147,17 +157,23 @@ enum HardwareKeys {
  /// that only for an app filling the screen. SwiftUI has no way to ask, so the answer is added to the
  /// class of the window's root view controller, which is who iPadOS asks.
  enum PointerLock {
@@ -15133,7 +15192,7 @@ index af0bc1b..c4205d4 100644
                  class_replaceMethod(kind, #selector(getter: UIViewController.prefersPointerLocked), imp_implementationWithBlock(answer), "B@:")
              }
              root.setNeedsUpdateOfPrefersPointerLocked()
-@@ -195,11 +205,16 @@ final class HardwareMouse {
+@@ -195,11 +211,16 @@ final class HardwareMouse {
      private var acceptsInput = false
      private var scrollCallbacks: UInt64 = 0, scrollFrames: UInt64 = 0
      private var largestScroll: Int32 = 0
@@ -15150,7 +15209,7 @@ index af0bc1b..c4205d4 100644
              releaseButtons()
              scrollTimer?.invalidate(); scrollTimer = nil
              scrollState = HardwareScroll()
-@@ -208,10 +223,13 @@ final class HardwareMouse {
+@@ -208,10 +229,13 @@ final class HardwareMouse {
      }
  
      var scrollDiagnostics: String {
@@ -15165,7 +15224,7 @@ index af0bc1b..c4205d4 100644
          acceptsInput = true
          scrollCallbacks = 0; scrollFrames = 0; largestScroll = 0
          let defaults = UserDefaults.standard
-@@ -237,19 +255,30 @@ final class HardwareMouse {
+@@ -237,19 +261,30 @@ final class HardwareMouse {
          })
          observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidDisconnect, object: nil, queue: .main) { [weak self] note in
              guard let self, let mouse = note.object as? GCMouse else { return }
@@ -15199,7 +15258,7 @@ index af0bc1b..c4205d4 100644
      }
  
      func stop() {
-@@ -275,7 +304,16 @@ final class HardwareMouse {
+@@ -275,7 +310,16 @@ final class HardwareMouse {
      }
  
      func releaseButtons() {
@@ -15217,7 +15276,7 @@ index af0bc1b..c4205d4 100644
      }
  
      private func attach(_ mouse: GCMouse) {
-@@ -283,18 +321,38 @@ final class HardwareMouse {
+@@ -283,18 +327,38 @@ final class HardwareMouse {
          mice.append(mouse)
          mouse.handlerQueue = .main
          HengeLog.log("input", "mouse: \(mouse.vendorName ?? "?"), right button \(input.rightButton != nil), middle \(input.middleButton != nil)")
@@ -15262,7 +15321,7 @@ index af0bc1b..c4205d4 100644
          restX += min(max(dx * speed, -32767), 32767)
          restY -= min(max(dy * speed, -32767), 32767)
          let x = restX.rounded(), y = restY.rounded()
-@@ -304,9 +362,12 @@ final class HardwareMouse {
+@@ -304,9 +368,12 @@ final class HardwareMouse {
          henge_vm_mouse_move(Int32(x), Int32(y))
      }
  
@@ -15278,7 +15337,7 @@ index af0bc1b..c4205d4 100644
          if !pressed { StickyKeys.shared.releaseAll() }
      }
  
-@@ -314,7 +375,8 @@ final class HardwareMouse {
+@@ -314,7 +381,8 @@ final class HardwareMouse {
      /// macOS accelerates wheel units roughly quadratically, so use a tunable square root
      /// and cap each event to keep a small pad gesture from jumping across a page.
      private func scrolled(_ first: Float, _ second: Float) {
@@ -15288,7 +15347,7 @@ index af0bc1b..c4205d4 100644
          scrollCallbacks &+= 1
          scrollState.push(first: Double(first), second: Double(second), scale: scrollScale, reversed: reverse)
          scheduleScrollIfNeeded()
-@@ -344,3 +406,40 @@ final class HardwareMouse {
+@@ -344,3 +412,40 @@ final class HardwareMouse {
          henge_vm_mouse_scroll(event.x, event.y)
      }
  }
@@ -15675,7 +15734,7 @@ index cab1ccf..15ca8b3 100644
          if let code = letters[c] { press(code) }
          else if let lower = c.lowercased().first, let code = letters[lower] { press(code, shifted: true) }
 diff --git a/ios/Henge/Installer.swift b/ios/Henge/Installer.swift
-index 2103167..60958e0 100644
+index 2103167..8c66db1 100644
 --- a/ios/Henge/Installer.swift
 +++ b/ios/Henge/Installer.swift
 @@ -199,6 +199,12 @@ final class Installer: NSObject, ObservableObject {
@@ -15684,7 +15743,7 @@ index 2103167..60958e0 100644
          mac.fitScreen = true
 +        M4Performance.applyRetinaDisplay(to: &mac)
 +        if HengeLog.deviceModel == "iPhone19,4" {
-+            let desktop = GuestScreenSize.desktopRetina(in: Device.displayViewport)
++            let desktop = Device.desktopRetina(in: Device.displayViewport)
 +            mac.desktopLayout = true; mac.retina = true; mac.fitScreen = false
 +            (mac.screenWidth, mac.screenHeight) = (desktop.width, desktop.height)
 +        }
@@ -16953,7 +17012,7 @@ index 1bc238f..ccdbb33 100644
  }
 diff --git a/ios/Henge/M4Performance.swift b/ios/Henge/M4Performance.swift
 new file mode 100644
-index 0000000..721e4bd
+index 0000000..1d3ab83
 --- /dev/null
 +++ b/ios/Henge/M4Performance.swift
 @@ -0,0 +1,47 @@
@@ -16984,7 +17043,7 @@ index 0000000..721e4bd
 +        mac.desktopLayout = true
 +        mac.retina = true
 +        mac.fitScreen = false
-+        let screen = GuestScreenSize.desktopRetina(in: Device.displayViewport)
++        let screen = Device.desktopRetina(in: Device.displayViewport)
 +        (mac.screenWidth, mac.screenHeight) = (screen.width, screen.height)
 +    }
 +    /// Explicit preset only; opening/upgrading Henge never overwrites choices.
@@ -17027,7 +17086,7 @@ index c0f52d6..0d81556 100644
                          .frame(maxWidth: .infinity, alignment: .leading)
                          .padding(.horizontal, 4).padding(.bottom, 12)
 diff --git a/ios/Henge/MacSettingsView.swift b/ios/Henge/MacSettingsView.swift
-index 800c854..e6e6988 100644
+index 800c854..2323699 100644
 --- a/ios/Henge/MacSettingsView.swift
 +++ b/ios/Henge/MacSettingsView.swift
 @@ -5,8 +5,10 @@ struct MacSettingsView: View {
@@ -17141,7 +17200,7 @@ index 800c854..e6e6988 100644
 -                        .pickerStyle(.segmented)
 +                        .pickerStyle(.menu)
 +                        if mac.desktopLayout == true {
-+                            Text("Like the mirrored Mac layout: 1280 points across with a sharp 2× backing. The iPad uses 2560 × 1920; Duo fits its current inner-screen proportions. Native Retina remains available for every panel pixel. Display changes apply on the next cold start; a saved Mac keeps its original display until then.")
++                            Text("Like the mirrored Mac layout: 1280 points across with a sharp 2× backing. The iPad keeps its panel's proportions when Henge's window changes; Duo uses its current screen. Fit follows the window instead. Native Retina remains available for every panel pixel. A saved Mac keeps its original display: shut down macOS and start again to apply this layout.")
 +                                .font(.system(size: 13)).foregroundStyle(Desk.dim)
 +                        }
                          if Device.largeScreen {
@@ -17172,7 +17231,7 @@ index 800c854..e6e6988 100644
              Button("Delete", role: .destructive) {
                  machines.delete(mac.id)
 diff --git a/ios/Henge/Machines.swift b/ios/Henge/Machines.swift
-index 29c8b3b..28300a1 100644
+index 29c8b3b..878d37e 100644
 --- a/ios/Henge/Machines.swift
 +++ b/ios/Henge/Machines.swift
 @@ -3,7 +3,7 @@ import UIKit
@@ -17209,7 +17268,7 @@ index 29c8b3b..28300a1 100644
 +                if area.width >= area.height { area.width -= Device.sideStrip }
 +                else { area.height -= Device.sideStrip }
 +            }
-+            return GuestScreenSize.desktopRetina(in: area)
++            return Device.desktopRetina(in: area)
 +        }
          if isRetina {
              let size = Device.retinaScreen
@@ -18918,7 +18977,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..9584c4b 100644
+index f84465e..bb15d97 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,18 @@ struct SessionView: View {
@@ -19306,7 +19365,7 @@ index f84465e..9584c4b 100644
              Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
          }
          .padding(18)
-@@ -577,12 +780,13 @@ struct SessionView: View {
+@@ -577,13 +780,24 @@ struct SessionView: View {
          NavigationStack {
              List {
                  Section(phase) {
@@ -19319,9 +19378,20 @@ index f84465e..9584c4b 100644
                  }
 +
                  Section("Display") {
++                    if let screen = runningScreen {
++                        LabeledContent("Current guest pixels", value: "\(screen.width) × \(screen.height)")
++                        if mac.desktopLayout == true {
++                            let requested = mac.displaySize(in: Device.displayViewport)
++                            if screen != requested {
++                                Text("This Mac kept its previous \(screen.width) × \(screen.height) display. Desktop Retina will use \(requested.width) × \(requested.height) after you shut down macOS and start again. Save & Leave preserves the current display.")
++                                    .font(.footnote).foregroundStyle(.secondary)
++                            }
++                        }
++                    }
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
-@@ -599,6 +803,7 @@ struct SessionView: View {
+                             .font(.footnote).foregroundStyle(.secondary)
+@@ -599,6 +813,7 @@ struct SessionView: View {
                  }
                  Section("Pointer") {
                      Picker("Size", selection: $cursorScale) {
@@ -19329,7 +19399,7 @@ index f84465e..9584c4b 100644
                          Text("1×").tag(1)
                          Text("2×").tag(2)
                          Text("3×").tag(3)
-@@ -608,7 +813,7 @@ struct SessionView: View {
+@@ -608,7 +823,7 @@ struct SessionView: View {
                      LabeledContent("Magic Keyboard / mouse scroll speed", value: String(format: "%.2f×", scrollSpeed))
                      Slider(value: $scrollSpeed, in: HardwareScroll.minimumSpeed...HardwareScroll.maximumSpeed)
                      Button("Reset hardware scroll speed") { scrollSpeed = HardwareScroll.defaultSpeed }
@@ -19338,7 +19408,7 @@ index f84465e..9584c4b 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  Section("Touch input") {
-@@ -618,16 +823,18 @@ struct SessionView: View {
+@@ -618,16 +833,18 @@ struct SessionView: View {
                          Text("Enable Guest sharing in Henge Settings and reopen Henge to use native touch.")
                              .font(.footnote).foregroundStyle(.secondary)
                      }
@@ -19364,7 +19434,7 @@ index f84465e..9584c4b 100644
                      }
                      Button("Type the Helper Update Command") {
                          showDetails = false
-@@ -640,8 +847,11 @@ struct SessionView: View {
+@@ -640,8 +857,11 @@ struct SessionView: View {
                  }
                  Section("Sharing") {
                      LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
@@ -19378,7 +19448,7 @@ index f84465e..9584c4b 100644
                              showDetails = false
                              Task {
                                  try? await Task.sleep(nanoseconds: 600_000_000)
-@@ -680,6 +890,8 @@ struct SessionView: View {
+@@ -680,6 +900,8 @@ struct SessionView: View {
      }
  
      private func run(viewport: CGSize) async {
@@ -19387,7 +19457,7 @@ index f84465e..9584c4b 100644
          error = nil
          state = 0
          userCode = false
-@@ -693,65 +905,109 @@ struct SessionView: View {
+@@ -693,65 +915,109 @@ struct SessionView: View {
          zoomCentre = CGPoint(x: 0.5, y: 0.5)
          map = nil
          showWallpaperTip = false
@@ -19542,7 +19612,7 @@ index f84465e..9584c4b 100644
              if state == 2 {
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
-@@ -769,38 +1025,58 @@ struct SessionView: View {
+@@ -769,38 +1035,58 @@ struct SessionView: View {
                  }
                  break
              }
@@ -23631,7 +23701,7 @@ index 0000000..b8cf598
 +    }
 +}
 diff --git a/tests/test_guest_screen.swift b/tests/test_guest_screen.swift
-index 6b80564..a3df6a2 100644
+index 6b80564..4dc5f8f 100644
 --- a/tests/test_guest_screen.swift
 +++ b/tests/test_guest_screen.swift
 @@ -1,4 +1,5 @@
@@ -23640,18 +23710,30 @@ index 6b80564..a3df6a2 100644
  
  @main struct TestGuestScreen {
      static func main() {
-@@ -33,6 +34,14 @@ import Foundation
+@@ -33,6 +34,26 @@ import Foundation
          precondition(GuestScreenSize.fitting(in: CGSize(width: CGFloat.greatestFiniteMagnitude,
                                                         height: CGFloat.greatestFiniteMagnitude)).height == 1920)
          precondition(GuestScreenSize.fitting(in: CGSize(width: 2556, height: 1179)) == wide)
 +        let desktop = GuestScreenSize.desktopRetina(in: CGSize(width:1376,height:1032))
 +        precondition(desktop == GuestScreenSize(width:2560,height:1920))
++        // Physical113: a 1181x756.5 window created2560x1640, then a saved
++        // restore filled1376x1032 with881.5 guest points and75.25-point bars.
++        let window = CGSize(width:1181,height:756.5), panel = CGSize(width:1376,height:1032)
++        let windowDesktop = GuestScreenSize.desktopRetina(in: window)
++        precondition(windowDesktop == GuestScreenSize(width:2560,height:1640))
++        precondition(abs((panel.height-panel.width/windowDesktop.aspect)/2-75.25)<0.001)
++        precondition(GuestScreenSize.desktopRetina(in: window,panel:panel)==desktop)
++        precondition(GuestScreenSize.desktopRetina(in: .zero,panel:panel)==desktop)
++        precondition(GuestScreenSize.desktopRetina(in: window,panel:CGSize(width:1032,height:1376))==desktop)
++        precondition(GuestScreenSize.desktopRetina(in: window,panel:.zero)==windowDesktop)
++        precondition(GuestScreenSize.fitting(in:window).height==1230) // Fit still follows the window.
 +        let duo = GuestScreenSize.desktopRetina(in: CGSize(width:951,height:669))
 +        precondition(duo == GuestScreenSize(width:2560,height:1800))
 +        precondition(abs(CGFloat(duo.height)-2560*669/951) <= 1)
 +        precondition(GuestScreenSize.desktopRetina(in: CGSize(width:669,height:951)) == duo)
 +        precondition(GuestScreenSize.desktopRetina(in: .zero) == desktop)
 +        print("Desktop Retina: iPad 2560x1920 and Duo aspect/rotation at 1280 logical width passed")
++        print("PASS Desktop Retina panel policy: reported Stage Manager/snapshot bars reproduced, stable iPad panel, independent window Fit and Duo geometry preserved")
          // Legacy Fit migration and explicit mode choices, including equal-sized
          // custom profiles, must remain distinguishable after encoding/decoding.
          precondition(GuestScreenSize.usesFit(width: 1920, height: 1320, selected: nil))
@@ -24238,10 +24320,10 @@ index 0000000..624db4e
 +}
 diff --git a/tests/test_m4_defaults.swift b/tests/test_m4_defaults.swift
 new file mode 100644
-index 0000000..c8dc9dd
+index 0000000..58bc0e1
 --- /dev/null
 +++ b/tests/test_m4_defaults.swift
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,56 @@
 +import Foundation
 +var fixtureM4: Int32 = 1
 +func hv_host_is_m4_16gb() -> Int32 { fixtureM4 }
@@ -24250,7 +24332,13 @@ index 0000000..c8dc9dd
 +    var retina: Bool? = false, fitScreen: Bool? = true, desktopLayout: Bool? = false
 +    var screenWidth: Int? = 1920, screenHeight: Int? = 1080
 +}
-+enum Device { static let retinaScreen = (width: 2752, height: 2064); static let displayViewport = CGSize(width:1376,height:1032) }
++enum Device {
++    static let retinaScreen = (width: 2752, height: 2064)
++    static let displayViewport = CGSize(width:1181,height:756.5)
++    static func desktopRetina(in viewport:CGSize)->GuestScreenSize {
++        GuestScreenSize.desktopRetina(in:viewport,panel:CGSize(width:1376,height:1032))
++    }
++}
 +@main struct Check {
 +    static func main() {
 +        let d = UserDefaults.standard

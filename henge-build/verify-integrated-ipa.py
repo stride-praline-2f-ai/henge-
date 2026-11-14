@@ -202,6 +202,12 @@ if manifest.get('physical_112_followup'):
         assert marker in app_executable,'Missing physical112 runtime: '+repr(marker)
     assert b'_snapshot_force_full_compression' not in app_executable,'Snapshot benchmark hook leaked into production'
     data['physical_112_followup']=dict(physical,runtime_markers_verified=True,physical_performance_verified=False)
+desktop=state.get('desktop_retina_followup',{})
+if manifest.get('desktop_retina_followup'):
+    assert desktop.get('complete') and desktop.get('source_commit')==state['final_validation']['source_commit']
+    for marker in (b'metal4-pipeline-timing:',b'Current guest pixels',b'Save & Leave preserves the current display.'):
+        assert marker in app_executable,'Missing Desktop Retina follow-up: '+repr(marker)
+    data['desktop_retina_followup']=dict(desktop,runtime_markers_verified=True)
 # Correct legacy metadata: verify the real configured default in the reconstructed source.
 assert 'as? Bool ?? true' in Path('Henge/ios/Henge/EngineTuning.swift').read_text()
 data['fastmem_default']=True

@@ -106,4 +106,10 @@ if manifest.get('physical_112_followup'):
     if hardware.get('state')=='blocked':
         assert isinstance(hardware.get('run_id'),int) and len(hardware.get('reason',''))>120, 'Physical GPU blocker needs concrete runner evidence'
 
+desktop=state.get('desktop_retina_followup',{})
+if manifest.get('desktop_retina_followup'):
+    assert desktop.get('complete') is True and desktop.get('source_commit')==validation.get('source_commit'), 'Desktop Retina follow-up requires exact-source proof'
+    assert desktop.get('geometry')=='passed_cloud' and desktop.get('ios_integration')=='passed_cloud' and desktop.get('metal_sdk')=='passed_cloud', 'Desktop Retina/diagnostic checks incomplete'
+    assert desktop.get('evidence'), 'Missing executed Desktop Retina proof'
+
 print('PASS complete implementation gate:'  ,  manifest['audit_repairs_sha256'])
