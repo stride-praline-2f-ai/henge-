@@ -2397,10 +2397,10 @@ index 0000000..e295be6
 +}
 diff --git a/devices/metal4_runtime.h b/devices/metal4_runtime.h
 new file mode 100644
-index 0000000..cffa8c1
+index 0000000..afbb50f
 --- /dev/null
 +++ b/devices/metal4_runtime.h
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,323 @@
 +#pragma once
 +/* Supported Metal 4 submission, shared by guest replay and native presentation.
 + * Classic/Metal4 queues are joined with a shared event in BOTH directions.
@@ -2443,6 +2443,7 @@ index 0000000..cffa8c1
 +    NSUInteger _created;
 +    _Atomic bool _retainIdleResources;
 +    NSLock *_compileLock;
++    dispatch_queue_t _archiveQueue;
 +    id<MTL4PipelineDataSetSerializer> _capture;
 +    NSURL *_cacheDirectory;
 +    NSArray<id<MTL4Archive>> *_archives;
@@ -2475,6 +2476,7 @@ index 0000000..cffa8c1
 +        NSError *error=nil;
 +        _queue=[device newMTL4CommandQueueWithDescriptor:[MTL4CommandQueueDescriptor new] error:&error];
 +        _compileLock=[NSLock new];_cacheAdmission=YES;
++        _archiveQueue=dispatch_queue_create("hengevm.metal4.archive",dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_UTILITY,0));
 +        NSURL *support=[[NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask]firstObject];
 +        NSOperatingSystemVersion os=NSProcessInfo.processInfo.operatingSystemVersion;
 +        NSString *identity=[NSString stringWithFormat:@"%@/%@/%ld.%ld/%@/schema1",device.architecture.name,NSBundle.mainBundle.bundleIdentifier?:@"Henge",(long)os.majorVersion,(long)os.minorVersion,NSProcessInfo.processInfo.operatingSystemVersionString];
@@ -2541,16 +2543,22 @@ index 0000000..cffa8c1
 +- (void)flushPipelines {
 +    [_compileLock lock];_saveScheduled=NO;
 +    if(!_cacheAdmission||!_pendingPipelines||!_capture){[_compileLock unlock];return;}
++    id<MTL4PipelineDataSetSerializer> capture=_capture;
++    __attribute__((objc_precise_lifetime)) id<MTL4Compiler> oldCompiler=_compiler;
++    (void)oldCompiler;
++    /* Hand future compiles to a fresh epoch before disk I/O. The old compiler
++       remains alive with its serializer, and can never capture concurrently
++       with serialization. The utility serial queue bounds concurrent saves. */
++    [self resetCompiler];[_compileLock unlock];
 +    NSFileManager *fm=NSFileManager.defaultManager;
 +    [fm createDirectoryAtURL:_cacheDirectory withIntermediateDirectories:YES attributes:nil error:nil];
 +    NSURL *final=[_cacheDirectory URLByAppendingPathComponent:[NSUUID.UUID.UUIDString stringByAppendingPathExtension:@"mtl4a"]];
 +    NSURL *temporary=[final URLByAppendingPathExtension:@"new"];NSError *error=nil;
-+    BOOL saved=[_capture serializeAsArchiveAndFlushToURL:temporary error:&error];
++    BOOL saved=[capture serializeAsArchiveAndFlushToURL:temporary error:&error];
 +    if(saved){NSNumber *size=nil;[temporary getResourceValue:&size forKey:NSURLFileSizeKey error:nil];saved=size.unsignedLongLongValue>255&&size.unsignedLongLongValue<=(64u<<20);}
 +    if(saved)saved=[fm moveItemAtURL:temporary toURL:final error:&error];
-+    if(saved){atomic_fetch_add(&pipeline_cache_writes,1);[self pruneArchiveFiles];[self loadArchives];}
++    if(saved){atomic_fetch_add(&pipeline_cache_writes,1);[self pruneArchiveFiles];[_compileLock lock];[self loadArchives];[_compileLock unlock];}
 +    else{[fm removeItemAtURL:temporary error:nil];fprintf(stderr,"hengevm: metal4-pipeline-cache: save unavailable; existing archives retained (%s)\n",error.localizedDescription.UTF8String?:"size limit");}
-+    [self resetCompiler];[_compileLock unlock];
 +}
 +- (id)pipeline:(id)descriptor tag:(uint32_t)tag bundle:(HvPipelineBundle *)bundle {
 +    if(!descriptor)return nil;
@@ -2575,11 +2583,11 @@ index 0000000..cffa8c1
 +            _pendingPipelines++;
 +            if(_pendingPipelines>=128&&!_urgentSaveScheduled){
 +                _urgentSaveScheduled=YES;__weak HvMetal4Runtime *owner=self;
-+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{[owner flushPipelines];});
++                dispatch_async(_archiveQueue,^{[owner flushPipelines];});
 +            }
 +            if(!_saveScheduled){
 +                _saveScheduled=YES;__weak HvMetal4Runtime *owner=self;
-+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,8*NSEC_PER_SEC),dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{[owner flushPipelines];});
++                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,8*NSEC_PER_SEC),_archiveQueue,^{[owner flushPipelines];});
 +            }
 +        }
 +    }
@@ -23419,10 +23427,10 @@ index 35ecb46..a80fef1 100644
      pt = aligned_alloc(16384, PT_SIZE);
 diff --git a/tests/test_metal4_ordering.m b/tests/test_metal4_ordering.m
 new file mode 100644
-index 0000000..be3a5e2
+index 0000000..0f32367
 --- /dev/null
 +++ b/tests/test_metal4_ordering.m
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,186 @@
 +/* Executes the real submission/pool/fence code with recording queues. It proves
 + * ordering and lifetime on CI without claiming Metal4 GPU execution. */
 +#import <Foundation/Foundation.h>
@@ -23508,9 +23516,75 @@ index 0000000..be3a5e2
 +- (id)newCommandBuffer {return [RecordingObject new];}
 +- (id)newResidencySetWithDescriptor:(id)d error:(NSError **)e {(void)d;(void)e;return [RecordingObject new];}
 +@end
++@interface CacheCapture : NSObject
++@property(nonatomic,strong) NSMutableSet *keys;
++@property(nonatomic,strong) dispatch_semaphore_t started,releaseWrite;
++@end
++@implementation CacheCapture
++- (BOOL)serializeAsArchiveAndFlushToURL:(NSURL *)url error:(NSError **)error {
++    (void)error;if(_started){dispatch_semaphore_signal(_started);dispatch_semaphore_wait(_releaseWrite,DISPATCH_TIME_FOREVER);}
++    NSMutableData *data=[[NSJSONSerialization dataWithJSONObject:_keys.allObjects options:0 error:nil]mutableCopy];
++    while(data.length<512){uint8_t space=' ';[data appendBytes:&space length:1];}
++    return [data writeToURL:url atomically:YES];
++}
++@end
++@interface CacheCompiler : NSObject
++@property(nonatomic,strong) CacheCapture *capture;
++@end
++@implementation CacheCompiler
++- (id)newRenderPipelineStateWithDescriptor:(id)d compilerTaskOptions:(id)o error:(NSError **)e {
++    (void)o;(void)e;[_capture.keys addObject:d];return [NSObject new];
++}
++@end
++@interface CacheArchive : NSObject
++@property(nonatomic,strong) NSArray *keys;
++@end
++@implementation CacheArchive
++- (id)newRenderPipelineStateWithDescriptor:(id)d error:(NSError **)e {(void)e;return [_keys containsObject:d]?[NSObject new]:nil;}
++@end
++@interface CacheDevice : RecordingDevice
++@property(nonatomic,strong) CacheCapture *capture;
++@property(nonatomic) unsigned compilers;
++@end
++@implementation CacheDevice
++- (id)newPipelineDataSetSerializerWithDescriptor:(id)d {
++    (void)d;_capture=[CacheCapture new];_capture.keys=[NSMutableSet new];return _capture;
++}
++- (id)newCompilerWithDescriptor:(MTL4CompilerDescriptor *)d error:(NSError **)e {
++    (void)e;_compilers++;CacheCompiler *c=[CacheCompiler new];c.capture=(id)d.pipelineDataSetSerializer;return c;
++}
++- (id)newArchiveWithURL:(NSURL *)url error:(NSError **)e {
++    (void)e;NSArray *keys=[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfURL:url] options:0 error:nil];
++    if(![keys isKindOfClass:NSArray.class])return nil;CacheArchive *a=[CacheArchive new];a.keys=keys;return a;
++}
++@end
++static void testCache(void){
++    NSURL *root=[NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString]];
++    NSURL *directory=[root URLByAppendingPathComponent:@"current"];
++    CacheDevice *device=[CacheDevice new];HvMetal4Runtime *runtime=[[HvMetal4Runtime alloc]initWithDevice:(id)device];assert(runtime);
++    [runtime setValue:directory forKey:@"cacheDirectory"];
++    assert([runtime pipeline:@"first" tag:0xe bundle:nil]);
++    CacheCapture *old=device.capture;old.started=dispatch_semaphore_create(0);old.releaseWrite=dispatch_semaphore_create(0);
++    dispatch_group_t saved=dispatch_group_create();dispatch_group_async(saved,dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{[runtime flushPipelines];});
++    assert(!dispatch_semaphore_wait(old.started,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC)));
++    dispatch_semaphore_t compiled=dispatch_semaphore_create(0);
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{assert([runtime pipeline:@"next epoch" tag:0xe bundle:nil]);dispatch_semaphore_signal(compiled);});
++    assert(!dispatch_semaphore_wait(compiled,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC)));
++    assert(device.capture!=old&&device.compilers>=2);
++    dispatch_semaphore_signal(old.releaseWrite);assert(!dispatch_group_wait(saved,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC)));
++    uint64_t misses=atomic_load(&runtime->pipeline_cache_misses);assert([runtime pipeline:@"first" tag:0xe bundle:nil]);
++    assert(atomic_load(&runtime->pipeline_cache_hits)==1&&atomic_load(&runtime->pipeline_cache_misses)==misses);
++    assert(atomic_load(&runtime->pipeline_cache_writes)==1);
++    [runtime setArchiveAdmission:NO];assert([runtime pipeline:@"uncached under pressure" tag:0xe bundle:nil]);
++    [runtime setArchiveAdmission:YES];assert([runtime pipeline:@"first" tag:0xe bundle:nil]);
++    assert(atomic_load(&runtime->pipeline_cache_hits)==2);
++    [NSFileManager.defaultManager removeItemAtURL:root error:nil];
++    puts("PASS Metal4 archive epochs: atomic file reuse, memory-pressure recovery, old capture isolated and new pipeline request completes while writer is blocked (recording compiler)");
++}
 +static void order(NSString *a,NSString *b){assert([trace indexOfObject:a]!=NSNotFound);assert([trace indexOfObject:a]<[trace indexOfObject:b]);}
 +int main(void){@autoreleasepool{
 +    alarm(30);trace=[NSMutableArray new];
++    testCache();
 +    for(unsigned mode=0;mode<5;mode++){
 +        RecordingDevice *device=[RecordingDevice new];device.queue.synchronous=mode==0;
 +        HvMetal4Runtime *runtime=[[HvMetal4Runtime alloc]initWithDevice:(id)device];assert(runtime);
