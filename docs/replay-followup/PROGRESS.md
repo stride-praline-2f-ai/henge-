@@ -9,3 +9,5 @@
 - [ ] Release gate and any subsequent119 IPA packaging.
 
 Next: full workflow on perf/replay-mapping-sync, fix any independent failures, then record exact-source results. No runtime changes to baseline perf/safari-compositing. No IPA during implementation. Partial copy stays opt-in; no new UI switches, resolution reduction, CPU topology changes or refresh cap.
+
+Final review correction: transient UIKit warning recovery now reuses the existing active-work budget deadline. No new timer or controller; a workload with no new shader libraries can recover command-cache admission. Final validation must use the patch containing this correction.
