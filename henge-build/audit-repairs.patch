@@ -242,7 +242,7 @@ index 4109920..8a8f565 100644
  _Static_assert(offsetof(HvCpu, pc) == HV_CPU_PC, "HvCpu layout");
  _Static_assert(offsetof(HvCpu, nzcv) == HV_CPU_NZCV, "HvCpu layout");
 diff --git a/core/dispatch.c b/core/dispatch.c
-index 12bd4a9..4f7fdb1 100644
+index 12bd4a9..dc3ca6e 100644
 --- a/core/dispatch.c
 +++ b/core/dispatch.c
 @@ -15,8 +15,17 @@
@@ -263,7 +263,7 @@ index 12bd4a9..4f7fdb1 100644
      /* Every other CPU is parked (stop_the_world): the one moment the TLB layout can change. */
      if ((hv_knob[HV_K_TLBT] != 0) != hv_tlb_tmajor) {
          hv_tlb_tmajor = hv_knob[HV_K_TLBT] != 0;
-@@ -37,21 +46,186 @@ void hv_flush_blocks(HvMachine *m) {
+@@ -37,21 +46,185 @@ void hv_flush_blocks(HvMachine *m) {
          }
      memset(m->hash, 0, sizeof m->hash);
      m->nblocks = 0;
@@ -331,8 +331,7 @@ index 12bd4a9..4f7fdb1 100644
 +    uint64_t t0 = mach_absolute_time();
 +    uint64_t seen=0;
 +    for(int i=0;i<m->ncpus;i++){seen|=m->percpu[i].jit_seen;m->percpu[i].jit_seen=0;}
-+    int adaptive=!getenv("HV_JIT_RETAIN_REFERENCE")||!atoi(getenv("HV_JIT_RETAIN_REFERENCE"));
-+    uint32_t seg = hv_jit_evict_policy(r,seen,adaptive);
++    uint32_t seg = hv_jit_evict_policy(r,seen,m->jit_retention);
 +    const uint32_t *lo = r->base + (size_t)seg * r->seg_words, *hi = lo + r->seg_words;
 +#define GONE(p) ((uintptr_t)(p) >= (uintptr_t)lo && (uintptr_t)(p) < (uintptr_t)hi)
 +    m->stats.evictions++;
@@ -459,7 +458,7 @@ index 12bd4a9..4f7fdb1 100644
  }
  
  /* Parked: not running guest code, nor using its TLB, so other CPUs need not
-@@ -97,7 +271,7 @@ static uint32_t block_flags(HvCpu *cpu) {
+@@ -97,7 +270,7 @@ static uint32_t block_flags(HvCpu *cpu) {
  
  /* Finding a block is lock-free (blocks are only ever added, with a release
     store, until a flush, which stops every CPU); making one takes the
@@ -468,7 +467,7 @@ index 12bd4a9..4f7fdb1 100644
     (m->flush_pending is set: the dispatcher does that, then tries again). */
  #define hash_of hv_block_hash
  #define find hv_block_find
-@@ -129,10 +303,14 @@ static void block_dump(const HvBlock *b, const uint32_t *code) {
+@@ -129,10 +302,14 @@ static void block_dump(const HvBlock *b, const uint32_t *code) {
  
  static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
      HvMachine *m = cpu->m;
@@ -484,7 +483,7 @@ index 12bd4a9..4f7fdb1 100644
      uint32_t h = hash_of(va, pa, flags);
      HvRam *ram = hv_ram_lookup(m, pa);
      uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
-@@ -141,6 +319,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+@@ -141,6 +318,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
      HvBlock *b = find(m, h, va, pa, flags, gen);
      if (b) {
          jc[j].va = va, jc[j].b = b;
@@ -492,7 +491,7 @@ index 12bd4a9..4f7fdb1 100644
          return b;
      }
  
-@@ -161,7 +340,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+@@ -161,7 +339,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
      uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
      uint8_t phase0 = cpu->pc_state ? __atomic_load_n(&cpu->pc_state->phase, __ATOMIC_RELAXED) : 0;
      if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_TRANSLATE, __ATOMIC_RELAXED);
@@ -501,7 +500,7 @@ index 12bd4a9..4f7fdb1 100644
      if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, phase0, __ATOMIC_RELAXED);
      if (failed) goto flush_unlocked;
      if (m->stats_interval) {
-@@ -182,12 +361,11 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+@@ -182,12 +360,11 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
          return b;
      }
      /* ...and place it in the region (space is reserved atomically, so no lock either)... */
@@ -517,7 +516,7 @@ index 12bd4a9..4f7fdb1 100644
      }
      if (m->gen_checks && nb.jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST))
          fprintf(stderr, "hengevm: cpu %u translated across a flush: gen %u to %u, placed at rx+%llx, used %llx, active %d\n", cpu->index, nb.jit_gen, m->jit_gen, (unsigned long long)(nb.code - m->jit.base) * 4, (unsigned long long)m->jit.used * 4, cpu->pc_state->active);
-@@ -201,23 +379,24 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+@@ -201,23 +378,24 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
              m->stats.tr_wait_ticks += mach_absolute_time() - w0;
          }
      }
@@ -548,7 +547,7 @@ index 12bd4a9..4f7fdb1 100644
          static uint64_t seen_va[1 << 18], seen_vapa[1 << 18]; /* was this code translated before? (hashed, so approximate) */
          uint32_t hv = (uint32_t)(((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull >> 40);
          uint32_t hp = (uint32_t)((((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull ^ pa * 0xc2b2ae3d27d4eb4full) >> 40);
-@@ -226,15 +405,19 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+@@ -226,15 +404,19 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
          seen_va[hv >> 6] |= 1ull << (hv & 63);
          seen_vapa[hp >> 6] |= 1ull << (hp & 63);
      }
@@ -569,7 +568,7 @@ index 12bd4a9..4f7fdb1 100644
      pthread_mutex_unlock(&m->tr_mu);
      hv_machine_kick_all(m);
      return NULL;
-@@ -257,6 +440,7 @@ static uint32_t wfe(HvCpu *cpu) {
+@@ -257,6 +439,7 @@ static uint32_t wfe(HvCpu *cpu) {
      uint64_t page = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
      if (spin || va == ~0ull || (size != 1 && size != 2 && size != 4 && size != 8) || (va & (size - 1)) ||
          e->read_tag == HV_TLB_INVALID || e->read_tag + HV_TLB_ADJ != page) {
@@ -577,7 +576,7 @@ index 12bd4a9..4f7fdb1 100644
          __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED); /* let another CPU run: the dispatcher's way */
          return 0;
      }
-@@ -284,7 +468,7 @@ static uint32_t wfe(HvCpu *cpu) {
+@@ -284,7 +467,7 @@ static uint32_t wfe(HvCpu *cpu) {
          }
          if (v != want || __atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED)) break;
          if (mach_absolute_time() >= deadline) {
@@ -586,7 +585,7 @@ index 12bd4a9..4f7fdb1 100644
              __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
              break;
          }
-@@ -292,7 +476,7 @@ static uint32_t wfe(HvCpu *cpu) {
+@@ -292,7 +475,7 @@ static uint32_t wfe(HvCpu *cpu) {
          else __asm__ volatile("yield" ::: "memory");
      }
      __asm__ volatile("clrex" ::: "memory");
@@ -595,11 +594,12 @@ index 12bd4a9..4f7fdb1 100644
      return 0;
  }
  
-@@ -360,6 +544,7 @@ static int tlbi_may_hit(HvCpu *cpu, uint32_t insn, uint64_t pc) {
+@@ -360,6 +543,8 @@ static int tlbi_may_hit(HvCpu *cpu, uint32_t insn, uint64_t pc) {
  static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in);
  
  uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info_in) {
-+    if((++cpu->pc_state->jit_sample_count&255u)==0)hv_jit_note_execution(cpu,(const uint32_t *)(uintptr_t)cpu->helper_ret);
++    if(cpu->m->jit_retention && (++cpu->pc_state->jit_sample_count&255u)==0)
++        hv_jit_note_execution(cpu,(const uint32_t *)(uintptr_t)cpu->helper_ret);
      HvPerCpu *pcs = cpu->pc_state;
      if (cpu->m->wait_stats && pcs) __atomic_store_n(&pcs->phase, HV_PHASE_HELPER, __ATOMIC_RELAXED);
      uint32_t r = helper(cpu, info_in);
@@ -885,7 +885,7 @@ index c341d16..3d49220 100644
  void hv_enter(HvCpu *cpu, void *block);
  /* While hv_run runs, the host FPCR/FPSR hold the guest's; these move them in and out. */
 diff --git a/core/fastmem_log.c b/core/fastmem_log.c
-index a41d6d2..f6c2447 100644
+index a41d6d2..51051f8 100644
 --- a/core/fastmem_log.c
 +++ b/core/fastmem_log.c
 @@ -21,13 +21,14 @@ void hv_fastmem_log(HvMachine *m, FILE *out) {
@@ -925,13 +925,13 @@ index a41d6d2..f6c2447 100644
 +    fprintf(out,"jit-ring: segments=%u evictions=%llu blocks_dropped=%llu exits_repaired=%llu (quiescent nonmoving segment reuse; full flush fallback retained)\n",
 +        m->jit.nseg,(unsigned long long)m->stats.evictions,(unsigned long long)m->stats.evict_blocks,(unsigned long long)m->stats.evict_unchained);
 +    fprintf(out,"jit-branch-preservation: examined=%llu removed=%llu preserved_observations=%llu (indexed quiescent eviction; return/descriptor resets retained)\n",(unsigned long long)__atomic_load_n(&m->ijc_evict_examined,__ATOMIC_RELAXED),(unsigned long long)__atomic_load_n(&m->ijc_evict_removed,__ATOMIC_RELAXED),(unsigned long long)__atomic_load_n(&m->ijc_evict_preserved,__ATOMIC_RELAXED));
-+    fprintf(out,"jit-retention: nonfifo=%llu activity_source=dispatcher-and-decimated-helpers no_poll_timer=1 code_moves=0 (heuristic policy; not an FPS claim)\n",(unsigned long long)__atomic_load_n(&m->jit.retention_nonfifo,__ATOMIC_RELAXED));
++    fprintf(out,"jit-retention: enabled=%d nonfifo=%llu activity_source=cache-hits-and-decimated-helpers no_poll_timer=1 code_moves=0 (heuristic policy; not an FPS claim)\n",m->jit_retention,(unsigned long long)__atomic_load_n(&m->jit.retention_nonfifo,__ATOMIC_RELAXED));
 +    fprintf(out,"branch-dispatch: paired-load=%d site-hints=%d hint_emissions=%llu (tag/ASID/flag checks retained; emissions are not hits)\n",m->ijc_pair,m->branch_site_hints,(unsigned long long)__atomic_load_n(&m->branch_hint_emissions,__ATOMIC_RELAXED));
      fprintf(out, "fastmem: mode=%s counters=%s (cumulative; diagnostic counting adds overhead)\n",
              m->fastmem_enabled ? "on" : "off", m->fastmem_diagnostics ? "on" : "off");
      if (m->fastmem_enabled) fprintf(out, "fastmem-layout: tagged-multiwindow entries=262144 per-PAN bytes-per-CPU=10485760 (bounded allocation; exact VA tags; all kernel windows)\n");
 diff --git a/core/machine.c b/core/machine.c
-index 7a01fdc..1ab5963 100644
+index 7a01fdc..0c0c127 100644
 --- a/core/machine.c
 +++ b/core/machine.c
 @@ -12,6 +12,7 @@
@@ -994,7 +994,7 @@ index 7a01fdc..1ab5963 100644
      /* The exact check for an access in a page's last 15 bytes, in the access's out-of-line path (code size only):
         on the phone, Golden Gate's boot and login send 80-240K such accesses a second to the helper without it. It
         costs ~13% of the code (Mac 2026-11-09: 296-300 against 259-261 bytes a block), and the phone's code cache
-@@ -124,10 +136,18 @@ static int init_rest(HvMachine *m) {
+@@ -124,10 +136,21 @@ static int init_rest(HvMachine *m) {
      m->max_blocks = (uint32_t)(bytes / 160 < 4096 ? 4096 : bytes / 160);
      m->max_slots = m->max_blocks * 2;
      m->blocks = calloc(m->max_blocks, sizeof(HvBlock));
@@ -1010,10 +1010,13 @@ index 7a01fdc..1ab5963 100644
 +    /* Pairing can shorten a hit but adds a rehash on way1. Native paired
 +       comparisons did not establish a stable win; retain the normal default. */
 +    m->ijc_pair=getenv("HV_IJC_PAIR")&&atoi(getenv("HV_IJC_PAIR"));
++    m->jit_retention=!getenv("HV_JIT_RETAIN_REFERENCE")||!atoi(getenv("HV_JIT_RETAIN_REFERENCE"));
++    fprintf(stderr,"henge: engine-paths: interleaved-groups=%d paired-ijc=%d site-hints=%d recent-use-retention=%d (checked guards, cache authority and global eviction barriers retained)\n",
++            hv_knob[HV_K_GROUPS]==2&&hv_translate_interleaved_groups(),m->ijc_pair,m->branch_site_hints,m->jit_retention);
      m->slots = calloc(m->max_slots, sizeof *m->slots);
      m->slot_site = calloc(m->max_slots, sizeof *m->slot_site);
      m->slot_stub = calloc(m->max_slots, sizeof *m->slot_stub);
-@@ -139,6 +159,9 @@ static int init_rest(HvMachine *m) {
+@@ -139,6 +162,9 @@ static int init_rest(HvMachine *m) {
      m->quiesce_initialized=hv_quiesce_init(&m->quiesce)==0;
      m->quiesce_enabled=m->quiesce_initialized && (!getenv("HV_STW_WAIT") || strcmp(getenv("HV_STW_WAIT"),"0"));
      fprintf(stderr,"henge: flush-wait: mode=%s; short spin then event wake, own requests serviced, 100us missed-wake fallback; guest WFE/timers unchanged\n",m->quiesce_enabled?"event":"legacy-yield");
@@ -1023,7 +1026,7 @@ index 7a01fdc..1ab5963 100644
      for (int i = 0; i < HV_MAX_CPUS; i++) { /* untouched pages cost nothing, so every CPU gets its tables now */
          HvPerCpu *p = &m->percpu[i];
          p->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
-@@ -219,10 +242,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+@@ -219,10 +245,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
  #define HV_ULF_WAKE_ALL 0x100u
  #define HV_ULF_NO_ERRNO 0x1000000u
  
@@ -1041,7 +1044,7 @@ index 7a01fdc..1ab5963 100644
  }
  
  void hv_cpu_ack_wake(HvCpu *cpu) {
-@@ -262,6 +289,13 @@ void hv_cpu_process_requests(HvCpu *cpu) {
+@@ -262,6 +292,13 @@ void hv_cpu_process_requests(HvCpu *cpu) {
  
  void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
      HvPerCpu *t = target->pc_state, *s = self ? self->pc_state : NULL;
@@ -1055,7 +1058,7 @@ index 7a01fdc..1ab5963 100644
      HvMachine *mm = target->m;
      uint64_t t0 = mm->stats_interval ? mach_absolute_time() : 0;
      if (s) {
-@@ -271,6 +305,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -271,6 +308,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
      int sleep = hv_knob[HV_K_SYNCWAIT], probed = !t0 || !mm->wait_stats, probed_long = !t0 || !mm->wait_stats;
      if (s && mm->wait_stats) __atomic_store_n(&s->phase, HV_PHASE_SYNC, __ATOMIC_RELAXED);
      for (uint32_t spins = 0;; spins++) {
@@ -1063,7 +1066,7 @@ index 7a01fdc..1ab5963 100644
          uint64_t ack = __atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE);
          if (ack >= seq) break;
          if (!probed && !(spins & 63) && mach_absolute_time() - t0 >= 2400) { /* 100 us: what is it doing? */
-@@ -295,10 +330,12 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -295,10 +333,12 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
          if (self) hv_cpu_process_requests(self);
          if (sleep && spins >= 64) {
              __atomic_add_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
@@ -1078,7 +1081,7 @@ index 7a01fdc..1ab5963 100644
                  if (rc == -ETIMEDOUT && s) __atomic_add_fetch(&s->sync_timeouts, 1, __ATOMIC_RELAXED);
                  if (rc < 0 && rc != -ETIMEDOUT && rc != -EINTR) {
                      if (s) __atomic_add_fetch(&s->sync_errors, 1, __ATOMIC_RELAXED);
-@@ -396,18 +433,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
+@@ -396,18 +436,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
      return marked;
  }
  
@@ -1107,7 +1110,7 @@ index 7a01fdc..1ab5963 100644
      if (marked) __asm__ volatile("sev" ::: "memory");
      return marked;
  }
-@@ -444,10 +488,12 @@ void hv_machine_free(HvMachine *m) {
+@@ -444,10 +491,12 @@ void hv_machine_free(HvMachine *m) {
          free(m->ram[i].ijc_va);
      }
      free(m->blocks);
@@ -1120,7 +1123,7 @@ index 7a01fdc..1ab5963 100644
          free(m->percpu[i].ucode);
          free(m->percpu[i].cid_chunks);
          for (int k = 0; k < HV_STASHES; k++) {
-@@ -467,6 +513,8 @@ void hv_machine_free(HvMachine *m) {
+@@ -467,6 +516,8 @@ void hv_machine_free(HvMachine *m) {
      free(m->slot_xa);
      free(m->slot_xpa);
      free(m->xchained);
@@ -1129,7 +1132,7 @@ index 7a01fdc..1ab5963 100644
      if (m->locks_initialized) {
          pthread_mutex_destroy(&m->big_mu);
          pthread_cond_destroy(&m->big_cv);
-@@ -514,6 +562,38 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
+@@ -514,6 +565,38 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
      return NULL;
  }
  
@@ -1168,7 +1171,7 @@ index 7a01fdc..1ab5963 100644
  uint32_t *hv_smc_counts;
  uint64_t *hv_smc_last;
  uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
-@@ -622,6 +702,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
+@@ -622,6 +705,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
  
  /* MMIO is accessed in naturally sized pieces of at most 8 bytes. */
  int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
@@ -1176,7 +1179,7 @@ index 7a01fdc..1ab5963 100644
      void *p = hv_phys_ptr(m, pa, len);
      if (p) {
          memcpy(buf, p, len);
-@@ -640,8 +721,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
+@@ -640,8 +724,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
  }
  
  int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
@@ -1187,7 +1190,7 @@ index 7a01fdc..1ab5963 100644
          if (r->readonly) return 0; /* ROM: writes are ignored */
          uint64_t off = pa - r->pa;
          uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
-@@ -674,6 +756,15 @@ void hv_cpu_reset(HvCpu *cpu, HvMachine *m) {
+@@ -674,6 +759,15 @@ void hv_cpu_reset(HvCpu *cpu, HvMachine *m) {
      hv_cpu_reset_index(cpu, m, 0);
  }
  
@@ -1203,7 +1206,7 @@ index 7a01fdc..1ab5963 100644
  void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
      /* Everything but m and pc_state: other CPUs' TLBIs read those of a CPU
         being started (PSCI CPU_ON) at any time. */
-@@ -690,6 +781,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
+@@ -690,6 +784,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
      if (m->ncpus <= (int)index) m->ncpus = (int)index + 1;
      if (index == 0) m->cpu = cpu;
      HvPerCpu *p = cpu->pc_state;
@@ -1212,7 +1215,7 @@ index 7a01fdc..1ab5963 100644
      /* Ids start over, so entries tagged with the old ones must go. */
      for (int t = 0; t < HV_IJC_TABLES; t++)
          if (p->ijc_tables_used >> t & 1) memset(p->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8), 0, HV_IJC_TABLE_BYTES);
-@@ -699,6 +792,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
+@@ -699,6 +795,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
      memset(p->ijc_pages, 0, sizeof p->ijc_pages);
      memset(p->ijc_hint, 0, sizeof p->ijc_hint);
      memset(p->jc, 0, sizeof p->jc);
@@ -1222,7 +1225,7 @@ index 7a01fdc..1ab5963 100644
      cpu->lines_ptr = (uint64_t)(uintptr_t)&p->irq_line;
      for (int t = 0; t < HV_IJC_TABLES; t++) cpu->ijc_tab[t] = (uint64_t)(uintptr_t)(p->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8));
 diff --git a/core/machine.h b/core/machine.h
-index cafe156..5a9ea7e 100644
+index cafe156..6fdd28a 100644
 --- a/core/machine.h
 +++ b/core/machine.h
 @@ -47,6 +47,7 @@ typedef struct HvBlock {
@@ -1310,7 +1313,7 @@ index cafe156..5a9ea7e 100644
      int wait_stats;
      int jit_tail_enabled;
      int chain;               /* block chaining and the indirect-branch cache are enabled */
-@@ -282,6 +298,16 @@ typedef struct HvMachine {
+@@ -282,6 +298,17 @@ typedef struct HvMachine {
      uint32_t xchain_heads[HV_XCHAIN_BUCKETS];
      uint64_t xchain_examined, xchain_removed;
      uint32_t nslots;
@@ -1318,6 +1321,7 @@ index cafe156..5a9ea7e 100644
 +    uint32_t blocks_wrap;
 +    int branch_site_hints;
 +    int ijc_pair;
++    int jit_retention;
 +    uint64_t branch_hint_emissions;
 +    uint32_t *jit_page_heads;
 +    size_t jit_page_count;
@@ -1327,7 +1331,7 @@ index cafe156..5a9ea7e 100644
      HvCpu *cpu;              /* CPU 0: the one that polls devices */
      HvCpu *cpus[HV_MAX_CPUS]; /* every CPU, so device and invalidation code can ask them to leave */
      int ncpus;
-@@ -316,7 +342,7 @@ static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
+@@ -316,7 +343,7 @@ static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
      return (uint32_t)(h ^ (h >> 29)) & (HV_BLOCK_HASH - 1);
  }
  
@@ -1336,7 +1340,7 @@ index cafe156..5a9ea7e 100644
  static inline HvBlock *hv_block_find(HvMachine *m, uint32_t h, uint64_t va, uint64_t pa, uint32_t flags, uint32_t gen) {
      for (HvBlock *b = __atomic_load_n(&m->hash[h], __ATOMIC_ACQUIRE); b; b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE))
          if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return b;
-@@ -333,6 +359,16 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
+@@ -333,6 +360,17 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
                          void (*write)(void *, uint64_t, uint64_t, unsigned), const char *name);
  
  HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa);
@@ -1344,6 +1348,7 @@ index cafe156..5a9ea7e 100644
 +HvBlock *hv_block_at(HvMachine *m, const uint32_t *pc);
 +void hv_block_index_add(HvMachine *m,uint32_t index);
 +static inline void hv_jit_note_execution(HvCpu *cpu,const uint32_t *pc) {
++    if(!cpu->m->jit_retention)return;
 +    HvJitRegion *r=&cpu->m->jit;uintptr_t value=(uintptr_t)pc,base=(uintptr_t)r->base;
 +    if(r->seg_words&&value>=base&&value-base<r->seg_words*r->nseg*4)
 +        cpu->pc_state->jit_seen|=1ull<<((value-base)/(r->seg_words*4));
@@ -1353,7 +1358,7 @@ index cafe156..5a9ea7e 100644
  /* Drop the translations made from the RAM page holding pa (it was written, or the guest invalidated it). */
  void hv_invalidate_code(HvMachine *m, uint64_t pa);
  void hv_ret_clear(HvCpu *cpu);
-@@ -340,7 +376,7 @@ int hv_ic_ivau_drops(void);
+@@ -340,7 +378,7 @@ int hv_ic_ivau_drops(void);
  /* Settings that say how to translate or wait, to compare ways of doing it in one running guest
     ("knob NAME VALUE" in HV_INPUT_FILE; a new way starts from an empty code cache). Each starts
     from the environment variable named in hv_knob_names. */
@@ -9087,25 +9092,67 @@ index 0000000..1d6c0b5
 +performance, P/E placement, watts or thermals.
 diff --git a/docs/m4-optimisation/ENGINE-IMPLEMENTATION.md b/docs/m4-optimisation/ENGINE-IMPLEMENTATION.md
 new file mode 100644
-index 0000000..c1367a2
+index 0000000..28a600f
 --- /dev/null
 +++ b/docs/m4-optimisation/ENGINE-IMPLEMENTATION.md
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,57 @@
 +# Engine implementation checkpoint
 +
-+Base runtime0179a1a; wrapper8f316b8c; branch perf/engine-memory-dispatch.
-+Keep cumulative pinned patch delivery; no IPA during development.
++Branch: `perf/engine-memory-dispatch`; runtime base0179a1a; wrapper base8f316b8c.
++Cumulative patch delivery and pinned dependencies remain authoritative. No IPA
++is generated by `henge-engine-next.yml`.
 +
-+Required workstreams:
-+- [ ] Broader checked reuse: independent bases, cached/register tiers, precise fallback.
-+- [ ] TLB lookup latency: native comparisons, guarded default and fault parity.
-+- [ ] Selective branch-cache preservation during segment eviction.
-+- [ ] Targeted branch-site acceleration integrated with existing invalidation.
-+- [ ] Workload-aware nonmoving segment retention and PC ownership lookup.
-+- [ ] Combined correctness, sanitizers, iOS compilation, native performance checks.
++Implemented workstreams (combined release validation follows below):
++- [x] Broader checked reuse across independent interleaved bases. Cached addends
++  survive scratch use; existing register-held tier remains. Four slots/eight
++  candidates, 256-byte/16-instruction bounds retained. Iterative pruning rejects
++  spans crossing an unselected access. Fallback closure includes earlier-started
++  overlapping groups; read/write fault order and completed stores are preserved.
++- [x] Lookup scheduling: guarded addend preload now covers grouped guards too.
++  Existing scalar fallback, page/permissions/PAN/MMIO/atomic rules unchanged.
++  Default stays OFF: native1/256/4096-page trials change sign by workload/run.
++- [x] Selective IJC eviction: per-segment slot indexes preserve unaffected salts
++  and targets. Overwritten bits are pruned, stale blocks outside the victim are
++  removed exactly. Allocation/shape/removed-list limits fall back to full reset.
++  Return predictions and descriptor caches still clear when required.
++- [x] Workload-aware nonmoving retention: existing lookup hits and every256th
++  full helper attribute recent execution; first-use translation is not heat.
++  Aged segment heat and birth order choose a victim under the existing global
++  barrier. Cold/unobserved scans fall back to birth order; no sampling timer,
++  code movement, persistent code, increased JIT reservation or topology change.
++  `HV_JIT_RETAIN_REFERENCE=1` selects FIFO without activity instrumentation.
++- [x] Host-PC ownership: sparse16KiB page heads link descriptors using previous
++  HvBlock padding (still80bytes). Rebuilt on compaction, reset on flush; bounded
++  nearest-entry diagnostic lookup handles non-FIFO code order. Allocation
++  failure retains the linear diagnostic fallback. Never an executable cache.
++- [x] Branch dispatch: table-base load overlaps hash arithmetic in normal IJC.
++  Optional paired tag/code loads and observed stable-site slot hints execute
++  the real generated path. Hints trust only the existing flag-specific IJC tag
++  and current ASID salt, so all invalidations remain authoritative. Cold misses
++  train bounded per-CPU history; admitted sites activate on normal retranslation.
++  Neither experiment is enabled by default: paired loads add second-way rehash
++  cost and showed no stable overall win; hints repeatedly hurt changing-target
++  calls. `HV_IJC_PAIR=1` / `HV_BRANCH_SITE_HINTS=1` are developer A/B overrides.
++- [ ] Final combined native regressions, sanitizer checks and full iOS app build.
 +
-+Reference paths must remain executable. No per-load production profiling, no
-+weakened page/permission/ASID/PAN/MMIO/SMC checks, no new competing cache policy.
++Evidence so far: native ARM64 checks43714528667 pass all new generated-code
++cases, MMU/exception checks, poisoned four-vCPU ring, alias builds and paired
++comparisons. Earlier runs43712706869/43713974029/43714203519 cover each milestone.
++The integration job found an extracted-test linkage omission, corrected by
++including the real allocator in the fixture; final rerun is pending.
++
++Cloud runner: Apple M1 (Virtual), Xcode27.1. These are not M4/Duo measurements.
++Expanded interleaved six-load benchmark: about2.2–2.6ns vs3.1–3.3ns baseline in
++representative paired rounds; some rounds are noisy. Retention's helper-heavy
++fixture reduced translations8576->8320 and evictions11->10, but elapsed time
++was not consistently faster. Cold-only scan has identical translation counts.
++Do not convert these into whole-app FPS, startup, thermal or battery claims.
++
++Next: inspect all results from43714528667, fix independent failures, export the
++exact source, run the combined gate, record proof in wrapper validation receipt.
++Physical follow-up: same guest RAM/vCPUs/Retina/refresh/diagnostics and workload;
++compare startup, Safari/Roblox, retranslations, segment evictions, preserved
++entries and process/compression headroom, with LPM states tested separately.
 diff --git a/docs/m4-optimisation/GUEST-GPU-BUDGET-ABI.md b/docs/m4-optimisation/GUEST-GPU-BUDGET-ABI.md
 new file mode 100644
 index 0000000..4ce282e
@@ -9623,10 +9670,10 @@ index 0000000..3777d6d
 +Validation required for this extension: real system-memory/read-right test, restricted/mixed-lifecycle capture fixture, resource budget boundaries, production FX pool/routing ASan/UBSan checks, both app SDKs and complete native/app compilation. Packaging remains disabled until completed validation and final release reconciliation.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
-index 0000000..566bc9b
+index 0000000..43238bb
 --- /dev/null
 +++ b/docs/m4-optimisation/PROGRESS.md
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,198 @@
 +# Current checkpoint
 +
 +- Reconstructed source inherited at wrapper commit 343d2d84, patch 9ee35476;
@@ -9815,6 +9862,16 @@ index 0000000..566bc9b
 +- Native/iOS SDK check43707512216 passed the first implementation. Enhanced
 +  real scattered-queue activation regression is pending the next source check.
 +- Release gates remain false. Existing verified IPA116 is untouched.
++
++## 2026-11-15: engine memory/dispatch implementation
++
++All four requested engine paths are implemented on `perf/engine-memory-dispatch`.
++See ENGINE-IMPLEMENTATION.md for activation, safe defaults and exact continuation.
++Interleaved checked reuse and selective branch preservation are enabled through
++existing normal paths. Nonmoving retention shares the original global barrier.
++Preload, paired IJC and site hints remain executable developer experiments with
++specific native timing trade-offs; no default Retina/refresh reduction is used.
++Combined native, sanitizer and app compilation gate is pending. No new IPA.
 diff --git a/docs/m4-optimisation/SPEC.md b/docs/m4-optimisation/SPEC.md
 new file mode 100644
 index 0000000..87f0a22
@@ -9908,10 +9965,10 @@ index 0000000..98fbd1b
 +Physical Duo/M4 desktop warmup and game performance still require comparison.
 diff --git a/docs/m4-optimisation/VALIDATION.md b/docs/m4-optimisation/VALIDATION.md
 new file mode 100644
-index 0000000..8538fc4
+index 0000000..7ef3488
 --- /dev/null
 +++ b/docs/m4-optimisation/VALIDATION.md
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,111 @@
 +# Validation
 +
 +Passed locally: production scheduling policy/detection regression compiled with
@@ -10010,6 +10067,19 @@ index 0000000..8538fc4
 +
 +Final enhanced real queue scatter test and diagnostic activation counters are
 +subject to the next exact-patch native/iOS run. No new IPA or hardware claim.
++
++## Engine memory/dispatch follow-up
++
++Native checks43714528667 cover mixed-base loads/stores, slot exhaustion, page
++crossings, precise read/write faults, real two-way branch collisions, ASID/TLBI/
++SMC/reset/eviction, CPU-owned hint isolation, MMU, poisoned four-vCPU eviction and
++reference paths. The new runtime retains HvCpu assembly offsets and80-byte
++HvBlock descriptors. Local source-extracted ASan/UBSan and emitted-memory checks
++also pass:2166 Unicorn cases, concurrent allocation, chain index, publication
++race, walk logs and shared fallback suffixes. Unicorn is not device execution.
++Integration validation found a missing extracted-fixture dependency; fixed with
++the production allocator. Full lifecycle/sanitizers and iOS app compilation need
++the next combined result. No physical M4/Duo speed or thermal result is claimed.
 diff --git a/docs/m4-optimisation/WARMUP.md b/docs/m4-optimisation/WARMUP.md
 new file mode 100644
 index 0000000..091a0de
@@ -24679,7 +24749,7 @@ index 0000000..5bb7c2c
 +    puts("PASS JIT dirty lines:65536 unordered writes ->16 exact lines; final word, outside range, allocation fallback and overflow bounds");
 +}
 diff --git a/tests/test_chain_index.py b/tests/test_chain_index.py
-index 88db6e8..569ea23 100644
+index 88db6e8..d46a4bb 100644
 --- a/tests/test_chain_index.py
 +++ b/tests/test_chain_index.py
 @@ -12,8 +12,10 @@ def function(file, signature):
@@ -24715,7 +24785,7 @@ index 88db6e8..569ea23 100644
  }
  '''
 -source=preamble+'\n'+function('core/machine.c','HvRam *hv_ram_lookup(')+'\n'+function('core/dispatch.c','void hv_flush_blocks(')+'\n'+function('core/dispatch.c','static void chain(')+'\n'+function('core/machine.c','void hv_invalidate_code(')+main
-+source=preamble+'\n'+function('host/jit_region.c','static size_t region_cap(')+'\n'+function('host/jit_region.c','size_t hv_jit_extent(')+'\n'+function('core/machine.c','HvRam *hv_ram_lookup(')+'\n'+function('core/dispatch.c','static int poison_on(')+'\n'+function('core/dispatch.c','void hv_flush_blocks(')+'\n'+function('core/dispatch.c','static void chain(')+'\n'+function('core/machine.c','void hv_invalidate_code(')+main
++source=preamble+'\n'+function('host/jit_region.c','static size_t region_cap(')+'\n'+function('host/jit_region.c','size_t hv_jit_extent(')+'\n'+function('core/machine.c','HvRam *hv_ram_lookup(')+'\n'+function('core/machine.c','void hv_ijc_evict_index(')+'\n'+function('core/dispatch.c','static int poison_on(')+'\n'+function('core/dispatch.c','void hv_flush_blocks(')+'\n'+function('core/dispatch.c','static void chain(')+'\n'+function('core/machine.c','void hv_invalidate_code(')+main
  with tempfile.TemporaryDirectory() as t:
   p=Path(t);(p/'test.c').write_text(source)
   subprocess.run([os.environ.get('CC','cc'),'-std=c11','-O1','-g','-fsanitize=address,undefined','-pthread','-I'+str(root/'core'),'-I'+str(root/'host'),str(p/'test.c'),'-o',str(p/'test')],check=True)
@@ -27300,14 +27370,15 @@ index 2b1be58..cf28a94 100644
  }
 diff --git a/tests/test_ijc_eviction.c b/tests/test_ijc_eviction.c
 new file mode 100644
-index 0000000..5d1c8fc
+index 0000000..7c993ad
 --- /dev/null
 +++ b/tests/test_ijc_eviction.c
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,35 @@
 +#include "machine.h"
 +#include "mmu.h"
 +#include "dispatch.h"
 +#include <assert.h>
++#include <stdlib.h>
 +#include <stdio.h>
 +static HvMachine m;static HvCpu cpu;
 +static uintptr_t hit(uint64_t va,unsigned flags){uint64_t tag=va^cpu.ijc_salt[flags&1];uint64_t *entry=m.percpu[0].ijc+(size_t)flags*(HV_IJC_TABLE_BYTES/8)+2*hv_ijc_index(tag);return entry[0]==tag?entry[1]:entry[2]==tag?entry[3]:0;}
@@ -27332,6 +27403,9 @@ index 0000000..5d1c8fc
 + assert(!hit(b.va,0)&&hit(c.va,0)==(uintptr_t)c.code);
 + hv_ijc_drop_asid(&cpu,0);assert(!hit(c.va,0));
 + assert(m.ijc_evict_removed>=2&&m.ijc_evict_examined<100);
++ hv_ijc_fill(&cpu,&c);
++ free(cpu.pc_state->ijc_segments);cpu.pc_state->ijc_segments=NULL;cpu.pc_state->ijc_segment_count=0;
++ hv_evict_blocks(&m);assert(!hit(c.va,0)); /* metadata allocation failure keeps full-reset fallback */
 + printf("PASS selective IJC eviction: two ways, survivors, overwritten slots, stale outside segment, ASID invalidation; examined=%llu removed=%llu\n",(unsigned long long)m.ijc_evict_examined,(unsigned long long)m.ijc_evict_removed);
 + hv_machine_free(&m);
 +}
@@ -27513,13 +27587,14 @@ index 7013cf9..5c10de9 100644
      return bad;
 diff --git a/tests/test_jit_retention.c b/tests/test_jit_retention.c
 new file mode 100644
-index 0000000..46c784b
+index 0000000..0b65c51
 --- /dev/null
 +++ b/tests/test_jit_retention.c
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,27 @@
 +#include "machine.h"
 +#include "dispatch.h"
 +#include <assert.h>
++#include <stdlib.h>
 +#include <stdio.h>
 +static HvMachine m;
 +int main(void){
@@ -27529,11 +27604,17 @@ index 0000000..46c784b
 + assert(r->retention_nonfifo>0);
 + hv_jit_reset(r);
 + for(unsigned i=0;i<16;i++){unsigned victim=hv_jit_evict_policy(r,0xff,1);assert(victim==(i%8));}
++ hv_jit_ring(r,64);
++ for(unsigned i=0;i<128;i++)assert(hv_jit_evict_policy(r,1ull<<63,1)!=63);
++ hv_jit_ring(r,3);for(unsigned i=0;i<9;i++)assert(hv_jit_evict_policy(r,0,1)==i%3);
++ hv_jit_ring(r,8);
 + /* Birth order is arbitrary; diagnostic lookup must follow executable pages. */
 + unsigned order[]={5,1,7,3};m.nblocks=4;
 + for(unsigned i=0;i<4;i++){m.blocks[i].code=r->base+order[i]*r->seg_words+4;hv_block_index_add(&m,i);}
 + for(unsigned i=0;i<4;i++)assert(hv_block_at(&m,m.blocks[i].code+2)==&m.blocks[i]);
 + assert(!hv_block_at(&m,r->base+2*r->seg_words));
++ free(m.jit_page_heads);m.jit_page_heads=NULL;
++ for(unsigned i=0;i<4;i++)assert(hv_block_at(&m,m.blocks[i].code+2)==&m.blocks[i]);
 + printf("PASS retention: protect executing segments; fair all-hot aging; non-FIFO host-PC lookup; HvBlock=%zu bytes\n",sizeof(HvBlock));
 + assert(sizeof(HvBlock)==80);hv_machine_free(&m);
 +}
