@@ -7098,7 +7098,7 @@ index 0000000..c550603
 +}
 +#endif
 diff --git a/devices/virtio_blk.c b/devices/virtio_blk.c
-index 873ab5e..9ed5627 100644
+index 873ab5e..4db05a6 100644
 --- a/devices/virtio_blk.c
 +++ b/devices/virtio_blk.c
 @@ -25,7 +25,12 @@
@@ -7115,7 +7115,7 @@ index 873ab5e..9ed5627 100644
          const HvVirtqSeg *g = &e->seg[s];
          if (g->write != writable) continue;
          if (off >= g->len) {
-@@ -33,17 +38,39 @@ static int seg_io(HvVirtioBlk *b, const HvVirtqElem *e, int writable, uint32_t o
+@@ -33,17 +38,43 @@ static int seg_io(HvVirtioBlk *b, const HvVirtqElem *e, int writable, uint32_t o
              continue;
          }
          uint32_t n = g->len - off;
@@ -7153,6 +7153,10 @@ index 873ab5e..9ed5627 100644
 +       together. The status descriptor is excluded by the caller's length. */
 +    if (remaining) return -1;
 +    if (!count) return 0;
++    if (b->log_stats || (__atomic_load_n(&b->capture_epoch,__ATOMIC_RELAXED)&1)) {
++        __atomic_fetch_add(&b->io_shape[count==1?0:1],1,__ATOMIC_RELAXED);
++        if(count>1)__atomic_fetch_add(&b->io_shape[2],(uint64_t)count,__ATOMIC_RELAXED);
++    }
 +    int result = count == 1 ? (writable ? hv_disk_read(b->disk, disk_off, iov[0].iov_base, len) :
 +                                        hv_disk_write(b->disk, disk_off, iov[0].iov_base, len)) :
 +                             (writable ? hv_disk_readv(b->disk, disk_off, iov, count) : hv_disk_writev(b->disk, disk_off, iov, count));
@@ -7163,7 +7167,7 @@ index 873ab5e..9ed5627 100644
  }
  
  static uint32_t readable(const HvVirtqElem *e) {
-@@ -57,19 +84,26 @@ static uint32_t readable(const HvVirtqElem *e) {
+@@ -57,19 +88,26 @@ static uint32_t readable(const HvVirtqElem *e) {
  static int handle(HvVirtioBlk *b, HvVirtqElem *e, uint32_t *written) {
      HvVirtio *v = &b->vio;
      struct { uint32_t type, reserved; uint64_t sector; } hdr;
@@ -7193,7 +7197,7 @@ index 873ab5e..9ed5627 100644
              status = S_IOERR;
          break;
      }
-@@ -115,7 +149,8 @@ static void *worker(void *opaque) {
+@@ -115,7 +153,8 @@ static void *worker(void *opaque) {
      /* HV_BLK_STATS: requests, bytes, flushes and how busy this worker was, every 10 s. */
      int stats = getenv("HV_BLK_STATS") != NULL;
      uint64_t every = stats && atoi(getenv("HV_BLK_STATS")) > 0 ? (uint64_t)atoi(getenv("HV_BLK_STATS")) * 1000000 : 10000000;
@@ -7203,7 +7207,7 @@ index 873ab5e..9ed5627 100644
      for (;;) {
          pthread_mutex_lock(&b->mu);
          while (b->fence || b->claimed == __atomic_load_n(&b->submitted, __ATOMIC_ACQUIRE)) {
-@@ -137,29 +172,51 @@ static void *worker(void *opaque) {
+@@ -137,29 +176,54 @@ static void *worker(void *opaque) {
          b->inflight++;
          pthread_mutex_unlock(&b->mu);
  
@@ -7234,6 +7238,9 @@ index 873ab5e..9ed5627 100644
 +                fprintf(stderr, "virtio-blk %s worker: %.0f req/s %.1f MB/s, %.0f flushes/s (%.1f ms each), busy %.0f%%; service_max_ms=%.2f interval_s=%.3f (host I/O service, not guest asset latency)\n",
 +                        b->disk->offset ? "aux" : "root", reqs * 1e6 / (t1-t_last), bytes * 1e6 / (t1-t_last) / (1 << 20), flushes * 1e6 / (t1-t_last),
 +                        flushes ? flush_us / 1000.0 / flushes : 0.0, busy * 100.0 / (t1-t_last), max_us / 1000.0, (t1-t_last)/1e6);
++                fprintf(stderr,"block-io-shape: disk=%s single_span_attempts=%llu scatter_attempts=%llu scatter_vectors=%llu (sampled since VM start while disk diagnostics/capture active; vectors are not syscall counts after short/chunked I/O)\n",
++                        b->disk->offset?"aux":"root",(unsigned long long)__atomic_load_n(&b->io_shape[0],__ATOMIC_RELAXED),
++                        (unsigned long long)__atomic_load_n(&b->io_shape[1],__ATOMIC_RELAXED),(unsigned long long)__atomic_load_n(&b->io_shape[2],__ATOMIC_RELAXED));
 +                t_last = t1, busy = reqs = bytes = flushes = flush_us = max_us = 0;
              }
          }
@@ -7264,7 +7271,7 @@ index 873ab5e..9ed5627 100644
      }
      return NULL;
  }
-@@ -184,6 +241,7 @@ static void notify(HvVirtio *v, int q) {
+@@ -184,6 +248,7 @@ static void notify(HvVirtio *v, int q) {
          }
          if (got == 0) break;
          r->q = q;
@@ -7272,7 +7279,7 @@ index 873ab5e..9ed5627 100644
          pthread_mutex_lock(&b->mu);
          __atomic_store_n(&b->submitted, b->submitted + 1, __ATOMIC_RELEASE);
          pthread_mutex_unlock(&b->mu);
-@@ -197,6 +255,18 @@ void hv_virtio_blk_drain(HvVirtioBlk *b) {
+@@ -197,6 +262,18 @@ void hv_virtio_blk_drain(HvVirtioBlk *b) {
      hv_virtio_blk_poll(b);
  }
  
@@ -7291,7 +7298,7 @@ index 873ab5e..9ed5627 100644
  void hv_virtio_blk_stop(HvVirtioBlk *b) {
      if (!b) return;
      pthread_mutex_lock(&b->mu);
-@@ -241,6 +311,9 @@ void hv_virtio_blk_destroy(HvVirtioBlk *b) {
+@@ -241,6 +318,9 @@ void hv_virtio_blk_destroy(HvVirtioBlk *b) {
     a slot is reused once it and every slot before it are back. */
  void hv_virtio_blk_poll(HvVirtioBlk *b) {
      if (!b) return;
@@ -7301,7 +7308,7 @@ index 873ab5e..9ed5627 100644
      int q = -1;
      for (uint32_t i = b->published; i != b->submitted; i++) {
          HvVblkReq *r = &b->ring[i % HV_VBLK_RING];
-@@ -269,6 +342,7 @@ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int a
+@@ -269,6 +349,7 @@ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int a
      v->dev = b;
      v->notify = notify;
      b->disk = disk;
@@ -7310,7 +7317,7 @@ index 873ab5e..9ed5627 100644
      pthread_mutex_init(&b->mu, NULL);
      pthread_cond_init(&b->cv, NULL);
 diff --git a/devices/virtio_blk.h b/devices/virtio_blk.h
-index e48d5b6..7be1322 100644
+index e48d5b6..3d91a9f 100644
 --- a/devices/virtio_blk.h
 +++ b/devices/virtio_blk.h
 @@ -23,6 +23,7 @@ typedef struct HvVblkReq {
@@ -7321,18 +7328,19 @@ index e48d5b6..7be1322 100644
  } HvVblkReq;
  
  #define HV_VBLK_WORKERS 4 /* requests in flight at once: the guest queues many, and each waits on the host disk */
-@@ -34,6 +35,10 @@ typedef struct HvVirtioBlk {
+@@ -34,6 +35,11 @@ typedef struct HvVirtioBlk {
      HvVblkReq *ring;
      uint32_t submitted;  /* CPU thread: requests handed to the worker */
      uint32_t completed;  /* workers: requests done (in any order) */
 +    int completion_pending; /* atomic: ready completions not yet claimed by a CPU poll */
 +    unsigned capture_epoch; /* atomic: odd while an explicit bounded capture is active */
 +    int log_stats;
++    uint64_t io_shape[3]; /* atomic, diagnostics only: single-span attempts, scatter attempts, scatter vectors */
 +    uint64_t timing[6]; /* mu: completed requests, service us, queued us, flush us, max service us, flush count */
      uint32_t claimed;    /* workers: requests taken (under mu) */
      int inflight;        /* taken, not done */
      int fence;           /* a flush or barrier waits for everything before it: nothing else is taken meanwhile */
-@@ -48,6 +53,9 @@ typedef struct HvVirtioBlk {
+@@ -48,6 +54,9 @@ typedef struct HvVirtioBlk {
  HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int apple_variant);
  /* CPU thread: publish finished requests and raise the interrupt. */
  void hv_virtio_blk_poll(HvVirtioBlk *b);
@@ -8923,10 +8931,10 @@ index 0000000..3478eac
 +7. A useful Metal4 comparison must hold guest configuration, workload, LPM and cache warmness constant, switching only Automatic vs Compatibility graphics backend. Presentation-only MetalFX cannot cure CPU-side emulation cost. Prioritise safe engine reductions and cold-pipeline latency alongside backend parity; do not promise 60 FPS from a backend switch.
 diff --git a/docs/m4-optimisation/PHYSICAL-116-M4-16GB.md b/docs/m4-optimisation/PHYSICAL-116-M4-16GB.md
 new file mode 100644
-index 0000000..6a8a05c
+index 0000000..ba2560e
 --- /dev/null
 +++ b/docs/m4-optimisation/PHYSICAL-116-M4-16GB.md
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,136 @@
 +# M4 capture: release 116, 16 GiB guest (2026-11-15)
 +
 +Complete input: `DF1F6DA8-978C-4CFB-B05E-55ACE377610B`, all three files.
@@ -9042,6 +9050,8 @@ index 0000000..6a8a05c
 +- Existing descriptor coalescing combines contiguous buffers only. Implement
 +  bounded `preadv`/`pwritev` for fragmented request buffers: fewer system calls,
 +  direct guest DMA, no staging or merging across requests/flushes/barriers.
++  Opt-in `block-io-shape` counters verify actual scatter-path use on devices;
++  they do not mistake vector count for syscall count after short/chunked I/O.
 +- Also repair sector-byte multiplication overflow and invalidate translated
 +  code after partial failed DMA; add production-path regressions.
 +- DNS reaches 418 host answers, zero fallback/timeouts; network counters move.
@@ -9087,10 +9097,10 @@ index 0000000..3777d6d
 +Validation required for this extension: real system-memory/read-right test, restricted/mixed-lifecycle capture fixture, resource budget boundaries, production FX pool/routing ASan/UBSan checks, both app SDKs and complete native/app compilation. Packaging remains disabled until completed validation and final release reconciliation.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
-index 0000000..a55c4c4
+index 0000000..566bc9b
 --- /dev/null
 +++ b/docs/m4-optimisation/PROGRESS.md
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,188 @@
 +# Current checkpoint
 +
 +- Reconstructed source inherited at wrapper commit 343d2d84, patch 9ee35476;
@@ -9260,6 +9270,25 @@ index 0000000..a55c4c4
 +
 +Pointer capture and loss cleanup are scoped to the active application scene;
 +external-display scene notifications cannot reset the primary Magic Keyboard.
++
++
++## 2026-11-15: physical 116 M4, 16 GiB capture
++
++- Analysed all three DF1F6DA8 files; filter word samples to PID 5314. See
++  PHYSICAL-116-M4-16GB.md. Normal thermal / LPM off; GPU replay and MetalFX
++  execute; physical compression and CPU/MMU remain material.
++- Added bounded per-request scattered disk I/O; fixed sector overflow and
++  failed-read DMA invalidation. Real queue/file tests cover scatter, malformed
++  later vectors, wrap, flush/barriers and stop/start.
++- Added opt-in block-io-shape activation counts and same-media-clock drawable
++  submission latency. Existing cadence remains raw; no new timer or defaults.
++- Actual guest Metal budget ABI investigated on cloud paravirtual Metal;
++  host swizzling cannot change the guest's cached IOGPU recommendation. No
++  invented capability field or allocation truncation shipped. See
++  GUEST-GPU-BUDGET-ABI.md for exact boundary / safe alternative.
++- Native/iOS SDK check43707512216 passed the first implementation. Enhanced
++  real scattered-queue activation regression is pending the next source check.
++- Release gates remain false. Existing verified IPA116 is untouched.
 diff --git a/docs/m4-optimisation/SPEC.md b/docs/m4-optimisation/SPEC.md
 new file mode 100644
 index 0000000..87f0a22
@@ -9353,10 +9382,10 @@ index 0000000..98fbd1b
 +Physical Duo/M4 desktop warmup and game performance still require comparison.
 diff --git a/docs/m4-optimisation/VALIDATION.md b/docs/m4-optimisation/VALIDATION.md
 new file mode 100644
-index 0000000..033a5b5
+index 0000000..8538fc4
 --- /dev/null
 +++ b/docs/m4-optimisation/VALIDATION.md
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,98 @@
 +# Validation
 +
 +Passed locally: production scheduling policy/detection regression compiled with
@@ -9436,6 +9465,25 @@ index 0000000..033a5b5
 +resume on physical hardware, remote game-server session retention, Apple Universal Clipboard
 +transport/account/radio availability. iOS can suspend/kill the app; only completed compatible
 +snapshots survive termination. No JIT pointers or host Metal objects are persisted.
++
++
++## Physical 116 follow-up: scattered disk I/O and causal presentation timing
++
++Local ASan/UBSan: original disk chunk loop, new vector partial/EINTR/EOF/error
++cursor, 128MiB ceiling, immutable iovecs, bounds/read-only/overflow, segment
++validation, partial failed-DMA invalidation, 4096 raced real queue completions,
++restart/flush/barrier and presentation clock/epoch/idle tests passed.
++
++Cloud43707512216 (source0573a4ff) reconstructed the cumulative pinned patch,
++passed native sanitizer targets and iOS SDK compilation of disk/virtio/renderer.
++Cloud CPU reports **Apple M1 (Virtual)**; do not call it M4/Duo hardware testing.
++Paired warm-file microbenchmark: 32 scattered 4KiB spans, same bytes, 2000
++requests × five alternating rounds: scalar median19810.5ns versus vector
++median4682.0ns per128KiB request (32 syscalls versus1). This measures a host I/O
++component only, not app loading, cold storage, guest FPS, heat or energy.
++
++Final enhanced real queue scatter test and diagnostic activation counters are
++subject to the next exact-patch native/iOS run. No new IPA or hardware claim.
 diff --git a/docs/m4-optimisation/WARMUP.md b/docs/m4-optimisation/WARMUP.md
 new file mode 100644
 index 0000000..091a0de
@@ -23461,10 +23509,10 @@ index b3af248..8493319 100644
  /* EL0, so the indirect-branch cache takes these low (user) addresses. */
 diff --git a/tests/test_blk_completion.c b/tests/test_blk_completion.c
 new file mode 100644
-index 0000000..ce29753
+index 0000000..ad9eaae
 --- /dev/null
 +++ b/tests/test_blk_completion.c
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,121 @@
 +/* Production virtio queue, block workers and file I/O. Only RAM/PCI/CPU-wake
 +   boundaries are supplied here so the same concurrency test runs on Linux. */
 +#define _DEFAULT_SOURCE 1
@@ -23482,6 +23530,7 @@ index 0000000..ce29753
 +static unsigned char ram[1<<20];
 +static atomic_uint wakes;
 +static int overflow_sector;
++static int scattered, bad_scatter;
 +int hv_knob[HV_K_COUNT];
 +void *hv_phys_ptr(HvMachine *m,uint64_t a,uint64_t n) {
 +    (void)m;return a<=sizeof ram && n<=sizeof ram-a ? ram+a : NULL;
@@ -23506,8 +23555,16 @@ index 0000000..ce29753
 +        uint32_t words[4]={type,0,overflow_sector?0:i,overflow_sector?0x80000000u:0};memcpy(ram+hdr,words,sizeof words);ram[status]=0xff;
 +        if(type==1)memset(ram+data,(unsigned char)(i+1),512);
 +        desc(h,hdr,16,1,h+1);
-+        desc(h+1,data,type==4||type==0x10000?0:512,1|(type==0?2:0),h+2);
-+        desc(h+2,status,1,2,0);
++        if(scattered) {
++            assert(n==1);
++            if(type==1){memset(ram+data,0x6a,256);memset(ram+data+8192,0x9b,256);}
++            desc(h+1,data,256,1|(type==0?2:0),h+2);
++            desc(h+2,bad_scatter?sizeof ram+1:data+8192,256,1|(type==0?2:0),h+3);
++            desc(h+3,status,1,2,0);
++        } else {
++            desc(h+1,data,type==4||type==0x10000?0:512,1|(type==0?2:0),h+2);
++            desc(h+2,status,1,2,0);
++        }
 +        avail[2+avail[1]%256]=(uint16_t)h;avail[1]++;
 +    }
 +    b->vio.notify(&b->vio,0);
@@ -23522,6 +23579,7 @@ index 0000000..ce29753
 +    hv_virtio_blk_stop(b);
 +}
 +int main(void){
++    unsetenv("HV_BLK_STATS"); /* explicitly verify diagnostics-off ownership */
 +    char path[]="/tmp/henge-block-test-XXXXXX";int fd=mkstemp(path);assert(fd>=0);unlink(path);assert(!ftruncate(fd,1<<20));
 +    HvDisk disk={.fd=fd,.wfd=-1,.size=1<<20};static HvMachine m;
 +    HvVirtioBlk *b=hv_virtio_blk_create(&m,NULL,&disk,0);assert(b);
@@ -23549,25 +23607,39 @@ index 0000000..ce29753
 +        }
 +        wait_done(b);hv_virtio_blk_poll(b);assert(b->published==b->submitted);
 +    }
++    assert(!b->io_shape[0] && !b->io_shape[1] && !b->io_shape[2]);
 +    hv_virtio_blk_capture_timing(b,1);
 +    assert(!hv_virtio_blk_start(b));submit(b,1,4);hv_virtio_blk_drain(b);assert(ram[0x50000]==0);
 +    assert(hv_virtio_blk_read_timing(b,measured) && measured[0]>=1 && measured[5]>=1);
 +    submit(b,1,0x10000);hv_virtio_blk_drain(b);assert(ram[0x50000]==0);
++    submit(b,1,0);hv_virtio_blk_drain(b);assert(ram[0x50000]==0);
 +    /* An overflowing sector must not wrap to sector zero, corrupt the disk,
 +       or return success to the guest. Run both directions on the real queue. */
 +    unsigned char first[512],after[512];assert(!hv_disk_read(&disk,0,first,sizeof first));overflow_sector=1;
 +    submit(b,1,1);hv_virtio_blk_drain(b);assert(ram[0x50000]==1);
 +    submit(b,1,0);hv_virtio_blk_drain(b);assert(ram[0x50000]==1 && b->errors==2);
 +    assert(!hv_disk_read(&disk,0,after,sizeof after) && !memcmp(first,after,sizeof first));
++    overflow_sector=0;scattered=1;
++    submit(b,1,1);hv_virtio_blk_drain(b);assert(ram[0x50000]==0);
++    assert(!hv_disk_read(&disk,0,first,sizeof first));
++    for(unsigned i=0;i<512;i++)assert(first[i]==(i<256?0x6a:0x9b));
++    memset(ram+0x30000,0xcc,256);memset(ram+0x32000,0xcc,256);
++    submit(b,1,0);hv_virtio_blk_drain(b);assert(ram[0x50000]==0);
++    for(unsigned i=0;i<256;i++)assert(ram[0x30000+i]==0x6a && ram[0x32000+i]==0x9b);
++    /* A bad later vector must not partially write the disk's earlier one. */
++    bad_scatter=1;submit(b,1,1);hv_virtio_blk_drain(b);assert(ram[0x50000]==1 && b->errors==3);
++    assert(!hv_disk_read(&disk,0,after,sizeof after) && !memcmp(first,after,sizeof first));
++    assert(b->io_shape[0]==1 && b->io_shape[1]==2 && b->io_shape[2]==4);
 +    hv_virtio_blk_stop(b);assert(hv_virtio_blk_idle(b));hv_virtio_blk_destroy(b);close(fd);
 +    puts("block completion: 64 ready requests / 1 wake; 4096 raced completions, ring wrap, read/write, flush, barrier, restart and sector-overflow rejection passed");
++    puts("PASS real virtqueue -> scattered DMA -> real preadv/pwritev; status/payload integrity and validate-before-file-write on invalid later vector");
 +}
 diff --git a/tests/test_blk_segments.c b/tests/test_blk_segments.c
 new file mode 100644
-index 0000000..ac06652
+index 0000000..b190295
 --- /dev/null
 +++ b/tests/test_blk_segments.c
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,69 @@
 +/* Execute production descriptor coalescing with observable I/O boundaries. */
 +#define _DEFAULT_SOURCE 1
 +#include "../devices/virtio_blk.c"
@@ -23607,7 +23679,7 @@ index 0000000..ac06652
 +}
 +void hv_dma_written(HvMachine *m,uint64_t a,uint64_t n){(void)m;(void)a;(void)n;invalidations++;}
 +int main(void) {
-+    HvDisk d={.size=sizeof disk};HvVirtioBlk b={.disk=&d};HvVirtqElem e={.nseg=5};
++    HvDisk d={.size=sizeof disk};HvVirtioBlk b={.disk=&d,.log_stats=1};HvVirtqElem e={.nseg=5};
 +    for(unsigned i=0;i<sizeof disk;i++)disk[i]=(unsigned char)(i*17);
 +    for(int i=0;i<4;i++)e.seg[i]=(HvVirtqSeg){.addr=4096+i*4096,.len=4096,.write=1};
 +    e.seg[4]=(HvVirtqSeg){.addr=20480,.len=1,.write=1};ram[20480]=0xa7;
@@ -23633,6 +23705,7 @@ index 0000000..ac06652
 +    /* Partial failed DMA still invalidates every potentially written span. */
 +    e.seg[0].write=1;fail_partial=1;calls=0;
 +    assert(seg_io(&b,&e,1,0,0,8192)==-1 && calls==1 && invalidations==2);
++    assert(b.io_shape[0]==2 && b.io_shape[1]==4 && b.io_shape[2]==9);
 +    e.nseg=HV_VIRTQ_MAX_SEGS+1;assert(seg_io(&b,&e,1,0,0,1)==-1);
 +    puts("block segments: adjacent and scattered pages / 1 I/O; distinct mappings, status/header/direction, all-before-I/O validation and partial-DMA invalidation passed");
 +}
