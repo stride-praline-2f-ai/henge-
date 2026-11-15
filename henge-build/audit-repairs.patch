@@ -885,7 +885,7 @@ index c341d16..3d49220 100644
  void hv_enter(HvCpu *cpu, void *block);
  /* While hv_run runs, the host FPCR/FPSR hold the guest's; these move them in and out. */
 diff --git a/core/fastmem_log.c b/core/fastmem_log.c
-index a41d6d2..7a2bf1a 100644
+index a41d6d2..f6c2447 100644
 --- a/core/fastmem_log.c
 +++ b/core/fastmem_log.c
 @@ -21,13 +21,14 @@ void hv_fastmem_log(HvMachine *m, FILE *out) {
@@ -922,11 +922,11 @@ index a41d6d2..7a2bf1a 100644
 +            (unsigned long long)__atomic_load_n(&m->jit.publication_words,__ATOMIC_RELAXED),
 +            (unsigned long long)__atomic_load_n(&m->jit.publication_lines,__ATOMIC_RELAXED),
 +            (unsigned long long)__atomic_load_n(&m->jit.publication_bitmap_batches,__ATOMIC_RELAXED));
-+    fprintf(out,"jit-ring: segments=%u evictions=%llu blocks_dropped=%llu exits_repaired=%llu (quiescent oldest-segment reuse; full flush fallback retained)\n",
++    fprintf(out,"jit-ring: segments=%u evictions=%llu blocks_dropped=%llu exits_repaired=%llu (quiescent nonmoving segment reuse; full flush fallback retained)\n",
 +        m->jit.nseg,(unsigned long long)m->stats.evictions,(unsigned long long)m->stats.evict_blocks,(unsigned long long)m->stats.evict_unchained);
-+    fprintf(out,"jit-branch-preservation: examined=%llu removed=%llu preserved_observations=%llu (indexed quiescent eviction; return and descriptor pointers keep safe resets)\n",(unsigned long long)m->ijc_evict_examined,(unsigned long long)m->ijc_evict_removed,(unsigned long long)m->ijc_evict_preserved);
-+    fprintf(out,"jit-branch-preservation: examined=%llu removed=%llu preserved_observations=%llu (indexed quiescent eviction; return/descriptor resets retained)\n",(unsigned long long)m->ijc_evict_examined,(unsigned long long)m->ijc_evict_removed,(unsigned long long)m->ijc_evict_preserved);
-+    fprintf(out,"jit-retention: nonfifo=%llu activity_source=dispatcher-and-decimated-helpers no_poll_timer=1 code_moves=0 (heuristic policy; not an FPS claim)\n",(unsigned long long)m->jit.retention_nonfifo);
++    fprintf(out,"jit-branch-preservation: examined=%llu removed=%llu preserved_observations=%llu (indexed quiescent eviction; return/descriptor resets retained)\n",(unsigned long long)__atomic_load_n(&m->ijc_evict_examined,__ATOMIC_RELAXED),(unsigned long long)__atomic_load_n(&m->ijc_evict_removed,__ATOMIC_RELAXED),(unsigned long long)__atomic_load_n(&m->ijc_evict_preserved,__ATOMIC_RELAXED));
++    fprintf(out,"jit-retention: nonfifo=%llu activity_source=dispatcher-and-decimated-helpers no_poll_timer=1 code_moves=0 (heuristic policy; not an FPS claim)\n",(unsigned long long)__atomic_load_n(&m->jit.retention_nonfifo,__ATOMIC_RELAXED));
++    fprintf(out,"branch-dispatch: paired-load=%d site-hints=%d hint_emissions=%llu (tag/ASID/flag checks retained; emissions are not hits)\n",m->ijc_pair,m->branch_site_hints,(unsigned long long)__atomic_load_n(&m->branch_hint_emissions,__ATOMIC_RELAXED));
      fprintf(out, "fastmem: mode=%s counters=%s (cumulative; diagnostic counting adds overhead)\n",
              m->fastmem_enabled ? "on" : "off", m->fastmem_diagnostics ? "on" : "off");
      if (m->fastmem_enabled) fprintf(out, "fastmem-layout: tagged-multiwindow entries=262144 per-PAN bytes-per-CPU=10485760 (bounded allocation; exact VA tags; all kernel windows)\n");
@@ -1411,7 +1411,7 @@ index bfbac5e..80e65ef 100644
              for (uint32_t off = 0; off < chunk && !rc; off += 8) { /* MMIO: at most 8 bytes at a time */
                  uint32_t piece = chunk - off < 8 ? chunk - off : 8;
 diff --git a/core/mmu.c b/core/mmu.c
-index dc7cabd..a84a87c 100644
+index dc7cabd..d2d2ef6 100644
 --- a/core/mmu.c
 +++ b/core/mmu.c
 @@ -581,13 +581,13 @@ static void write_hint(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code) {
@@ -1431,7 +1431,7 @@ index dc7cabd..a84a87c 100644
          if (now != old) __atomic_store_n(hint, now, __ATOMIC_RELAXED);
      }
  }
-@@ -907,6 +907,50 @@ int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags) {
+@@ -907,6 +907,54 @@ int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags) {
  
  /* Put block b in this CPU's indirect-branch cache under its VA (b->va must be in
     the half its flags say: kernel blocks, kernel VAs). */
@@ -1450,6 +1450,7 @@ index dc7cabd..a84a87c 100644
 +int hv_ijc_evict_range(HvCpu *cpu,const uint32_t *lo,const uint32_t *hi,uint32_t *const *removed,size_t count) {
 +    HvPerCpu *p=cpu->pc_state;HvMachine *m=cpu->m;HvJitRegion *r=&m->jit;
 +    if(!p->ijc_segments||p->ijc_segment_count!=r->nseg||count==SIZE_MAX)return -1;
++    uint64_t examined=0,retired=0,preserved=0;
 +    uint64_t mask=1ull<<((size_t)(lo-r->base)/r->seg_words);
 +    for(size_t k=0;k<count;k++) {
 +        uintptr_t target=(uintptr_t)removed[k],base=(uintptr_t)r->base;
@@ -1462,7 +1463,7 @@ index dc7cabd..a84a87c 100644
 +            while(pending) {
 +                unsigned bit=(unsigned)__builtin_ctzll(pending);pending&=pending-1;
 +                uint64_t *entry=p->ijc+2*(word*64+bit);uintptr_t target=(uintptr_t)entry[1];
-+                m->ijc_evict_examined++;
++                examined++;
 +                uintptr_t segment_lo=(uintptr_t)r->base+(size_t)segment*r->seg_words*4;
 +                /* Retire overwritten/invalidated index bits as we visit them.
 +                   The replacement's own segment was marked on fill. Without
@@ -1471,18 +1472,21 @@ index dc7cabd..a84a87c 100644
 +                    bits[word]&=~(1ull<<bit);
 +                int drop=target>=(uintptr_t)lo&&target<(uintptr_t)hi;
 +                if(!drop&&count){size_t a=0,b=count;while(a<b){size_t mid=a+(b-a)/2;if((uintptr_t)removed[mid]<target)a=mid+1;else b=mid;}drop=a<count&&(uintptr_t)removed[a]==target;}
-+                if(drop){entry[0]=0;entry[1]=0;bits[word]&=~(1ull<<bit);m->ijc_evict_removed++;}
-+                else if(entry[0])m->ijc_evict_preserved++;
++                if(drop){entry[0]=0;entry[1]=0;bits[word]&=~(1ull<<bit);retired++;}
++                else if(entry[0])preserved++;
 +            }
 +        }
 +    }
++    __atomic_fetch_add(&m->ijc_evict_examined,examined,__ATOMIC_RELAXED);
++    __atomic_fetch_add(&m->ijc_evict_removed,retired,__ATOMIC_RELAXED);
++    __atomic_fetch_add(&m->ijc_evict_preserved,preserved,__ATOMIC_RELAXED);
 +    return 0;
 +}
 +
  void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
      HvMachine *m = cpu->m;
      HvPerCpu *pcs = cpu->pc_state;
-@@ -917,6 +961,7 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
+@@ -917,6 +965,7 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
      if (ent[0] != tag && ent[0]) ent[2] = ent[0], ent[3] = ent[1]; /* way 0's goes to way 1 (over this one's, if there) */
      ent[0] = tag;
      ent[1] = (uint64_t)(uintptr_t)b->code;
@@ -1490,7 +1494,7 @@ index dc7cabd..a84a87c 100644
      pcs->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
      {   /* the page's hint: which piece has a target now */
          uint64_t key = ((b->va & ~(uint64_t)PAGE_MASK) ^ cpu->ijc_salt[kernel]) | 1, bit = 1ull << ((b->va >> 8) & 63);
-@@ -1026,6 +1071,36 @@ int hv_ijc_fill_checked(HvCpu *cpu, HvBlock *b) {
+@@ -1026,6 +1075,36 @@ int hv_ijc_fill_checked(HvCpu *cpu, HvBlock *b) {
  
  static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags);
  
@@ -1527,7 +1531,7 @@ index dc7cabd..a84a87c 100644
  void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
      return ijc_resolve(cpu, va, flags);
  }
-@@ -1082,6 +1157,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
+@@ -1082,6 +1161,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
      }
      /* Cached only while the TLB still maps it, inside ijc_seq (see hv_ijc_fill_checked). */
      if (!hv_ijc_fill_checked(cpu, b)) return 0;
@@ -12682,7 +12686,7 @@ index 0000000..e42b4b0
 +static inline int hv_env_flag(const char *name) { return hv_env_flag_value(getenv(name)); }
 +#endif
 diff --git a/host/jit_region.c b/host/jit_region.c
-index e1e8e9d..c191209 100644
+index e1e8e9d..e8badbb 100644
 --- a/host/jit_region.c
 +++ b/host/jit_region.c
 @@ -1,4 +1,5 @@
@@ -12796,7 +12800,7 @@ index e1e8e9d..c191209 100644
 +    __atomic_store_n(&region->used,0,__ATOMIC_RELAXED);
 +    __atomic_store_n(&region->wrapped,0,__ATOMIC_RELAXED);
 +    region->too_big = 0;
-+    region->retention_clock=region->nseg;region->retention_nonfifo=0;
++    region->retention_clock=region->nseg;__atomic_store_n(&region->retention_nonfifo,0,__ATOMIC_RELAXED);
 +    for(unsigned k=0;k<HV_JIT_MAX_SEGS;k++){region->segment_birth[k]=k+1;region->segment_heat[k]=0;}
 +    region->end = (size_t)region->seg_words * region->nseg;
 +    for (uint32_t k = 0; k < HV_JIT_MAX_SEGS; k++) region->seg_epoch[k]++;
@@ -12838,7 +12842,7 @@ index e1e8e9d..c191209 100644
 +           (region->segment_heat[k]==region->segment_heat[chosen] && region->segment_birth[k]<region->segment_birth[chosen]))chosen=k;
 +    }
 +    unsigned fifo=region->end>=region->seg_words*region->nseg?0:(unsigned)(region->end/region->seg_words);
-+    if(chosen!=fifo)region->retention_nonfifo++;
++    if(chosen!=fifo)__atomic_fetch_add(&region->retention_nonfifo,1,__ATOMIC_RELAXED);
 +    region->segment_birth[chosen]=++region->retention_clock;
 +    __atomic_store_n(&region->used,(size_t)chosen*region->seg_words,__ATOMIC_RELAXED);
 +    __atomic_store_n(&region->wrapped,1,__ATOMIC_RELAXED);
@@ -22705,7 +22709,7 @@ index 091433d..d5481c3 100644
  typedef uint32_t UInt32, AudioUnitRenderActionFlags;
 diff --git a/tests/bench_branch_sites.c b/tests/bench_branch_sites.c
 new file mode 100644
-index 0000000..5f1e453
+index 0000000..b3ff326
 --- /dev/null
 +++ b/tests/bench_branch_sites.c
 @@ -0,0 +1,42 @@
@@ -22745,9 +22749,9 @@ index 0000000..5f1e453
 +        uint64_t before=m.branch_hint_emissions;
 +        run(code,a,b,1000,changing);
 +        if(m.branch_site_hints)assert(m.branch_hint_emissions>before);
-+        uint64_t start=mach_absolute_time();run(code,a,b,2000000,changing);
++        uint64_t start=mach_absolute_time();run(code,a,b,20000000,changing);
 +        double ns=(double)(mach_absolute_time()-start)*tb.numer/tb.denom;
-+        printf("branch-site-bench: round=%d changing=%d variant=%d ns_per_call=%.3f result=correct\n",round,changing,variant,ns/2000000);
++        printf("branch-site-bench: round=%d changing=%d variant=%d ns_per_call=%.3f result=correct\n",round,changing,variant,ns/20000000);
 +    }
 +    hv_machine_free(&m);free(code);
 +}
@@ -22910,10 +22914,10 @@ index 0000000..e03e759
 +}
 diff --git a/tests/bench_jit_retention.c b/tests/bench_jit_retention.c
 new file mode 100644
-index 0000000..f40958a
+index 0000000..15444a3
 --- /dev/null
 +++ b/tests/bench_jit_retention.c
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,27 @@
 +#include "machine.h"
 +#include "dispatch.h"
 +#include <assert.h>
@@ -22922,19 +22926,23 @@ index 0000000..f40958a
 +#include <stdlib.h>
 +#include <string.h>
 +static HvMachine m;static HvCpu cpu;
++static uint64_t read_device(void *opaque,uint64_t offset,unsigned size){(void)opaque;(void)offset;(void)size;return 1;}
 +static uint32_t branch(uint32_t op,const uint32_t *from,const uint32_t *to){return op|((uint32_t)(to-from)&0x3ffffff);}
 +int main(void){
-+ enum {H=32,C=4096,P=16384};
++ enum {H=128,C=4096,P=16384};
++ int memory=getenv("HV_RETENTION_MMIO")!=NULL;
 + assert(!hv_machine_init(&m,256<<10));unsigned char *ram=aligned_alloc(P,(H+C+1)*P);assert(ram);memset(ram,0,(H+C+1)*P);
-+ for(int i=0;i<H;i++){uint32_t *p=(uint32_t *)(ram+i*P);p[0]=0x91000421;p[1]=i+1==H?0xd65f03c0:branch(0x14000000,p+1,(uint32_t *)(ram+(i+1)*P));}
++ for(int i=0;i<H;i++){uint32_t *p=(uint32_t *)(ram+i*P);unsigned n=0;p[n++]=0x91000421;if(memory)p[n++]=0xf9400123;p[n]=i+1==H?0xd65f03c0:branch(0x14000000,p+n,(uint32_t *)(ram+(i+1)*P));}
 + uint32_t *hot=(uint32_t *)ram,*cold=(uint32_t *)(ram+H*P),*tail=(uint32_t *)(ram+(H+C)*P);
 + for(int i=0;i<C;i++){uint32_t *p=(uint32_t *)(ram+(H+i)*P);p[0]=0x91000400;p[1]=branch(0x94000000,p+1,hot);p[2]=branch(0x14000000,p+2,(uint32_t *)(ram+(H+i+1)*P));}
 + tail[0]=0xf1000442;tail[1]=branch(0x14000000,tail+1,cold); /* patch conditional via C stop after one scan */
 + assert(!hv_machine_add_ram(&m,(uintptr_t)ram,(H+C+1)*P,ram,0));m.stop_pc=(uintptr_t)tail;
++ if(memory)assert(!hv_machine_add_mmio(&m,0x20000000,4096,NULL,read_device,NULL,"retention-bench"));
 + hv_knob[HV_K_JITSEGS]=8;hv_flush_blocks(&m);hv_cpu_reset(&cpu,&m);cpu.el=0;cpu.spsel=0;cpu.pc=(uintptr_t)cold;cpu.cpacr_el1=3u<<20;
++ cpu.x[9]=0x20000000;
 + mach_timebase_info_data_t tb;assert(!mach_timebase_info(&tb));uint64_t start=mach_absolute_time();assert(hv_run(&cpu)==HV_EXIT_HALT);double ns=(double)(mach_absolute_time()-start)*tb.numer/tb.denom;
 + assert(cpu.x[0]==C&&cpu.x[1]==(uint64_t)C*H);
-+ printf("retention-bench: reference=%s ns=%.0f translations=%llu evictions=%llu nonfifo=%llu repaired=%llu result=correct\n",getenv("HV_JIT_RETAIN_REFERENCE")?getenv("HV_JIT_RETAIN_REFERENCE"):"0",ns,(unsigned long long)m.stats.translations,(unsigned long long)m.stats.evictions,(unsigned long long)m.jit.retention_nonfifo,(unsigned long long)m.stats.evict_unchained);
++ printf("retention-bench: memory=%d reference=%s ns=%.0f translations=%llu evictions=%llu nonfifo=%llu repaired=%llu result=correct\n",memory,getenv("HV_JIT_RETAIN_REFERENCE")?getenv("HV_JIT_RETAIN_REFERENCE"):"0",ns,(unsigned long long)m.stats.translations,(unsigned long long)m.stats.evictions,(unsigned long long)m.jit.retention_nonfifo,(unsigned long long)m.stats.evict_unchained);
 + hv_machine_free(&m);free(ram);
 +}
 diff --git a/tests/bench_programs.S b/tests/bench_programs.S
