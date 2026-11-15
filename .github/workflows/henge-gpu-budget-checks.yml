@@ -1,11 +1,4 @@
-name: Henge guest GPU budget checks
-'on':
-  push:
-    branches:
-    - perf/guest-gpu-budget
-    paths:
-    - henge-build/probe-guest-gpu-budget.m
-    - .github/workflows/henge-gpu-budget-checks.yml
+name: Henge guest budget ABI and scattered I/O validation
 permissions:
   contents: read
 concurrency:
@@ -45,3 +38,101 @@ jobs:
           probe/*.bin'
         retention-days: 14
         if-no-files-found: warn
+    if: contains(github.event.head_commit.message, '[probe]')
+  native_io:
+    runs-on: xcode-27
+    timeout-minutes: 25
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: build-request
+        persist-credentials: false
+    - id: pins
+      run: "python3 - <<'PYPIN'\nimport json,os\nm=json.load(open('build-request/henge-build/manifest.json'))\n\
+        with open(os.environ['GITHUB_OUTPUT'],'a') as f:\n    f.write('henge='+m['henge_sha']+'\\\
+        n')\n    f.write('preview='+str(m.get('ui_preview_requested',True)).lower()+'\\\
+        n')\nPYPIN"
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Henge
+        ref: ${{ steps.pins.outputs.henge }}
+        path: Henge
+        persist-credentials: false
+    - name: Reconstruct exact pinned and patched source
+      run: 'set -euo pipefail
+
+        python3 - <<''PYPATCH''
+
+        from pathlib import Path
+
+        import hashlib,json,subprocess
+
+        root=Path(''build-request/henge-build'');m=json.loads((root/''manifest.json'').read_text());p=root/''henge.patch''
+
+        assert hashlib.sha256(p.read_bytes()).hexdigest()==m[''patch_sha256'']
+
+        subprocess.run([''git'',''-C'',''Henge'',''apply'',''--check'',str(p.resolve())],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''apply'',str(p.resolve())],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''add'',''-A''],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''-c'',''user.name=Henge CI'',''-c'',''user.email=henge-ci@users.noreply.github.com'',''commit'',''-m'',''Apply
+        pinned custom source for controller review''],check=True)
+
+        PYPATCH
+
+        bash build-request/henge-build/integrate-upstream.sh
+
+        '
+    - name: Native storage, DMA coherence and presentation regression checks
+      working-directory: Henge
+      shell: bash
+      run: 'set -euo pipefail
+
+        mkdir -p build
+
+        exec > >(tee build/guest-budget-native.log) 2>&1
+
+        xcodebuild -version
+
+        sysctl -n machdep.cpu.brand_string
+
+        make -j4 build/test_blk_segments build/test_blk_completion build/test_disk_iov
+        build/test_frame_metrics build/bench_disk_iov
+
+        build/test_blk_segments
+
+        build/test_blk_completion
+
+        build/test_disk_iov
+
+        build/test_frame_metrics
+
+        build/bench_disk_iov
+
+        '
+    - name: Compile changed production code against iOS SDK
+      working-directory: Henge
+      shell: bash
+      run: "set -euo pipefail\nexec > >(tee build/guest-budget-ios-sdk.log) 2>&1\n\
+        for source in host/disk.c devices/virtio_blk.c; do\n  xcrun --sdk iphoneos\
+        \ clang -arch arm64 -miphoneos-version-min=17.0 -std=c11 -D_DARWIN_C_SOURCE\
+        \ -Wall -Wextra -Werror -Icore -Ihost -Idevices -c \"$source\" -o \"build/$(basename\
+        \ \"$source\").ios.o\"\ndone\nxcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0\
+        \ -std=c11 -fobjc-arc -Wno-deprecated-declarations -Wno-unused-parameter -Icore\
+        \ -Ihost -Idevices -fsyntax-only devices/pvg_metal.m\n"
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: guest-budget-native-${{ github.sha }}
+        path: Henge/build/guest-budget-*.log
+        retention-days: 14
+        if-no-files-found: warn
+'on':
+  push:
+    branches:
+    - perf/guest-gpu-budget
+    paths:
+    - henge-build/**
+    - .github/workflows/henge-gpu-budget-checks.yml
