@@ -1,0 +1,495 @@
+name: Upstream feature series native and app checks
+'on':
+  push:
+    branches:
+    - contributions/prepare-upstream
+    paths:
+    - .github/workflows/henge-feature-series.yml
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: henge-upstream-feature-series-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  HUSK: ${{ github.workspace }}/Husk
+  IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
+  HENGE_GAME_MODE: '0'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+jobs:
+  native:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: build-request
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        repository: stride-praline-2f-ai/Henge
+        ref: 27284c58997bc0ebc122b2f63a590e5dd1742be4
+        path: Henge
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Husk
+        ref: afe83d45b31194c4cc9f7b3db7ec2c757db8346e
+        path: Husk
+        persist-credentials: false
+    - name: Select newest installed Xcode for native touch
+      run: "python3 - <<'PYSDK'\nimport glob, os, re, subprocess\nassert subprocess.check_output(['uname',\
+        \ '-m'], text=True).strip() == 'arm64', 'This Henge runner requires native\
+        \ arm64 macOS'\ncandidates = []\nfor app in glob.glob('/Applications/Xcode*.app'):\n\
+        \    developer = app + '/Contents/Developer'\n    try:\n        version =\
+        \ subprocess.check_output(['xcodebuild', '-version'], env={**os.environ, 'DEVELOPER_DIR':\
+        \ developer}, text=True)\n        match = re.search(r'Xcode (\\d+(?:\\.\\\
+        d+)*)', version)\n        if match: candidates.append((tuple(map(int, match[1].split('.'))),\
+        \ developer, version))\n    except subprocess.CalledProcessError:\n      \
+        \  pass\nif not candidates: raise SystemExit('No installed Xcode found')\n\
+        _, developer, version = max(candidates)\nprint(version + developer)\nwith\
+        \ open(os.environ['GITHUB_ENV'], 'a') as f: f.write('DEVELOPER_DIR=' + developer\
+        \ + '\\n')\nPYSDK\n"
+    - name: Ensure Metal shader compiler
+      run: "if ! xcrun --sdk macosx metal --version; then\n  xcodebuild -downloadComponent\
+        \ MetalToolchain\nfi\nxcrun --sdk macosx metal --version\n"
+    - name: Prepare and verify build prerequisites
+      run: 'set -euo pipefail
+
+        bash build-request/henge-build/setup-runner.sh --ci
+
+        test -d Husk/src/app/Frameworks/StikJIT.xcframework
+
+        test -f Husk/src/rppairing-ios/Cargo.lock
+
+        test -f Henge/third_party/libzip/CMakeLists.txt
+
+        df -h .
+
+
+        # Native networking lifecycle tests require a macOS libslirp.
+
+        if ! pkg-config --exists slirp; then brew install libslirp; fi
+
+        pkg-config --cflags --libs slirp
+
+        '
+    - name: Verify exact extracted source
+      run: 'test "$(git -C Henge rev-parse HEAD)" = "27284c58997bc0ebc122b2f63a590e5dd1742be4"
+
+        git -C Henge diff --exit-code
+
+        '
+    - name: Compile engine regression checks
+      id: native_compile
+      working-directory: Henge
+      run: 'set -euo pipefail
+
+        mkdir -p build
+
+        exec > >(tee build/validation-00.log) 2>&1
+
+        trap ''task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND"
+        >&2'' ERR
+
+        ulimit -s 65520
+
+        set -x
+
+        make -j4 build/test_register_groups build/bench_far_chain build/bench_snapshot_admission
+        build/test_tlb_preload build/test_stw_flush build/test_xhci_slots build/test_inline_sysreg
+        build/test_jit_region build/test_jit_ring build/test_pvg_linear_bounds build/test_mmu
+        build/test_mem build/test_jit build/test_devices build/test_fastmem build/test_memory_bounds
+        build/test_tail_recheck build/test_cpu_sync build/test_timer_dispatch build/test_blk_completion
+        build/test_blk_segments build/test_disk_iov build/test_idle_integration
+
+
+        make -j4 build/test_snapshot_pack build/test_shutdown build/test_dns_lifecycle
+        build/test_vm_lifecycle build/test_pvg_lifecycle build/test_audio_lifecycle
+        build/test_fastmem_bench
+
+        '
+    - name: Checked stack translations, precise exceptions and network batches
+      working-directory: Henge
+      shell: bash
+      run: 'set -euo pipefail
+
+        make -j4 build/test_exc build/test_mem_register_reference build/test_exc_register_reference
+        build/test_net_batch
+
+        build/test_net_batch
+
+        HV_GROUPS=2 build/test_mem
+
+        HV_GROUPS=2 build/test_mem_register_reference
+
+        build/test_exc
+
+        build/test_exc_register_reference
+
+        '
+    - name: Validate JIT publication, MMU and superblocks
+      working-directory: Henge
+      run: 'set -euo pipefail
+
+        mkdir -p build
+
+        exec > >(tee build/validation-01.log) 2>&1
+
+        trap ''task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND"
+        >&2'' ERR
+
+        ulimit -s 65520
+
+        set -x
+
+        build/test_register_groups
+
+        build/bench_far_chain
+
+        build/bench_snapshot_admission
+
+
+        build/test_stw_flush
+
+        HV_STW_IPI=1 build/test_stw_flush
+
+        build/test_xhci_slots
+
+        build/test_inline_sysreg
+
+        HV_JIT_SPLIT=1 build/test_inline_sysreg
+
+        build/test_jit_region
+
+        build/test_jit_ring
+
+        HV_JIT_POISON=1 build/test_jit_ring
+
+        HV_JIT_SPLIT=1 build/test_jit_ring
+
+        build/test_pvg_linear_bounds
+
+        HV_JIT_RELAXED_BRANCH=1 build/test_jit_region
+
+        build/test_mmu
+
+        HV_WALK_LOG=0 HV_IJC_PAGES=0 build/test_mmu
+
+        build/test_jit
+
+        HV_SUPERBLOCKS=1 build/test_jit
+
+        HV_SUPERBLOCKS=1 HV_JIT_SPLIT=1 build/test_jit
+
+        '
+    - name: Validate memory, timing, CPU sync and devices
+      working-directory: Henge
+      run: 'set -euo pipefail
+
+        mkdir -p build
+
+        exec > >(tee build/validation-02.log) 2>&1
+
+        trap ''task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND"
+        >&2'' ERR
+
+        ulimit -s 65520
+
+        set -x
+
+        build/test_mem
+
+        HV_WALK_LOG=0 HV_IJC_PAGES=0 build/test_mem
+
+        HV_FASTMEM=1 build/test_mem
+
+
+        HV_FASTMEM=1 HV_FASTMEM_ORDER=tlb-first build/test_mem
+
+
+        HV_FASTMEM=1 HV_FASTMEM_ORDER=tlb-first HV_JIT_SPLIT=1 build/test_mem
+
+
+        HV_FASTMEM=1 HV_FASTMEM_ORDER=tlb-first HV_TLB_PRELOAD=1 build/test_tail_recheck
+
+        HV_SUPERBLOCKS=1 build/test_mem
+
+        build/test_fastmem
+
+        build/test_memory_bounds
+
+        build/test_tail_recheck
+
+        HV_TLB_PRELOAD=1 build/test_mem
+
+        HV_TLB_PRELOAD=1 build/test_tail_recheck
+
+        build/test_tlb_preload
+
+        HV_JIT_SPLIT=1 build/test_tlb_preload
+
+
+        build/test_cpu_sync
+
+        build/test_timer_dispatch
+
+        build/test_blk_completion
+
+
+        build/test_blk_segments
+
+        build/test_disk_iov
+
+        build/test_idle_integration
+
+        build/test_devices
+
+        python3 tests/test_chain_index.py
+
+
+        build/test_shutdown
+
+        build/test_dns_lifecycle
+
+        build/test_snapshot_pack
+
+        build/test_vm_lifecycle
+
+        build/test_pvg_lifecycle
+
+        python3 tests/test_pipeline_archive.py
+
+        build/test_audio_lifecycle
+
+        bash tests/benchmark_fastmem.sh
+
+        python3 tests/benchmark_surface_hash.py
+
+
+        # One paired correctness/timing check of existing grouped shapes and address
+        increments.
+
+        make build/test_bench
+
+        HV_GROUPS=0 build/test_bench > build/groups-off.log
+
+        HV_GROUPS=1 build/test_bench > build/groups-on.log
+
+        cat build/groups-off.log build/groups-on.log
+
+        '
+    - name: Validate indexes, DNS, input and Link protocol
+      working-directory: Henge
+      run: 'set -euo pipefail
+
+        mkdir -p build
+
+        exec > >(tee build/validation-03.log) 2>&1
+
+        trap ''task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND"
+        >&2'' ERR
+
+        ulimit -s 65520
+
+        set -x
+
+        python3 tests/test_translation_race.py
+
+        python3 tests/test_walk_log.py
+
+        python3 tests/test_hvsparse.py
+
+        python3 tests/test_installer_preflight.py
+
+        python3 tests/test_session_resume.py
+
+        cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread
+        -Itests/dns_mock -Icore -Ihost tests/test_dns_proxy.c -o build/test_dns_proxy
+
+        build/test_dns_proxy
+
+        swiftc ios/Henge/PhysicalMouseButtons.swift tests/test_physical_mouse_buttons.swift
+        -o build/test_physical_mouse_buttons
+
+        build/test_physical_mouse_buttons
+
+        make test-runner
+
+        bash tools/link/check.sh
+
+        bash tools/check_host_scheduling.sh
+
+
+        # Reproduce Xcode environment while building real macOS guest samples.
+
+        SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" make build/tl-samples.dmg
+
+
+        touch_checks=0
+
+        bash tools/check_native_touch.sh || touch_checks=1
+
+        python3 tests/test_disk_resize.py || touch_checks=1
+
+        python3 tests/test_disk_recovery_macos.py || touch_checks=1
+
+        test "$touch_checks" -eq 0
+
+        '
+    - name: Collect independent lifetime, concurrency and graphics diagnostics
+      working-directory: Henge
+      run: 'set -euo pipefail
+
+        mkdir -p build
+
+        ulimit -s 65520
+
+        bash tests/run_lifecycle_sanitizers.sh 2>&1 | tee build/validation-04.log
+
+        '
+    - name: Save validation output
+      uses: actions/upload-artifact@v4
+      with:
+        name: upstream-series-native-${{ github.sha }}
+        retention-days: 7
+        if-no-files-found: ignore
+        path: 'Henge/build/validation-*.log
+
+          Henge/build/scheduling-check/*.log
+
+
+          Henge/build/fastmem-*.log
+
+          Henge/build/fastmem-native-summary.json
+
+
+          Henge/build/groups-*.log
+
+          '
+      if: always()
+  app:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: build-request
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        repository: stride-praline-2f-ai/Henge
+        ref: 27284c58997bc0ebc122b2f63a590e5dd1742be4
+        path: Henge
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Husk
+        ref: afe83d45b31194c4cc9f7b3db7ec2c757db8346e
+        path: Husk
+        persist-credentials: false
+    - name: Select newest installed Xcode for native touch
+      run: "python3 - <<'PYSDK'\nimport glob, os, re, subprocess\nassert subprocess.check_output(['uname',\
+        \ '-m'], text=True).strip() == 'arm64', 'This Henge runner requires native\
+        \ arm64 macOS'\ncandidates = []\nfor app in glob.glob('/Applications/Xcode*.app'):\n\
+        \    developer = app + '/Contents/Developer'\n    try:\n        version =\
+        \ subprocess.check_output(['xcodebuild', '-version'], env={**os.environ, 'DEVELOPER_DIR':\
+        \ developer}, text=True)\n        match = re.search(r'Xcode (\\d+(?:\\.\\\
+        d+)*)', version)\n        if match: candidates.append((tuple(map(int, match[1].split('.'))),\
+        \ developer, version))\n    except subprocess.CalledProcessError:\n      \
+        \  pass\nif not candidates: raise SystemExit('No installed Xcode found')\n\
+        _, developer, version = max(candidates)\nprint(version + developer)\nwith\
+        \ open(os.environ['GITHUB_ENV'], 'a') as f: f.write('DEVELOPER_DIR=' + developer\
+        \ + '\\n')\nPYSDK\n"
+    - name: Ensure Metal shader compiler
+      run: "if ! xcrun --sdk macosx metal --version; then\n  xcodebuild -downloadComponent\
+        \ MetalToolchain\nfi\nxcrun --sdk macosx metal --version\n"
+    - name: Prepare and verify build prerequisites
+      run: 'set -euo pipefail
+
+        bash build-request/henge-build/setup-runner.sh --ci
+
+        test -d Husk/src/app/Frameworks/StikJIT.xcframework
+
+        test -f Husk/src/rppairing-ios/Cargo.lock
+
+        test -f Henge/third_party/libzip/CMakeLists.txt
+
+        df -h .
+
+
+        # Native networking lifecycle tests require a macOS libslirp.
+
+        if ! pkg-config --exists slirp; then brew install libslirp; fi
+
+        pkg-config --cflags --libs slirp
+
+        '
+    - name: Verify exact extracted source
+      run: 'test "$(git -C Henge rev-parse HEAD)" = "27284c58997bc0ebc122b2f63a590e5dd1742be4"
+
+        git -C Henge diff --exit-code
+
+        '
+    - name: Fingerprint dependency toolchain
+      id: toolchain
+      run: "python3 - <<'PY'\nimport hashlib, os, subprocess\ncommands = [['xcodebuild',\
+        \ '-version'], ['xcrun', '--sdk', 'iphoneos', '--show-sdk-version'], ['rustc',\
+        \ '-vV'], ['meson', '--version'], ['ninja', '--version'], ['pkg-config', '--version'],\
+        \ ['cmake', '--version'], ['xcodegen', '--version']]\nidentity = b'\\n'.join(subprocess.check_output(c)\
+        \ for c in commands)\nwith open(os.environ['GITHUB_OUTPUT'], 'a') as f:\n\
+        \    f.write('id=' + hashlib.sha256(identity).hexdigest()[:24] + '\\n')\n\
+        PY\n"
+    - name: Restore pinned dependency cache
+      uses: actions/cache@v4
+      with:
+        path: 'Husk/third_party/build
+
+          Husk/build/ios-arm64
+
+          Husk/build/stamps
+
+          '
+        key: henge-cloud-v2-${{ runner.os }}-${{ runner.arch }}-afe83d45b31194c4cc9f7b3db7ec2c757db8346e-${{
+          steps.toolchain.outputs.id }}-${{ hashFiles('build-request/henge-build/fetch-required-sources.sh')
+          }}
+    - name: Fetch dependency sources
+      working-directory: Husk
+      run: bash ../build-request/henge-build/fetch-required-sources.sh "$PWD"
+    - name: Build required iOS libraries
+      working-directory: Husk
+      run: bash scripts/build_ios.sh libffi glib libslirp
+    - name: Build on-device pairing library
+      working-directory: Husk
+      run: bash scripts/build_rppairing_ios.sh
+    - name: Copy iOS dependencies
+      working-directory: Henge
+      run: zsh ios/scripts/fetch_deps.sh
+    - name: Restore exact iOS libzip dependency
+      uses: actions/cache@v4
+      with:
+        path: Henge/build/ios/deps/libzip
+        key: henge-ios-libzip-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id
+          }}-${{ hashFiles('Henge/third_party/libzip/**', 'Henge/tools/build_ios_restore.sh')
+          }}
+    - name: Build restore stack
+      working-directory: Henge
+      run: zsh tools/build_ios_restore.sh
+    - name: Build iOS engine
+      working-directory: Henge
+      run: make -j4 ios-lib
+    - name: Compile and inspect iOS application without packaging
+      working-directory: Henge
+      run: zsh ios/scripts/build_app.sh
+    - name: Preserve app compile logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: upstream-series-app-${{ github.sha }}
+        path: 'Henge/ios/build/*.buildlog
+
+          Henge/ios/build/DerivedData/Logs/Build/
+
+          '
+        if-no-files-found: warn
+        retention-days: 7
