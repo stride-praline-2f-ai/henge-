@@ -2925,7 +2925,7 @@ index 0000000..43bf5d2
 +#endif
 diff --git a/devices/gpu_command_storage.h b/devices/gpu_command_storage.h
 new file mode 100644
-index 0000000..d6b52c9
+index 0000000..51fc10f
 --- /dev/null
 +++ b/devices/gpu_command_storage.h
 @@ -0,0 +1,87 @@
@@ -2957,12 +2957,12 @@ index 0000000..d6b52c9
 +- (id)copyWithZone:(NSZone *)zone {(void)zone;return self;}
 +- (void)dealloc {if(owner)atomic_fetch_sub_explicit(&owner->users,1,memory_order_release);}
 +@end
-+@interface HvCommandLease : NSObject { @public HvCommandOwner *owner;NSUInteger length; }
++@interface HvCommandLease : NSObject { @public HvCommandOwner *owner;NSUInteger limit; }
 +- (NSData *)viewAt:(NSUInteger)offset length:(NSUInteger)length;
 +@end
 +@implementation HvCommandLease
 +- (NSData *)viewAt:(NSUInteger)offset length:(NSUInteger)length {
-+    if(offset>self->length||length>self->length-offset)return nil;
++    if(offset>limit||length>limit-offset)return nil;
 +    HvCommandView *view=[HvCommandView new];if(!view)return nil;
 +    view->owner=owner;view->offset=offset;view->count=length;
 +    atomic_fetch_add_explicit(&owner->users,1,memory_order_relaxed);return view;
@@ -3013,7 +3013,7 @@ index 0000000..d6b52c9
 +    atomic_fetch_add_explicit(&selected->users,1,memory_order_relaxed);
 +    HvCommandLease *lease=[HvCommandLease new];
 +    if(!lease){atomic_fetch_sub_explicit(&selected->users,1,memory_order_release);return nil;}
-+    lease->owner=selected;lease->length=bytes;return lease;
++    lease->owner=selected;lease->limit=bytes;return lease;
 +}
 +@end
 diff --git a/devices/gpu_copy_bounds.h b/devices/gpu_copy_bounds.h
@@ -3044,10 +3044,10 @@ index 0000000..803678a
 +#endif
 diff --git a/devices/gpu_dirty_copy.h b/devices/gpu_dirty_copy.h
 new file mode 100644
-index 0000000..1751c54
+index 0000000..69b8af5
 --- /dev/null
 +++ b/devices/gpu_dirty_copy.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,64 @@
 +#ifndef HENGE_GPU_DIRTY_COPY_H
 +#define HENGE_GPU_DIRTY_COPY_H
 +#include <stdint.h>
@@ -3100,6 +3100,12 @@ index 0000000..1751c54
 +            size_t row = hv_copy_probe_index(rows - 1, i);s->probes++;
 +            if (!memcmp(to + row * to_row, from + row * from_row, bytes)) { full = 0; break; }
 +        }
++    }
++    if (full) {
++        for (size_t row = 0; row < rows; row++)
++            memcpy(to + row * to_row, from + row * from_row, bytes);
++        s->candidate_bytes += rows * bytes;s->copied_bytes += rows * bytes;
++        s->chunks += rows;s->writes += rows;return 1;
 +    }
 +    for (size_t row = 0; row < rows; row++)
 +        hv_copy_span(to + row * to_row, from + row * from_row, bytes, full, s);
@@ -5257,7 +5263,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..8386b54 100644
+index 9073d22..db3b66f 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -7636,7 +7642,7 @@ index 9073d22..8386b54 100644
 +           lookup cache. Mutable resource entries remain checked on each use.
 +           Explicit environment overrides retain the reference path. */
 +        if(!getenv("HV_GPU_COMMAND_POOL")||hv_env_flag("HV_GPU_COMMAND_POOL"))r->command_pool=[HvCommandPool new];
-+        r->copy_full = hv_env_flag("HV_PVG_COPY_FULL");
++        r->copy_full = !hv_env_flag("HV_PVG_COPY_PARTIAL");
 +        r->batch_cache = getenv("HV_GPU_BATCH_CACHE") ? hv_env_flag("HV_GPU_BATCH_CACHE") : YES;
          r->tasks = [NSMutableDictionary new];
          r->mapped_textures = [NSMutableDictionary new];
