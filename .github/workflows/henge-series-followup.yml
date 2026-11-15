@@ -1,0 +1,202 @@
+name: Upstream series independent graphics input lifetime checks
+'on':
+  push:
+    branches:
+    - contributions/prepare-upstream
+    paths:
+    - .github/workflows/henge-series-followup.yml
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: henge-upstream-independent-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  HUSK: ${{ github.workspace }}/Husk
+  IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
+  HENGE_GAME_MODE: '0'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+jobs:
+  remaining:
+    runs-on: xcode-27
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: build-request
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        repository: stride-praline-2f-ai/Henge
+        ref: 27284c58997bc0ebc122b2f63a590e5dd1742be4
+        path: Henge
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Husk
+        ref: afe83d45b31194c4cc9f7b3db7ec2c757db8346e
+        path: Husk
+        persist-credentials: false
+    - name: Select newest installed Xcode for native touch
+      run: "python3 - <<'PYSDK'\nimport glob, os, re, subprocess\nassert subprocess.check_output(['uname',\
+        \ '-m'], text=True).strip() == 'arm64', 'This Henge runner requires native\
+        \ arm64 macOS'\ncandidates = []\nfor app in glob.glob('/Applications/Xcode*.app'):\n\
+        \    developer = app + '/Contents/Developer'\n    try:\n        version =\
+        \ subprocess.check_output(['xcodebuild', '-version'], env={**os.environ, 'DEVELOPER_DIR':\
+        \ developer}, text=True)\n        match = re.search(r'Xcode (\\d+(?:\\.\\\
+        d+)*)', version)\n        if match: candidates.append((tuple(map(int, match[1].split('.'))),\
+        \ developer, version))\n    except subprocess.CalledProcessError:\n      \
+        \  pass\nif not candidates: raise SystemExit('No installed Xcode found')\n\
+        _, developer, version = max(candidates)\nprint(version + developer)\nwith\
+        \ open(os.environ['GITHUB_ENV'], 'a') as f: f.write('DEVELOPER_DIR=' + developer\
+        \ + '\\n')\nPYSDK\n"
+    - name: Ensure Metal shader compiler
+      run: "if ! xcrun --sdk macosx metal --version; then\n  xcodebuild -downloadComponent\
+        \ MetalToolchain\nfi\nxcrun --sdk macosx metal --version\n"
+    - name: Prepare and verify build prerequisites
+      run: 'set -euo pipefail
+
+        bash build-request/henge-build/setup-runner.sh --ci
+
+        test -d Husk/src/app/Frameworks/StikJIT.xcframework
+
+        test -f Husk/src/rppairing-ios/Cargo.lock
+
+        test -f Henge/third_party/libzip/CMakeLists.txt
+
+        df -h .
+
+
+        # Native networking lifecycle tests require a macOS libslirp.
+
+        if ! pkg-config --exists slirp; then brew install libslirp; fi
+
+        pkg-config --cflags --libs slirp
+
+        '
+    - name: Verify exact extracted source
+      run: 'test "$(git -C Henge rev-parse HEAD)" = "27284c58997bc0ebc122b2f63a590e5dd1742be4"
+
+        git -C Henge diff --exit-code
+
+        '
+    - name: Independently test current cloud Metal archive behavior
+      working-directory: Henge
+      run: "mkdir -p build\nexec > >(tee build/archive-api-build.log) 2>&1\nxcrun\
+        \ -sdk macosx metal -c tests/archive_fixture.metal -o build/archive_fixture.air\n\
+        xcrun -sdk macosx metallib build/archive_fixture.air -o build/archive_fixture.metallib\n\
+        xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror tests/test_pipeline_archive_api.m\
+        \ -framework Foundation -framework Metal -o build/test_pipeline_archive_api\n\
+        for name in av af anr ak ak2; do\n  xcrun -sdk macosx metal -DHENGE_ARCHIVE_FUNC_$name=1\
+        \ -c tests/archive_fixture.metal -o \"build/archive_$name.air\"\n  xcrun -sdk\
+        \ macosx metallib \"build/archive_$name.air\" -o \"build/archive_$name.metallib\"\
+        \ndone\nset +e\nfailed=0\nfor kind in basic compute mixed separate delayed;\
+        \ do\n  extra=()\n  if [[ \"$kind\" != basic ]]; then extra=(\"$kind\"); fi\n\
+        \  build/test_pipeline_archive_api build/archive_fixture.metallib \"build/archive-api-$kind.bin\"\
+        \ write \"${extra[@]}\" 2>&1 | tee -a build/archive-api.log\n  if [[ ${PIPESTATUS[0]}\
+        \ != 0 ]]; then failed=$((failed+1)); fi\n  build/test_pipeline_archive_api\
+        \ build/archive_fixture.metallib \"build/archive-api-$kind.bin\" read \"${extra[@]}\"\
+        \ 2>&1 | tee -a build/archive-api.log\n  read_rc=${PIPESTATUS[0]}\n  if [[\
+        \ \"$kind\" == mixed && \"$read_rc\" == 78 ]]; then\n    echo 'Mixed-container\
+        \ driver limitation reproduced; production must use separate render/compute/tile\
+        \ files' | tee -a build/archive-api.log\n  elif [[ ( \"$kind\" == separate\
+        \ || \"$kind\" == delayed ) && \"$read_rc\" == 78 ]]; then\n    echo 'Independent\
+        \ exact single-function API control proved Paravirtual missing-function behavior;\
+        \ all four GPU executions and normal fallback passed; production cold-hit\
+        \ requirements unchanged' | tee -a build/archive-api.log\n  elif [[ \"$read_rc\"\
+        \ != 0 ]]; then failed=$((failed+1)); fi\ndone\nif [[ \"$failed\" == 0 ]];\
+        \ then echo 'PASS independent Metal archives: cold render hits; compute persistence\
+        \ capability checked; all four PSOs executed; fallback checked' | tee -a build/archive-api.log;\
+        \ fi\nexit $((failed > 0))\n"
+    - name: Validate indexes, DNS, input and Link protocol
+      working-directory: Henge
+      run: 'set -euo pipefail
+
+        mkdir -p build
+
+        exec > >(tee build/validation-03.log) 2>&1
+
+        trap ''task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND"
+        >&2'' ERR
+
+        ulimit -s 65520
+
+        set -x
+
+        python3 tests/test_translation_race.py
+
+        python3 tests/test_walk_log.py
+
+        python3 tests/test_hvsparse.py
+
+        python3 tests/test_installer_preflight.py
+
+        python3 tests/test_session_resume.py
+
+        cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread
+        -Itests/dns_mock -Icore -Ihost tests/test_dns_proxy.c -o build/test_dns_proxy
+
+        build/test_dns_proxy
+
+        swiftc ios/Henge/PhysicalMouseButtons.swift tests/test_physical_mouse_buttons.swift
+        -o build/test_physical_mouse_buttons
+
+        build/test_physical_mouse_buttons
+
+        make test-runner
+
+        bash tools/link/check.sh
+
+        bash tools/check_host_scheduling.sh
+
+
+        # Reproduce Xcode environment while building real macOS guest samples.
+
+        SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" make build/tl-samples.dmg
+
+
+        touch_checks=0
+
+        bash tools/check_native_touch.sh || touch_checks=1
+
+        python3 tests/test_disk_resize.py || touch_checks=1
+
+        python3 tests/test_disk_recovery_macos.py || touch_checks=1
+
+        test "$touch_checks" -eq 0
+
+        '
+      if: ${{ !cancelled() }}
+    - name: Collect independent lifetime, concurrency and graphics diagnostics
+      working-directory: Henge
+      run: 'set -euo pipefail
+
+        mkdir -p build
+
+        ulimit -s 65520
+
+        bash tests/run_lifecycle_sanitizers.sh 2>&1 | tee build/validation-04.log
+
+        '
+      if: ${{ !cancelled() }}
+    - name: Save validation output
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: upstream-series-independent-${{ github.sha }}
+        retention-days: 7
+        if-no-files-found: ignore
+        path: 'Henge/build/validation-*.log
+
+          Henge/build/scheduling-check/*.log
+
+
+          Henge/build/fastmem-*.log
+
+          Henge/build/fastmem-native-summary.json
+
+
+          Henge/build/groups-*.log
+
+
+          Henge/build/archive-api*.log'
