@@ -1,0 +1,15 @@
+# Physical116 follow-up: verified source checkpoint
+
+Runtime source: `1c28233` (`fix/physical116-log-review`). Delivery repository source: `622ad719183248b00bed85d7993e4ce6e498dd64`. Integrated patch SHA-256: `4499a979080639433645af56e58c567c53b5886b1cafba4966bb2b6dc5b2e3a0`.
+
+- PASS [focused GPU/SDK checks](https://github.com/stride-praline-2f-ai/henge-/actions/runs/43664093255): ASan/UBSan bounded stream parsing, production Metal4 planning, 50,000 argument updates compared with a full-clear reference, native argument-table identity, sparse reuse (175 -> 3 reset calls in the sparse fixture), nil/stride/high-index/bounds cases, MetalFX routing/lifetimes, 89 production Swift source device and Simulator SDK typechecks.
+- PASS [native/application checks](https://github.com/stride-praline-2f-ai/henge-/actions/runs/43664093248): native regressions, memory/concurrency checks, input/Link checks and full iOS app compilation/inspection. IPA packaging and packaged-IPA inspection were correctly skipped; no new IPA is supplied by this checkpoint.
+- PASS [separate engine contribution on current upstream e98920c](https://github.com/stride-praline-2f-ai/henge-/actions/runs/43665484564): 128 MMU checks; 16 memory programs x 4 modes + MMIO; 11 JIT programs x 2 seeds; inline-register/PAN and counter-origin tests; four-vCPU code-ring pressure; grouped-access and tail-recheck checks. This validates this focused extraction, not all custom features rebased onto new main. Preparation branch `contributions/engine-memory-jit`, head `5e9863c`.
+
+Cloud Metal4 GPU execution/readback is unavailable on the runner's Apple Paravirtual device. Recording-table equivalence and SDK compilation are not physical M4/A20 FPS, energy or pixel validation. No speedup, eliminated heating or resolved iPad crash is claimed.
+
+Memory-path source check: the Duo log confirms all 8192 MiB of configured guest RAM is successfully ledger-backed outside process footprint. This changes accounting, not physical RAM consumption. Allocation is mapped lazily, and resident guest pages still compete with iOS, JIT and graphics. No HV_BALLOON activation is recorded; the source only creates that device explicitly, and UIKit warnings do not automatically inflate it. The renderer already owns one event-driven memory-pressure source; no competing pressure controller was added.
+
+The iPad upload records a 3.8-second startup, a two-line current native log, and 40 previous-run lines. It does not establish whether the reported termination occurred during that startup or the preceding VM session, and contains no OS termination reason. The matching full previous app/native logs and iOS Analytics report remain needed for crash attribution. The new Share diagnostic logs action includes previous-run files by default.
+
+Upstream PRs are being split separately; the first source extraction is cloud checked. Publishing still awaits the requested fork-account selection (stride-praline-2f-ai vs aaULTra). No upstream PR has been opened or claimed complete.
