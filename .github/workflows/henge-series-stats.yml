@@ -1,0 +1,101 @@
+name: Upstream series focused lifecycle statistics
+'on':
+  push:
+    branches:
+    - contributions/prepare-upstream
+    paths:
+    - .github/workflows/henge-series-stats.yml
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: henge-upstream-stats-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  HUSK: ${{ github.workspace }}/Husk
+  IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
+  HENGE_GAME_MODE: '0'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+jobs:
+  stats:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: build-request
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        repository: stride-praline-2f-ai/Henge
+        ref: 27284c58997bc0ebc122b2f63a590e5dd1742be4
+        path: Henge
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Husk
+        ref: afe83d45b31194c4cc9f7b3db7ec2c757db8346e
+        path: Husk
+        persist-credentials: false
+    - name: Select newest installed Xcode for native touch
+      run: "python3 - <<'PYSDK'\nimport glob, os, re, subprocess\nassert subprocess.check_output(['uname',\
+        \ '-m'], text=True).strip() == 'arm64', 'This Henge runner requires native\
+        \ arm64 macOS'\ncandidates = []\nfor app in glob.glob('/Applications/Xcode*.app'):\n\
+        \    developer = app + '/Contents/Developer'\n    try:\n        version =\
+        \ subprocess.check_output(['xcodebuild', '-version'], env={**os.environ, 'DEVELOPER_DIR':\
+        \ developer}, text=True)\n        match = re.search(r'Xcode (\\d+(?:\\.\\\
+        d+)*)', version)\n        if match: candidates.append((tuple(map(int, match[1].split('.'))),\
+        \ developer, version))\n    except subprocess.CalledProcessError:\n      \
+        \  pass\nif not candidates: raise SystemExit('No installed Xcode found')\n\
+        _, developer, version = max(candidates)\nprint(version + developer)\nwith\
+        \ open(os.environ['GITHUB_ENV'], 'a') as f: f.write('DEVELOPER_DIR=' + developer\
+        \ + '\\n')\nPYSDK\n"
+    - name: Ensure Metal shader compiler
+      run: "if ! xcrun --sdk macosx metal --version; then\n  xcodebuild -downloadComponent\
+        \ MetalToolchain\nfi\nxcrun --sdk macosx metal --version\n"
+    - name: Prepare and verify build prerequisites
+      run: 'set -euo pipefail
+
+        bash build-request/henge-build/setup-runner.sh --ci
+
+        test -d Husk/src/app/Frameworks/StikJIT.xcframework
+
+        test -f Husk/src/rppairing-ios/Cargo.lock
+
+        test -f Henge/third_party/libzip/CMakeLists.txt
+
+        df -h .
+
+
+        # Native networking lifecycle tests require a macOS libslirp.
+
+        if ! pkg-config --exists slirp; then brew install libslirp; fi
+
+        pkg-config --cflags --libs slirp
+
+        '
+    - name: Verify exact extracted source
+      run: 'test "$(git -C Henge rev-parse HEAD)" = "27284c58997bc0ebc122b2f63a590e5dd1742be4"
+
+        git -C Henge diff --exit-code
+
+        '
+    - name: Build required production lifecycle fixture and run statistics checks
+      working-directory: Henge
+      run: 'set -euo pipefail
+
+        ulimit -s 65520
+
+        make -j4 build/test_vm_lifecycle
+
+        python3 tests/test_stats_lifecycle.py
+
+        '
+    - name: Retain native statistics output
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: upstream-series-stats-${{ github.sha }}
+        path: Henge/build/stats-lifecycle-*.log
+        if-no-files-found: warn
+        retention-days: 7
