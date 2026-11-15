@@ -1,5 +1,7 @@
-# Current validation
+# Exact-source desktop upscaler validation
 
-Physical114 source follow-up is pending macOS CI. Local touch watchdog ASan/UBSan passes. Linux has no Swift/macOS SDK; no local Swift/native lifecycle pass is claimed. New source invalidates the prior115 release validation. Existing115 artifact remains delivered and unchanged.
+Source `4678636973855ad0b9a0f4de43fa11526d74ac1b`, patch `79c00f1eac73cdb7e9dac5b9663edd83a27dc3f11cca24ad867f5046bc2ffd12`. Full run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43657238549; focused https://github.com/stride-praline-2f-ai/henge-/actions/runs/43657238631.
 
-Required checks: production NativeReportPump and SessionDiagnosticCapture worker/stale-result tests under ASan; native touch idle/held watchdog; real PVG lifecycle/allocation snapshot; complete native regressions and device/Simulator SDK plus full app compile. Packaging is disabled.
+Passed: native JIT/MMU/VM/audio/input/network/storage/Link/snapshot/clipboard regression suite, sanitizers/concurrency, complete iOS Release compilation, production Metal4 SDK checks, actual VirtualMac upscaler policy, legacy/native snapshot defaults, exact saved presentation scale, fixed output geometry, production MetalFX routing via recording objects, post-scale cursor ordering, epoch cache reuse/rejected-job invalidation, bounded leases and memory-pressure recovery. Real classic Metal GPU readback and existing component benchmarks remain in the focused receipt.
+
+Metal4FX GPU fixture compiled but returned78 on the unsupported Paravirtual GPU. It exercises flat encoded/linear half-float output, separate sharp cursor and cached reuse when run on supported hardware. Source-pixel reduction is mathematical, not a measured whole-app/FPS/energy gain. The mode is optional, reconstructs detail and can soften text. Native Retina and the guest Metal4 renderer remain unchanged. Existing hardware-only touch/Pencil/peripheral/Link/game-resume/iCloud/background-deadline validation remains pending physical testing. Saved memory is build-bound: shut down macOS before updating; virtual disks are retained.

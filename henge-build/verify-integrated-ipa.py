@@ -215,6 +215,19 @@ if manifest.get('desktop_metalfx'):
         assert marker in app_executable,'Missing desktop upscaler activation: '+repr(marker)
     assert b'MetalFX.framework/MetalFX' in app_executable,'MetalFX framework not linked'
     data['desktop_metalfx']=dict(fx,runtime_markers_verified=True,physical_performance_verified=False)
+# Follow-up source can compile only if the real native/Swift resource ABI agrees.
+# Verify the diagnostic and pressure paths also survived Release linking.
+for feature,markers in (
+    ('physical_114_diagnostics_followup',(b'classic command buffers only; Metal4 timing is separate',b'metal4_gpu_ms=',b'kernel read cache order=')),
+    ('physical_115_metalfx_followup',(b'desktop-metalfx-admission:',b'pressure_fallbacks=',b'resource_fallbacks=',b'geometry_fallbacks=')),
+    ('memory_pressure_fx_followup',(b'moderate pressure trims spare leases',b'system_vm_available=',b'raw system categories in bytes'))):
+    if manifest.get(feature):
+        followup=state.get(feature,{})
+        assert followup.get('complete') and followup.get('source_commit')==state['final_validation']['source_commit'], feature+' source validation missing'
+        for marker in markers:
+            assert marker in app_executable, 'Follow-up runtime missing: '+repr(marker)
+        data[feature]=dict(followup,runtime_markers_verified=True,updated_physical_performance_verified=False)
+
 # Correct legacy metadata: verify the real configured default in the reconstructed source.
 assert 'as? Bool ?? true' in Path('Henge/ios/Henge/EngineTuning.swift').read_text()
 data['fastmem_default']=True
