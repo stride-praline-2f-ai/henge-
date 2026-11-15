@@ -1,6 +1,7 @@
 name: Henge native validation and gated IPA
 permissions:
   contents: read
+  actions: write
 concurrency:
   group: henge-custom-ipa
   cancel-in-progress: true
@@ -47,6 +48,32 @@ jobs:
         >&2; exit 1; }
 
         '
+    - name: Cancel superseded IPA runs from the two packaging workflows
+      env:
+        GH_TOKEN: ${{ github.token }}
+      shell: bash
+      run: "python3 - <<'PYCANCEL'\nimport json, os, urllib.request, urllib.error\n\
+        from pathlib import Path\nbase='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']\n\
+        headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}\n\
+        def call(path, method='GET'):\n    request=urllib.request.Request(base+path,headers=headers,method=method)\n\
+        \    with urllib.request.urlopen(request,timeout=30) as response:\n      \
+        \  body=response.read()\n        return json.loads(body) if body else {}\n\
+        current=call('/actions/runs/'+os.environ['GITHUB_RUN_ID'])\npaths={'.github/workflows/henge-ipa.yml','.github/workflows/henge-duo-checks.yml'}\n\
+        ids={w['id'] for w in call('/actions/workflows?per_page=100')['workflows']\
+        \ if w['path'] in paths}\nresults=[]\nfor status in ('queued','in_progress','waiting','pending','requested'):\n\
+        \    for run in call('/actions/runs?status='+status+'&per_page=100')['workflow_runs']:\n\
+        \        if run['id']==current['id'] or run['workflow_id'] not in ids or run['created_at']>current['created_at']:continue\n\
+        \        if any(x['id']==run['id'] for x in results):continue\n        item={'id':run['id'],'head_sha':run['head_sha'],'status':run['status']}\n\
+        \        results.append(item)\n        for action in ('cancel','force-cancel'):\n\
+        \            try:\n                call('/actions/runs/'+str(run['id'])+'/'+action,'POST')\n\
+        \                item['request']=action;item['result']='accepted';break\n\
+        \            except urllib.error.HTTPError as error:\n                item[action+'_http']=error.code\n\
+        \                if error.code!=409:break\n        if item.get('result')!='accepted':item['result']='provider\
+        \ rejected; preserved for review'\n        print('Superseded IPA cleanup:',json.dumps(item))\n\
+        out=Path(os.environ['HENGE_IPA_OUTPUT']).parent\nout.mkdir(parents=True,exist_ok=True)\n\
+        (out/'Henge-build-cleanup.json').write_text(json.dumps({'current_run':current['id'],'results':results},indent=2)+'\\\
+        n')\nprint('Checked only the two IPA workflows; unrelated workflows retained.')\n\
+        PYCANCEL\n"
     - name: Load pinned inputs
       id: inputs
       run: "python3 - <<'PY'\nimport json, os\nfrom pathlib import Path\ndata = json.loads(Path('build-request/henge-build/manifest.json').read_text())\n\
@@ -670,6 +697,9 @@ jobs:
           ${{ github.workspace }}/Henge-output/Henge-optimization-completion.json
 
           ${{ github.workspace }}/Henge-output/Henge-symbols.txt
+
+
+          ${{ github.workspace }}/Henge-output/Henge-build-cleanup.json
 
           '
       if: ${{ success() && ((github.event_name == 'workflow_dispatch' && inputs.build_ipa

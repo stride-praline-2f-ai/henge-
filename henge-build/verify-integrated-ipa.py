@@ -228,6 +228,20 @@ for feature,markers in (
             assert marker in app_executable, 'Follow-up runtime missing: '+repr(marker)
         data[feature]=dict(followup,runtime_markers_verified=True,updated_physical_performance_verified=False)
 
+# The log-driven CPU/shader/network changes must survive Release linking into
+# this actual IPA, not merely pass source-only tests on an earlier build.
+follow116=state.get('physical116_followup',{})
+if follow116:
+    assert follow116.get('complete') and follow116.get('source_commit')==state['final_validation']['source_commit'], 'Physical116 source validation missing'
+    for marker in (b'checked writeback groups=',b'_hv_translate_writeback_groups',
+                   b'metal4-pipeline-warmup:',b'hengevm.metal4.compile',
+                   b'metal4-rejection-hotspot:',b'_hv_virtio_net_receive_batch'):
+        assert marker in app_executable,'Physical116 fix missing from IPA: '+repr(marker)
+    log_source=Path('Henge/ios/Henge/HengeLog.swift').read_text()
+    settings_source=Path('Henge/ios/Henge/SettingsView.swift').read_text()
+    assert 'diagnosticFileURLs' in log_source and 'ShareLink(items: HengeLog.diagnosticFileURLs)' in settings_source, 'Previous-session diagnostic sharing not wired'
+    data['physical116_followup']=dict(follow116,runtime_markers_verified=True,physical_performance_verified=False)
+
 # Correct legacy metadata: verify the real configured default in the reconstructed source.
 assert 'as? Bool ?? true' in Path('Henge/ios/Henge/EngineTuning.swift').read_text()
 data['fastmem_default']=True
