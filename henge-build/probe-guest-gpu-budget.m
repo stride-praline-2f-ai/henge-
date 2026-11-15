@@ -53,7 +53,7 @@ int main(void){@autoreleasepool{
         kern_return_t status=mach_vm_region(mach_task_self(),&region,&size,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&info,&count,&object);
         if(object)mach_port_deallocate(mach_task_self(),object);
         if(status==KERN_SUCCESS&&region<=code&&code-region<size&&(info.protection&VM_PROT_READ)){
-            size_t length=(size_t)MIN((uint64_t)4096,size-(code-region));NSString *file=[name stringByAppendingString:@".bin"];
+            size_t length=(size_t)MIN((uint64_t)4096,size-(code-region));NSString *file=[[name stringByReplacingOccurrencesOfString:@":" withString:@"_"] stringByAppendingString:@".bin"];
             [[NSData dataWithBytes:(void *)code length:length]writeToFile:file atomically:YES];m[@"code_file"]=file;
         }
         [methods addObject:m];
