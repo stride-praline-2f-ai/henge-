@@ -1,7 +1,17 @@
-# Physical116 complete-fixes IPA release request
+# Current source checkpoint: physical 116 M4 follow-up
 
-User explicitly requested: “Make ipa with all fixes from my logs.” The release gate passed locally for the frozen implementation55d472b7a8ecfe87f1cc7288f7ae8964e193fd86, runtime67cd3e9, cumulative patch ed92adf94c7ff4c161b3a64b054fd708c0bdaa347eee055bb7fe05b7fcada289. Native/app43673650998 and focused GPU43673650970 both passed. This request changes validation/release metadata and archive inspection only; source, pinned dependencies, version0.3.15(116), and patch remain frozen.
+- Validated source wrapper: bb3c4666; runtime code0179a1a.
+- Exact patch / run / test details: [guest-budget-validation.json](guest-budget-validation.json).
+- All focused native sanitizer and changed-production iOS SDK checks passed43707970393.
+- New code: scattered per-request disk I/O; overflow and failed-DMA coherence fixes;
+  opt-in activation counts and idle-independent presentation latency.
+- Full log findings: [PHYSICAL-116-M4-16GB.md](PHYSICAL-116-M4-16GB.md).
+- Guest budget adaptation is NOT implemented: demonstrated guest IOGPU boundary;
+  no verified PVG budget key. See [GUEST-GPU-BUDGET-ABI.md](GUEST-GPU-BUDGET-ABI.md).
+- Retain4vCPU/8GiB automatic profile; explicit user RAM / existing snapshots unchanged.
+- Hardware gains remain unverified. No new IPA; release flags remain false.
 
-Packaging must verify the actual CPU writeback reuse, bounded background compiler, fallback attribution and receive-batch symbols in the IPA, plus all existing packaging, signature, extension, entitlement and source checks. Do not substitute the previously shipped116 IPA. Distinguish this archive by exact release commit and SHA256. Publish the verified artifact and copy the IPA into the user’s Google Drive.
-
-Cloud validation does not prove physical M4/A20 FPS, cooling, Metal4 pixels or the reported iPad termination cause. Preserve these limitations in the release receipt. Upstream PR extraction/publication is a separate task and remains unfinished; do not misrepresent it as complete.
+Next source action if continuing: preserve this validated patch; use actual device
+`block-io-shape` and `frame-submit-latency` evidence before claiming app/frame gains.
+If releasing, run the complete integration/IPA gate against this exact patch;
+do not substitute the old116 artifact as a newly built implementation.
