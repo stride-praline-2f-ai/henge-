@@ -148,4 +148,11 @@ if manifest.get('safari_replay_followup'):
     assert safari.get('focused_validation')=='passed' and safari.get('patch_sha256')==manifest['audit_repairs_sha256'], 'Safari replay requires exact-patch GPU/sanitizer proof'
     assert safari.get('native_validated_source')==validation.get('source_commit') and safari.get('native_validation_run')==validation.get('run_id'), 'Safari replay requires final native/app integration proof'
     assert isinstance(safari.get('validation_run'),int), 'Missing focused Safari replay run'
+replay=state.get('replay_followup',{})
+if manifest.get('replay_followup'):
+    assert replay.get('complete') and replay.get('source_commit')==validation.get('source_commit'), 'Replay follow-up needs final exact-source integration proof'
+    assert replay.get('patch_sha256')==manifest['audit_repairs_sha256'], 'Replay follow-up checked another patch'
+    assert all(replay.get(k)=='passed_cloud' for k in ('mapping','copy_correctness','snapshot_storage','concurrency','lease_pressure','sdk')), 'Replay correctness checks incomplete'
+    assert replay.get('partial_copy_default') is False and replay.get('cost_rejection'), 'Retain measured-safe copy default and concrete rejection evidence'
+    assert isinstance(replay.get('focused_validation_run'),int) and isinstance(replay.get('native_cost_run'),int), 'Missing executed replay evidence'
 print('PASS complete implementation gate:', manifest['audit_repairs_sha256'])

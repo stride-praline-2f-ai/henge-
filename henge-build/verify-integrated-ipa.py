@@ -260,6 +260,15 @@ if manifest.get('safari_replay_followup'):
         assert marker in app_executable, 'Safari replay fix missing from IPA: '+repr(marker)
     data['safari_replay_followup']=dict(safari,runtime_markers_verified=True,physical_safari_improvement_verified=False)
 
+if manifest.get('replay_followup'):
+    replay=state['replay_followup']
+    assert replay['complete'] and replay['source_commit']==state['final_validation']['source_commit']
+    assert replay['patch_sha256']==manifest['audit_repairs_sha256']
+    for marker in (b'gpu-buffer-mapping:', b'gpu-command-storage: enabled=1', b'gpu-surface-copy:',
+                   b'HV_GPU_COMMAND_POOL', b'HV_PVG_COPY_PARTIAL', b'scope=registered-vCPU-threads'):
+        assert marker in app_executable, 'Post118 replay fix missing: '+repr(marker)
+    data['replay_followup']=dict(replay,runtime_markers_verified=True,physical_Safari_gain_measured=False)
+
 # Correct legacy metadata: verify the real configured default in the reconstructed source.
 assert 'as? Bool ?? true' in Path('Henge/ios/Henge/EngineTuning.swift').read_text()
 data['fastmem_default']=True
