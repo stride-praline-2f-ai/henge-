@@ -24,3 +24,7 @@ Fixture reductions:10000 repeated uses ->1 full320-page check;10001 immutable ac
 Changes are on `perf/safari-compositing`, not installed117. No IPA generated. Full app/release validation remains pending before packaging. Physical M4/Duo Safari FPS, heat and actual Metal4 pixels have not been measured. Compare blank vs loaded Safari and Notes window movement under identical RAM/vCPUs/Retina/refresh/LPM/diagnostics. Do not infer a WebKit JavaScript speedup or guaranteed60Hz from native helper checks.
 
 Next source action if device results remain poor: compare existing GPU resource-scan/submission/pipeline/queue and vCPU/JIT diagnostics during those separate workloads. Before a requested IPA, freeze the patch, run the comprehensive native/app release gate, then package a new version; never overwrite117 or use this focused gate as full release proof.
+
+## Requested release118
+
+User requested the latest fixed IPA. Version0.3.17(118), branch perf/safari-compositing. Full native/app validation runs before an explicit one-shot packaging request. Existing shared IPA concurrency/cancellation remains. Packaged-binary checks require Safari mapping/submission markers and focused/native receipts. Upstream contributions are outside this release task.
