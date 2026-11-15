@@ -10,3 +10,8 @@ Implemented against frozen117 runtime ebeaad5, preserving CPU/JIT work:
 Local ASan/UBSan production helper tests passed:10000 page uses ->1 full320-page metadata comparison; alias dedup, distinct allocations, changed last page, failed remap retry, task/command boundaries, wrap and explicit reference. This is fixture work reduction, not measured Safari FPS or heat.
 
 Next: inspect the focused source job, fix all independent failures, then record native GPU pixels/ordering and macOS/iOS production compile results. No IPA is requested or generated. Physical Safari performance still needs the same RAM/vCPUs/Retina/refresh/LPM configuration, blank page vs loaded page, and comparable Notes-window movement. Do not overwrite117 or claim this fixes WebKit JavaScript performance.
+
+
+## Large-surface mapping
+
+Found actual missing support when comparing Oliver Ames upstream PR187: surfaces over64MiB use a second table level. The old path read the root as a flat leaf array. Adapted only this checked mapping fix; retain the custom immutable planar backend and all-leaf-page identity. Invalid/non-RAM leaves and failed vm_remap now reject the incomplete allocation. Tests cover boundaries, flags/holes, changed final leaf and actual production newSurface through real Mach aliases/Metal buffer reads. No evidence yet that the user current Safari workload allocated such a surface. Native logs now identify flat vs two-level mapping. This is a concrete correctness fix, not a proven Safari root cause.
