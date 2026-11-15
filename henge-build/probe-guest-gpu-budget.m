@@ -31,7 +31,7 @@ int main(void){@autoreleasepool{
         for(unsigned i=0;i<count;i++){NSString *name=NSStringFromSelector(method_getName(list[i]));if(memoryKey(name)||[name hasPrefix:@"initWith"])[names addObject:name];}free(list);
         unsigned ic=0;Ivar *il=class_copyIvarList(c,&ic);
         for(unsigned i=0;i<ic;i++){
-            NSString *name=@(ivar_getName(il[i]));if(!memoryKey(name))continue;
+            NSString *name=@(ivar_getName(il[i]));
             ptrdiff_t offset=ivar_getOffset(il[i]);const char *type=ivar_getTypeEncoding(il[i]);
             NSMutableDictionary *field=[@{@"name":name,@"offset":@(offset),@"type":@(type)}mutableCopy];
             size_t width=(type[0]=='Q'||type[0]=='q')?8:(type[0]=='I'||type[0]=='i')?4:0;
@@ -42,7 +42,7 @@ int main(void){@autoreleasepool{
         }free(il);
         [classes addObject:@{@"class":NSStringFromClass(c),@"methods":names,@"ivars":ivars}];
     }
-    for(NSString *name in @[@"recommendedMaxWorkingSetSize",@"currentAllocatedSize",@"maxBufferLength",@"hasUnifiedMemory",@"recommendedMaxMemorySize",@"sharedMemorySize",@"dedicatedMemorySize",@"memoryInfo",@"initWithAccelerator:options:",@"initWithAccelerator:"]){
+    for(NSString *name in @[@"recommendedMaxWorkingSetSize",@"currentAllocatedSize",@"maxBufferLength",@"hasUnifiedMemory",@"recommendedMaxMemorySize",@"sharedMemorySize",@"dedicatedMemorySize",@"memoryInfo",@"initWithAccelerator:options:",@"initWithAccelerator:",@"initWithAcceleratorPort:",@"initWithAcceleratorPort:options:"]){
         Method method=class_getInstanceMethod([device class],NSSelectorFromString(name));if(!method)continue;
         uintptr_t code=(uintptr_t)ptrauth_strip(method_getImplementation(method),ptrauth_key_function_pointer);
         Dl_info image={0};dladdr((void *)code,&image);
@@ -63,7 +63,7 @@ int main(void){@autoreleasepool{
         io_name_t name={0};IORegistryEntryGetName(entry,name);CFMutableDictionaryRef properties=NULL;
         NSMutableDictionary *values=[NSMutableDictionary new];
         if(IORegistryEntryCreateCFProperties(entry,&properties,kCFAllocatorDefault,0)==KERN_SUCCESS){
-            NSDictionary *dict=CFBridgingRelease(properties);for(id key in dict)if([key isKindOfClass:NSString.class]&&memoryKey(key))values[key]=scalar(dict[key]);
+            NSDictionary *dict=CFBridgingRelease(properties);for(id key in dict)if([key isKindOfClass:NSString.class])values[key]=scalar(dict[key]);
         }
         [registry addObject:@{@"name":@(name),@"memory_properties":values}];
         io_registry_entry_t parent=MACH_PORT_NULL;IORegistryEntryGetParentEntry(entry,kIOServicePlane,&parent);IOObjectRelease(entry);entry=parent;
