@@ -124,3 +124,6 @@ All implementation, native/sanitizer/app and final IPA gates passed. Release c7a
 
 
 Build118 Safari follow-up: source `763e02fd4b114737af093f683b01d5ecd421df3a`, patch `53b3f15acb3c4a75fa42f96ee0ddf7e78732852472dda92aeecb7e39ab4673ef`, full native/app validation [43741006562](https://github.com/stride-praline-2f-ai/henge-/actions/runs/43741006562) passed. Focused GPU proof43736645861 includes exact pixels,4097->1 Mach remaps and full-byte reference equality. Existing CPU/JIT unchanged from117. Version0.3.17(118); final IPA is still subject to packaging and artifact inspection. Device Safari FPS/heat unmeasured.
+
+
+Build119 replay follow-up: source `49a1c6a23c56f093a1b6fb2f4d195c31df4fe2dc`, patch `629ce4011fc1fcf8390c9a88a1e097901f1b206f89aad269c1537fce1f9b534c`, full native/app validation [43752798689](https://github.com/stride-praline-2f-ai/henge-/actions/runs/43752798689) passed. Exact GPU/IOSurface/Mach and command-storage correctness proof is attached in replay_followup. Full-copy default retained after measured partial-copy regressions; pooled command fixture improved, physical FPS/energy remain unmeasured. Existing CPU/JIT unchanged from118; profiling scope is labelled. Version0.3.18(119); final IPA is still subject to packaging and artifact inspection. Device Safari FPS/heat unmeasured.
