@@ -15,3 +15,5 @@ Final review correction: transient UIKit warning recovery now reuses the existin
 Pooled snapshots now align every individual segment to16 bytes, including odd-length input. Arena sizing includes padding; transient oversized streams retain the independent reference path. Final validation must include this correction.
 
 The new mapper also rejects allocation+first-byte rounding overflow before making a host alias; actual production-method regression asserts no Mach remap occurs for that malformed descriptor. Implementation is now frozen for full validation.
+
+Native comparison after alignment showed tiny-buffer pooling could regress7.27%; admission is now>=4KiB, retaining the existing independent path below that threshold. A boundary-size native comparison and correctness test cover the actual selection.
