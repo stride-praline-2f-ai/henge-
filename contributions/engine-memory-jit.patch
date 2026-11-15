@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 8e61e55..ff6c7c9 100644
+index 8e61e55..50dd716 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -3,7 +3,7 @@ CC = clang
@@ -21,7 +21,7 @@ index 8e61e55..ff6c7c9 100644
  # mmu.c: no SIMD (hv_tlb_refill runs with the guest's SIMD registers live).
  $(B)/mmu.o: core/mmu.c core/*.h host/*.h | $(B)
  	$(CC) $(CFLAGS) -mgeneral-regs-only -c $< -o $@
-@@ -264,3 +267,30 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
+@@ -264,3 +267,41 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
  test-jit-advice: $(B)/test_jit_advice
  	$(B)/test_jit_advice
  .PHONY: test-jit-advice
@@ -52,6 +52,17 @@ index 8e61e55..ff6c7c9 100644
 +	$(B)/test_tail_recheck
 +	$(B)/test_jit_ring
 +	$(B)/test_register_groups
++
++# Differential build: same production emitter, previous register-only policy.
++$(B)/translate-register-reference.o: core/translate.c core/*.h host/*.h | $(B)
++	$(CC) $(CFLAGS) -DHV_GROUP_WRITEBACK=0 -c $< -o $@
++ENGINE_REGISTER_REFERENCE = $(filter-out $(B)/translate.o,$(ENGINE)) $(B)/translate-register-reference.o
++$(B)/test_mem_register_reference: tests/test_mem.c tests/mem_programs.S $(ENGINE_REGISTER_REFERENCE)
++	$(CC) $(CFLAGS) tests/test_mem.c tests/mem_programs.S $(ENGINE_REGISTER_REFERENCE) -o $@
++$(B)/bench_stack_groups: tests/bench_stack_groups.c tests/mem_programs.S $(ENGINE)
++	$(CC) $(CFLAGS) $^ -o $@
++$(B)/bench_stack_groups_reference: tests/bench_stack_groups.c tests/mem_programs.S $(ENGINE_REGISTER_REFERENCE)
++	$(CC) $(CFLAGS) $^ -o $@
 diff --git a/core/cpu.h b/core/cpu.h
 index aa9b938..4109920 100644
 --- a/core/cpu.h
@@ -1120,10 +1131,10 @@ index 0000000..9ff30e2
 +    }
 +}
 diff --git a/core/machine.c b/core/machine.c
-index 5ff52b4..ca1491b 100644
+index 5ff52b4..6ef3e2b 100644
 --- a/core/machine.c
 +++ b/core/machine.c
-@@ -4,11 +4,13 @@
+@@ -4,12 +4,15 @@
  #include <mach/mach_time.h>
  #include <sched.h>
  #include <stdatomic.h>
@@ -1135,9 +1146,11 @@ index 5ff52b4..ca1491b 100644
  #include "mmu.h"
 +#include "fastmem.h"
  #include "sysreg.h"
++#include "translate.h"
  
  extern void hv_exit(void);
-@@ -21,7 +23,7 @@ extern void hv_xjump_thunk(void);
+ extern void hv_helper_entry(void);
+@@ -21,7 +24,7 @@ extern void hv_xjump_thunk(void);
  static int init_rest(HvMachine *m);
  
  int hv_knob[HV_K_COUNT];
@@ -1146,7 +1159,7 @@ index 5ff52b4..ca1491b 100644
  
  static void knobs_init(void) {
      for (int i = 0; i < HV_K_COUNT; i++)
-@@ -31,6 +33,7 @@ static void knobs_init(void) {
+@@ -31,6 +34,7 @@ static void knobs_init(void) {
         since 2026-11-09: a checked skip on the phone found a kept user entry out of date (a stack page, no mapping),
         the stale state that flush exists to retire (xnu reusing a hardware ASID, which can leave every process's kept
         entries stale, not just the incoming one's). It was worth ~3% on a process-spawn loop; not worth guest memory. */
@@ -1154,7 +1167,7 @@ index 5ff52b4..ca1491b 100644
      if (!getenv("HV_IJC_PAGES")) hv_knob[HV_K_IJCPAGES] = 1;
      if (!getenv("HV_DNS_PROXY")) hv_knob[HV_K_DNSPROXY] = 1;
  }
-@@ -47,6 +50,7 @@ int hv_knob_set(HvMachine *m, const char *name, int value) {
+@@ -47,6 +51,7 @@ int hv_knob_set(HvMachine *m, const char *name, int value) {
  }
  
  int hv_machine_init(HvMachine *m, size_t jit_bytes) {
@@ -1162,7 +1175,7 @@ index 5ff52b4..ca1491b 100644
      memset(m, 0, sizeof *m);
      if (hv_jit_region_open(&m->jit, jit_bytes) != 0) return -1;
      return init_rest(m);
-@@ -76,9 +80,30 @@ static int init_rest(HvMachine *m) {
+@@ -76,9 +81,31 @@ static int init_rest(HvMachine *m) {
          pthread_mutex_init(&m->percpu[i].req_mu, NULL);
      }
      m->locks_initialized = 1;
@@ -1178,6 +1191,7 @@ index 5ff52b4..ca1491b 100644
 +    m->fastmem_diagnostics = getenv("HV_FASTMEM_STATS") && atoi(getenv("HV_FASTMEM_STATS")) == 1;
 +    /* Native A/B was mixed, including split-alias regressions. Keep this
 +       correct but unproven scheduling experiment opt-in. */
++    fprintf(stderr,"henge: checked writeback groups=%d (cached spans; whole-range guards and plain fallback retained)\n",hv_translate_writeback_groups());
 +    m->tlb_preload = getenv("HV_TLB_PRELOAD") && !strcmp(getenv("HV_TLB_PRELOAD"), "1");
 +    fprintf(stderr, "henge: memory-path: tlb-addend-preload=%d fastmem-cache=tagged-multiwindow (permissions and invalidations retained)\n", m->tlb_preload);
 +    fprintf(stderr, "henge: kernel read cache order=%s counters=%s\n",
@@ -1193,7 +1207,7 @@ index 5ff52b4..ca1491b 100644
      /* HV_MOVIMM=1: constants built in registers instead of loaded from the pool (translate.c put_lit). Off: no
         measured gain (Mac mix 24.1 s either way, 2026-11-08); the tests pass with it on (HV_MOVIMM=1 make test). */
      hv_knob[HV_K_MOVIMM] = getenv("HV_MOVIMM") ? atoi(getenv("HV_MOVIMM")) : 0;
-@@ -92,12 +117,16 @@ static int init_rest(HvMachine *m) {
+@@ -92,12 +119,16 @@ static int init_rest(HvMachine *m) {
      hv_knob[HV_K_IJCPAGES] = getenv("HV_IJC_PAGES") ? atoi(getenv("HV_IJC_PAGES")) : 1;
      hv_knob[HV_K_DNSPROXY] = getenv("HV_DNS_PROXY") ? atoi(getenv("HV_DNS_PROXY")) : 1;
      /* So the tests can run the translator these ways too (the iOS and --phone paths read them in knobs_init). */
@@ -1211,7 +1225,7 @@ index 5ff52b4..ca1491b 100644
      /* As many blocks as the region holds (a block is at least ~160 bytes of
         code), so the region filling, not this table, is what flushes; two
         chainable exits each at most. Untouched entries cost nothing. */
-@@ -115,8 +144,14 @@ static int init_rest(HvMachine *m) {
+@@ -115,8 +146,14 @@ static int init_rest(HvMachine *m) {
      m->slot_cond = calloc(m->max_slots, sizeof *m->slot_cond);
      m->slot_xa = calloc(m->max_slots, sizeof *m->slot_xa);
      m->slot_xpa = calloc(m->max_slots, sizeof *m->slot_xpa);
@@ -1228,7 +1242,7 @@ index 5ff52b4..ca1491b 100644
      for (int i = 0; i < HV_MAX_CPUS; i++) { /* untouched pages cost nothing, so every CPU gets its tables now */
          HvPerCpu *p = &m->percpu[i];
          p->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
-@@ -153,6 +188,7 @@ static uint64_t post_locked_done(HvCpu *target, HvPerCpu *p) {
+@@ -153,6 +190,7 @@ static uint64_t post_locked_done(HvCpu *target, HvPerCpu *p) {
      pthread_mutex_unlock(&p->req_mu);
      __atomic_store_n(&target->exit_req, 1, __ATOMIC_SEQ_CST);
      __asm__ volatile("sev" ::: "memory"); /* a WFE waiting in place (wfe() in dispatch.c) sees it now */
@@ -1236,7 +1250,7 @@ index 5ff52b4..ca1491b 100644
      if (target->m->stats_interval) target->m->stats.kick_src[0]++;
      return seq;
  }
-@@ -196,10 +232,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+@@ -196,10 +234,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
  #define HV_ULF_WAKE_ALL 0x100u
  #define HV_ULF_NO_ERRNO 0x1000000u
  
@@ -1254,7 +1268,7 @@ index 5ff52b4..ca1491b 100644
  }
  
  void hv_cpu_ack_wake(HvCpu *cpu) {
-@@ -239,22 +279,31 @@ void hv_cpu_process_requests(HvCpu *cpu) {
+@@ -239,22 +281,31 @@ void hv_cpu_process_requests(HvCpu *cpu) {
  
  void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
      HvPerCpu *t = target->pc_state, *s = self ? self->pc_state : NULL;
@@ -1289,7 +1303,7 @@ index 5ff52b4..ca1491b 100644
              mm->stats.sync_probe[on ? 1 : 0]++;
              if (__atomic_load_n(&t->walk_seq, __ATOMIC_RELAXED) & 1) mm->stats.sync_probe[2]++;
              if (__atomic_load_n(&t->ijc_seq, __ATOMIC_RELAXED) & 1) mm->stats.sync_probe[3]++;
-@@ -263,16 +312,26 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -263,16 +314,26 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
              probed_long = 1;
              thread_basic_info_data_t ti;
              mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
@@ -1320,7 +1334,7 @@ index 5ff52b4..ca1491b 100644
              __atomic_sub_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
          } else if (spins > 200) {
              sched_yield();
-@@ -281,7 +340,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -281,7 +342,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
      if (s) {
          __atomic_store_n(&s->tlb_live, 1, __ATOMIC_SEQ_CST);
          hv_cpu_process_requests(self); /* anything that came in while we were not live */
@@ -1329,7 +1343,7 @@ index 5ff52b4..ca1491b 100644
      }
      if (mm->stats_interval) {
          uint64_t dt = mach_absolute_time() - t0;
-@@ -349,6 +408,44 @@ void hv_machine_kick_all(HvMachine *m) {
+@@ -349,6 +410,44 @@ void hv_machine_kick_all(HvMachine *m) {
      __asm__ volatile("sev" ::: "memory");
  }
  
@@ -1374,7 +1388,7 @@ index 5ff52b4..ca1491b 100644
  void hv_machine_halt(HvMachine *m, enum HvHaltReason reason) {
      for (int i = 0; i < m->ncpus; i++) if (m->cpus[i]) {
          /* CPU_ON resets a parked CPU under this lock. It must not erase a
-@@ -372,18 +469,18 @@ void hv_machine_wake(HvMachine *m) {
+@@ -372,18 +471,18 @@ void hv_machine_wake(HvMachine *m) {
  }
  
  void hv_machine_free(HvMachine *m) {
@@ -1395,7 +1409,7 @@ index 5ff52b4..ca1491b 100644
          free(m->percpu[i].ijc);
          free(m->percpu[i].ucode);
          free(m->percpu[i].cid_chunks);
-@@ -403,7 +500,9 @@ void hv_machine_free(HvMachine *m) {
+@@ -403,7 +502,9 @@ void hv_machine_free(HvMachine *m) {
      free(m->slot_cond);
      free(m->slot_xa);
      free(m->slot_xpa);
@@ -1406,7 +1420,7 @@ index 5ff52b4..ca1491b 100644
      if (m->locks_initialized) {
          pthread_mutex_destroy(&m->big_mu);
          pthread_cond_destroy(&m->big_cv);
-@@ -432,8 +531,7 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
+@@ -432,8 +533,7 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
      r->npages = pages;
      r->whint = calloc(pages * HV_MAX_CPUS, sizeof *r->whint);
      r->ijc_va = calloc(pages, sizeof *r->ijc_va);
@@ -1416,7 +1430,7 @@ index 5ff52b4..ca1491b 100644
  }
  
  int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
-@@ -452,6 +550,26 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
+@@ -452,6 +552,26 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
      return NULL;
  }
  
@@ -1443,7 +1457,7 @@ index 5ff52b4..ca1491b 100644
  uint32_t *hv_smc_counts;
  uint64_t *hv_smc_last;
  uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
-@@ -478,10 +596,19 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
+@@ -478,10 +598,19 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
         (whose next chain finds the new translation). Under the translation lock,
         as chaining them is: one that saw the old generation is done by now. */
      pthread_mutex_lock(&m->tr_mu);
@@ -1467,7 +1481,7 @@ index 5ff52b4..ca1491b 100644
          m->slot_xpa[idx] = 0;
          __atomic_store_n(&m->slots[idx], 0, __ATOMIC_RELEASE);
          uint32_t *site = m->slot_site[idx];
-@@ -490,9 +617,7 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
+@@ -490,9 +619,7 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
              hv_jit_write(&m->jit, site, &insn, 4);
              hv_jit_finish(&m->jit, site, 1);
          }
@@ -1477,7 +1491,7 @@ index 5ff52b4..ca1491b 100644
      pthread_mutex_unlock(&m->tr_mu);
      /* The indirect-branch cache may lead into the stale blocks: drop those entries (or, without HV_IJC_PAGES, the
         whole cache), here at once and on the other CPUs before they next leave a block (their cache lookups and
-@@ -545,12 +670,15 @@ HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa) {
+@@ -545,12 +672,15 @@ HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa) {
  
  void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
      HvRam *r = hv_ram_lookup(m, pa);
@@ -1494,7 +1508,7 @@ index 5ff52b4..ca1491b 100644
      void *p = hv_phys_ptr(m, pa, len);
      if (p) {
          memcpy(buf, p, len);
-@@ -569,8 +697,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
+@@ -569,8 +699,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
  }
  
  int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
@@ -1505,7 +1519,7 @@ index 5ff52b4..ca1491b 100644
          if (r->readonly) return 0; /* ROM: writes are ignored */
          uint64_t off = pa - r->pa;
          uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
-@@ -649,5 +778,7 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
+@@ -649,5 +780,7 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
      /* Architectural reset value has the MMU and caches off; RES1 bits set. */
      cpu->sctlr_el1 = 0x30d00980; /* RES1 bits, and ITD and SED, which read as 1 without AArch32 at EL0 */
      cpu->nkernel_fills = HV_KERNEL_FILLS + 1; /* nothing is logged yet: make every entry invalid */
@@ -1948,7 +1962,7 @@ index a4fe1b2..ed831ed 100644
  other:
      /* PAuth key registers (CRn 2, CRm 1..3): kept, never used, since signing is a no-op. */
 diff --git a/core/translate.c b/core/translate.c
-index 2084e98..4194823 100644
+index 2084e98..30cdf9f 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -6,6 +6,7 @@
@@ -1971,16 +1985,27 @@ index 2084e98..4194823 100644
      uint64_t site;      /* guest PC of the instruction that branches out of line */
      uint32_t retry;     /* loads and stores: where their translation starts, to run again after a refill */
      uint32_t rflags;    /* hv_tlb_refill's flags for it (0: no refill, straight to the helper) */
-@@ -65,7 +68,7 @@ typedef struct {
+@@ -63,13 +66,18 @@ typedef struct {
+ #define GROUP_SLOTS 4
+ #define GROUP_SPAN 4096   /* bytes one group may cover */
  #define GROUP_INSNS 48    /* and instructions */
++#ifndef HV_GROUP_WRITEBACK
++#define HV_GROUP_WRITEBACK 1 /* 0 builds the existing register-only reference */
++#endif
  typedef struct {
      int32_t lo, hi;       /* bytes touched, relative to the base at the first access */
 -    uint8_t store, base, slot, live;
-+    uint8_t store, base, slot, live, register_only;
++    uint8_t store, base, slot, live, register_only, writeback, accesses;
      uint16_t first, last, end;
      uint32_t copy_at;
  } Group;
-@@ -82,6 +85,9 @@ typedef struct {
+ 
++int hv_translate_writeback_groups(void) { return HV_GROUP_WRITEBACK; }
++
+ typedef struct {
+     uint32_t hot[MAX_WORDS], cold[MAX_WORDS];
+     uint32_t *w;        /* the part being written */
+@@ -82,6 +90,9 @@ typedef struct {
      uint32_t nhot, ncold; /* the finished block's parts in words, ncold with the pool */
      uint64_t pool[MAX_LITS];
      uint32_t npool;
@@ -1990,7 +2015,7 @@ index 2084e98..4194823 100644
      LitFix fix[MAX_LITS];
      uint32_t nfix;
      Ool ool[MAX_OOL];
-@@ -223,8 +229,20 @@ static int put_mov_imm(Emit *e, int reg, uint64_t value, int max) {
+@@ -223,8 +234,20 @@ static int put_mov_imm(Emit *e, int reg, uint64_t value, int max) {
     (off: no measured gain on the Mac mix, 2026-11-08). */
  static void put_lit(Emit *e, int reg, uint64_t value) {
      if (hv_knob[HV_K_MOVIMM] && put_mov_imm(e, reg, value, 3)) return;
@@ -2013,7 +2038,7 @@ index 2084e98..4194823 100644
      put(e, 0x58000000u | reg);
  }
  
-@@ -397,9 +415,18 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
+@@ -397,9 +420,18 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
      uint32_t slot_index = ~0u;
      int same_page = (target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) == e->page;
      uint64_t xa = same_page ? 0 : cross_addend(e, target);
@@ -2035,7 +2060,7 @@ index 2084e98..4194823 100644
      }
      if (slot_index == ~0u) {
          /* Another page may be remapped under us, so look it up by VA instead of chaining. */
-@@ -434,9 +461,10 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
+@@ -434,9 +466,10 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
          to_miss = e->n;
          put(e, CBNZ_X(7));                                      /* not mapped so now: the branch cache */
      }
@@ -2049,7 +2074,7 @@ index 2084e98..4194823 100644
      uint32_t site_at = e->n;
      put(e, B_OP | 1);
      if (!p0) cold_on(e);
-@@ -452,15 +480,28 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
+@@ -452,15 +485,28 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
          e->site[e->nsite++].stub_cold = (uint8_t)(e->in_cold && !e->flat);
          e->site_direct = !check && !xa;
      }
@@ -2087,7 +2112,7 @@ index 2084e98..4194823 100644
      if (xa) {
          link_here(e, to_miss, p0);
          if (use_xjump()) put_xjump(e, target, 0); /* exit_req was checked above if it had to be */
-@@ -482,6 +523,7 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
+@@ -482,6 +528,7 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
     from where the helper would resume (bits 31..19, in words). */
  static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rflags, uint32_t retry) {
      put_helper(e, pc, insn, HV_OP_MEM);
@@ -2095,7 +2120,7 @@ index 2084e98..4194823 100644
      uint32_t resume = e->n - 1; /* the ldr x0, [x28] the helper comes back to */
      uint32_t back = resume - retry;
      if (back < (1u << 13) && rflags < (1u << 11)) e->pool[e->npool - 1] = (uint64_t)insn | (uint64_t)(HV_OP_MEM | rflags << 8 | back << 19) << 32;
-@@ -490,6 +532,7 @@ static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rfla
+@@ -490,6 +537,7 @@ static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rfla
  /* The return address is where it goes back to, so the thunk's RET goes where the CPU expects
     and leaves its stack of return addresses as it was. The HvHelperInfo is in the pool. */
  static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
@@ -2103,7 +2128,7 @@ index 2084e98..4194823 100644
      uint32_t info = e->npool;
      e->pool[info] = pc;
      e->pool[info + 1] = (uint64_t)insn | (uint64_t)op << 32;
-@@ -502,7 +545,8 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
+@@ -502,7 +550,8 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
      put(e, LDR_X(0, 28, 0));
  }
  
@@ -2113,7 +2138,7 @@ index 2084e98..4194823 100644
  static void put_add_imm(Emit *e, int d, int n, int64_t imm) {
      if (imm == 0) {
          if (d != n) put(e, MOV_X(d, n));
-@@ -810,7 +854,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
+@@ -810,7 +859,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
  /* Ends the block (returns 1), or 0 for a conditional branch the block goes on past. */
  static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
      if ((insn & 0x7c000000) == 0x14000000) { /* B, BL */
@@ -2122,7 +2147,7 @@ index 2084e98..4194823 100644
          if (insn >> 31) {
              if (use_ras(e)) put_call(e, pc + 4);
              else put_const_to(e, 30, pc + 4);
-@@ -819,7 +863,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -819,7 +868,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
          return 1;
      }
      if ((insn & 0xff000000) == 0x54000000) { /* B.cond, BC.cond */
@@ -2131,7 +2156,7 @@ index 2084e98..4194823 100644
          uint32_t cond = insn & 0xf;
          if (cond >= 14) {
              put_branch_exit(e, target, 1);
-@@ -835,7 +879,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -835,7 +884,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
      }
      /* CBZ/CBNZ (imm19) and TBZ/TBNZ (imm14) */
      int tb = (insn & 0x7e000000) == 0x36000000;
@@ -2140,7 +2165,7 @@ index 2084e98..4194823 100644
      uint32_t bare = tb ? insn & ~(0x3fffu << 5) : insn & ~(0x7ffffu << 5);
      int rt = insn & 0x1f;
      if (!is_stolen(rt)) {
-@@ -947,6 +991,61 @@ static void translate_excl(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -947,6 +996,61 @@ static void translate_excl(Emit *e, uint32_t insn, uint64_t pc) {
      patch_branch(&e->w[to_done], (int64_t)e->n - to_done);
  }
  
@@ -2202,7 +2227,7 @@ index 2084e98..4194823 100644
  static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      HvMemOp op;
      if (hv_mem_decode(insn, &op) != 0) {
-@@ -1018,14 +1117,14 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1018,14 +1122,14 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
          put(e, CBNZ_X(U));
          put_ool(e, (Ool){.kind = OOL_GROUP, .pc = (uint64_t)(grp - e->grp), .nrestore = 3, .restore = {A, T, U}});
          put(e, LDR_X(U, T, gtlb + 24));
@@ -2220,7 +2245,7 @@ index 2084e98..4194823 100644
  
      /* Effective address into A, or used where it is: a guest base register with nothing added. */
      int sp_base = !literal && op.rn == 31; /* the guest SP, which is the host SP while blocks run */
-@@ -1038,6 +1137,13 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1038,6 +1142,13 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
          /* the address is in A already */
      } else if (literal) {
          put_lit(e, A, pc + op.imm);
@@ -2234,7 +2259,7 @@ index 2084e98..4194823 100644
      } else {
          if (base_stolen) {
              put(e, sp_base ? ADD_SP_TO(A) : LDR_X(A, 28, slot_of(op.rn)));
-@@ -1068,33 +1174,52 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1068,33 +1179,52 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      int el_idx = g_el;
      uint32_t slow = ~0u;
      if (!role) {
@@ -2299,7 +2324,7 @@ index 2084e98..4194823 100644
      }
      /* Single loads and stores take [addr, addend] directly; the rest want the host address in A. */
      int reg_offset = op.kind == HV_MEM_SINGLE || op.kind == HV_MEM_LITERAL || op.kind == HV_MEM_LDRA;
-@@ -1196,7 +1321,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1196,7 +1326,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      unspill(e, s, 3);
      if (slow != ~0u) e->ool[slow].join = e->n;
      /* Stand-ins for x18/x28 and writeback may have used U. */
@@ -2308,7 +2333,7 @@ index 2084e98..4194823 100644
  }
  
  /* DC ZVA: zero the 64-byte block holding Xt, on the host's own copy when the
-@@ -1441,10 +1566,10 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1441,10 +1571,10 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
      return 0;
  }
  
@@ -2323,7 +2348,7 @@ index 2084e98..4194823 100644
     helper when they are off. */
  #define COMMPAGE_TIMEBASE_OFFSET 0xfffffc088ull
  #define COMMPAGE_TIMEBASE_TYPE   0xfffffc090ull
-@@ -1453,7 +1578,7 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
+@@ -1453,7 +1583,7 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
      if (type < 0) type = *(volatile uint8_t *)(uintptr_t)COMMPAGE_TIMEBASE_TYPE;
      if (type == 0) return 0; /* the kernel's own path: leave it to the helper */
      int rt = insn & 0x1f;
@@ -2332,7 +2357,7 @@ index 2084e98..4194823 100644
      if (!(e->flags & HV_BLOCK_EL1)) {
          put(e, 0xb9400000u | (HV_CPU_EL0_CNT / 4) << 10 | 28 << 5 | 6); /* ldr w6, [x28, #el0_cnt] */
          put(e, 0x36000000u | (physical ? 0u : 1u) << 19 | 6);         /* tbz w6, #enable, helper (patched) */
-@@ -1461,6 +1586,10 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
+@@ -1461,6 +1591,10 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
      }
      uint32_t slow = e->nool - 1;
      int el0 = !(e->flags & HV_BLOCK_EL1);
@@ -2343,7 +2368,7 @@ index 2084e98..4194823 100644
      int r = is_stolen(rt) ? 15 : rt;
      if (type == 1) put(e, 0xd5033fdfu);                                  /* isb; then CNTVCT_EL0 */
      put(e, (type == 1 ? 0xd53be040u : type == 2 ? 0xd53be0c0u : 0xd53cfac0u) | (uint32_t)r);
-@@ -1471,7 +1600,7 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
+@@ -1471,7 +1605,7 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical)
          put(e, LDR_X(6, 28, HV_CPU_CNTVOFF));
          put(e, SUB_X(r, r, 6));
      }
@@ -2352,7 +2377,7 @@ index 2084e98..4194823 100644
      if (el0) e->ool[slow].join = e->n;
      return 1;
  }
-@@ -1523,12 +1652,21 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1523,12 +1657,21 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
          put_load_field(e, rt, off);
          return 1;
      }
@@ -2376,7 +2401,7 @@ index 2084e98..4194823 100644
          if (!read || !el1) return 0;
          put_const_to(e, rt, (e->flags & HV_BLOCK_PAN) ? HV_PSTATE_PAN : 0);
          return 1;
-@@ -1774,12 +1912,15 @@ static void emit_ool(Emit *e) {
+@@ -1774,12 +1917,15 @@ static void emit_ool(Emit *e) {
              plink(e, retry, 1, o->retry, 0);
          }
          uint32_t site_at = link_site(e, o->at);
@@ -2397,7 +2422,7 @@ index 2084e98..4194823 100644
              put(e, B_OP);
              plink(e, e->n - 1, 1, o->at + 1, 0);
          }
-@@ -1828,6 +1969,35 @@ static int group_op(const HvMemOp *op) {
+@@ -1828,6 +1974,35 @@ static int group_op(const HvMemOp *op) {
             (op->rn == 31 || !is_stolen(op->rn)) && op->bytes <= 64;
  }
  
@@ -2433,7 +2458,7 @@ index 2084e98..4194823 100644
  static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va) {
      e->ngrp = 0;
      memset(e->gid, -1, sizeof e->gid);
-@@ -1842,7 +2012,46 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1842,7 +2017,54 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
          HvInsnKind kind = hv_classify(insn);
          if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) break;
          if (kind == HV_INSN_COPY && (insn & 0xfffff01fu) == 0xd503201fu) continue; /* hints (NOP, BTI): no register */
@@ -2443,6 +2468,7 @@ index 2084e98..4194823 100644
 +               candidates here; later accesses form independent checked
 +               groups. register_group still verifies every accepted span. */
 +            int boundary = kind != HV_INSN_MEMORY && kind != HV_INSN_COPY;
++            int keep = -1;
 +            if (kind == HV_INSN_COPY) {
 +                uint32_t fields = hv_gpr_fields(insn);
 +                for (int f = 0; f < 4; f++)
@@ -2452,13 +2478,20 @@ index 2084e98..4194823 100644
 +                    }
 +            } else if (kind == HV_INSN_MEMORY) {
 +                HvMemOp candidate;
-+                if (hv_mem_decode(insn, &candidate) || !group_op(&candidate) || candidate.mode != HV_ADDR_OFFSET) boundary = 1;
++                if (hv_mem_decode(insn, &candidate) || !group_op(&candidate) || (!HV_GROUP_WRITEBACK && candidate.mode != HV_ADDR_OFFSET)) boundary = 1;
++                else if (candidate.mode != HV_ADDR_OFFSET) {
++                    /* Retain only this base's candidate across writeback.
++                       It will use the already-tested cached-addend path,
++                       never the fixed host-address register path. */
++                    boundary = 1; keep = cur[candidate.rn];
++                }
 +                else {
 +                    for (int r = 0; r < 32; r++)
 +                        if (r != candidate.rn) cur[r] = -1, delta[r] = 0;
 +                }
 +            }
-+            if (boundary) for (int r = 0; r < 32; r++) cur[r] = -1, delta[r] = 0;
++            if (boundary) for (int r = 0; r < 32; r++)
++                if (keep < 0 || cur[r] != keep) cur[r] = -1, delta[r] = 0;
 +        }
          if (kind == HV_INSN_COPY || kind == HV_INSN_PCREL || kind == HV_INSN_LOAD_LITERAL) {
 +            /* ADD/SUB Xn, Xn, #imm changes only the address origin, not the
@@ -2480,7 +2513,7 @@ index 2084e98..4194823 100644
              KILL(insn);
              continue;
          }
-@@ -1851,16 +2060,26 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1851,18 +2073,29 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
              continue;
          }
          if (kind == HV_INSN_PREFETCH) continue;
@@ -2497,7 +2530,7 @@ index 2084e98..4194823 100644
          HvMemOp op;
          if (hv_mem_decode(insn, &op) != 0) break;
 -        if (group_op(&op)) {
-+        if (group_op(&op) && (hv_knob[HV_K_GROUPS] != 2 || op.mode == HV_ADDR_OFFSET)) {
++        if (group_op(&op) && (hv_knob[HV_K_GROUPS] != 2 || op.mode == HV_ADDR_OFFSET || HV_GROUP_WRITEBACK)) {
              int b = op.rn;
              int64_t off = delta[b] + (op.mode == HV_ADDR_POST ? 0 : op.imm);
              Group *g = cur[b] >= 0 ? &e->grp[cur[b]] : NULL;
@@ -2508,8 +2541,19 @@ index 2084e98..4194823 100644
 +                    i - g->first > (hv_knob[HV_K_GROUPS] == 2 ? 16 : GROUP_INSNS)) g = NULL;
                  else {
                      g->lo = (int32_t)lo, g->hi = (int32_t)hi, g->last = (uint16_t)i, g->store |= op.store;
++                    g->writeback |= op.mode != HV_ADDR_OFFSET; g->accesses++;
                      e->gid[i] = (int8_t)cur[b], e->grole[i] = 2, e->goff[i] = (int32_t)off;
-@@ -1894,8 +2113,12 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+                 }
+             }
+@@ -1871,6 +2104,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+                 delta[b] = 0;
+                 off = op.mode == HV_ADDR_POST ? 0 : op.imm;
+                 e->grp[e->ngrp++] = (Group){.lo = (int32_t)off, .hi = (int32_t)(off + op.bytes), .store = op.store,
++                                            .writeback = op.mode != HV_ADDR_OFFSET, .accesses = 1,
+                                             .base = (uint8_t)b, .first = (uint16_t)i, .last = (uint16_t)i};
+                 e->gid[i] = (int8_t)cur[b], e->grole[i] = 1, e->goff[i] = (int32_t)off;
+             } else if (!g) {
+@@ -1894,8 +2128,20 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
      uint16_t slot_free[GROUP_SLOTS] = {0};
      for (uint32_t k = 0; k < e->ngrp; k++) {
          Group *g = &e->grp[k];
@@ -2517,13 +2561,21 @@ index 2084e98..4194823 100644
 +        g->live = g->register_only = 0;
          if (g->last == g->first) continue;
 +        if (hv_knob[HV_K_GROUPS] == 2) {
-+            if (!register_group(e,g,k,code)) continue;
-+            g->register_only = 1;
++            if (g->writeback) {
++                /* Two offset accesses keep the cheaper register path. A
++                   writeback span needs three accesses before paying for a
++                   cached slot. The whole-span permission/page guard and
++                   original-instruction fallback are unchanged. */
++                if (g->accesses < 3) continue;
++            } else {
++                if (!register_group(e,g,k,code)) continue;
++                g->register_only = 1;
++            }
 +        }
          for (int s = 0; s < GROUP_SLOTS; s++)
              if (slot_free[s] <= g->first) {
                  g->slot = (uint8_t)s, g->live = 1;
-@@ -1924,13 +2147,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1924,13 +2170,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
  /* After the block: each live group's plain copy. Returns -1 if they do not fit. */
  static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_t ntrans) {
      e->nogroup = 1;
@@ -2551,7 +2603,7 @@ index 2084e98..4194823 100644
              e->cur_pc = va + 4ull * i;
              e->cur_i = i;
              e->u_prev = e->u_live = 0;
-@@ -1945,8 +2182,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
+@@ -1945,8 +2205,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
  static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup);
  
  int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
@@ -2563,7 +2615,7 @@ index 2084e98..4194823 100644
      if (hv_knob[HV_K_GROUPS] && translate_emit(m, b, code, avail, 0) == 0) return 0;
      return translate_emit(m, b, code, avail, 1);
  }
-@@ -1954,6 +2192,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
+@@ -1954,6 +2215,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
  static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup) {
      Emit *e = &E;
      e->n = e->other_n = e->npool = e->nfix = e->nool = e->nsite = e->nrel = 0;
@@ -2571,7 +2623,7 @@ index 2084e98..4194823 100644
      e->w = e->hot;
      e->in_cold = 0;
      e->flat = hv_knob[HV_K_TEST2];
-@@ -2021,6 +2260,7 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
+@@ -2021,6 +2283,7 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
  }
  
  uint32_t hv_translate_last_words(void) { return E.flat ? E.pool_at : E.nhot; } /* hot words (no pool) of this thread's last block */
@@ -2579,7 +2631,7 @@ index 2084e98..4194823 100644
  
  /* A B, B.cond, CBZ or CBNZ now going off words away, if it reaches. 1 if it does. */
  int hv_branch_retarget(uint32_t *w, int64_t off) {
-@@ -2040,20 +2280,35 @@ static __thread struct {
+@@ -2040,20 +2303,35 @@ static __thread struct {
      HvMachine *m;
      uint64_t gen;
      uint32_t *hot, *cold;
@@ -2621,10 +2673,20 @@ index 2084e98..4194823 100644
      *hot_at = chunk.hot;
      chunk.hot += hot;
 diff --git a/core/translate.h b/core/translate.h
-index ec52d6d..a5c29f4 100644
+index ec52d6d..736f3f1 100644
 --- a/core/translate.h
 +++ b/core/translate.h
-@@ -39,6 +39,7 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t
+@@ -5,6 +5,9 @@
+ 
+ #include "machine.h"
+ 
++/* Build-time reference switch for differential codegen/performance checks. */
++int hv_translate_writeback_groups(void);
++
+ /* What a block passes to hv_helper. Lives in the block's literal pool. */
+ typedef struct HvHelperInfo {
+     uint64_t pc;
+@@ -39,6 +42,7 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t
  int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail);
  int hv_translate_place(HvMachine *m, HvBlock *b);
  uint32_t hv_translate_last_words(void);
@@ -3106,6 +3168,48 @@ index 0000000..ef1d8a6
 +#endif
 +}
 +#endif
+diff --git a/tests/bench_stack_groups.c b/tests/bench_stack_groups.c
+new file mode 100644
+index 0000000..244a767
+--- /dev/null
++++ b/tests/bench_stack_groups.c
+@@ -0,0 +1,36 @@
++#include "machine.h"
++#include "dispatch.h"
++#include "translate.h"
++#include <assert.h>
++#include <mach/mach_time.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++extern const char mem_programs_begin[],mem_programs_finish[],bench_stack_groups[],bench_stack_groups_end[];
++static HvMachine machine;
++static HvCpu cpu;
++static uint64_t initial_sp;
++static void run(unsigned iterations) {
++    cpu.pc=(uintptr_t)bench_stack_groups;cpu.sp=initial_sp;cpu.x[2]=iterations;
++    cpu.x[19]=19;cpu.x[20]=20;cpu.x[21]=21;cpu.x[22]=22;cpu.x[29]=29;cpu.x[30]=30;
++    assert(hv_run(&cpu)==HV_EXIT_HALT);
++    assert(!cpu.x[2]&&cpu.sp==initial_sp&&cpu.x[19]==19&&cpu.x[20]==20&&cpu.x[21]==21&&cpu.x[22]==22&&cpu.x[29]==29&&cpu.x[30]==30);
++}
++int main(int argc,const char **argv) {
++    unsigned round=argc>1?(unsigned)atoi(argv[1]):0;
++    assert(!hv_machine_init(&machine,4<<20));machine.chain=1;machine.stats_interval=1;
++    hv_knob[HV_K_GROUPS]=2;
++    uint8_t *stack=aligned_alloc(16384,65536);assert(stack);memset(stack,0x5a,65536);
++    initial_sp=(uintptr_t)stack+32768;
++    assert(!hv_machine_add_ram(&machine,(uintptr_t)mem_programs_begin,mem_programs_finish-mem_programs_begin,(void *)mem_programs_begin,1));
++    assert(!hv_machine_add_ram(&machine,(uintptr_t)stack,65536,stack,0));
++    machine.stop_pc=(uintptr_t)bench_stack_groups_end;
++    hv_cpu_reset(&cpu,&machine);cpu.cpacr_el1=3u<<20;
++    run(2000);
++    mach_timebase_info_data_t tb;assert(!mach_timebase_info(&tb));
++    uint64_t start=mach_absolute_time();run(500000);
++    double ns=(double)(mach_absolute_time()-start)*tb.numer/tb.denom;
++    printf("stack-group-bench: round=%u writeback=%d ns_per_frame=%.3f inline_words=%llu result=correct\n",round,hv_translate_writeback_groups(),ns/500000,(unsigned long long)machine.stats.words_inline);
++    hv_machine_free(&machine);free(stack);return 0;
++}
 diff --git a/tests/harness.h b/tests/harness.h
 index bff9786..6b2997e 100644
 --- a/tests/harness.h
@@ -3180,7 +3284,7 @@ index b149c3a..babc278 100644
      mov x0, #0
      mov x1, #5
 diff --git a/tests/mem_programs.S b/tests/mem_programs.S
-index bcbed3f..2f7848a 100644
+index bcbed3f..7f1bbf4 100644
 --- a/tests/mem_programs.S
 +++ b/tests/mem_programs.S
 @@ -355,6 +355,87 @@ PROGRAM groups
@@ -3271,7 +3375,7 @@ index bcbed3f..2f7848a 100644
  PROGRAM mmio
      str w1, [x0]
      ldr w2, [x0, #4]
-@@ -368,5 +449,22 @@ PROGRAM mmio
+@@ -368,5 +449,74 @@ PROGRAM mmio
      ldr x28, [x18, #8]
  END mmio
  
@@ -3291,6 +3395,58 @@ index bcbed3f..2f7848a 100644
 +    ldr x10,[x20,#8]
 +    str x4,[x0,#24]
 +END groups_two
++
++// Stack-frame translation reuse: pre-indexed allocation, fixed fields,
++// then post-indexed restoration. The original instruction sequence is the
++// native reference; no test-specific memory implementation is involved.
++PROGRAM groups_stack_frame
++    stp x29,x30,[sp,#-64]!
++    stp x20,x19,[sp,#16]
++    stp x22,x21,[sp,#32]
++    ldp x20,x19,[sp,#16]
++    ldp x22,x21,[sp,#32]
++    ldp x29,x30,[sp],#64
++END groups_stack_frame
++
++PROGRAM groups_writeback_cross
++    add x13,x0,#4,lsl#12
++    add x13,x13,#8
++    stp x1,x2,[x13,#-16]!
++    stp x3,x4,[x13,#16]
++    ldp x8,x9,[x13],#16
++END groups_writeback_cross
++
++PROGRAM groups_writeback_negative
++    add x13,x0,#128
++    str x1,[x13,#-8]!
++    str x2,[x13,#-8]!
++    str x3,[x13,#-8]!
++    ldr x8,[x13],#8
++    ldr x9,[x13],#8
++    ldr x10,[x13],#8
++END groups_writeback_negative
++
++PROGRAM groups_writeback_scratch
++    mov x13,x0
++    stp x1,x2,[x13,#16]!
++    mov x6,#0x5432
++    stp x3,x4,[x13,#16]
++    ldp x8,x9,[x13],#32
++    str x6,[x0]
++END groups_writeback_scratch
++
++// Standalone benchmark body; test_mem selects only the programs above.
++PROGRAM bench_stack_groups
++Lbench_stack_groups_loop:
++    stp x29,x30,[sp,#-64]!
++    stp x20,x19,[sp,#16]
++    stp x22,x21,[sp,#32]
++    ldp x20,x19,[sp,#16]
++    ldp x22,x21,[sp,#32]
++    ldp x29,x30,[sp],#64
++    subs x2,x2,#1
++    b.ne Lbench_stack_groups_loop
++END bench_stack_groups
 +
      .p2align 14
  _mem_programs_finish:
@@ -3879,10 +4035,10 @@ index 0000000..b85e3b8
 +    hv_machine_free(&machine);free(memory);pthread_cond_destroy(&ready_cv);pthread_mutex_destroy(&ready_mu);
 +}
 diff --git a/tests/test_mem.c b/tests/test_mem.c
-index 35ecb46..cdfe161 100644
+index 35ecb46..d4d6898 100644
 --- a/tests/test_mem.c
 +++ b/tests/test_mem.c
-@@ -16,13 +16,17 @@ DECLARE_PROGRAM(epilogue);
+@@ -16,13 +16,22 @@ DECLARE_PROGRAM(epilogue);
  DECLARE_PROGRAM(dczva);
  DECLARE_PROGRAM(pageend);
  DECLARE_PROGRAM(groups);
@@ -3890,6 +4046,10 @@ index 35ecb46..cdfe161 100644
 +DECLARE_PROGRAM(groups_shared);
 +DECLARE_PROGRAM(groups_register);
 +DECLARE_PROGRAM(groups_two);
++DECLARE_PROGRAM(groups_stack_frame);
++DECLARE_PROGRAM(groups_writeback_cross);
++DECLARE_PROGRAM(groups_writeback_negative);
++DECLARE_PROGRAM(groups_writeback_scratch);
  DECLARE_PROGRAM(mmio);
  extern const char mem_programs_begin[], mem_programs_finish[];
  
@@ -3898,10 +4058,19 @@ index 35ecb46..cdfe161 100644
      TEST_PROGRAM(exclusive), TEST_PROGRAM(atomics),  TEST_PROGRAM(literal), TEST_PROGRAM(loops), TEST_PROGRAM(epilogue),
 -    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups),
 +    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups), TEST_PROGRAM(groups_increment), TEST_PROGRAM(groups_shared), TEST_PROGRAM(groups_register), TEST_PROGRAM(groups_two),
++    TEST_PROGRAM(groups_stack_frame), TEST_PROGRAM(groups_writeback_cross), TEST_PROGRAM(groups_writeback_negative), TEST_PROGRAM(groups_writeback_scratch),
  };
  
  #define DATA_SIZE 65536
-@@ -164,6 +168,9 @@ int main(void) {
+@@ -36,6 +45,7 @@ static uint64_t data_seed;
+ static uint64_t ttbr0, ttbr0_el0, pt_next, map_ap;
+ 
+ static void reset_data(void) {
++    memset(stack,0x5a,STACK_SIZE);
+     uint64_t s = data_seed * 0x2545f4914f6cdd1dull + 7;
+     for (size_t i = 0; i < DATA_SIZE; i += 8) {
+         s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+@@ -164,6 +174,9 @@ int main(void) {
      setvbuf(stdout, NULL, _IONBF, 0);
      static HvMachine m;
      if (hv_machine_init(&m, 8 << 20) != 0) return 1;
@@ -3911,6 +4080,39 @@ index 35ecb46..cdfe161 100644
      data = aligned_alloc(16384, DATA_SIZE);
      stack = aligned_alloc(16384, STACK_SIZE);
      pt = aligned_alloc(16384, PT_SIZE);
+@@ -180,6 +193,7 @@ int main(void) {
+     size_t count = sizeof programs / sizeof programs[0];
+     int failed = 0;
+     static uint8_t native_data[DATA_SIZE];
++    static uint8_t native_stack[STACK_SIZE];
+     for (int mode = 0; mode < 4; mode++) {
+         m.slow_mem = mode == 0;
+         hv_flush_blocks(&m);
+@@ -192,6 +206,7 @@ int main(void) {
+             data_seed = i + 3;
+             run_native(p, &init, &native, reset_data);
+             memcpy(native_data, data, DATA_SIZE);
++            memcpy(native_stack, stack, STACK_SIZE);
+             reset_data();
+             m.stat_slow_mem = 0;
+             int bad = run_jit(&m, p, &init, &jit, mode == 2 ? mmu_on : mode == 3 ? mmu_on_el0 : NULL);
+@@ -205,6 +220,16 @@ int main(void) {
+                            (unsigned long long)b);
+                     bad = 1;
+                 }
++            /* Native END uses 16 bytes below its final SP as capture scratch.
++               Compare every other stack byte, including the new frame's
++               three stored register pairs, after independent memory resets. */
++            size_t native_sp=(size_t)(native.sp-(uint64_t)(uintptr_t)stack);
++            for(size_t off=0;off<STACK_SIZE&&!bad;off++) {
++                if(native_sp>=16&&off>=native_sp-16&&off<native_sp)continue;
++                if(stack[off]!=native_stack[off]){
++                    printf("  %s: stack byte %zu native %02x jit %02x\n",p->name,off,native_stack[off],stack[off]);bad=1;
++                }
++            }
+             printf("%-11s %-18s: %-4s (%llu slow-path accesses)\n", p->name, mode_names[mode], bad ? "FAIL" : "ok",
+                    (unsigned long long)m.stat_slow_mem);
+             failed += bad != 0;
 diff --git a/tests/test_memory_bounds.c b/tests/test_memory_bounds.c
 new file mode 100644
 index 0000000..922cb41
@@ -4069,10 +4271,10 @@ index 1d63ee6..d231f2a 100644
      /* Another CPU's big range TLBI (64 user pages of ASID 5: over the 32 done from here by default). With HV_RANGE_DROP it is done from here in one pass:
 diff --git a/tests/test_register_groups.c b/tests/test_register_groups.c
 new file mode 100644
-index 0000000..f8aee69
+index 0000000..4c46c83
 --- /dev/null
 +++ b/tests/test_register_groups.c
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,40 @@
 +#include "translate.h"
 +#include <assert.h>
 +#include <stdio.h>
@@ -4089,6 +4291,10 @@ index 0000000..f8aee69
 +}
 +int main(void) {
 +    assert(!hv_machine_init(&machine,4<<20));machine.chain=1;machine.stats_interval=1;
++    const uint32_t stack_frame[]={0xa9bc7bfd,0xa9014ff4,0xa90257f6,0xa9414ff4,0xa94257f6,0xa8c47bfd,0xd65f03c0};
++    unsigned frame_plain=hot(0,stack_frame,7),frame_grouped=hot(2,stack_frame,7);
++    printf("writeback-groups: enabled=%d plain=%u grouped=%u\n",hv_translate_writeback_groups(),frame_plain,frame_grouped);
++    assert(frame_grouped<frame_plain);
 +    const uint32_t stream[]={0xf9400001,0xf9400402,0xf9400803,0xf9400c04,0xd65f03c0};
 +    unsigned plain=hot(0,stream,5),selected=hot(2,stream,5);
 +    assert(selected+10<plain); /* actual emitter, not a copied cost model */
