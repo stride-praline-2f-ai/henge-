@@ -249,6 +249,17 @@ for marker in (b'engine-paths: interleaved-groups=', b'jit-branch-preservation:'
     assert marker in app_executable, 'Engine integration missing from IPA: '+repr(marker)
 data['engine_memory_dispatch']=dict(engine,runtime_markers_verified=True,physical_performance_verified=False)
 
+# Verify the Safari follow-up is linked in this device IPA, with the exact
+# native/app and focused GPU validation receipts retained in the artifact.
+if manifest.get('safari_replay_followup'):
+    safari=state['safari_replay_followup']
+    assert safari['native_validated_source']==state['final_validation']['source_commit']
+    assert safari['patch_sha256']==manifest['audit_repairs_sha256']
+    for marker in (b'remap_calls=%llu',b'empty_classic_before_metal4_avoided=',
+                   b'surface leaf is outside guest RAM; allocation rejected'):
+        assert marker in app_executable, 'Safari replay fix missing from IPA: '+repr(marker)
+    data['safari_replay_followup']=dict(safari,runtime_markers_verified=True,physical_safari_improvement_verified=False)
+
 # Correct legacy metadata: verify the real configured default in the reconstructed source.
 assert 'as? Bool ?? true' in Path('Henge/ios/Henge/EngineTuning.swift').read_text()
 data['fastmem_default']=True

@@ -143,4 +143,9 @@ engine=state.get('engine_memory_dispatch',{})
 assert engine.get('complete') and engine.get('source_commit')==validation.get('source_commit'), 'Engine implementation needs exact-source proof'
 assert all(engine.get(k)=='passed' for k in ('checked_reuse','lookup_trials','selective_eviction','nonmoving_retention','branch_dispatch','faults_simd_sanitizers','ios_integration')), 'Engine regression checks incomplete'
 assert engine.get('evidence') and engine.get('performance_rejections'), 'Engine defaults require concrete measurement evidence'
+safari=state.get('safari_replay_followup',{})
+if manifest.get('safari_replay_followup'):
+    assert safari.get('focused_validation')=='passed' and safari.get('patch_sha256')==manifest['audit_repairs_sha256'], 'Safari replay requires exact-patch GPU/sanitizer proof'
+    assert safari.get('native_validated_source')==validation.get('source_commit') and safari.get('native_validation_run')==validation.get('run_id'), 'Safari replay requires final native/app integration proof'
+    assert isinstance(safari.get('validation_run'),int), 'Missing focused Safari replay run'
 print('PASS complete implementation gate:', manifest['audit_repairs_sha256'])
