@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 8e61e55..baa1c7a 100644
+index 8e61e55..2963bb4 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -3,7 +3,7 @@ CC = clang
@@ -21,7 +21,7 @@ index 8e61e55..baa1c7a 100644
  # mmu.c: no SIMD (hv_tlb_refill runs with the guest's SIMD registers live).
  $(B)/mmu.o: core/mmu.c core/*.h host/*.h | $(B)
  	$(CC) $(CFLAGS) -mgeneral-regs-only -c $< -o $@
-@@ -264,3 +267,41 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
+@@ -264,3 +267,44 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
  test-jit-advice: $(B)/test_jit_advice
  	$(B)/test_jit_advice
  .PHONY: test-jit-advice
@@ -62,6 +62,9 @@ index 8e61e55..baa1c7a 100644
 +$(B)/bench_stack_groups: tests/bench_stack_groups.c tests/mem_programs.S tests/harness.S $(ENGINE)
 +	$(CC) $(CFLAGS) $^ -o $@
 +$(B)/bench_stack_groups_reference: tests/bench_stack_groups.c tests/mem_programs.S tests/harness.S $(ENGINE_REGISTER_REFERENCE)
++	$(CC) $(CFLAGS) $^ -o $@
++
++$(B)/test_exc_register_reference: tests/test_exc.c tests/exc_programs.S tests/harness.S $(ENGINE_REGISTER_REFERENCE)
 +	$(CC) $(CFLAGS) $^ -o $@
 diff --git a/core/cpu.h b/core/cpu.h
 index aa9b938..4109920 100644
@@ -1962,7 +1965,7 @@ index a4fe1b2..ed831ed 100644
  other:
      /* PAuth key registers (CRn 2, CRm 1..3): kept, never used, since signing is a no-op. */
 diff --git a/core/translate.c b/core/translate.c
-index 2084e98..30cdf9f 100644
+index 2084e98..d37149f 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -6,6 +6,7 @@
@@ -2610,7 +2613,7 @@ index 2084e98..30cdf9f 100644
 -    /* HV_GROUPS=1: group accesses (off by default: measured no faster, and the
 -       plain copies make the code about 15% bigger, so the JIT region fills sooner). */
 +    /* HV_GROUPS=1 retains the reference broad planner. Mode2 selects only
-+       bounded register-only groups; mode0 remains the plain differential path.
++       bounded register groups and checked writeback spans; mode0 remains the plain differential path.
 +       Default selection belongs to the measured host policy, not this emitter. */
      if (hv_knob[HV_K_GROUPS] && translate_emit(m, b, code, avail, 0) == 0) return 0;
      return translate_emit(m, b, code, avail, 1);
@@ -3210,6 +3213,52 @@ index 0000000..244a767
 +    printf("stack-group-bench: round=%u writeback=%d ns_per_frame=%.3f inline_words=%llu result=correct\n",round,hv_translate_writeback_groups(),ns/500000,(unsigned long long)machine.stats.words_inline);
 +    hv_machine_free(&machine);free(stack);return 0;
 +}
+diff --git a/tests/exc_programs.S b/tests/exc_programs.S
+index e164bea..98203d4 100644
+--- a/tests/exc_programs.S
++++ b/tests/exc_programs.S
+@@ -108,6 +108,41 @@ PROGRAM p_dabt
+     mov x10, x8
+ END p_dabt
+ 
++// A grouped range must preserve completed loads and the exact first fault PC.
++PROGRAM p_group_fault
++    SETUP
++    ldr x15, [x9] // warm ordinary RAM before the independently planned group
++    dmb ish
++1:  ldr x1, [x9]
++    ldr x2, [x9, #8]
++2:  ldr x3, [x9, #16] // first byte beyond the mapped RAM region
++    adr x4, 2b
++END p_group_fault
++
++// The span guard falls back as a whole; each completed post-index updates
++// its base exactly once, and a faulting pre-index never commits writeback.
++PROGRAM p_group_writeback_fault
++    SETUP
++    ldr x15, [x9]
++    dmb ish
++    ldr x1, [x9], #8
++    ldr x2, [x9], #8
++1:  ldr x3, [x9, #8]!
++    adr x4, 1b
++END p_group_writeback_fault
++
++PROGRAM p_group_writeback_store_fault
++    SETUP
++    ldr x15, [x9]
++    dmb ish
++    mov x1, #13
++    mov x2, #17
++    str x1, [x9], #8
++    str x2, [x9], #8
++1:  str x3, [x9, #8]!
++    adr x4, 1b
++END p_group_writeback_store_fault
++
+ // Down to EL0 and back up through SVC and an undefined MRS.
+ PROGRAM p_el0
+     SETUP
 diff --git a/tests/harness.h b/tests/harness.h
 index bff9786..6b2997e 100644
 --- a/tests/harness.h
@@ -3450,6 +3499,63 @@ index bcbed3f..7f1bbf4 100644
 +
      .p2align 14
  _mem_programs_finish:
+diff --git a/tests/test_exc.c b/tests/test_exc.c
+index 52bf4de..65ac689 100644
+--- a/tests/test_exc.c
++++ b/tests/test_exc.c
+@@ -6,6 +6,9 @@
+ DECLARE_PROGRAM(p_svc);
+ DECLARE_PROGRAM(p_brk_undef);
+ DECLARE_PROGRAM(p_dabt);
++DECLARE_PROGRAM(p_group_fault);
++DECLARE_PROGRAM(p_group_writeback_fault);
++DECLARE_PROGRAM(p_group_writeback_store_fault);
+ DECLARE_PROGRAM(p_el0);
+ DECLARE_PROGRAM(p_sysregs);
+ DECLARE_PROGRAM(p_irq);
+@@ -86,6 +89,42 @@ int main(void) {
+         check("dabt", "no writeback on a fault", c.x[10], 0x10000);
+     }
+ 
++    static const TestProgram grouped_fault = TEST_PROGRAM(p_group_fault);
++    *(uint64_t *)(stack+65536-16)=7;*(uint64_t *)(stack+65536-8)=11;
++    if (!run(&grouped_fault,&c,ADDR(stack)+65536-16)) {
++        check("grouped fault","first completed load",c.x[1],7);
++        check("grouped fault","second completed load",c.x[2],11);
++        check("grouped fault","exact fault PC",c.x[22],c.x[4]);
++        check("grouped fault","exact fault address",c.x[21],ADDR(stack)+65536);
++        check("grouped fault","single exception",c.x[24],1);
++    }
++
++    static const TestProgram writeback_fault=TEST_PROGRAM(p_group_writeback_fault);
++    static const TestProgram writeback_store_fault=TEST_PROGRAM(p_group_writeback_store_fault);
++    int saved_groups=hv_knob[HV_K_GROUPS];
++    for(int grouped=0;grouped<=2;grouped+=2) {
++        hv_knob[HV_K_GROUPS]=grouped;hv_flush_blocks(&m);
++        *(uint64_t *)(stack+65536-16)=7;*(uint64_t *)(stack+65536-8)=11;
++        if(!run(&writeback_fault,&c,ADDR(stack)+65536-16)) {
++            check("writeback fault","first completed load",c.x[1],7);
++            check("writeback fault","second completed load",c.x[2],11);
++            check("writeback fault","exact fault PC",c.x[22],c.x[4]);
++            check("writeback fault","exact fault address",c.x[21],ADDR(stack)+65536+8);
++            check("writeback fault","completed updates only",c.x[9],ADDR(stack)+65536);
++            check("writeback fault","single exception",c.x[24],1);
++        }
++        if(!run(&writeback_store_fault,&c,ADDR(stack)+65536-16)) {
++            check("writeback store fault","first completed store",*(uint64_t *)(stack+65536-16),13);
++            check("writeback store fault","second completed store",*(uint64_t *)(stack+65536-8),17);
++            check("writeback store fault","exact fault PC",c.x[22],c.x[4]);
++            check("writeback store fault","exact fault address",c.x[21],ADDR(stack)+65536+8);
++            check("writeback store fault","completed updates only",c.x[9],ADDR(stack)+65536);
++            check("writeback store fault","store abort",(c.x[20]>>6)&1,1);
++            check("writeback store fault","single exception",c.x[24],1);
++        }
++    }
++    hv_knob[HV_K_GROUPS]=saved_groups;hv_flush_blocks(&m);
++
+     static const TestProgram el0 = TEST_PROGRAM(p_el0);
+     uint64_t sp0 = ADDR(stack) + 8192;
+     uint64_t sp1 = ADDR(stack) + 32768;
 diff --git a/tests/test_fastmem.c b/tests/test_fastmem.c
 new file mode 100644
 index 0000000..7901051
