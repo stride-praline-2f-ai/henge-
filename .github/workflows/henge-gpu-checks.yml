@@ -3,6 +3,7 @@ name: Henge focused GPU validation
   push:
     branches:
     - feature/metal4-pipeline-efficiency
+    - perf/shader-warmup
     paths:
     - henge-build/**
     - .github/workflows/henge-gpu-checks.yml
@@ -71,6 +72,29 @@ jobs:
     - name: Integrate pinned Henge main and reviewed device PRs
       id: integration
       run: bash build-request/henge-build/integrate-upstream.sh
+    - name: Bounded shader warmup concurrency and compiler admission
+      working-directory: Henge
+      shell: bash
+      run: 'set -euo pipefail
+
+        mkdir -p build/gpu-proof
+
+        xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -Wno-deprecated-declarations -fsanitize=address,undefined
+        tests/test_metal4_compilation.m -framework Foundation -framework Metal -o build/gpu-proof/test_metal4_compilation
+
+        build/gpu-proof/test_metal4_compilation
+
+        xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -Wno-deprecated-declarations -fsanitize=thread
+        tests/test_metal4_compilation.m -framework Foundation -framework Metal -o build/gpu-proof/test_metal4_compilation_tsan
+
+        build/gpu-proof/test_metal4_compilation_tsan
+
+        xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -Wno-deprecated-declarations -fsanitize=address,undefined
+        tests/test_metal4_ordering.m -framework Foundation -framework Metal -o build/gpu-proof/test_metal4_ordering
+
+        build/gpu-proof/test_metal4_ordering
+
+        '
     - name: Desktop Retina window and M4 default regressions
       working-directory: Henge
       run: 'set -euo pipefail
@@ -178,11 +202,6 @@ jobs:
         xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -fsanitize=address,undefined tests/test_metal4_arguments.m\
         \ -framework Foundation -framework Metal -o build/gpu-proof/test_metal4_arguments\nbuild/gpu-proof/test_metal4_arguments\n\
         xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -Wno-deprecated-declarations -fsanitize=address,undefined\
-        \ tests/test_metal4_compilation.m -framework Foundation -framework Metal -o build/gpu-proof/test_metal4_compilation\n\
-        build/gpu-proof/test_metal4_compilation\nxcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror\
-        \ -Wno-deprecated-declarations -fsanitize=thread tests/test_metal4_compilation.m -framework Foundation\
-        \ -framework Metal -o build/gpu-proof/test_metal4_compilation_tsan\nbuild/gpu-proof/test_metal4_compilation_tsan\n\
-        xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -Wno-deprecated-declarations -fsanitize=address,undefined\
         \ tests/test_metal4_plan.m -framework Foundation -framework Metal -o build/gpu-proof/test_metal4_plan\n\
         build/gpu-proof/test_metal4_plan\nxcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -Wno-deprecated-declarations\
         \ tests/test_metal4_runtime.m -framework Foundation -framework AppKit -framework Metal -o build/gpu-proof/test_metal4_runtime\n\
@@ -195,20 +214,18 @@ jobs:
         set +e\nbuild/gpu-proof/test_metal4_screen > build/gpu-proof/metal4-screen.log 2>&1\nscreen_rc=$?\n\
         set -e\ncat build/gpu-proof/metal4-screen.log\nif [[ \"$screen_rc\" != 0 && \"$screen_rc\" !=\
         \ 78 ]]; then exit \"$screen_rc\"; fi\nxcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror\
-        \ -Wno-deprecated-declarations -fsanitize=address,undefined tests/test_metal4_ordering.m -framework\
-        \ Foundation -framework Metal -o build/gpu-proof/test_metal4_ordering\nbuild/gpu-proof/test_metal4_ordering\n\
-        xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -Wno-deprecated-declarations -fsanitize=address,undefined\
-        \ tests/test_pipeline_bundle.m -framework Foundation -framework Metal -o build/gpu-proof/test_pipeline_bundle\n\
-        build/gpu-proof/test_pipeline_bundle\nxcrun --sdk macosx clang -O2 -fobjc-arc -Wall -Wextra -Werror\
-        \ tests/bench_gpu_bindings.m -framework Foundation -framework AppKit -framework Metal -o build/gpu-proof/bench_gpu_bindings\n\
-        build/gpu-proof/bench_gpu_bindings | tee build/gpu-proof/binding-benchmark.log\nif ! pkg-config\
-        \ --exists slirp; then HOMEBREW_NO_AUTO_UPDATE=1 brew install libslirp; fi\npkg-config --cflags\
-        \ --libs slirp\nmake -j3 build/test_register_groups build/bench_far_chain build/bench_snapshot_admission\n\
-        build/test_register_groups | tee build/gpu-proof/register-groups.log\nbuild/bench_far_chain |\
-        \ tee build/gpu-proof/far-chain-benchmark.log\nbuild/bench_snapshot_admission | tee build/gpu-proof/snapshot-admission-benchmark.log\n\
-        make -j3 build/test_vm_lifecycle\npython3 tests/test_stats_lifecycle.py\npython3 tests/test_display_pulses.py\n\
-        python3 tests/test_pacing_scheduler.py\npython3 tests/test_pipeline_bundle_plan.py\npython3 -\
-        \ <<'PROBE'\nimport subprocess\nfrom pathlib import Path\nfor tool,args in [('metal-config',['--help']),('metal-config',['-h']),('metal-tt',['-help']),('metal-tt',['-arch','help'])]:\n\
+        \ -Wno-deprecated-declarations -fsanitize=address,undefined tests/test_pipeline_bundle.m -framework\
+        \ Foundation -framework Metal -o build/gpu-proof/test_pipeline_bundle\nbuild/gpu-proof/test_pipeline_bundle\n\
+        xcrun --sdk macosx clang -O2 -fobjc-arc -Wall -Wextra -Werror tests/bench_gpu_bindings.m -framework\
+        \ Foundation -framework AppKit -framework Metal -o build/gpu-proof/bench_gpu_bindings\nbuild/gpu-proof/bench_gpu_bindings\
+        \ | tee build/gpu-proof/binding-benchmark.log\nif ! pkg-config --exists slirp; then HOMEBREW_NO_AUTO_UPDATE=1\
+        \ brew install libslirp; fi\npkg-config --cflags --libs slirp\nmake -j3 build/test_register_groups\
+        \ build/bench_far_chain build/bench_snapshot_admission\nbuild/test_register_groups | tee build/gpu-proof/register-groups.log\n\
+        build/bench_far_chain | tee build/gpu-proof/far-chain-benchmark.log\nbuild/bench_snapshot_admission\
+        \ | tee build/gpu-proof/snapshot-admission-benchmark.log\nmake -j3 build/test_vm_lifecycle\npython3\
+        \ tests/test_stats_lifecycle.py\npython3 tests/test_display_pulses.py\npython3 tests/test_pacing_scheduler.py\n\
+        python3 tests/test_pipeline_bundle_plan.py\npython3 - <<'PROBE'\nimport subprocess\nfrom pathlib\
+        \ import Path\nfor tool,args in [('metal-config',['--help']),('metal-config',['-h']),('metal-tt',['-help']),('metal-tt',['-arch','help'])]:\n\
         \ r=subprocess.run(['xcrun','-sdk','iphoneos',tool,*args],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)\n\
         \ name=tool+'-'+('-'.join(args)).replace('/','_')+'.txt'\n Path('build/gpu-proof',name).write_text(r.stdout)\n\
         \ print(tool,args,'status',r.returncode)\n print(r.stdout[:7000])\nPROBE\npython3 tools/build_pipeline_bundle.py\
