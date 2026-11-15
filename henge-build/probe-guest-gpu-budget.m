@@ -27,11 +27,22 @@ int main(void){@autoreleasepool{
         @"physical":@(NSProcessInfo.processInfo.physicalMemory),@"os":NSProcessInfo.processInfo.operatingSystemVersionString} mutableCopy];
     NSMutableArray *methods=[NSMutableArray new],*classes=[NSMutableArray new],*registry=[NSMutableArray new];
     for(Class c=[device class];c;c=class_getSuperclass(c)){
-        NSMutableArray *names=[NSMutableArray new];unsigned count=0;Method *list=class_copyMethodList(c,&count);
-        for(unsigned i=0;i<count;i++){NSString *name=NSStringFromSelector(method_getName(list[i]));if(memoryKey(name))[names addObject:name];}free(list);
-        [classes addObject:@{@"class":NSStringFromClass(c),@"methods":names}];
+        NSMutableArray *names=[NSMutableArray new],*ivars=[NSMutableArray new];unsigned count=0;Method *list=class_copyMethodList(c,&count);
+        for(unsigned i=0;i<count;i++){NSString *name=NSStringFromSelector(method_getName(list[i]));if(memoryKey(name)||[name hasPrefix:@"initWith"])[names addObject:name];}free(list);
+        unsigned ic=0;Ivar *il=class_copyIvarList(c,&ic);
+        for(unsigned i=0;i<ic;i++){
+            NSString *name=@(ivar_getName(il[i]));if(!memoryKey(name))continue;
+            ptrdiff_t offset=ivar_getOffset(il[i]);const char *type=ivar_getTypeEncoding(il[i]);
+            NSMutableDictionary *field=[@{@"name":name,@"offset":@(offset),@"type":@(type)}mutableCopy];
+            size_t width=(type[0]=='Q'||type[0]=='q')?8:(type[0]=='I'||type[0]=='i')?4:0;
+            if(width&&offset>=0&&(size_t)offset+width<=class_getInstanceSize([device class])){
+                uint64_t value=0;memcpy(&value,(const char *)(__bridge void *)device+offset,width);field[@"value"]=@(value);
+            }
+            [ivars addObject:field];
+        }free(il);
+        [classes addObject:@{@"class":NSStringFromClass(c),@"methods":names,@"ivars":ivars}];
     }
-    for(NSString *name in @[@"recommendedMaxWorkingSetSize",@"currentAllocatedSize",@"maxBufferLength",@"hasUnifiedMemory",@"recommendedMaxMemorySize"]){
+    for(NSString *name in @[@"recommendedMaxWorkingSetSize",@"currentAllocatedSize",@"maxBufferLength",@"hasUnifiedMemory",@"recommendedMaxMemorySize",@"sharedMemorySize",@"dedicatedMemorySize",@"memoryInfo",@"initWithAccelerator:options:",@"initWithAccelerator:"]){
         Method method=class_getInstanceMethod([device class],NSSelectorFromString(name));if(!method)continue;
         uintptr_t code=(uintptr_t)ptrauth_strip(method_getImplementation(method),ptrauth_key_function_pointer);
         Dl_info image={0};dladdr((void *)code,&image);
@@ -42,7 +53,7 @@ int main(void){@autoreleasepool{
         kern_return_t status=mach_vm_region(mach_task_self(),&region,&size,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&info,&count,&object);
         if(object)mach_port_deallocate(mach_task_self(),object);
         if(status==KERN_SUCCESS&&region<=code&&code-region<size&&(info.protection&VM_PROT_READ)){
-            size_t length=(size_t)MIN((uint64_t)1024,size-(code-region));NSString *file=[name stringByAppendingString:@".bin"];
+            size_t length=(size_t)MIN((uint64_t)4096,size-(code-region));NSString *file=[name stringByAppendingString:@".bin"];
             [[NSData dataWithBytes:(void *)code length:length]writeToFile:file atomically:YES];m[@"code_file"]=file;
         }
         [methods addObject:m];
