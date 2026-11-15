@@ -13,3 +13,5 @@ Next: full workflow on perf/replay-mapping-sync, fix any independent failures, t
 Final review correction: transient UIKit warning recovery now reuses the existing active-work budget deadline. No new timer or controller; a workload with no new shader libraries can recover command-cache admission. Final validation must use the patch containing this correction.
 
 Pooled snapshots now align every individual segment to16 bytes, including odd-length input. Arena sizing includes padding; transient oversized streams retain the independent reference path. Final validation must include this correction.
+
+The new mapper also rejects allocation+first-byte rounding overflow before making a host alias; actual production-method regression asserts no Mach remap occurs for that malformed descriptor. Implementation is now frozen for full validation.
