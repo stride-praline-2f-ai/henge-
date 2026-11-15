@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 81b0736..894a09c 100644
+index 81b0736..7ba5fb4 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -5,14 +5,14 @@ B = build
@@ -126,7 +126,7 @@ index 81b0736..894a09c 100644
  # Session-owned display routing, independent of JIT, Metal and a connected monitor.
  $(B)/test_display_targets: ios/Henge/DisplayTargetSelection.swift tests/test_display_targets.swift | $(B)
  	xcrun --sdk macosx swiftc $^ -o $@
-@@ -316,5 +348,68 @@ $(B)/test_cpu_sync: tests/test_cpu_sync.c $(ENGINE)
+@@ -316,5 +348,71 @@ $(B)/test_cpu_sync: tests/test_cpu_sync.c $(ENGINE)
  $(B)/test_timer_dispatch: tests/test_timer_dispatch.c $(ENGINE)
  	$(CC) $(CFLAGS) $< $(ENGINE) -o $@
  
@@ -195,6 +195,9 @@ index 81b0736..894a09c 100644
 +
 +$(B)/test_net_batch: tests/test_net_batch.c devices/virtio_net.c devices/virtio.c devices/*.h core/*.h host/*.h | $(B)
 +	$(CC) $(CFLAGS) -O1 -fsanitize=address,undefined tests/test_net_batch.c devices/virtio_net.c devices/virtio.c -o $@
++
++$(B)/bench_interleaved_groups: tests/bench_interleaved_groups.c tests/mem_programs.S tests/harness.S $(ENGINE)
++	$(CC) $(CFLAGS) -Itests $^ -o $@
 diff --git a/core/dispatch.c b/core/dispatch.c
 index 12bd4a9..204b2c6 100644
 --- a/core/dispatch.c
@@ -1240,7 +1243,7 @@ index 3a4ee8f..89ad6ac 100644
     can be read before the page ends. On a fault, the instruction abort is taken
     and NULL is returned. */
 diff --git a/core/translate.c b/core/translate.c
-index cebfb7d..d37149f 100644
+index cebfb7d..7ce9e95 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -48,6 +48,8 @@ typedef struct {
@@ -1252,10 +1255,13 @@ index cebfb7d..d37149f 100644
      uint64_t site;      /* guest PC of the instruction that branches out of line */
      uint32_t retry;     /* loads and stores: where their translation starts, to run again after a refill */
      uint32_t rflags;    /* hv_tlb_refill's flags for it (0: no refill, straight to the helper) */
-@@ -64,13 +66,18 @@ typedef struct {
+@@ -64,13 +66,22 @@ typedef struct {
  #define GROUP_SLOTS 4
  #define GROUP_SPAN 4096   /* bytes one group may cover */
  #define GROUP_INSNS 48    /* and instructions */
++#ifndef HV_GROUP_INTERLEAVE
++#define HV_GROUP_INTERLEAVE 1 /* 0 keeps the previously shipped planner for A/B */
++#endif
 +#ifndef HV_GROUP_WRITEBACK
 +#define HV_GROUP_WRITEBACK 1 /* 0 builds the existing register-only reference */
 +#endif
@@ -1268,11 +1274,12 @@ index cebfb7d..d37149f 100644
  } Group;
  
 +int hv_translate_writeback_groups(void) { return HV_GROUP_WRITEBACK; }
++int hv_translate_interleaved_groups(void) { return HV_GROUP_INTERLEAVE; }
 +
  typedef struct {
      uint32_t hot[MAX_WORDS], cold[MAX_WORDS];
      uint32_t *w;        /* the part being written */
-@@ -83,6 +90,9 @@ typedef struct {
+@@ -83,6 +94,9 @@ typedef struct {
      uint32_t nhot, ncold; /* the finished block's parts in words, ncold with the pool */
      uint64_t pool[MAX_LITS];
      uint32_t npool;
@@ -1282,7 +1289,7 @@ index cebfb7d..d37149f 100644
      LitFix fix[MAX_LITS];
      uint32_t nfix;
      Ool ool[MAX_OOL];
-@@ -224,8 +234,20 @@ static int put_mov_imm(Emit *e, int reg, uint64_t value, int max) {
+@@ -224,8 +238,20 @@ static int put_mov_imm(Emit *e, int reg, uint64_t value, int max) {
     (off: no measured gain on the Mac mix, 2026-11-08). */
  static void put_lit(Emit *e, int reg, uint64_t value) {
      if (hv_knob[HV_K_MOVIMM] && put_mov_imm(e, reg, value, 3)) return;
@@ -1305,7 +1312,7 @@ index cebfb7d..d37149f 100644
      put(e, 0x58000000u | reg);
  }
  
-@@ -398,9 +420,18 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
+@@ -398,9 +424,18 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
      uint32_t slot_index = ~0u;
      int same_page = (target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) == e->page;
      uint64_t xa = same_page ? 0 : cross_addend(e, target);
@@ -1327,7 +1334,7 @@ index cebfb7d..d37149f 100644
      }
      if (slot_index == ~0u) {
          /* Another page may be remapped under us, so look it up by VA instead of chaining. */
-@@ -435,9 +466,10 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
+@@ -435,9 +470,10 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
          to_miss = e->n;
          put(e, CBNZ_X(7));                                      /* not mapped so now: the branch cache */
      }
@@ -1341,7 +1348,7 @@ index cebfb7d..d37149f 100644
      uint32_t site_at = e->n;
      put(e, B_OP | 1);
      if (!p0) cold_on(e);
-@@ -453,15 +485,28 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
+@@ -453,15 +489,28 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
          e->site[e->nsite++].stub_cold = (uint8_t)(e->in_cold && !e->flat);
          e->site_direct = !check && !xa;
      }
@@ -1379,7 +1386,7 @@ index cebfb7d..d37149f 100644
      if (xa) {
          link_here(e, to_miss, p0);
          if (use_xjump()) put_xjump(e, target, 0); /* exit_req was checked above if it had to be */
-@@ -483,6 +528,7 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
+@@ -483,6 +532,7 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
     from where the helper would resume (bits 31..19, in words). */
  static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rflags, uint32_t retry) {
      put_helper(e, pc, insn, HV_OP_MEM);
@@ -1387,7 +1394,7 @@ index cebfb7d..d37149f 100644
      uint32_t resume = e->n - 1; /* the ldr x0, [x28] the helper comes back to */
      uint32_t back = resume - retry;
      if (back < (1u << 13) && rflags < (1u << 11)) e->pool[e->npool - 1] = (uint64_t)insn | (uint64_t)(HV_OP_MEM | rflags << 8 | back << 19) << 32;
-@@ -491,6 +537,7 @@ static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rfla
+@@ -491,6 +541,7 @@ static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rfla
  /* The return address is where it goes back to, so the thunk's RET goes where the CPU expects
     and leaves its stack of return addresses as it was. The HvHelperInfo is in the pool. */
  static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
@@ -1395,7 +1402,7 @@ index cebfb7d..d37149f 100644
      uint32_t info = e->npool;
      e->pool[info] = pc;
      e->pool[info + 1] = (uint64_t)insn | (uint64_t)op << 32;
-@@ -503,7 +550,8 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
+@@ -503,7 +554,8 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
      put(e, LDR_X(0, 28, 0));
  }
  
@@ -1405,7 +1412,7 @@ index cebfb7d..d37149f 100644
  static void put_add_imm(Emit *e, int d, int n, int64_t imm) {
      if (imm == 0) {
          if (d != n) put(e, MOV_X(d, n));
-@@ -811,7 +859,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
+@@ -811,7 +863,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
  /* Ends the block (returns 1), or 0 for a conditional branch the block goes on past. */
  static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
      if ((insn & 0x7c000000) == 0x14000000) { /* B, BL */
@@ -1414,7 +1421,7 @@ index cebfb7d..d37149f 100644
          if (insn >> 31) {
              if (use_ras(e)) put_call(e, pc + 4);
              else put_const_to(e, 30, pc + 4);
-@@ -820,7 +868,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -820,7 +872,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
          return 1;
      }
      if ((insn & 0xff000000) == 0x54000000) { /* B.cond, BC.cond */
@@ -1423,7 +1430,7 @@ index cebfb7d..d37149f 100644
          uint32_t cond = insn & 0xf;
          if (cond >= 14) {
              put_branch_exit(e, target, 1);
-@@ -836,7 +884,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -836,7 +888,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
      }
      /* CBZ/CBNZ (imm19) and TBZ/TBNZ (imm14) */
      int tb = (insn & 0x7e000000) == 0x36000000;
@@ -1432,7 +1439,7 @@ index cebfb7d..d37149f 100644
      uint32_t bare = tb ? insn & ~(0x3fffu << 5) : insn & ~(0x7ffffu << 5);
      int rt = insn & 0x1f;
      if (!is_stolen(rt)) {
-@@ -956,6 +1004,53 @@ static void put_fastmem_count(Emit *e, int scratch, uint32_t offset) {
+@@ -956,6 +1008,53 @@ static void put_fastmem_count(Emit *e, int scratch, uint32_t offset) {
      put(e, STR_X(scratch, 28, offset));
  }
  
@@ -1486,7 +1493,7 @@ index cebfb7d..d37149f 100644
  static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      HvMemOp op;
      if (hv_mem_decode(insn, &op) != 0) {
-@@ -1027,14 +1122,14 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1027,14 +1126,14 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
          put(e, CBNZ_X(U));
          put_ool(e, (Ool){.kind = OOL_GROUP, .pc = (uint64_t)(grp - e->grp), .nrestore = 3, .restore = {A, T, U}});
          put(e, LDR_X(U, T, gtlb + 24));
@@ -1504,7 +1511,7 @@ index cebfb7d..d37149f 100644
  
      /* Effective address into A, or used where it is: a guest base register with nothing added. */
      int sp_base = !literal && op.rn == 31; /* the guest SP, which is the host SP while blocks run */
-@@ -1047,6 +1142,13 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1047,6 +1146,13 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
          /* the address is in A already */
      } else if (literal) {
          put_lit(e, A, pc + op.imm);
@@ -1518,7 +1525,7 @@ index cebfb7d..d37149f 100644
      } else {
          if (base_stolen) {
              put(e, sp_base ? ADD_SP_TO(A) : LDR_X(A, 28, slot_of(op.rn)));
-@@ -1080,42 +1182,12 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1080,42 +1186,12 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      /* Opt-in LUT fastmem for plain scalar kernel loads only. Every failed
         guard falls through to the existing TLB, including allocation failure.
         Like the TLB, leave the final 15 bytes to the helper. No NZCV changes. */
@@ -1566,7 +1573,7 @@ index cebfb7d..d37149f 100644
      uint32_t tlb = put_tlb_slot(e, T, addr, el_idx);
      /* Both CPU-owned fields share a cache line. Issue independent loads
         before checking the tag, instead of serializing the addend load behind
-@@ -1148,9 +1220,10 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1148,9 +1224,10 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
                       .recheck = hv_knob[HV_K_RECHECK] && !(op.align && op.bytes > 1) && op.bytes < HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
                       .t = (uint8_t)T, .u = (uint8_t)U, .bytes = (uint8_t)op.bytes,
                       .tag_off = tlb + (op.store ? 8 : 0), .retry = retry, .rflags = rflags,
@@ -1578,7 +1585,7 @@ index cebfb7d..d37149f 100644
      if (fm_done != ~0u) patch_branch(&e->w[fm_done], (int64_t)e->n - fm_done);
      }
      /* Single loads and stores take [addr, addend] directly; the rest want the host address in A. */
-@@ -1253,7 +1326,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1253,7 +1330,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      unspill(e, s, 3);
      if (slow != ~0u) e->ool[slow].join = e->n;
      /* Stand-ins for x18/x28 and writeback may have used U. */
@@ -1587,7 +1594,7 @@ index cebfb7d..d37149f 100644
  }
  
  /* DC ZVA: zero the 64-byte block holding Xt, on the host's own copy when the
-@@ -1844,8 +1917,9 @@ static void emit_ool(Emit *e) {
+@@ -1844,8 +1921,9 @@ static void emit_ool(Emit *e) {
              plink(e, retry, 1, o->retry, 0);
          }
          uint32_t site_at = link_site(e, o->at);
@@ -1598,7 +1605,7 @@ index cebfb7d..d37149f 100644
              int check = o->preloaded ? o->t : o->u;
              put(e, LDR_X(check, o->t, o->tag_off));
              put(e, SUB_X(check, o->addr, check));
-@@ -1900,6 +1974,35 @@ static int group_op(const HvMemOp *op) {
+@@ -1900,6 +1978,52 @@ static int group_op(const HvMemOp *op) {
             (op->rn == 31 || !is_stolen(op->rn)) && op->bytes <= 64;
  }
  
@@ -1631,14 +1638,31 @@ index cebfb7d..d37149f 100644
 +    return count >= (unsigned)(hv_knob[HV_K_GROUP_MIN] >= 3 ? 3 : 2); /* fixed-base pairs share the same checked range; 3 retains the reference policy */
 +}
 +
++/* A stored addend survives scratch-register reuse. Every intervening access
++   must itself be a live checked group: otherwise its slow helper could service
++   an invalidation before a later unchecked access. Selection verifies that
++   closure after slot assignment. No branch/helper/system/barrier is admitted. */
++static int cached_group(const Emit *e,const Group *g,const uint32_t *code) {
++    unsigned minimum=g->writeback?3:2;
++    if(hv_knob[HV_K_GROUP_MIN]>=3 && minimum<3)minimum=3;
++    if(g->accesses<minimum)return 0;
++    for(unsigned i=g->first;i<=g->last;i++) {
++        HvInsnKind kind=hv_classify(code[i]);
++        if(kind==HV_INSN_COPY)continue;
++        HvMemOp op;
++        if(kind!=HV_INSN_MEMORY || e->gid[i]<0 || hv_mem_decode(code[i],&op) || !group_op(&op))return 0;
++    }
++    return 1;
++}
++
  static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va) {
      e->ngrp = 0;
      memset(e->gid, -1, sizeof e->gid);
-@@ -1914,7 +2017,54 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1914,7 +2038,62 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
          HvInsnKind kind = hv_classify(insn);
          if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) break;
          if (kind == HV_INSN_COPY && (insn & 0xfffff01fu) == 0xd503201fu) continue; /* hints (NOP, BTI): no register */
-+        if (hv_knob[HV_K_GROUPS] == 2) {
++        if (hv_knob[HV_K_GROUPS] == 2 && !HV_GROUP_INTERLEAVE) {
 +            /* A clobber used to poison an entire candidate, losing valid
 +               object/stack field pairs on BOTH sides. End only the current
 +               candidates here; later accesses form independent checked
@@ -1669,6 +1693,14 @@ index cebfb7d..d37149f 100644
 +            if (boundary) for (int r = 0; r < 32; r++)
 +                if (keep < 0 || cur[r] != keep) cur[r] = -1, delta[r] = 0;
 +        }
++        if(hv_knob[HV_K_GROUPS]==2 && HV_GROUP_INTERLEAVE) {
++            int boundary=kind!=HV_INSN_COPY && kind!=HV_INSN_MEMORY;
++            if(kind==HV_INSN_MEMORY) {
++                HvMemOp candidate;
++                if(hv_mem_decode(insn,&candidate)||!group_op(&candidate)||(!HV_GROUP_WRITEBACK&&candidate.mode!=HV_ADDR_OFFSET))boundary=1;
++            }
++            if(boundary)for(int r=0;r<32;r++){cur[r]=-1;delta[r]=0;}
++        }
          if (kind == HV_INSN_COPY || kind == HV_INSN_PCREL || kind == HV_INSN_LOAD_LITERAL) {
 +            /* ADD/SUB Xn, Xn, #imm changes only the address origin, not the
 +               validated translation. Include its delta in the group's extent.
@@ -1689,7 +1721,7 @@ index cebfb7d..d37149f 100644
              KILL(insn);
              continue;
          }
-@@ -1923,18 +2073,29 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1923,18 +2102,29 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
              continue;
          }
          if (kind == HV_INSN_PREFETCH) continue;
@@ -1721,7 +1753,7 @@ index cebfb7d..d37149f 100644
                      e->gid[i] = (int8_t)cur[b], e->grole[i] = 2, e->goff[i] = (int32_t)off;
                  }
              }
-@@ -1943,6 +2104,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1943,6 +2133,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
                  delta[b] = 0;
                  off = op.mode == HV_ADDR_POST ? 0 : op.imm;
                  e->grp[e->ngrp++] = (Group){.lo = (int32_t)off, .hi = (int32_t)(off + op.bytes), .store = op.store,
@@ -1729,7 +1761,7 @@ index cebfb7d..d37149f 100644
                                              .base = (uint8_t)b, .first = (uint16_t)i, .last = (uint16_t)i};
                  e->gid[i] = (int8_t)cur[b], e->grole[i] = 1, e->goff[i] = (int32_t)off;
              } else if (!g) {
-@@ -1966,8 +2128,20 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1966,8 +2157,14 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
      uint16_t slot_free[GROUP_SLOTS] = {0};
      for (uint32_t k = 0; k < e->ngrp; k++) {
          Group *g = &e->grp[k];
@@ -1737,21 +1769,41 @@ index cebfb7d..d37149f 100644
 +        g->live = g->register_only = 0;
          if (g->last == g->first) continue;
 +        if (hv_knob[HV_K_GROUPS] == 2) {
-+            if (g->writeback) {
-+                /* Two offset accesses keep the cheaper register path. A
-+                   writeback span needs three accesses before paying for a
-+                   cached slot. The whole-span permission/page guard and
-+                   original-instruction fallback are unchanged. */
-+                if (g->accesses < 3) continue;
-+            } else {
-+                if (!register_group(e,g,k,code)) continue;
-+                g->register_only = 1;
-+            }
++            if (!g->writeback && register_group(e,g,k,code))g->register_only=1;
++            else if(HV_GROUP_INTERLEAVE) {if(!cached_group(e,g,code))continue;}
++            else if(g->writeback) {if(g->accesses<3)continue;}
++            else continue;
 +        }
          for (int s = 0; s < GROUP_SLOTS; s++)
              if (slot_free[s] <= g->first) {
                  g->slot = (uint8_t)s, g->live = 1;
-@@ -1996,13 +2170,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1975,6 +2172,16 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+                 break;
+             }
+     }
++    /* Prune any reusable span crossing an access which did not get a checked
++       fast path (including slot exhaustion). Iterate because groups overlap. */
++    if(hv_knob[HV_K_GROUPS]==2 && HV_GROUP_INTERLEAVE)for(int changed=1;changed;) {
++        changed=0;
++        for(unsigned k=0;k<e->ngrp;k++) {
++            Group *g=&e->grp[k];if(!g->live)continue;
++            for(unsigned i=g->first;i<=g->last;i++)if(hv_classify(code[i])==HV_INSN_MEMORY &&
++                (e->gid[i]<0 || !e->grp[(unsigned)e->gid[i]].live)) {g->live=0;changed=1;break;}
++        }
++    }
+     /* A failed group runs its instructions plain, through its last access and
+        through every later-starting group that runs on past it (whose first
+        access the plain copy then makes too). */
+@@ -1986,7 +2193,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+             again = 0;
+             for (uint32_t j = 0; j < e->ngrp; j++) {
+                 Group *h = &e->grp[j];
+-                if (h->live && h->first > g->first && h->first <= end && h->last > end) end = h->last, again = 1;
++                if (h->live && h->first <= end && h->last > end) end = h->last, again = 1;
+             }
+         }
+         g->end = end;
+@@ -1996,13 +2203,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
  /* After the block: each live group's plain copy. Returns -1 if they do not fit. */
  static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_t ntrans) {
      e->nogroup = 1;
@@ -1779,7 +1831,7 @@ index cebfb7d..d37149f 100644
              e->cur_pc = va + 4ull * i;
              e->cur_i = i;
              e->u_prev = e->u_live = 0;
-@@ -2017,8 +2205,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
+@@ -2017,8 +2238,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
  static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup);
  
  int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
@@ -1791,7 +1843,7 @@ index cebfb7d..d37149f 100644
      if (hv_knob[HV_K_GROUPS] && translate_emit(m, b, code, avail, 0) == 0) return 0;
      return translate_emit(m, b, code, avail, 1);
  }
-@@ -2026,6 +2215,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
+@@ -2026,6 +2248,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
  static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup) {
      Emit *e = &E;
      e->n = e->other_n = e->npool = e->nfix = e->nool = e->nsite = e->nrel = 0;
@@ -1799,7 +1851,7 @@ index cebfb7d..d37149f 100644
      e->w = e->hot;
      e->in_cold = 0;
      e->flat = hv_knob[HV_K_TEST2];
-@@ -2113,13 +2303,20 @@ static __thread struct {
+@@ -2113,13 +2336,20 @@ static __thread struct {
      HvMachine *m;
      uint64_t gen;
      uint32_t *hot, *cold;
@@ -1822,7 +1874,7 @@ index cebfb7d..d37149f 100644
          if (want < (size_t)hot + cold) want = (size_t)hot + cold;
          uint32_t *p = hv_jit_reserve(&m->jit, want);
          if (!p && m->jit_tail_enabled && want > (size_t)hot + cold) {
-@@ -2131,6 +2328,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
+@@ -2131,6 +2361,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
          }
          if (!p) { chunk.hot = NULL; return -1; }
          chunk.m = m, chunk.gen = gen, chunk.hot = p, chunk.cold = p + ((want + 1) & ~(size_t)1);
@@ -1834,15 +1886,16 @@ index cebfb7d..d37149f 100644
      *hot_at = chunk.hot;
      chunk.hot += hot;
 diff --git a/core/translate.h b/core/translate.h
-index a5c29f4..736f3f1 100644
+index a5c29f4..12937d8 100644
 --- a/core/translate.h
 +++ b/core/translate.h
-@@ -5,6 +5,9 @@
+@@ -5,6 +5,10 @@
  
  #include "machine.h"
  
 +/* Build-time reference switch for differential codegen/performance checks. */
 +int hv_translate_writeback_groups(void);
++int hv_translate_interleaved_groups(void);
 +
  /* What a block passes to hv_helper. Lives in the block's literal pool. */
  typedef struct HvHelperInfo {
@@ -8580,6 +8633,27 @@ index 0000000..1d6c0b5
 +the strict native-window test; no app release timer, feature or test is disabled.
 +M4 tests retain the actual M4 device type. Neither setup emulates physical chip
 +performance, P/E placement, watts or thermals.
+diff --git a/docs/m4-optimisation/ENGINE-IMPLEMENTATION.md b/docs/m4-optimisation/ENGINE-IMPLEMENTATION.md
+new file mode 100644
+index 0000000..c1367a2
+--- /dev/null
++++ b/docs/m4-optimisation/ENGINE-IMPLEMENTATION.md
+@@ -0,0 +1,15 @@
++# Engine implementation checkpoint
++
++Base runtime0179a1a; wrapper8f316b8c; branch perf/engine-memory-dispatch.
++Keep cumulative pinned patch delivery; no IPA during development.
++
++Required workstreams:
++- [ ] Broader checked reuse: independent bases, cached/register tiers, precise fallback.
++- [ ] TLB lookup latency: native comparisons, guarded default and fault parity.
++- [ ] Selective branch-cache preservation during segment eviction.
++- [ ] Targeted branch-site acceleration integrated with existing invalidation.
++- [ ] Workload-aware nonmoving segment retention and PC ownership lookup.
++- [ ] Combined correctness, sanitizers, iOS compilation, native performance checks.
++
++Reference paths must remain executable. No per-load production profiling, no
++weakened page/permission/ASID/PAN/MMIO/SMC checks, no new competing cache policy.
 diff --git a/docs/m4-optimisation/GUEST-GPU-BUDGET-ABI.md b/docs/m4-optimisation/GUEST-GPU-BUDGET-ABI.md
 new file mode 100644
 index 0000000..4ce282e
@@ -22266,6 +22340,37 @@ index 0000000..d964a16
 +    }}
 +    puts("PASS real classic Metal GPU results with repeated/range-changing bindings, both cache modes; encoding benchmark excludes commit/wait and is not a game FPS measurement");return 0;
 +}}
+diff --git a/tests/bench_interleaved_groups.c b/tests/bench_interleaved_groups.c
+new file mode 100644
+index 0000000..e03e759
+--- /dev/null
++++ b/tests/bench_interleaved_groups.c
+@@ -0,0 +1,25 @@
++#include "machine.h"
++#include "dispatch.h"
++#include <assert.h>
++#include <mach/mach_time.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++extern const char mem_programs_begin[],mem_programs_finish[],bench_interleaved_groups[],bench_interleaved_groups_end[];
++static HvMachine m;static HvCpu cpu;
++static void run(unsigned iterations,void *data){cpu.pc=(uintptr_t)bench_interleaved_groups;cpu.x[0]=(uintptr_t)data;cpu.x[24]=iterations;cpu.x[10]=0;assert(hv_run(&cpu)==HV_EXIT_HALT);assert(!cpu.x[24]&&cpu.x[10]==iterations*2ull);}
++int main(void){
++ assert(!hv_machine_init(&m,8<<20));m.stats_interval=1;
++ void *data=aligned_alloc(16384,65536);assert(data);memset(data,0,65536);
++ for(int i=0;i<65536;i+=8)*(uint64_t *)((char *)data+i)=1;
++ assert(!hv_machine_add_ram(&m,(uintptr_t)data,65536,data,0));
++ assert(!hv_machine_add_ram(&m,(uintptr_t)mem_programs_begin,mem_programs_finish-mem_programs_begin,(void *)mem_programs_begin,1));
++ m.stop_pc=(uintptr_t)bench_interleaved_groups_end;
++ mach_timebase_info_data_t tb;assert(!mach_timebase_info(&tb));
++ for(int round=0;round<5;round++)for(int k=0;k<2;k++){
++  int mode=(k^(round&1))?2:0;hv_knob[HV_K_GROUPS]=mode;hv_flush_blocks(&m);hv_cpu_reset(&cpu,&m);cpu.cpacr_el1=3u<<20;
++  run(1000,data);uint64_t start=mach_absolute_time();run(300000,data);double ns=(double)(mach_absolute_time()-start)*tb.numer/tb.denom;
++  printf("interleaved-bench: round=%d groups=%d ns_per_six_loads=%.3f result=600000\n",round,mode,ns/300000);
++ }
++ hv_machine_free(&m);free(data);
++}
 diff --git a/tests/bench_programs.S b/tests/bench_programs.S
 index b4f57c2..f409aac 100644
 --- a/tests/bench_programs.S
@@ -22563,10 +22668,10 @@ index 0000000..74083bb
 + return rc?1:0;
 +}
 diff --git a/tests/exc_programs.S b/tests/exc_programs.S
-index e164bea..98203d4 100644
+index e164bea..87c978e 100644
 --- a/tests/exc_programs.S
 +++ b/tests/exc_programs.S
-@@ -108,6 +108,41 @@ PROGRAM p_dabt
+@@ -108,6 +108,55 @@ PROGRAM p_dabt
      mov x10, x8
  END p_dabt
  
@@ -22580,6 +22685,20 @@ index e164bea..98203d4 100644
 +2:  ldr x3, [x9, #16] // first byte beyond the mapped RAM region
 +    adr x4, 2b
 +END p_group_fault
++
++PROGRAM p_group_interleaved_fault
++    SETUP
++    sub x12,x9,#256
++    ldr x15,[x12]
++    ldr x15,[x9]
++    dmb ish
++    ldr x1,[x12]
++    ldr x2,[x9]
++    ldr x3,[x12,#8]
++1:  ldr x5,[x9,#16]
++    ldr x6,[x12,#16]
++    adr x4,1b
++END p_group_interleaved_fault
 +
 +// The span guard falls back as a whole; each completed post-index updates
 +// its base exactly once, and a faulting pre-index never commits writeback.
@@ -23203,7 +23322,7 @@ index c682d62..8d8dc78 100644
 +
 +enum HostScheduling { static var isDuo:Bool { false } }
 diff --git a/tests/mem_programs.S b/tests/mem_programs.S
-index bcbed3f..7f1bbf4 100644
+index bcbed3f..7aac629 100644
 --- a/tests/mem_programs.S
 +++ b/tests/mem_programs.S
 @@ -355,6 +355,87 @@ PROGRAM groups
@@ -23294,7 +23413,7 @@ index bcbed3f..7f1bbf4 100644
  PROGRAM mmio
      str w1, [x0]
      ldr w2, [x0, #4]
-@@ -368,5 +449,74 @@ PROGRAM mmio
+@@ -368,5 +449,119 @@ PROGRAM mmio
      ldr x28, [x18, #8]
  END mmio
  
@@ -23353,6 +23472,51 @@ index bcbed3f..7f1bbf4 100644
 +    ldp x8,x9,[x13],#32
 +    str x6,[x0]
 +END groups_writeback_scratch
++
++// Interleaved bases need independent checked slots, including a scratch clobber.
++PROGRAM groups_interleaved
++    add x12,x0,#512
++    add x13,x0,#1024
++    ldr x1,[x12]
++    ldr x2,[x13]
++    add x6,x6,#17
++    ldr x3,[x12,#8]
++    ldr x4,[x13,#8]
++    str x3,[x12,#16]
++    str x4,[x13,#16]
++    ldr x5,[x12,#16]
++    ldr x7,[x13,#16]
++END groups_interleaved
++
++// The later group's guard crosses a page. Its plain suffix must also cover
++// the older group's later accesses, rather than reusing state after a helper.
++PROGRAM groups_interleaved_cross
++    add x12,x0,#512
++    add x13,x0,#4,lsl#12
++    sub x13,x13,#8
++    ldr x1,[x12]
++    ldr x2,[x13]
++    ldr x3,[x12,#8]
++    ldr x4,[x13,#8]
++    str x3,[x12,#16]
++    ldr x5,[x12,#16]
++END groups_interleaved_cross
++
++PROGRAM bench_interleaved_groups
++    add x12,x0,#512
++    add x13,x0,#1024
++Lbench_interleaved_loop:
++    ldr x1,[x12]
++    ldr x2,[x13]
++    ldr x3,[x12,#8]
++    ldr x4,[x13,#8]
++    ldr x5,[x12,#16]
++    ldr x7,[x13,#16]
++    add x10,x10,x1
++    add x10,x10,x4
++    subs x24,x24,#1
++    b.ne Lbench_interleaved_loop
++END bench_interleaved_groups
 +
 +// Standalone benchmark body; test_mem selects only the programs above.
 +PROGRAM bench_stack_groups
@@ -25383,20 +25547,21 @@ index 0000000..0987167
 +    puts("PASS explicit false and legacy presence flags");
 +}
 diff --git a/tests/test_exc.c b/tests/test_exc.c
-index 52bf4de..65ac689 100644
+index 52bf4de..fc6ab60 100644
 --- a/tests/test_exc.c
 +++ b/tests/test_exc.c
-@@ -6,6 +6,9 @@
+@@ -6,6 +6,10 @@
  DECLARE_PROGRAM(p_svc);
  DECLARE_PROGRAM(p_brk_undef);
  DECLARE_PROGRAM(p_dabt);
 +DECLARE_PROGRAM(p_group_fault);
++DECLARE_PROGRAM(p_group_interleaved_fault);
 +DECLARE_PROGRAM(p_group_writeback_fault);
 +DECLARE_PROGRAM(p_group_writeback_store_fault);
  DECLARE_PROGRAM(p_el0);
  DECLARE_PROGRAM(p_sysregs);
  DECLARE_PROGRAM(p_irq);
-@@ -86,6 +89,42 @@ int main(void) {
+@@ -86,6 +90,57 @@ int main(void) {
          check("dabt", "no writeback on a fault", c.x[10], 0x10000);
      }
  
@@ -25410,6 +25575,21 @@ index 52bf4de..65ac689 100644
 +        check("grouped fault","single exception",c.x[24],1);
 +    }
 +
++    static const TestProgram interleaved_fault=TEST_PROGRAM(p_group_interleaved_fault);
++    for(int grouped=0;grouped<=2;grouped+=2) {
++        hv_knob[HV_K_GROUPS]=grouped;hv_flush_blocks(&m);
++        *(uint64_t *)(stack+65536-16)=11;
++        *(uint64_t *)(stack+65536-272)=7;*(uint64_t *)(stack+65536-264)=13;*(uint64_t *)(stack+65536-256)=17;
++        if(!run(&interleaved_fault,&c,ADDR(stack)+65536-16)) {
++            check("interleaved fault","earlier group load",c.x[1],7);
++            check("interleaved fault","later group load",c.x[2],11);
++            check("interleaved fault","completed older group load",c.x[3],13);
++            check("interleaved fault","older group after fault",c.x[6],17);
++            check("interleaved fault","precise PC",c.x[22],c.x[4]);
++            check("interleaved fault","precise FAR",c.x[21],ADDR(stack)+65536);
++            check("interleaved fault","one exception",c.x[24],1);
++        }
++    }
 +    static const TestProgram writeback_fault=TEST_PROGRAM(p_group_writeback_fault);
 +    static const TestProgram writeback_store_fault=TEST_PROGRAM(p_group_writeback_store_fault);
 +    int saved_groups=hv_knob[HV_K_GROUPS];
@@ -27009,15 +27189,17 @@ index 0000000..58bc0e1
 +    }
 +}
 diff --git a/tests/test_mem.c b/tests/test_mem.c
-index 35ecb46..d4d6898 100644
+index 35ecb46..4777582 100644
 --- a/tests/test_mem.c
 +++ b/tests/test_mem.c
-@@ -16,13 +16,22 @@ DECLARE_PROGRAM(epilogue);
+@@ -16,13 +16,24 @@ DECLARE_PROGRAM(epilogue);
  DECLARE_PROGRAM(dczva);
  DECLARE_PROGRAM(pageend);
  DECLARE_PROGRAM(groups);
 +DECLARE_PROGRAM(groups_increment);
 +DECLARE_PROGRAM(groups_shared);
++DECLARE_PROGRAM(groups_interleaved);
++DECLARE_PROGRAM(groups_interleaved_cross);
 +DECLARE_PROGRAM(groups_register);
 +DECLARE_PROGRAM(groups_two);
 +DECLARE_PROGRAM(groups_stack_frame);
@@ -27031,12 +27213,12 @@ index 35ecb46..d4d6898 100644
      TEST_PROGRAM(single), TEST_PROGRAM(stolen_mem), TEST_PROGRAM(pairs),   TEST_PROGRAM(simd_mem),
      TEST_PROGRAM(exclusive), TEST_PROGRAM(atomics),  TEST_PROGRAM(literal), TEST_PROGRAM(loops), TEST_PROGRAM(epilogue),
 -    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups),
-+    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups), TEST_PROGRAM(groups_increment), TEST_PROGRAM(groups_shared), TEST_PROGRAM(groups_register), TEST_PROGRAM(groups_two),
++    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups), TEST_PROGRAM(groups_increment), TEST_PROGRAM(groups_shared), TEST_PROGRAM(groups_interleaved), TEST_PROGRAM(groups_interleaved_cross), TEST_PROGRAM(groups_register), TEST_PROGRAM(groups_two),
 +    TEST_PROGRAM(groups_stack_frame), TEST_PROGRAM(groups_writeback_cross), TEST_PROGRAM(groups_writeback_negative), TEST_PROGRAM(groups_writeback_scratch),
  };
  
  #define DATA_SIZE 65536
-@@ -36,6 +45,7 @@ static uint64_t data_seed;
+@@ -36,6 +47,7 @@ static uint64_t data_seed;
  static uint64_t ttbr0, ttbr0_el0, pt_next, map_ap;
  
  static void reset_data(void) {
@@ -27044,7 +27226,7 @@ index 35ecb46..d4d6898 100644
      uint64_t s = data_seed * 0x2545f4914f6cdd1dull + 7;
      for (size_t i = 0; i < DATA_SIZE; i += 8) {
          s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-@@ -164,6 +174,9 @@ int main(void) {
+@@ -164,6 +176,9 @@ int main(void) {
      setvbuf(stdout, NULL, _IONBF, 0);
      static HvMachine m;
      if (hv_machine_init(&m, 8 << 20) != 0) return 1;
@@ -27054,7 +27236,7 @@ index 35ecb46..d4d6898 100644
      data = aligned_alloc(16384, DATA_SIZE);
      stack = aligned_alloc(16384, STACK_SIZE);
      pt = aligned_alloc(16384, PT_SIZE);
-@@ -180,6 +193,7 @@ int main(void) {
+@@ -180,6 +195,7 @@ int main(void) {
      size_t count = sizeof programs / sizeof programs[0];
      int failed = 0;
      static uint8_t native_data[DATA_SIZE];
@@ -27062,7 +27244,7 @@ index 35ecb46..d4d6898 100644
      for (int mode = 0; mode < 4; mode++) {
          m.slow_mem = mode == 0;
          hv_flush_blocks(&m);
-@@ -192,6 +206,7 @@ int main(void) {
+@@ -192,6 +208,7 @@ int main(void) {
              data_seed = i + 3;
              run_native(p, &init, &native, reset_data);
              memcpy(native_data, data, DATA_SIZE);
@@ -27070,7 +27252,7 @@ index 35ecb46..d4d6898 100644
              reset_data();
              m.stat_slow_mem = 0;
              int bad = run_jit(&m, p, &init, &jit, mode == 2 ? mmu_on : mode == 3 ? mmu_on_el0 : NULL);
-@@ -205,6 +220,16 @@ int main(void) {
+@@ -205,6 +222,16 @@ int main(void) {
                             (unsigned long long)b);
                      bad = 1;
                  }
@@ -29381,10 +29563,10 @@ index 0000000..60d7847
 +}
 diff --git a/tests/test_register_groups.c b/tests/test_register_groups.c
 new file mode 100644
-index 0000000..4c46c83
+index 0000000..6742ecb
 --- /dev/null
 +++ b/tests/test_register_groups.c
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,43 @@
 +#include "translate.h"
 +#include <assert.h>
 +#include <stdio.h>
@@ -29416,6 +29598,9 @@ index 0000000..4c46c83
 +    assert(hot(2,alternating,7)+10<hot(0,alternating,7)); /* field groups on distinct base registers */
 +    assert(hot(2,stream+1,4)+6<hot(0,stream+1,4)); /* three-field objects also reuse the translation */
 +    assert(hot(2,stream+2,3)<hot(0,stream+2,3)); /* two fields share one validated lookup */
++    const uint32_t interleaved[]={0xf9400181,0xf94001a2,0xf9400583,0xf94005a4,0xf9400985,0xf94009a7,0xd65f03c0};
++    if(hv_translate_interleaved_groups())assert(hot(2,interleaved,7)+10<hot(0,interleaved,7));
++    else assert(hot(2,interleaved,7)==hot(0,interleaved,7));
 +    hv_knob[HV_K_GROUP_MIN]=3;
 +    assert(hot(0,stream+2,3)==hot(2,stream+2,3));
 +    hv_knob[HV_K_GROUP_MIN]=2;
