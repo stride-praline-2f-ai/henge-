@@ -47,7 +47,7 @@ int main(void){@autoreleasepool{
         uintptr_t code=(uintptr_t)ptrauth_strip(method_getImplementation(method),ptrauth_key_function_pointer);
         Dl_info image={0};dladdr((void *)code,&image);
         NSMutableDictionary *m=[@{@"selector":name,@"encoding":@(method_getTypeEncoding(method)),@"address":@(code),
-            @"image":image.dli_fname?@(image.dli_fname):@"unknown",@"image_base":@((uintptr_t)image.dli_fbase)}mutableCopy];
+            @"image":image.dli_fname?@(image.dli_fname):@"unknown",@"image_base":@((uintptr_t)image.dli_fbase),@"symbol":image.dli_sname?@(image.dli_sname):@"unknown"}mutableCopy];
         mach_vm_address_t region=code;mach_vm_size_t size=0;vm_region_basic_info_data_64_t info={0};
         mach_msg_type_number_t count=VM_REGION_BASIC_INFO_COUNT_64;mach_port_t object=MACH_PORT_NULL;
         kern_return_t status=mach_vm_region(mach_task_self(),&region,&size,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&info,&count,&object);
@@ -57,6 +57,23 @@ int main(void){@autoreleasepool{
             [[NSData dataWithBytes:(void *)code length:length]writeToFile:file atomically:YES];m[@"code_file"]=file;
         }
         [methods addObject:m];
+        if([name isEqualToString:@"initWithAcceleratorPort:options:"]&&m[@"code_file"]){
+            NSData *bytes=[NSData dataWithContentsOfFile:m[@"code_file"]];const uint32_t *words=bytes.bytes;
+            unsigned limit=(unsigned)MIN(bytes.length/4,(NSUInteger)320);
+            NSMutableArray *calls=[NSMutableArray new];
+            for(unsigned j=0;j<limit;j++)if((words[j]&0xfc000000)==0x94000000){
+                int64_t displacement=(int64_t)(int32_t)(words[j]<<6)>>4;
+                uintptr_t dest=code+j*4+displacement;Dl_info symbol={0};
+                if(!dladdr((void *)dest,&symbol)||symbol.dli_fbase!=image.dli_fbase)continue;
+                NSMutableDictionary *call=[@{@"address":@(dest),@"offset":@(j*4),@"symbol":symbol.dli_sname?@(symbol.dli_sname):@"unknown"}mutableCopy];
+                if(j*4>=0x180&&j*4<=0x1b0){
+                    NSString *file=[NSString stringWithFormat:@"memory-init-call-%x.bin",j*4];
+                    [[NSData dataWithBytes:(void *)dest length:2048]writeToFile:file atomically:YES];call[@"code_file"]=file;
+                }
+                [calls addObject:call];
+            }
+            m[@"initialization_calls"]=calls;
+        }
     }
     io_registry_entry_t entry=IOServiceGetMatchingService(kIOMainPortDefault,IORegistryEntryIDMatching(device.registryID));
     for(unsigned depth=0;entry&&depth<8;depth++){
