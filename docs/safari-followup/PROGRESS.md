@@ -1,31 +1,26 @@
 # Safari replay follow-up
 
-User report on117: Safari page loading, scrolling/typing and moving its own window are slow; Notes, Settings and Roblox are comparatively usable. This narrows the investigation but is not foreground-app profiling or proof of a specific bottleneck.
+Report on117: Safari page loading, scrolling/typing and moving its own window are slow; Notes, Settings and Roblox comparatively usable. Window movement points beyond network loading but does not prove an exclusive cause.
 
-Implemented against frozen117 runtime ebeaad5, preserving CPU/JIT work:
-- Admit the existing command/task-scoped immutable object and page-mapping reuse by default; mutable resource entries still checked. HV_GPU_BATCH_CACHE=0 selects the reference path.
-- One full guest-byte hash per exact planar backing per command, sharing only validated all-pages/layout aliases. Independent allocations and new commands recheck all bytes. Command numbers advance even after rejection and saturate safely to uncached mode at wrap.
-- Omit the redundant empty classic command buffer immediately before a successful Metal4 handoff. Real staging/legacy work, the runtime's bidirectional signal/wait bridge and final guest completion remain. HV_PVG_SYNC retains diagnostic synchronization.
+## Implementation
 
-Local ASan/UBSan production helper tests passed:10000 page uses ->1 full320-page metadata comparison; alias dedup, distinct allocations, changed last page, failed remap retry, task/command boundaries, wrap and explicit reference. This is fixture work reduction, not measured Safari FPS or heat.
+Runtime `458eb0ff26ae776fadf8090d0ec3a5cfa1c523b1`, exported patch `53b3f15acb3c4a75fa42f96ee0ddf7e78732852472dda92aeecb7e39ab4673ef` preserves all117 CPU/JIT code.
 
-Next: inspect the focused source job, fix all independent failures, then record native GPU pixels/ordering and macOS/iOS production compile results. No IPA is requested or generated. Physical Safari performance still needs the same RAM/vCPUs/Retina/refresh/LPM configuration, blank page vs loaded page, and comparable Notes-window movement. Do not overwrite117 or claim this fixes WebKit JavaScript performance.
+- Default on: existing command/task-scoped immutable GPU-object/page-metadata reuse. Mutable resource metadata still checked; HV_GPU_BATCH_CACHE=0 preserves reference mode. Rejected commands advance epochs; wrap saturates to uncached mode.
+- Share a full-byte backing scan only across exact all-pages/layout aliases within one command. Independent allocations and new commands recheck. Backend ownership remains immutable.
+- Omit empty classic submissions before successful Metal4 handoff. Real legacy/upload work, the runtime bidirectional signal/wait bridge and final guest completion remain.
+- Adapt Oliver Ames upstream PR187 two-level surface tables above64MiB; flatten leaves once for mapping and exact registry identity. Invalid RAM and failed mappings reject incomplete allocations. Presence of such surfaces in the reported Safari workload is unproven.
+- Coalesce contiguous physical pages only within a checked host RAM span; split RAM regions safely and fall back to individual pages after a host rejection. HV_PVG_REMAP_SINGLE=1 is the reference. Existing surface logs now show table level, page count and actual remap calls.
+- Added reuse/epoch/real-Mach-mapping regressions to the existing final sanitizer gate. No extra runtime timers, UI settings, resolution reduction or refresh cap.
 
+## Verification
 
-## Large-surface mapping
+[Focused run 43736645861](https://github.com/stride-praline-2f-ai/henge-/actions/runs/43736645861) passed on exact wrapper `65bede48f3838d2c04a7fd11a3acb16a63ba8278`. Source reconstruction, ASan/UBSan metadata/alias/wrap checks, real GPU pixels/ownership, recorded Metal4 queue/fence lifetimes and production macOS/iOS renderer compilation passed. Host GPU: Apple Paravirtual device.
 
-Found actual missing support when comparing Oliver Ames upstream PR187: surfaces over64MiB use a second table level. The old path read the root as a flat leaf array. Adapted only this checked mapping fix; retain the custom immutable planar backend and all-leaf-page identity. Invalid/non-RAM leaves and failed vm_remap now reject the incomplete allocation. Tests cover boundaries, flags/holes, changed final leaf and actual production newSurface through real Mach aliases/Metal buffer reads. No evidence yet that the user current Safari workload allocated such a surface. Native logs now identify flat vs two-level mapping. This is a concrete correctness fix, not a proven Safari root cause.
+Fixture reductions:10000 repeated uses ->1 full320-page check;10001 immutable accesses ->1 metadata read;4097 contiguous pages ->1 real Mach call instead of4097, all67125248 bytes equal reference. Injected combined-remap rejection recovers correctly. These are work reductions, not measured Safari FPS or energy. Release-request policy tests also passed.
 
-## Verified checkpoint
+## Remaining boundary
 
-Focused native/SDK run [43735267109](https://github.com/stride-praline-2f-ai/henge-/actions/runs/43735267109) passed on exact wrapper `3a18919c8dd79b07221d51a5be154ce0ca4b1d1c`, runtime `1ff0e31a058ac20f80d8e4843c39db1f9f60dea6`, cumulative patch `cf3a7f5e66d71ab1aecc05383bd5694d3870c3ec9820157f5e649e767d472291`. The real production surface mapping passed CPU/GPU first+last byte checks on a >64MiB allocation, flat compatibility, changed leaf, old mapping retention, malformed-tag holes and outside-RAM rejection. Metadata, alias, epoch-wrap, all display pixels, queue/fence/lifetime, warmup and resource ownership checks passed. Production renderer compiled for macOS and iOS. Core CPU/JIT files are unchanged from117.
+Changes are on `perf/safari-compositing`, not installed117. No IPA generated. Full app/release validation remains pending before packaging. Physical M4/Duo Safari FPS, heat and actual Metal4 pixels have not been measured. Compare blank vs loaded Safari and Notes window movement under identical RAM/vCPUs/Retina/refresh/LPM/diagnostics. Do not infer a WebKit JavaScript speedup or guaranteed60Hz from native helper checks.
 
-Next action: if an updated IPA is requested, run the full final native/app release gate on this frozen patch before packaging build118; do not call the focused renderer compile a full app/release gate. Physical comparison: Safari blank page and moving its window, loaded page/scrolling, and equivalent Notes movement with identical guest RAM/vCPUs/resolution/refresh/LPM/diagnostics. Existing diagnostic counters now expose actual resource-reuse and skipped-empty-submission counts; initial surface logs identify two-level allocations. No visible Safari FPS or energy gain is claimed yet. No user-facing setting or resolution reduction was added.
-
-## Contiguous remap follow-up
-
-Runtime1757ecb coalesces physically adjacent leaf pages only when a single checked guest RAM region backs the full host span. Crossing RAM regions uses a checked valid prefix; Mach rejection switches this allocation to individual-page mappings. HV_PVG_REMAP_SINGLE=1 keeps the reference path for comparisons. Source logs include page count and actual remap calls. No pixels, resolution, refresh or frame cap change.
-
-Local surface-table/helper ASan/UBSan checks passed. Current cloud gate must check the actual production mapper:4097 contiguous pages in one real Mach remap vs4097 reference calls, full-byte equality, real GPU reads and injected large-remap rejection with individual-page recovery. Prior green receipt above predates this change; do not present it as validation of the new patch. Next: run focused source workflow, fix any failures and update VALIDATION.json before release consideration.
-
-Contiguous remap checkpoint passed43736408228 on763cf5ce:4097 ->1 actual Mach calls, all67125248 bytes match the single-page reference, real GPU edge reads pass, and a rejected combined remap recovers using4097 single-page remaps. Production iOS/macOS compile and all other focused checks passed. Runtime458eb0f adds these checks to the existing release sanitizer gate; it makes no further production changes. Next: confirm the frozen exported patch in the focused source workflow, record its exact receipt, then leave full app/release validation pending for a requested IPA.
+Next source action if device results remain poor: compare existing GPU resource-scan/submission/pipeline/queue and vCPU/JIT diagnostics during those separate workloads. Before a requested IPA, freeze the patch, run the comprehensive native/app release gate, then package a new version; never overwrite117 or use this focused gate as full release proof.
