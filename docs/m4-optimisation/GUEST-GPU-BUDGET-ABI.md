@@ -53,7 +53,7 @@ do not enable kernel debug overrides or allocation failures under this label.
 - Existing M4 automatic default is **4 vCPUs / 8 GiB guest RAM**. Explicit user
   memory and saved snapshots remain unchanged. Ledger accounting does not
   make guest pages free physical memory.
-- New physical 116 capture shows Metal allocations below 600 MiB, while a
+- New physical 116 capture shows observed Metal allocation up to 618.1 MiB, while a
   16 GiB guest exceeds whole-device physical capacity and system compression
   reaches 6.39 GiB. A copied 5 GiB cap would not address this capture's symptom.
 - Implement bounded scattered disk I/O and failed-DMA invalidation based on

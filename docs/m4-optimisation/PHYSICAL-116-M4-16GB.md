@@ -40,7 +40,9 @@ Original input identities:
   memory-warning events are recorded. Live guest allocations are retained.
 - Metal allocations in rate captures are **166.5–571.5 MiB**, far below the
   CyPort screenshot's 6–7 GiB symptom. Resource accounting may overlap guest
-  RAM/zero-copy mappings. A 5 GiB GPU cap would not constrain these observations.
+  RAM/zero-copy mappings. The more frequent native replay reports reach
+  **618.1 MiB**; this is the highest observed figure across both logs. A 5 GiB
+  GPU cap would not constrain these observations.
 
 Action: retain safe 8 GiB M4 automatic default, and compare this machine at
 8 GiB after a full shutdown. Do not increase RAM/JIT as an assumed cure or
