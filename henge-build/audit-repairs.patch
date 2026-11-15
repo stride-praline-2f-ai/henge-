@@ -25947,13 +25947,14 @@ index 0000000..03b97d3
 +}}
 diff --git a/tests/test_metal4_compilation.m b/tests/test_metal4_compilation.m
 new file mode 100644
-index 0000000..630b446
+index 0000000..f068829
 --- /dev/null
 +++ b/tests/test_metal4_compilation.m
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,148 @@
 +#import <Foundation/Foundation.h>
 +#include <assert.h>
 +#include <unistd.h>
++#include <pthread.h>
 +#include "../devices/metal4_encoder.h"
 +
 +@interface WarmFunction : NSObject @end
@@ -26019,6 +26020,20 @@ index 0000000..630b446
 +    assert([q enqueue:^(BOOL allowed){assert(allowed);dispatch_semaphore_signal(done);}]);
 +    assert(!dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC)));
 +}
++/* pthread_create publishes the captured objects explicitly to TSan. Keeping
++   them in this joined context also avoids dispatch_apply's copied ObjC-block
++   capture publication being invisible to some libdispatch/TSan combinations. */
++typedef struct {
++    __unsafe_unretained WarmRuntime *runtime;
++    __unsafe_unretained WarmState *state;
++    __unsafe_unretained dispatch_semaphore_t start;
++} WarmConcurrentContext;
++static void *prepareConcurrent(void *opaque) {@autoreleasepool{
++    WarmConcurrentContext *context=opaque;
++    assert(!dispatch_semaphore_wait(context->start,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC)));
++    for(unsigned i=0;i<8;i++)assert(!hv_metal4_variant(context->runtime,context->state));
++    return NULL;
++}}
 +int main(void){@autoreleasepool{
 +    alarm(30);
 +    WarmRuntime *runtime=[WarmRuntime new];
@@ -26043,7 +26058,11 @@ index 0000000..630b446
 +    assert(hv_metal4_variant(runtime,b)&&atomic_load(&runtime->calls)==2);
 +    /* Concurrent first use is coalesced to one retained compiler request. */
 +    unsigned before=atomic_load(&runtime->calls);
-+    dispatch_apply(64,dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^(size_t i){(void)i;assert(!hv_metal4_variant(runtime,c));});
++    dispatch_semaphore_t start=dispatch_semaphore_create(0);
++    WarmConcurrentContext context={runtime,c,start};pthread_t workers[8];
++    for(unsigned i=0;i<8;i++)assert(!pthread_create(&workers[i],NULL,prepareConcurrent,&context));
++    for(unsigned i=0;i<8;i++)dispatch_semaphore_signal(start);
++    for(unsigned i=0;i<8;i++)assert(!pthread_join(workers[i],NULL));
 +    waitStarted(runtime);assert(atomic_load(&runtime->calls)==before+1);
 +    finish(runtime,cv);barrier(runtime->pipelineQueue);assert(hv_metal4_variant(runtime,c));
 +    for(unsigned mode=0;mode<3;mode++) {
