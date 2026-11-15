@@ -1,0 +1,40 @@
+# Physical 116: Duo / iPad comparison (2026-11-15)
+
+Scope: supplied D5169011 Duo and 34A5245B iPad exports. Both report 0.3.15 (116), wrapper 488d560f7ee460080e90c89384380761c082a2d0. No paired baseline or measured speedup exists. Native stderr is mirrored in henge.log: never sum the two files. Profiler dumps span multiple launches: filter by PID.
+
+## Duo: complete current session, PID 4740
+
+- Four vCPUs, 8 GiB guest RAM, 1.5 GiB JIT, 1280x900 non-Retina guest with 2x presentation. Low Power Mode OFF throughout capture. These logs do not measure the previously discussed LPM configuration.
+- 26 comparable running intervals cover 253.949 s. Time-weighted process CPU is 3.268 core equivalents (individual-window median across all captures including transitions 3.366). This is CPU time, not physical-core placement. Nine profiler windows attribute 74.5–80.4% of busy samples to generated JIT code.
+- Current-PID JIT instruction samples: 3 recurring TLB-related loads comprise 3066/12379 = 24.77%. This is a statistical sample share, not a removable percentage or a proven speedup opportunity. Existing checked grouped spans are active; addend preload is off.
+- Fastmem (a kernel read cache probed after the ordinary software TLB) ends at 99.48%, 99.63%, 99.64%, 99.54% hit rates. This does not measure every guest memory access and does not eliminate ordinary TLB overhead.
+- JIT: 16,372,605 translations, 8,233,790 approximate retranslations, 20 segment evictions, zero full resets. Evictions dropped 12,000,714 blocks and repaired 2,614,145 exits. Last engine report accounts 3.642 s cumulative eviction work, mainly exit repair (2.697 s). Not the only cause of sluggishness.
+- Metal4: 43,615 guest submissions, 43,614 completions at the final report, zero guest GPU errors. 6,429 fallbacks: 4,804 unsupported streams, 1,625 pool/disabled events. Last rejected stream is compute tag 219 / four payload bytes. Other tags cannot be excluded from aggregate counters. Classic decoder already consumes 219 with no encoder call.
+- MetalFX: 1,647 encoded new images, 1,375 cached cursor reuses, zero recorded fallbacks. It IS active; this does not prove a performance gain. It only upscales final presentation, not guest CPU execution.
+- GPU durations across comparable windows: classic 793.777 ms, Metal4 guest+display 9,131.194 ms. These overlapping command lifetimes are not utilization. Many weak-presentation windows still use >3 CPU equivalents with little reported GPU execution. CPU-side emulation is a strong bottleneck candidate, not evidence that graphics are CPU-rendered.
+- Metal4 compiler: 478 attempts / 9.743 s total / 781.84 ms maximum; classic cold compiles 130 / 4.018 s, archive hits 1,446 / 1.998 s lookup+state creation. Cold shader compilation can visibly interrupt interaction; totals overlap other work and cannot be added into a frame-time estimate.
+- Process footprint peaks 4.61 GiB; headroom bottoms at 1.89 GiB. Device GPU allocations peak 1.03 GiB. These overlap other accounting categories. Raw system compressor bytes rise 1.38 -> 2.63 GiB while free pages stay small (64.6 -> 87.3 MiB at endpoints). Process allowance remaining is not proof of abundant physical RAM, especially with footprint-excluded guest backing. No UIKit memory warnings are recorded in this run.
+- Reported host presentation rates vary 0–39.42/s, with multi-second gaps; includes cursor and legitimate unchanged desktop intervals, not game FPS or active-animation latency. No continuous-animation marker exists, so do not treat the session-average rate as a benchmark.
+- Thermal reaches Fair about 64 s after VM start, Serious about 229 s after start. These are OS categories, not temperatures. No explicit presentation cap is applied in this run. The heating concern remains unresolved.
+- DNS answers all recorded 134 queries with zero fallback/timeouts; root I/O final maximum 194.981 ms, cumulative service 38.175 s / queue 34.030 s across 203,562 requests. Last three storage windows are only 4% busy; storage is not shown to be continuously saturated. CPU-side guest loading and cold shader work deserve priority over blindly enlarging I/O queues.
+- The Duo ends by host-requested pause/save/stop, not a crash. In-memory pause completed in milliseconds; persistent snapshot took 30.03 s (29.43 s compression, 24.91 s writer waiting for compression). Background save still cannot be promised to finish within iOS time.
+
+## iPad: previous-run tail only, current PID 4046 is startup
+
+Current henge.log ends 3.815 s after launch, just after starting JITHelper; current native log is 181 bytes. No VM was started in this current log. The crash run is represented only by 40 replayed previous native lines. No fatal signal, exception, jetsam, OS termination reason, stack trace or full memory history is supplied. Do not claim the crash was caused or fixed by memory, MetalFX or Metal4.
+
+- Previous tail: 808,000 replay execs, 6,601,899 draws, zero failed replay execs. Metal4 522,299 submissions / 522,289 completions, zero guest errors at last observation. Ten pending commands do not identify a hang or crash.
+- Metal4 fallbacks 283,580: unsupported streams 268,629; pool/disabled 14,951. Last unsupported record is also compute 219 / four bytes. Relative to Duo, this session uses a very different command mix and has much more fallback activity. Lengths/workloads differ; not a controlled device comparison.
+- MetalFX 31,936 encodes / 4,188 cursor reuses / zero fallbacks. Reported short-window host cadence 29.443/s, p95 up to 50 ms, maximum 49.999 ms. Requested 120 Hz appears only in the NEW launch; the crashed run's LPM/refresh/cap policy is missing. Do not infer a 30 FPS limiter from this tail alone.
+- Fastmem previous-run hit rates 79.05–80.91%; 67 JIT segment evictions; about 39.1 million blocks dropped. The larger cache does not eliminate churn or invalidations.
+- Metal4 cold compiler 633 attempts / 12.838 s / maximum 638.24 ms. Classic pipeline builds 982 / 3.271 s, disk cache 954 hits, 28 cold compiles. GPU allocations 1,882.8 MiB; no process headroom or raw system memory accompanies the tail. Zero recorded library memory-warning count is not proof that iOS could not terminate the app.
+- Append-only profiler contains five OLD PIDs (9561, 11196, 560, 1400, 3085), none for 4046. Latest PID 3085 has 34,199 JIT samples, with the three recurring loads at 22.51%. It cannot supply the missing launch configuration or identify the crash cause.
+
+## Implemented response and next evidence
+
+1. Align Metal4 preflight with the existing decoder's deliberate no-op for exactly the observed four-byte compute-219 record. Other layouts/unknown records retain full fallback. This removes one avoidable cause of queue bridging without changing the reference decoder's semantics. No measured FPS/cooling claim.
+2. Expand Settings log sharing to include current and previous app/native logs plus available profiler words. The missing previous-run files are now included by default when sharing. No new always-on diagnostic timer.
+3. Keep high-risk TLB permission/invalidation checks; these logs do not justify bypassing them. Do not increase guest vCPU count or cache budgets blindly on the Duo, where physical compression is already high. Preserve current explicit user settings.
+4. Validate the change with bounded malformed-stream/fuzz tests under ASan+UBSan, production Metal4 planner tests and device/simulator SDK typechecks in cloud. Native Metal4 execution on a paravirtual cloud GPU is not physical M4/A20 validation.
+5. A crash diagnosis needs henge-prev.log and henge-native-prev.log from this export, plus the matching iOS Analytics termination report if available. No source-level change can reconstruct a SIGKILL/OS crash reason absent from app logs.
+6. A useful Metal4 comparison must hold guest configuration, workload, LPM and cache warmness constant, switching only Automatic vs Compatibility graphics backend. Presentation-only MetalFX cannot cure CPU-side emulation cost. Prioritise safe engine reductions and cold-pipeline latency alongside backend parity; do not promise 60 FPS from a backend switch.
