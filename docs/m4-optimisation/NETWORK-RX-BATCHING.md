@@ -6,4 +6,4 @@ No frame is delayed to fill a batch. No timer, extra worker, socket-buffer expan
 
 The real queue/device regression passed ASan/UBSan on Linux and macOS: 32 frames make1 interrupt API call versus32 single calls, with exact payloads and headers, partial completion, short buffers, suffix retry, empty queues and65536-index wrap. Existing level interrupts may already coalesce guest interrupts: the test measures fewer host API calls, not a32x reduction in actual guest IRQs or a measured network speedup.
 
-Upstream-source cloud [43673171842](https://github.com/stride-praline-2f-ai/henge-/actions/runs/43673171842) also compiled the actual slirp consumer and passed141 device checks. Full custom VM lifecycle, iOS compile and final integration remain pending for this checkpoint.
+Upstream-source cloud [43673171842](https://github.com/stride-praline-2f-ai/henge-/actions/runs/43673171842) also compiled the actual slirp consumer and passed141 device checks. Full custom VM lifecycle, iOS compile and final integration passed in43673650998.
