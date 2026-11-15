@@ -8,6 +8,6 @@ Cloud source check [43672136703](https://github.com/stride-praline-2f-ai/henge-/
 
 The synthetic six-memory-operation stack loop emits30 inline words instead of43 (30.2% smaller hot code). Six alternating paired runs all favoured the new policy: 1.856–2.013 vs1.992–2.111 ns/frame. Each timed loop is short and cloud scheduling is uncontrolled; this is supporting microbenchmark evidence, not a physical M4/A20, app-load, FPS or energy result.
 
-Additional exact-fault coverage verifies completed loads/stores, the first failing PC/address, one exception and no faulting pre-index writeback against the previous emitter. This final extension and the combined app build are pending.
+Additional exact-fault coverage verifies completed loads/stores, the first failing PC/address, one exception and no faulting pre-index writeback against the previous emitter. The exact-fault extension passed in upstream-source check [43672638299](https://github.com/stride-praline-2f-ai/henge-/actions/runs/43672638299). The final combined app build remains pending.
 
 Metal compatibility diagnostics also retain32 exact reason/type/tag buckets and report the top3 at existing checkpoints, including payload size range and overflow. This replaces inference from the last rejected opcode. Counters neither change command admission nor suppress classic GPU replay; no new timer or resource-content logging.
