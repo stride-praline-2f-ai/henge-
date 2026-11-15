@@ -5263,7 +5263,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..db3b66f 100644
+index 9073d22..5e33904 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -7072,7 +7072,7 @@ index 9073d22..db3b66f 100644
 -        fprintf(stderr, "hengevm: gpu-libraries: hits=%llu loads=%llu retained=%lu bytes=%lu load_ms=%.2f worst_ms=%.2f (exact bytes; session-only; limits 32 libraries/8MiB binary keys)\n",
 +        fprintf(stderr,"gpu-submission-reuse: empty_classic_before_metal4_avoided=%llu (runtime queue signal/wait and guest completion retained)\n",(unsigned long long)classic_empty_avoided);
 +        fprintf(stderr,"gpu-buffer-mapping: allocations=%llu pages=%llu remap_calls=%llu checked_snapshots_reused=%llu (immutable buffer backing; single-page fallback retained)\n",(unsigned long long)buffer_map_allocations,(unsigned long long)buffer_map_pages,(unsigned long long)buffer_map_calls,(unsigned long long)buffer_map_snapshot_reuses);
-+        if(command_pool)fprintf(stderr,"gpu-command-storage: allocations=%llu reuses=%llu views=%llu captured_bytes=%llu independent_buffers=%llu cached_bytes=%lu suspended=%d (bounded CPU snapshot storage; all active views retain immutable bytes)\n",(unsigned long long)command_pool->allocations,(unsigned long long)command_pool->reuses,(unsigned long long)command_pool->views,(unsigned long long)command_pool->captured_bytes,(unsigned long long)command_pool->independent_buffers,(unsigned long)[command_pool cachedBytes],command_pool->suspended);
++        if(command_pool)fprintf(stderr,"gpu-command-storage: arena_allocations=%llu arena_reuses=%llu published_views=%llu captured_bytes=%llu independent_buffers=%llu cached_bytes=%lu suspended=%d (bounded CPU snapshot storage; all active views retain immutable bytes)\n",(unsigned long long)command_pool->allocations,(unsigned long long)command_pool->reuses,(unsigned long long)command_pool->views,(unsigned long long)command_pool->captured_bytes,(unsigned long long)command_pool->independent_buffers,(unsigned long)[command_pool cachedBytes],command_pool->suspended);
 +        fprintf(stderr,"gpu-surface-copy: full_reference=%d hashed_bytes=%llu candidate_bytes=%llu copied_bytes=%llu unchanged_bytes=%llu chunks=%llu writes=%llu dense_probes=%llu (all skipped bytes compared exactly; dense updates use full copies)\n",copy_full,(unsigned long long)surface_hash_bytes,(unsigned long long)surface_copy.candidate_bytes,(unsigned long long)surface_copy.copied_bytes,(unsigned long long)surface_copy.skipped_bytes,(unsigned long long)surface_copy.chunks,(unsigned long long)surface_copy.writes,(unsigned long long)surface_copy.probes);
 +        fprintf(stderr, "hengevm: gpu-libraries: hits=%llu loads=%llu retained=%lu bytes=%lu load_ms=%.2f worst_ms=%.2f (exact bytes; session-only; limits %lu libraries/%.1fMiB binary keys)\n",
                  (unsigned long long)library_cache.hits, (unsigned long long)library_cache.loads,
@@ -27530,10 +27530,10 @@ index 0000000..c69b750
 +}
 diff --git a/tests/test_gpu_command_storage.py b/tests/test_gpu_command_storage.py
 new file mode 100644
-index 0000000..d50ab9e
+index 0000000..edd559e
 --- /dev/null
 +++ b/tests/test_gpu_command_storage.py
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,104 @@
 +"""Exercise the production snapshot helper and actual Foundation byte owners."""
 +from pathlib import Path
 +import subprocess,tempfile,os
@@ -27565,17 +27565,24 @@ index 0000000..d50ab9e
 +static double now_s(void){struct timespec t;assert(!clock_gettime(CLOCK_MONOTONIC,&t));return t.tv_sec+t.tv_nsec*1e-9;}
 +int main(void){@autoreleasepool{
 + if(getenv("HENGE_COMMAND_BENCH")) {
++  memset(guest,0x5a,sizeof guest);
 +  for(unsigned length=64;length<=65536;length*=32){
-+   for(unsigned pooled=0;pooled<2;pooled++){
++   double times[2][5];
++   for(unsigned round=0;round<5;round++)for(unsigned order=0;order<2;order++){
++    unsigned pooled=(round+order)&1;
 +    HvReplay *test=[HvReplay new];if(pooled)test->command_pool=[HvCommandPool new];
 +    uint64_t descriptors[]={0,length,length,length,2*length,length,3*length,length};
++    for(unsigned i=0;i<20;i++){@autoreleasepool{assert(snapshot_commands(test,7,(const uint8_t *)descriptors,4,4*length).count==4);}}
 +    double begin=now_s();volatile unsigned consume=0;
 +    for(unsigned i=0;i<3000;i++){@autoreleasepool{
 +     NSArray<NSData *> *data=snapshot_commands(test,7,(const uint8_t *)descriptors,4,4*length);
 +     assert(data.count==4);consume+=((const uint8_t *)data[3].bytes)[0];
 +    }}
-+    printf("command-storage-bench buffer_bytes=%u pool=%u ms=%.3f consume=%u (host fixture; not app FPS/energy)\n",length,pooled,1000*(now_s()-begin),consume);
++    assert(consume==3000*0x5a);times[pooled][round]=now_s()-begin;
 +   }
++   for(unsigned mode=0;mode<2;mode++)for(unsigned i=0;i<5;i++)for(unsigned j=i+1;j<5;j++)
++    if(times[mode][i]>times[mode][j]){double t=times[mode][i];times[mode][i]=times[mode][j];times[mode][j]=t;}
++   printf("command-storage-bench buffer_bytes=%u reference_ms=%.3f pool_ms=%.3f change_pct=%.2f rounds=5 alternating_order=1 warmup=20 (host fixture; not app FPS/energy)\n",length,1000*times[0][2],1000*times[1][2],100*(times[1][2]/times[0][2]-1));
 +  }
 +  return 0;
 + }
