@@ -2487,9 +2487,78 @@ index 0000000..7c0cdee
 +    ring[(*tail)++ % HV_VINPUT_RING] = (HvInputEvent){type,code,(uint32_t)value};
 +}
 +#endif
+diff --git a/devices/metal4_arguments.h b/devices/metal4_arguments.h
+new file mode 100644
+index 0000000..0bdabcb
+--- /dev/null
++++ b/devices/metal4_arguments.h
+@@ -0,0 +1,63 @@
++#pragma once
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++#include <stdint.h>
++
++/* Metadata belongs to one pooled job/table. The native argument table, not
++   this owner, is passed to Metal. A job cannot be borrowed again until GPU
++   feedback has retired it, so clearing never races an in-flight encoder. */
++API_AVAILABLE(macos(26.0),ios(26.0))
++@interface HvMetal4Arguments : NSObject {
++    uint32_t _buffers;
++    uint64_t _textures[2];
++    uint16_t _samplers;
++}
++@property(nonatomic,readonly) id<MTL4ArgumentTable> table;
++- (instancetype)initWithTable:(id<MTL4ArgumentTable>)table;
++- (void)clearForReuse;
++- (void)setAddress:(MTLGPUAddress)address atIndex:(NSUInteger)index;
++- (void)setAddress:(MTLGPUAddress)address attributeStride:(NSUInteger)stride atIndex:(NSUInteger)index;
++- (void)setTexture:(MTLResourceID)texture atIndex:(NSUInteger)index;
++- (void)setSamplerState:(MTLResourceID)sampler atIndex:(NSUInteger)index;
++@end
++
++@implementation HvMetal4Arguments
++- (instancetype)initWithTable:(id<MTL4ArgumentTable>)table {
++    if(!table || !(self=[super init]))return nil;
++    _table=table;
++    /* Do not assume a newly allocated Metal table is initialised. Establish
++       exactly the same zero baseline as the original full-clear path once. */
++    for(NSUInteger i=0;i<31;i++)[_table setAddress:0 attributeStride:0 atIndex:i];
++    MTLResourceID zero={0};
++    for(NSUInteger i=0;i<128;i++)[_table setTexture:zero atIndex:i];
++    for(NSUInteger i=0;i<16;i++)[_table setSamplerState:zero atIndex:i];
++    return self;
++}
++- (void)clearForReuse {
++    for(uint32_t used=_buffers;used;used&=used-1)
++        [_table setAddress:0 attributeStride:0 atIndex:(NSUInteger)__builtin_ctz(used)];
++    MTLResourceID zero={0};
++    for(unsigned half=0;half<2;half++)
++        for(uint64_t used=_textures[half];used;used&=used-1)
++            [_table setTexture:zero atIndex:64*half+(NSUInteger)__builtin_ctzll(used)];
++    for(uint32_t used=_samplers;used;used&=used-1)
++        [_table setSamplerState:zero atIndex:(NSUInteger)__builtin_ctz(used)];
++    _buffers=0;_textures[0]=_textures[1]=0;_samplers=0;
++}
++- (void)setAddress:(MTLGPUAddress)address atIndex:(NSUInteger)index {
++    if(index>=31){[NSException raise:NSRangeException format:@"Metal4 buffer index"];return;}
++    _buffers|=1u<<index;[_table setAddress:address atIndex:index];
++}
++- (void)setAddress:(MTLGPUAddress)address attributeStride:(NSUInteger)stride atIndex:(NSUInteger)index {
++    if(index>=31){[NSException raise:NSRangeException format:@"Metal4 buffer index"];return;}
++    _buffers|=1u<<index;[_table setAddress:address attributeStride:stride atIndex:index];
++}
++- (void)setTexture:(MTLResourceID)texture atIndex:(NSUInteger)index {
++    if(index>=128){[NSException raise:NSRangeException format:@"Metal4 texture index"];return;}
++    _textures[index/64]|=1ull<<(index%64);[_table setTexture:texture atIndex:index];
++}
++- (void)setSamplerState:(MTLResourceID)sampler atIndex:(NSUInteger)index {
++    if(index>=16){[NSException raise:NSRangeException format:@"Metal4 sampler index"];return;}
++    _samplers|=(uint16_t)(1u<<index);[_table setSamplerState:sampler atIndex:index];
++}
++@end
 diff --git a/devices/metal4_encoder.h b/devices/metal4_encoder.h
 new file mode 100644
-index 0000000..72b017f
+index 0000000..b4ae9c9
 --- /dev/null
 +++ b/devices/metal4_encoder.h
 @@ -0,0 +1,365 @@
@@ -2580,7 +2649,7 @@ index 0000000..72b017f
 +    HvMetal4Job *job;
 +    BOOL render;
 +    BOOL ended;
-+    id<MTL4ArgumentTable> vertex,fragment;
++    HvMetal4Arguments *vertex,*fragment;
 +    MTLGPUAddress bases[2][31];
 +    NSUInteger lengths[2][31];
 +    NSUInteger strides[31];
@@ -2652,7 +2721,7 @@ index 0000000..72b017f
 +}
 +- (void)buffers:(id<MTLBuffer>const __unsafe_unretained *)buffers offsets:(const NSUInteger *)offsets strides:(const NSUInteger *)step range:(NSRange)range stage:(NSUInteger)stage {
 +    if(range.location>31||range.length>31-range.location)[NSException raise:@"HengeMetal4Fallback" format:@"buffer range"];
-+    id<MTL4ArgumentTable> table=stage?fragment:vertex;
++    HvMetal4Arguments * table=stage?fragment:vertex;
 +    for(NSUInteger i=0;i<range.length;i++) {
 +        id<MTLBuffer> b=buffers[i];NSUInteger slot=range.location+i;
 +        if(b && offsets[i]>b.length)[NSException raise:@"HengeMetal4Fallback" format:@"buffer offset"];
@@ -2668,7 +2737,7 @@ index 0000000..72b017f
 +- (void)setVertexBuffers:(id<MTLBuffer>const __unsafe_unretained *)b offsets:(const NSUInteger *)o attributeStrides:(const NSUInteger *)s withRange:(NSRange)r {[self buffers:b offsets:o strides:s range:r stage:0];}
 +- (void)offset:(NSUInteger)offset index:(NSUInteger)i stage:(NSUInteger)stage stride:(NSUInteger)stride {
 +    if(i>=31||!bases[stage][i]||offset>lengths[stage][i])[NSException raise:@"HengeMetal4Fallback" format:@"offset without buffer"];
-+    id<MTL4ArgumentTable> t=stage?fragment:vertex;
++    HvMetal4Arguments * t=stage?fragment:vertex;
 +    if(stride!=NSUIntegerMax){strides[i]=stride;[t setAddress:bases[stage][i]+offset attributeStride:stride atIndex:i];}
 +    else [t setAddress:bases[stage][i]+offset atIndex:i];
 +}
@@ -2678,7 +2747,7 @@ index 0000000..72b017f
 +- (void)setVertexBufferOffset:(NSUInteger)o attributeStride:(NSUInteger)s atIndex:(NSUInteger)i {[self offset:o index:i stage:0 stride:s];}
 +- (void)textures:(id<MTLTexture>const __unsafe_unretained *)textures range:(NSRange)range stage:(NSUInteger)stage {
 +    if(range.location>128||range.length>128-range.location)[NSException raise:@"HengeMetal4Fallback" format:@"texture range"];
-+    id<MTL4ArgumentTable> t=stage?fragment:vertex;
++    HvMetal4Arguments * t=stage?fragment:vertex;
 +    for(NSUInteger i=0;i<range.length;i++){id<MTLTexture>x=textures[i];[runtime retainResource:x job:job];[t setTexture:x.gpuResourceID atIndex:range.location+i];}
 +}
 +- (void)setVertexTextures:(id<MTLTexture>const __unsafe_unretained *)t withRange:(NSRange)r {[self textures:t range:r stage:0];}
@@ -2686,7 +2755,7 @@ index 0000000..72b017f
 +- (void)setTextures:(id<MTLTexture>const __unsafe_unretained *)t withRange:(NSRange)r {[self textures:t range:r stage:0];}
 +- (void)samplers:(id<MTLSamplerState>const __unsafe_unretained *)samplers range:(NSRange)range stage:(NSUInteger)stage {
 +    if(range.location>16||range.length>16-range.location)[NSException raise:@"HengeMetal4Fallback" format:@"sampler range"];
-+    id<MTL4ArgumentTable> t=stage?fragment:vertex;
++    HvMetal4Arguments * t=stage?fragment:vertex;
 +    for(NSUInteger i=0;i<range.length;i++){
 +        id<MTLSamplerState> s=samplers[i],variant=objc_getAssociatedObject(s,"henge.metal4.sampler");
 +        if(s&&!variant)[NSException raise:@"HengeMetal4Fallback" format:@"sampler descriptor unavailable"];
@@ -2715,7 +2784,7 @@ index 0000000..72b017f
 +- (void)waitForFence:(id<MTLFence>)f beforeStages:(MTLRenderStages)stages {(void)stages;[self waitForFence:f];}
 +- (void)clampedSamplers:(id<MTLSamplerState>const __unsafe_unretained *)samplers minimums:(const float *)minimums maximums:(const float *)maximums range:(NSRange)range stage:(NSUInteger)stage {
 +    if(range.location>16||range.length>16-range.location)[NSException raise:@"HengeMetal4Fallback" format:@"sampler range"];
-+    id<MTL4ArgumentTable> t=stage?fragment:vertex;
++    HvMetal4Arguments * t=stage?fragment:vertex;
 +    for(NSUInteger i=0;i<range.length;i++){
 +        id<MTLSamplerState> sampler=samplers[i];MTLResourceID zero={0};
 +        if(!sampler){[t setSamplerState:zero atIndex:range.location+i];continue;}
@@ -2820,8 +2889,8 @@ index 0000000..72b017f
 +    p->vertex=[runtime table:job];if(render)p->fragment=[runtime table:job];
 +    if(!p->vertex || (render&&!p->fragment)){[encoder endEncoding];return nil;}
 +    [(id<MTL4CommandEncoder>)encoder barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:(MTL4VisibilityOptionDevice|MTL4VisibilityOptionResourceAlias)];
-+    if(render){[encoder setArgumentTable:p->vertex atStages:MTLRenderStageVertex];[encoder setArgumentTable:p->fragment atStages:MTLRenderStageFragment];}
-+    else [encoder setArgumentTable:p->vertex];
++    if(render){[encoder setArgumentTable:p->vertex.table atStages:MTLRenderStageVertex];[encoder setArgumentTable:p->fragment.table atStages:MTLRenderStageFragment];}
++    else [encoder setArgumentTable:p->vertex.table];
 +    return p;
 +}
 +
@@ -2936,10 +3005,10 @@ index 0000000..b12dd17
 +}
 diff --git a/devices/metal4_runtime.h b/devices/metal4_runtime.h
 new file mode 100644
-index 0000000..2258d0a
+index 0000000..aa6a1ef
 --- /dev/null
 +++ b/devices/metal4_runtime.h
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,331 @@
 +#pragma once
 +/* Supported Metal 4 submission, shared by guest replay and native presentation.
 + * Classic/Metal4 queues are joined with a shared event in BOTH directions.
@@ -2952,6 +3021,7 @@ index 0000000..2258d0a
 +#include <math.h>
 +#include <time.h>
 +#include "pipeline_bundle.h"
++#include "metal4_arguments.h"
 +
 +API_AVAILABLE(macos(26.0),ios(26.0))
 +@interface HvMetal4Job : NSObject {
@@ -2962,7 +3032,7 @@ index 0000000..2258d0a
 +    id<MTLBuffer> uniforms;
 +    NSMutableSet *keep;
 +    NSMutableSet *allocations;
-+    NSMutableArray<id<MTL4ArgumentTable>> *tables;
++    NSMutableArray<HvMetal4Arguments *> *tables;
 +    NSUInteger nextTable;
 +    uint64_t bridgeOutput;
 +    NSMutableOrderedSet<id<MTLFence>> *fenceWaits,*fenceUpdates;
@@ -3001,7 +3071,7 @@ index 0000000..2258d0a
 +- (id)pipeline:(id)descriptor tag:(uint32_t)tag bundle:(HvPipelineBundle *)bundle;
 +- (void)setArchiveAdmission:(BOOL)enabled;
 +- (void)retainResource:(id)resource job:(HvMetal4Job *)job;
-+- (id<MTL4ArgumentTable>)table:(HvMetal4Job *)job;
++- (HvMetal4Arguments *)table:(HvMetal4Job *)job;
 +- (void)discard:(HvMetal4Job *)job;
 +- (BOOL)commit:(HvMetal4Job *)job classicQueue:(id<MTLCommandQueue>)classic
 +          lock:(os_unfair_lock *)lock drawable:(id<MTLDrawable>)drawable
@@ -3187,17 +3257,15 @@ index 0000000..2258d0a
 +        [job->allocations addObject:allocation];[job->residency addAllocation:allocation];
 +    }
 +}
-+- (id<MTL4ArgumentTable>)table:(HvMetal4Job *)job {
++- (HvMetal4Arguments *)table:(HvMetal4Job *)job {
 +    NSUInteger index=job->nextTable++;
-+    id<MTL4ArgumentTable> table=index<job->tables.count?job->tables[index]:nil;
++    HvMetal4Arguments *table=index<job->tables.count?job->tables[index]:nil;
++    if(table){[table clearForReuse];return table;}
 +    MTL4ArgumentTableDescriptor *d=[MTL4ArgumentTableDescriptor new];
 +    d.maxBufferBindCount=31;d.maxTextureBindCount=128;d.maxSamplerStateBindCount=16;
 +    d.supportAttributeStrides=YES;
-+    if(!table){table=[_device newArgumentTableWithDescriptor:d error:nil];if(table)[job->tables addObject:table];}
-+    for(NSUInteger i=0;i<31;i++)[table setAddress:0 attributeStride:0 atIndex:i];
-+    MTLResourceID zero={0};
-+    for(NSUInteger i=0;i<128;i++)[table setTexture:zero atIndex:i];
-+    for(NSUInteger i=0;i<16;i++)[table setSamplerState:zero atIndex:i];
++    table=[[HvMetal4Arguments alloc]initWithTable:[_device newArgumentTableWithDescriptor:d error:nil]];
++    if(table)[job->tables addObject:table];
 +    return table;
 +}
 +- (void)returnJob:(HvMetal4Job *)job {
@@ -3274,7 +3342,7 @@ index 0000000..2258d0a
 +}
 diff --git a/devices/metal4_screen.h b/devices/metal4_screen.h
 new file mode 100644
-index 0000000..31983ff
+index 0000000..a3a4e8a
 --- /dev/null
 +++ b/devices/metal4_screen.h
 @@ -0,0 +1,164 @@
@@ -3336,7 +3404,7 @@ index 0000000..31983ff
 +    return self;
 +}
 +- (BOOL)draw:(id<MTLTexture>)source target:(id<MTLTexture>)target half:(BOOL)half cursor:(id<MTLTexture>)cursor rect:(const float *)rect sharp:(BOOL)sharp
-+         job:(HvMetal4Job *)job vertex:(id<MTL4ArgumentTable>)vertex fragment:(id<MTL4ArgumentTable>)fragment {
++         job:(HvMetal4Job *)job vertex:(HvMetal4Arguments *)vertex fragment:(HvMetal4Arguments *)fragment {
 +    MTL4RenderPassDescriptor *pass=[MTL4RenderPassDescriptor new];
 +    pass.colorAttachments[0].texture=target;pass.colorAttachments[0].loadAction=MTLLoadActionDontCare;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
 +    id<MTL4RenderCommandEncoder> e=[job->buffer renderCommandEncoderWithDescriptor:pass];
@@ -3344,7 +3412,7 @@ index 0000000..31983ff
 +    [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:(MTL4VisibilityOptionDevice|MTL4VisibilityOptionResourceAlias)];
 +    [vertex setAddress:job->uniforms.gpuAddress atIndex:0];[fragment setAddress:job->uniforms.gpuAddress+16 atIndex:0];
 +    [fragment setTexture:source.gpuResourceID atIndex:0];[fragment setSamplerState:_smooth.gpuResourceID atIndex:0];
-+    [e setArgumentTable:vertex atStages:MTLRenderStageVertex];[e setArgumentTable:fragment atStages:MTLRenderStageFragment];
++    [e setArgumentTable:vertex.table atStages:MTLRenderStageVertex];[e setArgumentTable:fragment.table atStages:MTLRenderStageFragment];
 +    [e setRenderPipelineState:half?_linear:_plain];[e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 +    if(cursor&&rect){
 +        [vertex setAddress:job->uniforms.gpuAddress+32 atIndex:0];[fragment setTexture:cursor.gpuResourceID atIndex:0];
@@ -3388,7 +3456,7 @@ index 0000000..31983ff
 +    if(!source||!target)return nil;
 +    HvMetal4Job *job=[_runtime begin];if(!job)return nil;
 +    if(!job->uniforms)job->uniforms=[_device newBufferWithLength:256 options:MTLResourceStorageModeShared];
-+    id<MTL4ArgumentTable> vertex=[_runtime table:job],fragment=[_runtime table:job];
++    HvMetal4Arguments *vertex=[_runtime table:job],*fragment=[_runtime table:job];
 +    if(!job->uniforms||!vertex||!fragment){[_runtime discard:job];return nil;}
 +    float full[]={-1,-1,2,2};memcpy(job->uniforms.contents,full,sizeof full);
 +    memcpy((uint8_t *)job->uniforms.contents+16,&mode,sizeof mode);
@@ -8249,10 +8317,10 @@ index 0000000..8b6ce4c
 +Cloud validation for the final combined patch must pass before any IPA. This follow-up does not claim the prior iPadOS interruption's cause or steady60FPS has been established.
 diff --git a/docs/m4-optimisation/PHYSICAL-116-COMPARISON.md b/docs/m4-optimisation/PHYSICAL-116-COMPARISON.md
 new file mode 100644
-index 0000000..6833ae9
+index 0000000..3478eac
 --- /dev/null
 +++ b/docs/m4-optimisation/PHYSICAL-116-COMPARISON.md
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,41 @@
 +# Physical 116: Duo / iPad comparison (2026-11-15)
 +
 +Scope: supplied D5169011 Duo and 34A5245B iPad exports. Both report 0.3.15 (116), wrapper 488d560f7ee460080e90c89384380761c082a2d0. No paired baseline or measured speedup exists. Native stderr is mirrored in henge.log: never sum the two files. Profiler dumps span multiple launches: filter by PID.
@@ -8289,10 +8357,11 @@ index 0000000..6833ae9
 +
 +1. Align Metal4 preflight with the existing decoder's deliberate no-op for exactly the observed four-byte compute-219 record. Other layouts/unknown records retain full fallback. This removes one avoidable cause of queue bridging without changing the reference decoder's semantics. No measured FPS/cooling claim.
 +2. Expand Settings log sharing to include current and previous app/native logs plus available profiler words. The missing previous-run files are now included by default when sharing. No new always-on diagnostic timer.
-+3. Keep high-risk TLB permission/invalidation checks; these logs do not justify bypassing them. Do not increase guest vCPU count or cache budgets blindly on the Duo, where physical compression is already high. Preserve current explicit user settings.
-+4. Validate the change with bounded malformed-stream/fuzz tests under ASan+UBSan, production Metal4 planner tests and device/simulator SDK typechecks in cloud. Native Metal4 execution on a paravirtual cloud GPU is not physical M4/A20 validation.
-+5. A crash diagnosis needs henge-prev.log and henge-native-prev.log from this export, plus the matching iOS Analytics termination report if available. No source-level change can reconstruct a SIGKILL/OS crash reason absent from app logs.
-+6. A useful Metal4 comparison must hold guest configuration, workload, LPM and cache warmness constant, switching only Automatic vs Compatibility graphics backend. Presentation-only MetalFX cannot cure CPU-side emulation cost. Prioritise safe engine reductions and cold-pipeline latency alongside backend parity; do not promise 60 FPS from a backend switch.
++3. Reduce Metal4 CPU binding reset work: pooled argument tables now track exactly which buffer/texture/sampler slots were modified. New tables still initialize all 175 slots; reused tables clear only touched slots, including strides and explicit nil writes. The same real Metal table is submitted. A recording-table differential test covers 50,000 updates, boundary slots and empty reuse; actual FPS benefit remains unmeasured.
++4. Keep high-risk TLB permission/invalidation checks; these logs do not justify bypassing them. Do not increase guest vCPU count or cache budgets blindly on the Duo, where physical compression is already high. Preserve current explicit user settings.
++5. Validate the change with bounded malformed-stream/fuzz tests under ASan+UBSan, production Metal4 planner tests and device/simulator SDK typechecks in cloud. Native Metal4 execution on a paravirtual cloud GPU is not physical M4/A20 validation.
++6. A crash diagnosis needs henge-prev.log and henge-native-prev.log from this export, plus the matching iOS Analytics termination report if available. No source-level change can reconstruct a SIGKILL/OS crash reason absent from app logs.
++7. A useful Metal4 comparison must hold guest configuration, workload, LPM and cache warmness constant, switching only Automatic vs Compatibility graphics backend. Presentation-only MetalFX cannot cure CPU-side emulation cost. Prioritise safe engine reductions and cold-pipeline latency alongside backend parity; do not promise 60 FPS from a backend switch.
 diff --git a/docs/m4-optimisation/PRESSURE-AND-FX.md b/docs/m4-optimisation/PRESSURE-AND-FX.md
 new file mode 100644
 index 0000000..3777d6d
@@ -22933,10 +23002,10 @@ index 0000000..26b72af
 +    subprocess.run([str(path/'check')],check=True,timeout=20)
 diff --git a/tests/test_desktop_fx.m b/tests/test_desktop_fx.m
 new file mode 100644
-index 0000000..40af138
+index 0000000..9e892e1
 --- /dev/null
 +++ b/tests/test_desktop_fx.m
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,193 @@
 +/* Executes the production pool and compositor against recording objects. This
 +   proves routing/lifetime/cache behavior, NOT MetalFX image quality or GPU time. */
 +#import <Foundation/Foundation.h>
@@ -23006,6 +23075,7 @@ index 0000000..40af138
 +@interface FXTable : NSObject @end
 +@implementation FXTable
 +- (void)setAddress:(MTLGPUAddress)a atIndex:(NSUInteger)i {(void)a;(void)i;}
++- (void)setAddress:(MTLGPUAddress)a attributeStride:(NSUInteger)s atIndex:(NSUInteger)i {(void)a;(void)s;(void)i;}
 +- (void)setTexture:(MTLResourceID)a atIndex:(NSUInteger)i {(void)a;(void)i;}
 +- (void)setSamplerState:(MTLResourceID)a atIndex:(NSUInteger)i {(void)a;(void)i;}
 +@end
@@ -23013,7 +23083,7 @@ index 0000000..40af138
 +@implementation FXEncoder
 +- (void)barrierAfterQueueStages:(MTLStages)a beforeStages:(MTLStages)b visibilityOptions:(MTL4VisibilityOptions)c {(void)a;(void)b;(void)c;}
 +- (void)barrierAfterStages:(MTLStages)a beforeQueueStages:(MTLStages)b visibilityOptions:(MTL4VisibilityOptions)c {(void)a;(void)b;(void)c;}
-+- (void)setArgumentTable:(id)t atStages:(MTLRenderStages)s {(void)t;(void)s;}
++- (void)setArgumentTable:(id)t atStages:(MTLRenderStages)s {assert([t isKindOfClass:FXTable.class]);(void)s;}
 +- (void)setRenderPipelineState:(id)p {(void)p;}
 +- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)c {(void)t;(void)s;assert(c==4);[events addObject:@"draw"];}
 +- (void)endEncoding {[events addObject:@"end"];}
@@ -23026,7 +23096,7 @@ index 0000000..40af138
 +@implementation FXRuntime
 +- (id)pipeline:(id)d tag:(uint32_t)tag bundle:(id)b {(void)d;(void)b;assert(tag==0xe);return [NSObject new];}
 +- (HvMetal4Job *)begin {HvMetal4Job *j=[HvMetal4Job new];j->buffer=(id)[FXBuffer new];j->keep=[NSMutableSet new];return j;}
-+- (id)table:(id)job {(void)job;return [FXTable new];}
++- (id)table:(id)job {(void)job;return [[HvMetal4Arguments alloc]initWithTable:(id)[FXTable new]];}
 +- (void)retainResource:(id)r job:(HvMetal4Job *)j {[j->keep addObject:r];}
 +- (void)discard:(HvMetal4Job *)j {[j->keep removeAllObjects];}
 +@end
@@ -25644,6 +25714,85 @@ index 35ecb46..cdfe161 100644
      data = aligned_alloc(16384, DATA_SIZE);
      stack = aligned_alloc(16384, STACK_SIZE);
      pt = aligned_alloc(16384, PT_SIZE);
+diff --git a/tests/test_metal4_arguments.m b/tests/test_metal4_arguments.m
+new file mode 100644
+index 0000000..03b97d3
+--- /dev/null
++++ b/tests/test_metal4_arguments.m
+@@ -0,0 +1,73 @@
++#import <Foundation/Foundation.h>
++#include "../devices/metal4_arguments.h"
++#include <assert.h>
++#include <string.h>
++
++/* Recording table exercises the production owner/reset code without claiming
++   Metal4 GPU execution on the cloud runner's paravirtual GPU. */
++@interface ArgumentRecorder : NSObject {
++@public
++    uint64_t addresses[31],strides[31],textures[128],samplers[16];
++    unsigned calls;
++}
++@end
++@implementation ArgumentRecorder
++- (void)setAddress:(MTLGPUAddress)a atIndex:(NSUInteger)i {assert(i<31);addresses[i]=a;calls++;}
++- (void)setAddress:(MTLGPUAddress)a attributeStride:(NSUInteger)s atIndex:(NSUInteger)i {assert(i<31);addresses[i]=a;strides[i]=s;calls++;}
++- (void)setTexture:(MTLResourceID)t atIndex:(NSUInteger)i {assert(i<128);memcpy(&textures[i],&t,8);calls++;}
++- (void)setSamplerState:(MTLResourceID)t atIndex:(NSUInteger)i {assert(i<16);memcpy(&samplers[i],&t,8);calls++;}
++@end
++static void fullClear(ArgumentRecorder *t) {
++    MTLResourceID zero={0};
++    for(unsigned i=0;i<31;i++)[t setAddress:0 attributeStride:0 atIndex:i];
++    for(unsigned i=0;i<128;i++)[t setTexture:zero atIndex:i];
++    for(unsigned i=0;i<16;i++)[t setSamplerState:zero atIndex:i];
++}
++static void equal(ArgumentRecorder *a,ArgumentRecorder *b) {
++    assert(!memcmp(a->addresses,b->addresses,sizeof a->addresses));
++    assert(!memcmp(a->strides,b->strides,sizeof a->strides));
++    assert(!memcmp(a->textures,b->textures,sizeof a->textures));
++    assert(!memcmp(a->samplers,b->samplers,sizeof a->samplers));
++}
++int main(void){@autoreleasepool{
++    ArgumentRecorder *native=[ArgumentRecorder new],*reference=[ArgumentRecorder new];
++    /* Begin with dirty memory: first-use initialization is mandatory. */
++    memset(native->addresses,0xff,sizeof native->addresses);
++    memset(native->strides,0xff,sizeof native->strides);
++    memset(native->textures,0xff,sizeof native->textures);
++    memset(native->samplers,0xff,sizeof native->samplers);
++    HvMetal4Arguments *owner=[[HvMetal4Arguments alloc]initWithTable:(id)native];
++    assert(owner.table==(id)native&&native->calls==175);fullClear(reference);equal(native,reference);
++    uint64_t bits=77;MTLResourceID resource;memcpy(&resource,&bits,8);
++    [owner setAddress:100 attributeStride:16 atIndex:30];
++    [owner setTexture:resource atIndex:127];[owner setTexture:resource atIndex:127];
++    [owner setSamplerState:resource atIndex:15];
++    unsigned before=native->calls;[owner clearForReuse];
++    assert(native->calls-before==3);equal(native,reference);
++    before=native->calls;[owner clearForReuse];assert(native->calls==before);
++    uint32_t random=0x749abe01;
++    for(unsigned cycle=0;cycle<1000;cycle++) {
++        for(unsigned update=0;update<50;update++) {
++            random^=random<<13;random^=random>>17;random^=random<<5;
++            bits=(update%7)?random:0;memcpy(&resource,&bits,8);
++            unsigned kind=random%4,index=(random>>8)%(kind<2?31:kind==2?128:16);
++            switch(kind) {
++            case 0:[owner setAddress:bits atIndex:index];[reference setAddress:bits atIndex:index];break;
++            case 1:[owner setAddress:bits attributeStride:random%256 atIndex:index];[reference setAddress:bits attributeStride:random%256 atIndex:index];break;
++            case 2:[owner setTexture:resource atIndex:index];[reference setTexture:resource atIndex:index];break;
++            default:[owner setSamplerState:resource atIndex:index];[reference setSamplerState:resource atIndex:index];break;
++            }
++        }
++        equal(native,reference);[owner clearForReuse];fullClear(reference);equal(native,reference);
++    }
++    before=native->calls;
++    unsigned rejected=0;
++    @try{[owner setAddress:1 atIndex:31];}@catch(NSException *e){(void)e;rejected++;}
++    @try{[owner setAddress:1 attributeStride:1 atIndex:NSUIntegerMax];}@catch(NSException *e){(void)e;rejected++;}
++    @try{[owner setTexture:resource atIndex:128];}@catch(NSException *e){(void)e;rejected++;}
++    @try{[owner setSamplerState:resource atIndex:16];}@catch(NSException *e){(void)e;rejected++;}
++    assert(rejected==4&&native->calls==before);
++    assert(![[HvMetal4Arguments alloc]initWithTable:nil]);
++    puts("PASS Metal4 argument reuse: native table identity, full first initialization, sparse reset 175->3 calls, 50,000 updates vs full-clear reference, high slots, nils and invalid indices");
++    return 0;
++}}
 diff --git a/tests/test_metal4_ordering.m b/tests/test_metal4_ordering.m
 new file mode 100644
 index 0000000..0f32367
@@ -25838,10 +25987,10 @@ index 0000000..0f32367
 +}}
 diff --git a/tests/test_metal4_plan.m b/tests/test_metal4_plan.m
 new file mode 100644
-index 0000000..a0c82a3
+index 0000000..5cfb409
 --- /dev/null
 +++ b/tests/test_metal4_plan.m
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,150 @@
 +#import <Foundation/Foundation.h>
 +#include "../devices/metal4_encoder.h"
 +#include <assert.h>
@@ -25851,7 +26000,7 @@ index 0000000..a0c82a3
 +@property unsigned ends,draws;
 +@end
 +@implementation PlanEncoder
-+- (void)setArgumentTable:(id)t atStages:(MTLRenderStages)s {(void)t;(void)s;}
++- (void)setArgumentTable:(id)t atStages:(MTLRenderStages)s {assert([t isKindOfClass:NSClassFromString(@"PlanArgumentTable")]);(void)s;}
 +- (void)barrierAfterQueueStages:(MTLStages)a beforeStages:(MTLStages)b visibilityOptions:(MTL4VisibilityOptions)o {(void)a;(void)b;(void)o;}
 +- (void)barrierAfterStages:(MTLStages)a beforeQueueStages:(MTLStages)b visibilityOptions:(MTL4VisibilityOptions)o {(void)a;(void)b;(void)o;}
 +- (void)endEncoding {self.ends++;}
@@ -25865,10 +26014,18 @@ index 0000000..a0c82a3
 +@implementation PlanBuffer
 +- (id)renderCommandEncoderWithDescriptor:(MTL4RenderPassDescriptor *)d {self.pass=d;self.encoder=[PlanEncoder new];return self.encoder;}
 +@end
++@interface PlanArgumentTable : NSObject
++@end
++@implementation PlanArgumentTable
++- (void)setAddress:(MTLGPUAddress)a atIndex:(NSUInteger)i {(void)a;(void)i;}
++- (void)setAddress:(MTLGPUAddress)a attributeStride:(NSUInteger)s atIndex:(NSUInteger)i {(void)a;(void)s;(void)i;}
++- (void)setTexture:(MTLResourceID)t atIndex:(NSUInteger)i {(void)t;(void)i;}
++- (void)setSamplerState:(MTLResourceID)t atIndex:(NSUInteger)i {(void)t;(void)i;}
++@end
 +@interface PlanRuntime : NSObject
 +@end
 +@implementation PlanRuntime
-+- (id)table:(id)job {(void)job;return [NSObject new];}
++- (id)table:(id)job {(void)job;return [[HvMetal4Arguments alloc]initWithTable:(id)[PlanArgumentTable new]];}
 +- (void)retainResource:(id)resource job:(id)job {(void)resource;(void)job;}
 +@end
 +@interface PlanArguments : NSObject
@@ -25930,10 +26087,10 @@ index 0000000..a0c82a3
 +    uint32_t value=0;
 +    /* The reference decoder consumes 219 without an encoder operation. It
 +       must not split adjacent supported compute units into different queues. */
-+    NSData *compute=segment(1,@[record(214,NULL,0),record(219,&value,4)],NO);
-+    HvMetal4Plan *computePlan=hv_metal4_plan_commands(@[compute],&why);
++    NSData *computeCommands=segment(1,@[record(214,&value,0),record(219,&value,4)],NO);
++    HvMetal4Plan *computePlan=hv_metal4_plan_commands(@[computeCommands],&why);
 +    assert(computePlan&&computePlan.graphics&&!computePlan.options.length);
-+    NSArray<HvMetal4Run *> *computeRuns=hv_metal4_command_runs(@[compute,compute]);
++    NSArray<HvMetal4Run *> *computeRuns=hv_metal4_command_runs(@[computeCommands,computeCommands]);
 +    assert(computeRuns.count==1&&computeRuns[0]->plan&&computeRuns[0]->commands.count==2);
 +    assert(!hv_metal4_plan_commands(@[segment(1,@[record(219,&value,3)],NO)],&why));
 +    assert(why.reason==HV_GPU_PAYLOAD&&why.tag==219);
