@@ -2925,10 +2925,10 @@ index 0000000..43bf5d2
 +#endif
 diff --git a/devices/gpu_command_storage.h b/devices/gpu_command_storage.h
 new file mode 100644
-index 0000000..51fc10f
+index 0000000..3fd6d3a
 --- /dev/null
 +++ b/devices/gpu_command_storage.h
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,88 @@
 +#pragma once
 +#import <Foundation/Foundation.h>
 +#include <stdatomic.h>
@@ -2995,8 +2995,9 @@ index 0000000..51fc10f
 +        if(!suspended&&bytes<=(8u<<20)) {
 +            capacity=4096;while(capacity<bytes)capacity*=2;
 +        }
-+        selected=[HvCommandOwner new];if(!selected)return nil;selected->memory=malloc(capacity);
-+        if(!selected->memory)return nil;
++        selected=[HvCommandOwner new];if(!selected)return nil;
++        void *memory=NULL;if(posix_memalign(&memory,16,capacity))return nil;
++        selected->memory=memory;
 +        selected->capacity=capacity;atomic_init(&selected->users,0);allocations++;
 +        if(!suspended&&capacity<=(8u<<20)) {
 +            /* Replace idle, smaller cache entries rather than accumulate them.
@@ -5263,7 +5264,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..34aeb1f 100644
+index 9073d22..cf470e2 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -6822,7 +6823,7 @@ index 9073d22..34aeb1f 100644
 +        if(!to||hv_pvg_lite_task_read(r->lite,task,offset,to,(uint32_t)length)) {
 +            [r complain:@"command buffer unreadable"];continue;
 +        }
-+        if(copy){used+=(NSUInteger)length;r->command_pool->views++;}
++        if(copy){used+=((NSUInteger)length+15)&~(NSUInteger)15;r->command_pool->views++;}
 +        else if(r->command_pool)r->command_pool->independent_buffers++;
 +        if(r->command_pool)r->command_pool->captured_bytes+=length;
 +        [result addObject:copy?:independent];
@@ -6904,7 +6905,7 @@ index 9073d22..34aeb1f 100644
 -                else [self complain:[NSString stringWithFormat:@"encoder type %u command %u (%u bytes) skipped", type, tag, sz]];
 -                q += sz;
 +    uint64_t commandBytes=0;
-+    for(uint32_t b=0;b<nbuf;b++){uint64_t n;memcpy(&n,bufs+b*16+8,8);if(n>=8 && n<=(64u<<20))commandBytes+=n;}
++    for(uint32_t b=0;b<nbuf;b++){uint64_t n;memcpy(&n,bufs+b*16+8,8);if(n>=8 && n<=(64u<<20))commandBytes+=(n+15)&~15ull;}
 +    BOOL snapshotCommands=commandBytes<=(64u<<20);
 +    NSArray<NSData *> *commands=snapshotCommands?snapshot_commands(self,task,bufs,nbuf,commandBytes):@[];
 +    BOOL hasMetal4=NO;
@@ -27552,10 +27553,10 @@ index 0000000..c69b750
 +}
 diff --git a/tests/test_gpu_command_storage.py b/tests/test_gpu_command_storage.py
 new file mode 100644
-index 0000000..edd559e
+index 0000000..9a99364
 --- /dev/null
 +++ b/tests/test_gpu_command_storage.py
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,112 @@
 +"""Exercise the production snapshot helper and actual Foundation byte owners."""
 +from pathlib import Path
 +import subprocess,tempfile,os
@@ -27625,6 +27626,14 @@ index 0000000..edd559e
 + memset(guest,0x26,sizeof guest);NSArray<NSData *> *fresh=capture(r,192);
 + assert(((const uint8_t *)old[2].bytes)[95]==0x51&&((const uint8_t *)fresh[2].bytes)[95]==0x26);
 + old=nil;fresh=nil;r->command_pool->suspended=NO;
++ @autoreleasepool{
++  uint64_t descriptors[]={0,13,13,19,32,27};
++  NSArray<NSData *> *odd=snapshot_commands(r,7,(const uint8_t *)descriptors,3,80);
++  assert(odd.count==3&&odd[0].length==13&&odd[1].length==19&&odd[2].length==27);
++  for(NSData *view in odd)assert(!((uintptr_t)view.bytes&15));
++  assert(!memcmp(odd[1].bytes,guest+13,19)&&!memcmp(odd[2].bytes,guest+32,27));
++ }
++
 + uint64_t before=r->command_pool->allocations;
 + for(unsigned i=0;i<10000;i++){@autoreleasepool{
 +  memset(guest,(uint8_t)i,sizeof guest);NSArray<NSData *> *data=capture(r,192);
@@ -27652,7 +27661,7 @@ index 0000000..edd559e
 +  if(!(i%31))[pool trim];
 + }}
 + assert(!dispatch_group_wait(released,dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC)));
-+ puts("Command snapshot storage: 10000 batches -> <=2 byte allocations; exact Foundation data, retained old views, bounded cache, pressure trim, partial reads, grown descriptors and reference fallback passed");
++ puts("Command snapshot storage: 10000 batches -> <=2 byte allocations; exact Foundation data, retained old views, bounded cache, pressure trim, partial reads, grown descriptors, odd-length16-byte alignment and reference fallback passed");
 +}}
 +'''
 +with tempfile.TemporaryDirectory(prefix='henge-command-storage-') as d:
