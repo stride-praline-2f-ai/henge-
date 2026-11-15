@@ -41,3 +41,7 @@ For a controlled next comparison use a fully shut-down **8GiB guest,4vCPUs,60Hz*
 Cloud validation for the final combined patch must pass before any IPA. This follow-up does not claim the prior iPadOS interruption's cause or steady60FPS has been established.
 
 A failed initial MetalFX compiler/pool creation previously latched the unavailable flag permanently. Recovery now permits one new attempt when pressure admission returns, without per-frame compiler retries. The regression injects initial compiler failure, checks that repeated frames do not recreate it, and verifies successful recovery.
+
+## Hardware scroll detail
+
+Hardware scroll speed is0.02, the configured minimum (default0.15). The end counters show247hardware callbacks and46delivered batches, maximum2axis units. The production accumulator deliberately retains fractions until integer guest wheel units are available. Tiny deltas therefore arrive as accumulated steps; this can contribute to scrolling feel, but does not explain page-loading delay or all frame-time spikes. The scroll preference is preserved. Reset hardware scroll speed is an existing control for a separate comparison. Captured native mouse drop/queue counters are zero; Pencil has no begins in this test, so Pencil hardware behavior is not validated by this log.

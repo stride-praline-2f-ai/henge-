@@ -133,4 +133,10 @@ if physical115:
         assert physical115.get(name)=='passed_cloud', 'Physical115 follow-up incomplete: '+name
     assert physical115.get('evidence'), 'Missing physical MetalFX follow-up evidence'
 
+pressurefx=state.get('memory_pressure_fx_followup')
+if pressurefx:
+    assert pressurefx.get('complete') is True and pressurefx.get('source_commit')==validation.get('source_commit'), 'Memory-pressure/FX follow-up needs exact-source proof'
+    for key in ('budget','pool','accounting','lifecycle_telemetry','ios_integration'):
+        assert pressurefx.get(key)=='passed_cloud', 'Memory-pressure/FX check incomplete: '+key
+    assert pressurefx.get('evidence'), 'Missing memory-pressure/FX evidence'
 print('PASS complete implementation gate:', manifest['audit_repairs_sha256'])

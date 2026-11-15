@@ -1805,10 +1805,10 @@ index 0000000..7f164e0
 +#endif
 diff --git a/devices/desktop_fx.h b/devices/desktop_fx.h
 new file mode 100644
-index 0000000..23cb2e8
+index 0000000..eaec22c
 --- /dev/null
 +++ b/devices/desktop_fx.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,90 @@
 +#pragma once
 +#import <MetalFX/MetalFX.h>
 +#import <Foundation/Foundation.h>
@@ -1837,13 +1837,14 @@ index 0000000..23cb2e8
 +    id<MTLDevice> _device;
 +    id<MTL4Compiler> _compiler;
 +    NSMutableArray<HvDesktopFXFrame *> *_idle;
-+    NSUInteger _created;
++    NSUInteger _created,_limit;
 +    uint64_t _epoch;
 +}
 +- (instancetype)initWithDevice:(id<MTLDevice>)device;
 +- (HvDesktopFXLease *)acquireWidth:(NSUInteger)width height:(NSUInteger)height outputWidth:(NSUInteger)ow outputHeight:(NSUInteger)oh NS_RETURNS_RETAINED;
 +- (void)recycle:(HvDesktopFXFrame *)frame;
 +- (void)trim;
++- (void)setLimit:(NSUInteger)limit;
 +@end
 +@implementation HvDesktopFXLease
 +- (void)dealloc { [_owner recycle:_frame]; }
@@ -1851,14 +1852,18 @@ index 0000000..23cb2e8
 +@implementation HvDesktopFXPool
 +- (instancetype)initWithDevice:(id<MTLDevice>)device {
 +    if(!(self=[super init]) || ![MTLFXSpatialScalerDescriptor supportsMetal4FX:device])return nil;
-+    _device=device;_idle=[NSMutableArray new];
++    _device=device;_idle=[NSMutableArray new];_limit=3;
 +    // A private compiler avoids racing the guest archive compiler's epochs.
 +    _compiler=[device newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:nil];
 +    return _compiler?self:nil;
 +}
 +- (void)trim { @synchronized(self) { _epoch++;_created-=_idle.count;[_idle removeAllObjects]; } }
++- (void)setLimit:(NSUInteger)limit { @synchronized(self) {
++    _limit=MIN(limit,3u);
++    while(_created>_limit && _idle.count){[_idle removeLastObject];_created--;}
++} }
 +- (void)recycle:(HvDesktopFXFrame *)frame { @synchronized(self) {
-+    if(frame->epoch==_epoch)[_idle addObject:frame];else _created--;
++    if(frame->epoch==_epoch && _created<=_limit)[_idle addObject:frame];else _created--;
 +} }
 +- (HvDesktopFXLease *)acquireWidth:(NSUInteger)width height:(NSUInteger)height outputWidth:(NSUInteger)ow outputHeight:(NSUInteger)oh {
 +    if(!width||!height||ow<width||oh<height||ow>8192||oh>8192)return nil;
@@ -1871,7 +1876,7 @@ index 0000000..23cb2e8
 +            // Dispose only idle wrong-size allocations. Three leases cover the
 +            // cached image plus two admitted presentations, independent of vCPUs.
 +            _created-=_idle.count;[_idle removeAllObjects];
-+            if(_created>=3)return nil;
++            if(_created>=_limit)return nil;
 +            frame=[HvDesktopFXFrame new];
 +            MTLFXSpatialScalerDescriptor *d=[MTLFXSpatialScalerDescriptor new];
 +            d.inputWidth=width;d.inputHeight=height;d.outputWidth=ow;d.outputHeight=oh;
@@ -3263,10 +3268,10 @@ index 0000000..2258d0a
 +}
 diff --git a/devices/metal4_screen.h b/devices/metal4_screen.h
 new file mode 100644
-index 0000000..cb09476
+index 0000000..31983ff
 --- /dev/null
 +++ b/devices/metal4_screen.h
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,164 @@
 +#pragma once
 +#include "metal4_runtime.h"
 +#include "pipeline_bundle.h"
@@ -3284,6 +3289,7 @@ index 0000000..cb09476
 +    uint64_t _cachedEpoch,_pendingEpoch;
 +    uint32_t _cachedMode,_pendingMode;
 +    BOOL _fxCacheEnabled,_fxUnavailableLogged,_fxSourceSizeLogged;
++    NSUInteger _fxLimit;
 +@public
 +    _Atomic uint64_t fx_encoded,fx_reused,fx_fallback;
 +    _Atomic uint64_t fx_pressure_fallback,fx_resource_fallback,fx_size_fallback;
@@ -3296,10 +3302,11 @@ index 0000000..cb09476
 +                 cursor:(id<MTLTexture>)cursor rect:(const float *)rect sharp:(BOOL)sharp imageEpoch:(uint64_t)epoch upscale:(BOOL)upscale;
 +- (void)didCommit:(BOOL)committed;
 +- (void)setFXCacheAdmission:(BOOL)enabled;
++- (void)setFXCacheLimit:(NSUInteger)limit;
 +@end
 +@implementation HvMetal4Screen
 +- (instancetype)initWithRuntime:(HvMetal4Runtime *)runtime device:(id<MTLDevice>)device library:(id<MTLLibrary>)library bundle:(HvPipelineBundle *)bundle {
-+    if(!(self=[super init]))return nil;_runtime=runtime;_device=device;_fxCacheEnabled=YES;
++    if(!(self=[super init]))return nil;_runtime=runtime;_device=device;_fxCacheEnabled=YES;_fxLimit=3;
 +    id<MTLRenderPipelineState> states[3];
 +    NSArray *names=@[@"screen_plain",@"screen_linear",@"screen_cursor"];
 +    for(unsigned i=0;i<3;i++){
@@ -3342,10 +3349,17 @@ index 0000000..cb09476
 +    return YES;
 +}
 +- (void)setFXCacheAdmission:(BOOL)enabled {
++    [self setFXCacheLimit:enabled?3:0];
++}
++- (void)setFXCacheLimit:(NSUInteger)limit {
++    limit=MIN(limit,3u);
 +    // The presenter reapplies current admission for every damaged frame.
 +    // Trim only on a transition, not once per fallback presentation.
-+    if(_fxCacheEnabled==enabled)return;
++    if(_fxLimit==limit)return;
++    BOOL enabled=limit!=0;
++    _fxLimit=limit;
 +    _fxCacheEnabled=enabled;
++    [_fxPool setLimit:limit];
 +    if(!enabled){_cachedFX=nil;_cachedSource=nil;[_fxPool trim];}
 +    // A failed compiler/pool allocation must not permanently disable FX.
 +    // Retry once after real pressure recovery, without retrying every frame.
@@ -3382,7 +3396,10 @@ index 0000000..cb09476
 +        BOOL reuse=epoch && lease && _cachedEpoch==epoch && _cachedSource==source && _cachedMode==key &&
 +            lease.frame->outWidth==target.width && lease.frame->outHeight==target.height;
 +        if(!reuse){
-+            if(!_fxPool && !_fxUnavailableLogged)_fxPool=[[HvDesktopFXPool alloc]initWithDevice:_device];
++            if(!_fxPool && !_fxUnavailableLogged){
++                _fxPool=[[HvDesktopFXPool alloc]initWithDevice:_device];
++                [_fxPool setLimit:_fxLimit];
++            }
 +            lease=[_fxPool acquireWidth:source.width height:source.height outputWidth:target.width outputHeight:target.height];
 +        }
 +        if(lease){
@@ -4005,7 +4022,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..712f615 100644
+index 9073d22..6e882b4 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -4127,7 +4144,7 @@ index 9073d22..712f615 100644
 +    id metal4; /* populated only behind the OS/GPU capability gate */
 +    id metal4_screen;
 +    BOOL desktop_fx;
-+    atomic_bool display_fx_admission;
++    atomic_uint display_fx_limit;
 +    uint64_t screen_image_epoch;
 +    id pipeline_bundle;
 +    os_unfair_lock submission_lock;
@@ -4319,11 +4336,11 @@ index 9073d22..712f615 100644
 +    }
 +    archive_budget_pressure=pressure;
 +    if(@available(macOS 26.0,iOS 26.0,*))[metal4 setArchiveAdmission:!archive_pressure_suspended];
-+    BOOL allowFX=!pressure && available>=(512ull<<20);
-+    BOOL previousFX=atomic_exchange(&display_fx_admission,allowFX);
-+    if(desktop_fx && previousFX!=allowFX){
-+        fprintf(stderr,"desktop-metalfx-admission: enabled=%d pressure=%d process_headroom=%llu UIKit_hold=%d (pressure fallback preserves output geometry; guest RAM unchanged)\n",allowFX,pressure,(unsigned long long)available,now_seconds()<cache_warning_until);
-+        dispatch_async(presenter,^{if(@available(macOS 26.0,iOS 26.0,*))[self->metal4_screen setFXCacheAdmission:allowFX];});
++    unsigned fxLimit=hv_desktop_fx_limit(available,pressure);
++    unsigned previousFX=atomic_exchange(&display_fx_limit,fxLimit);
++    if(desktop_fx && previousFX!=fxLimit){
++        fprintf(stderr,"desktop-metalfx-admission: enabled=%d leases=%u pressure=%d process_headroom=%llu UIKit_hold=%d (moderate pressure trims spare leases; critical fallback preserves output geometry; guest RAM unchanged)\n",fxLimit!=0,fxLimit,pressure,(unsigned long long)available,now_seconds()<cache_warning_until);
++        dispatch_async(presenter,^{if(@available(macOS 26.0,iOS 26.0,*))[self->metal4_screen setFXCacheLimit:fxLimit];});
 +    }
 +    HvResourceBudget budget = hv_resource_budget_profile(available, pressure, hv_host_is_m4_16gb());
 +    [library_cache setAdmissionBytes:hv_env_flag("HV_GPU_LIBRARY_CACHE_OFF") ? 0 : (NSUInteger)budget.library_bytes
@@ -5665,7 +5682,7 @@ index 9073d22..712f615 100644
 +            if(!pipeline_bundle)pipeline_bundle=[[HvPipelineBundle alloc]initWithDevice:device directory:folder];
 +            HvPipelineBundle *bundle=pipeline_bundle;
 +            metal4_screen=[[HvMetal4Screen alloc]initWithRuntime:metal4 device:device library:(bundle&&bundle->screenLibrary?bundle->screenLibrary:lib) bundle:pipeline_bundle];
-+            [metal4_screen setFXCacheAdmission:atomic_load(&display_fx_admission)];
++            [metal4_screen setFXCacheLimit:atomic_load(&display_fx_limit)];
 +            fprintf(stderr,"hengevm: metal4-display: active=%d bundle_hits=%llu bundle_misses=%llu\n",metal4_screen!=nil,bundle?(unsigned long long)bundle->hits:0,bundle?(unsigned long long)bundle->misses:0);
 +        }}
          screen_pipe = hv_screen_pipeline(device, lib, @"screen_plain", NO, &err);
@@ -8224,6 +8241,30 @@ index 0000000..8b6ce4c
 +For a controlled next comparison use a fully shut-down **8GiB guest,4vCPUs,60Hz**, keeping the chosen native Retina or optional MetalFX mode explicit and constant. Existing16GiB saved state remains compatible and is not resized silently. This is a lower-pressure comparison, not a claim that more RAM or120Hz can never help.
 +
 +Cloud validation for the final combined patch must pass before any IPA. This follow-up does not claim the prior iPadOS interruption's cause or steady60FPS has been established.
+diff --git a/docs/m4-optimisation/PRESSURE-AND-FX.md b/docs/m4-optimisation/PRESSURE-AND-FX.md
+new file mode 100644
+index 0000000..3777d6d
+--- /dev/null
++++ b/docs/m4-optimisation/PRESSURE-AND-FX.md
+@@ -0,0 +1,18 @@
++# Memory pressure, physical accounting and MetalFX continuity
++
++This extends the fully validated79fc181 source after the user's request to counter unnecessary MetalFX deactivation during warnings. It does not assume process allowance equals free physical RAM, suppress OS warnings, shrink live guest RAM or replace the memory controller.
++
++- Normal: the existing MetalFX pool retains at most three resource sets.
++- Moderate warning, with at least512MiB process headroom: cap the pool at two sets. Drop spare idle allocations and retire surplus sets after GPU completion. Preserve the current upscaled image, cursor reuse and new-image upscaling when a lease is available.
++- Critical system pressure or less than512MiB process allowance: release optional idle/cached FX resources and use the existing linear compositor. Output geometry and guest workspace stay fixed; live GPU jobs keep their resources until completion.
++- Recovery: restore the normal budget on the existing pressure/cache events and permit one retry of failed initial compiler creation. No timer, per-frame compiler retry, second cache manager or new render path.
++
++The pool counts distinct leased frames, not command buffers. A cached image may be retained by several reads. Reducing the cap cannot overwrite an in-flight texture; surplus leases are discarded only when their last owner releases them. Tests exercise3->2->3, live retirement, two-set new-image encoding/cursor reuse, critical fallback, allocation failure and compiler recovery.
++
++Existing capture now reads raw public HOST_VM_INFO64 categories on its utility worker: free, speculative, purgeable, compressor, wired, active, inactive, external and internal bytes. Some categories overlap; they are not added into an invented physical-available number. Process headroom, physical RAM, footprint, resident bytes and Metal allocation remain separately labelled. If the OS restricts the system read, system_vm_available=false is explicit. Mach send rights are balanced and tested against real macOS accounting.
++
++System/process memory is still recorded while a VM lifecycle writer prevents VM statistics access. Generation-fenced VM rates remain discarded during mixed transitions. Memory rows carry the worker's sample uptime to distinguish sample time from UI/log-delivery delay. The existing warning notification advances the same capture deadline and wakeup; no high-frequency memory poll is added.
++
++The prior115 logs establish real1280x960 ->2560x1920 Metal4FX execution and pressure-associated linear fallbacks. They do not measure actual free physical memory or prove an iPadOS reset cause. The new counters address that missing distinction on the next device capture. A16GiB guest still competes with iPadOS/JIT/Metal for physical memory even when it is excluded from the process footprint.8GiB remains a comparison option after full shutdown, not a silent change to saved sessions.
++
++Validation required for this extension: real system-memory/read-right test, restricted/mixed-lifecycle capture fixture, resource budget boundaries, production FX pool/routing ASan/UBSan checks, both app SDKs and complete native/app compilation. Packaging remains disabled until completed validation and final release reconciliation.
 diff --git a/docs/m4-optimisation/PROGRESS.md b/docs/m4-optimisation/PROGRESS.md
 new file mode 100644
 index 0000000..a55c4c4
@@ -12098,10 +12139,10 @@ index 0000000..ef1d8a6
 +#endif
 diff --git a/host/resource_policy.h b/host/resource_policy.h
 new file mode 100644
-index 0000000..2467c4a
+index 0000000..acc334a
 --- /dev/null
 +++ b/host/resource_policy.h
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,32 @@
 +#ifndef HENGE_RESOURCE_POLICY_H
 +#define HENGE_RESOURCE_POLICY_H
 +#include <stdint.h>
@@ -12125,6 +12166,13 @@ index 0000000..2467c4a
 +        budget.library_entries=128;
 +    }
 +    return budget;
++}
++/* Keep a smaller useful presentation pool for a moderate warning. Critical
++   system pressure or low process allowance still disables optional upscaling.
++   This is the existing cache controller, not another memory/thermal policy. */
++static inline unsigned hv_desktop_fx_limit(uint64_t available,int pressure) {
++    if(pressure>=2 || available<(512ull<<20))return 0;
++    return pressure>0 ? 2 : 3;
 +}
 +#endif
 diff --git a/host/scheduling.c b/host/scheduling.c
@@ -13047,6 +13095,42 @@ index 67fc764..d061ad7 100644
 +int hv_snapshot_inspect(const char *path, char *ident, size_t ident_capacity, HvSnapshotInfo *info);
  
  #endif
+diff --git a/host/system_memory.h b/host/system_memory.h
+new file mode 100644
+index 0000000..3153386
+--- /dev/null
++++ b/host/system_memory.h
+@@ -0,0 +1,30 @@
++#pragma once
++#include <stdint.h>
++#include <mach/mach.h>
++
++/* Raw categories can overlap (notably purgeable/speculative/file-backed).
++   No sum of these is a promise of allocatable physical RAM. */
++typedef struct {
++    uint64_t free, speculative, purgeable, compressed, wired;
++    uint64_t active, inactive, external, internal;
++} HvSystemMemory;
++static inline int hv_system_memory_read(HvSystemMemory *out) {
++    if(!out)return 0;
++    *out=(HvSystemMemory){0};
++    host_t host=mach_host_self();
++    if(!MACH_PORT_VALID(host))return 0;
++    vm_size_t page=0;
++    vm_statistics64_data_t vm={0};
++    mach_msg_type_number_t count=HOST_VM_INFO64_COUNT;
++    int ok=host_page_size(host,&page)==KERN_SUCCESS && page &&
++        host_statistics64(host,HOST_VM_INFO64,(host_info64_t)&vm,&count)==KERN_SUCCESS &&
++        count>=HOST_VM_INFO64_COUNT;
++    mach_port_deallocate(mach_task_self(),host);
++    if(!ok)return 0;
++    *out=(HvSystemMemory){(uint64_t)vm.free_count*page,(uint64_t)vm.speculative_count*page,
++        (uint64_t)vm.purgeable_count*page,(uint64_t)vm.compressor_page_count*page,
++        (uint64_t)vm.wire_count*page,(uint64_t)vm.active_count*page,
++        (uint64_t)vm.inactive_count*page,(uint64_t)vm.external_page_count*page,
++        (uint64_t)vm.internal_page_count*page};
++    return 1;
++}
 diff --git a/host/vm.c b/host/vm.c
 index db95c05..76f1010 100644
 --- a/host/vm.c
@@ -17800,20 +17884,21 @@ index 29c8b3b..1cf7b46 100644
          all.removeAll { $0.id == id }
          save()
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..752b845 100644
+index 34d6a98..0414192 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
-@@ -3,7 +3,9 @@
+@@ -3,7 +3,10 @@
  #include "net_slirp.h"
  #include <sys/mman.h>
  #include "henge-vm.h"
 +#include "disk_resize.h"
  #include "fastmem.h"
 +#include "native_touch.h"
++#include "system_memory.h"
  
  #include <os/proc.h>
  #include <TargetConditionals.h>
-@@ -23,23 +25,58 @@
+@@ -23,23 +26,58 @@
  
  #include <fcntl.h>
  #include <unistd.h>
@@ -17874,7 +17959,7 @@ index 34d6a98..752b845 100644
      exit_reason = reason;
      int halt = hv_vm_cpu(0)->halted;
      exit_outcome = HENGE_VM_OUTCOME_ERROR;
-@@ -49,13 +86,12 @@ static void on_exit(int reason) {
+@@ -49,13 +87,12 @@ static void on_exit(int reason) {
      case HV_HALT_HOST: exit_outcome = HENGE_VM_OUTCOME_HOST_STOP; break;
      case HV_HALT_PANIC: exit_outcome = HENGE_VM_OUTCOME_PANIC; break;
      }
@@ -17891,7 +17976,7 @@ index 34d6a98..752b845 100644
      fprintf(stderr, "henge: the machine stopped (%s, halt reason %d); CPU threads ended, disks flushed%s\n",
              exit_description(), halt, installer_session ? "" : ", machine released");
      pthread_rwlock_unlock(&api_lock);
-@@ -67,6 +103,11 @@ static int begin_start(char *err, size_t errlen) {
+@@ -67,6 +104,11 @@ static int begin_start(char *err, size_t errlen) {
          snprintf(err, errlen, "A Mac app ran in this launch. Quit Henge (swipe it away) and open it again to start a Mac.");
          return -1;
      }
@@ -17903,7 +17988,7 @@ index 34d6a98..752b845 100644
      pthread_rwlock_wrlock(&api_lock);
      if ((state != 0 && state != 2) || installer_session) {
          snprintf(err, errlen, "%s", installer_session
-@@ -75,26 +116,31 @@ static int begin_start(char *err, size_t errlen) {
+@@ -75,26 +117,31 @@ static int begin_start(char *err, size_t errlen) {
          pthread_rwlock_unlock(&api_lock);
          return -1;
      }
@@ -17940,7 +18025,7 @@ index 34d6a98..752b845 100644
      pthread_rwlock_unlock(&api_lock);
      return 0;
  }
-@@ -116,9 +162,25 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
+@@ -116,9 +163,25 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
      return hv_snapshot_check(path, ident, bytes, saved_at);
  }
  
@@ -17968,7 +18053,7 @@ index 34d6a98..752b845 100644
          snprintf(err, errlen, "No Mac is running.");
          return -1;
      }
-@@ -133,21 +195,73 @@ int henge_vm_pause(char *err, size_t errlen) {
+@@ -133,21 +196,73 @@ int henge_vm_pause(char *err, size_t errlen) {
          snprintf(err, errlen, "The Mac stopped by itself.");
          return -1;
      }
@@ -18048,7 +18133,7 @@ index 34d6a98..752b845 100644
      fprintf(stderr, "henge: %s\n", r ? err : "the paused Mac is saved");
      return r;
  }
-@@ -160,18 +274,39 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
+@@ -160,18 +275,39 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
  }
  
  int henge_vm_continue(void) {
@@ -18091,7 +18176,7 @@ index 34d6a98..752b845 100644
      }
      pthread_rwlock_unlock(&api_lock);
      fprintf(stderr, "henge: the Mac runs on%s\n", r ? " -- no, its CPU threads could not start" : "");
-@@ -192,17 +327,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
+@@ -192,17 +328,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
      fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
              jit->size >> 20);
      if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
@@ -18120,7 +18205,7 @@ index 34d6a98..752b845 100644
  }
  
  static volatile int install_step = -1;
-@@ -239,7 +382,7 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
+@@ -239,7 +383,7 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
          snprintf(err, errlen, "The installer could not start.");
          return failed_start();
      }
@@ -18129,7 +18214,7 @@ index 34d6a98..752b845 100644
  }
  
  int henge_install_step(void) { return install_step; }
-@@ -293,22 +436,29 @@ static int lock_running(void) {
+@@ -293,22 +437,29 @@ static int lock_running(void) {
      return 0;
  }
  void henge_vm_stop(void) {
@@ -18170,7 +18255,7 @@ index 34d6a98..752b845 100644
  }
  
  long henge_vm_balloon(long target_mb) {
-@@ -336,21 +486,23 @@ int henge_vm_knob(const char *name, int value) {
+@@ -336,21 +487,23 @@ int henge_vm_knob(const char *name, int value) {
      return result;
  }
  void henge_vm_log_cache(void) {
@@ -18197,7 +18282,7 @@ index 34d6a98..752b845 100644
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
-@@ -375,9 +527,35 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
+@@ -375,9 +528,35 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
      if (hv_share_start(folder, socket_path, agent) == 0) hv_net_set_share_socket(socket_path);
  }
  void henge_share_set_clipboard(const char *text) { hv_share_set_clipboard(text); }
@@ -18233,7 +18318,7 @@ index 34d6a98..752b845 100644
  void henge_vm_set_display(uint32_t width, uint32_t height) { hv_pvg_lite_set_mode(width, height); }
  void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm) { hv_pvg_lite_set_size_mm(width_mm, height_mm); }
  int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,uint32_t height_mm,uint32_t hz) {
-@@ -388,6 +566,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
+@@ -388,6 +567,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
@@ -18260,7 +18345,7 @@ index 34d6a98..752b845 100644
  void henge_vm_link_connected(int connected) {
      if (!lock_running()) return;
      HvVmapple *b = hv_vm_board();
-@@ -454,13 +652,51 @@ void henge_vm_set_display_layer(void *layer) {
+@@ -454,13 +653,51 @@ void henge_vm_set_display_layer(void *layer) {
      hv_vm_set_display_layer(layer);
  }
  uint64_t henge_vm_gpu_frames(void) {
@@ -18315,7 +18400,7 @@ index 34d6a98..752b845 100644
      HvBootDisplay d;
      int result = -1;
      if (hv_vm_boot_display(&d) == 0) {
-@@ -509,3 +745,118 @@ uint64_t henge_largest_mapping_mb(void) {
+@@ -509,3 +746,130 @@ uint64_t henge_largest_mapping_mb(void) {
      }
      return 0;
  }
@@ -18362,6 +18447,18 @@ index 34d6a98..752b845 100644
 +    if (task_info(mach_task_self(),TASK_VM_INFO,(task_info_t)&info,&count)==KERN_SUCCESS) {
 +        out->footprint=info.phys_footprint;out->resident=info.resident_size;
 +        out->available|=2;
++    }
++    /* Supported system accounting, once per admitted diagnostic read. This
++       separates raw system categories from a process's jetsam allowance.
++       Failure/restriction is explicitly unavailable, never "zero free RAM". */
++    HvSystemMemory system;
++    if(hv_system_memory_read(&system)){
++        out->available|=128;
++        out->system_free=system.free;out->system_speculative=system.speculative;
++        out->system_purgeable=system.purgeable;out->system_compressed=system.compressed;
++        out->system_wired=system.wired;out->system_active=system.active;
++        out->system_inactive=system.inactive;out->system_external=system.external;
++        out->system_internal=system.internal;
 +    }
 +#if TARGET_OS_IPHONE
 +    out->headroom=os_proc_available_memory();
@@ -18435,7 +18532,7 @@ index 34d6a98..752b845 100644
 +    hv_vm_release_input_source(source);pthread_rwlock_unlock(&api_lock);
 +}
 diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
-index b8c41fa..e5d78e5 100644
+index b8c41fa..e4b2ab9 100644
 --- a/ios/Henge/Native/henge-vm.h
 +++ b/ios/Henge/Native/henge-vm.h
 @@ -4,6 +4,7 @@
@@ -18496,7 +18593,7 @@ index b8c41fa..e5d78e5 100644
  /* Testing: sets a translation knob (core/machine.h) in the running machine; nonzero if it exists. */
  int henge_vm_knob(const char *name, int value);
  /* The memory balloon (only with HV_BALLOON set before boot): asks the guest to hand over target_mb (when >= 0)
-@@ -62,6 +86,44 @@ int henge_vm_knob(const char *name, int value);
+@@ -62,6 +86,47 @@ int henge_vm_knob(const char *name, int value);
  long henge_vm_balloon(long target_mb);
  
  /* Progress, for the session screen. */
@@ -18518,10 +18615,13 @@ index b8c41fa..e5d78e5 100644
 +    uint64_t mouse_delivered, mouse_dropped, mouse_queued;
 +    uint64_t replay_gpu_completed, replay_gpu_ns, replay_gpu_max_ns, replay_gpu_unavailable;
 +    uint64_t metal_allocated, metal4_gpu_completed, metal4_gpu_ns, metal4_gpu_max_ns;
++    /* Raw HOST_VM_INFO64 categories. Some overlap; never sum as allocatable RAM. */
++    uint64_t system_free, system_speculative, system_purgeable, system_compressed;
++    uint64_t system_wired, system_active, system_inactive, system_external, system_internal;
 +    uint64_t disk[2][6];
 +    int disk_timing_enabled[2];
 +    int detailed_counters;
-+    unsigned available; /* bits: 0 CPU, 1 memory, 2 headroom, 3 VM, 4 classic replay timing, 5 Metal4 timing, 6 Metal allocation */
++    unsigned available; /* bits: 0 CPU, 1 memory, 2 headroom, 3 VM, 4 classic replay timing, 5 Metal4 timing, 6 Metal allocation, 7 system VM */
 +    uint64_t generation, epoch;
 +    int state;
 +} HengeVmResources;
@@ -18541,7 +18641,7 @@ index b8c41fa..e5d78e5 100644
  void henge_vm_log_cache(void);           /* optional per-CPU cache-use diagnostics */
  uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
  uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
-@@ -74,6 +136,9 @@ int henge_vm_guest_el0(void);              /* any CPU running user code right no
+@@ -74,6 +139,9 @@ int henge_vm_guest_el0(void);              /* any CPU running user code right no
     henge_share_take_clipboard returns what the guest copied, once: a malloc'd string, or NULL. */
  void henge_vm_share(const char *folder, const char *socket_path, const char *agent);
  void henge_share_set_clipboard(const char *text);
@@ -18551,7 +18651,7 @@ index b8c41fa..e5d78e5 100644
  char *henge_share_take_clipboard(void);
  long henge_share_agent_seen(void);
  
-@@ -82,7 +147,12 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
+@@ -82,7 +150,12 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
  /* The panel's physical size; 0, 0 for the default (a ~122 ppi, 1x screen). Before boot. */
  void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm);
  int henge_vm_set_link_display(uint32_t width, uint32_t height, uint32_t width_mm, uint32_t height_mm, uint32_t hz);
@@ -19325,10 +19425,10 @@ index 0000000..1b65c83
 +}
 diff --git a/ios/Henge/SessionDiagnosticCapture.swift b/ios/Henge/SessionDiagnosticCapture.swift
 new file mode 100644
-index 0000000..ce00563
+index 0000000..b941ce4
 --- /dev/null
 +++ b/ios/Henge/SessionDiagnosticCapture.swift
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,132 @@
 +import Foundation
 +import Combine
 +
@@ -19390,7 +19490,9 @@ index 0000000..ce00563
 +            var observation = HengeVmObservation()
 +            let observed = henge_vm_try_observation(&observation) != 0
 +            var resources = HengeVmResources()
-+            if observed { henge_vm_resources(&resources) }
++            // Process/system memory remains useful while a lifecycle writer
++            // owns the VM. Resources uses a nonblocking VM read-lock itself.
++            henge_vm_resources(&resources)
 +            let sampledAt = ProcessInfo.processInfo.systemUptime
 +            Task { @MainActor in
 +                self?.acceptSample(revision:revision, observed:observed,
@@ -19403,6 +19505,7 @@ index 0000000..ce00563
 +                              resources: HengeVmResources, now: TimeInterval) {
 +        if samplePending == revision { samplePending = nil }
 +        guard active, revision == sampleRevision else { return }
++        HengeLog.log("capture-memory", "sampled_uptime_s=\(String(format:"%.3f",now)) footprint=\(resources.footprint) resident=\(resources.resident) process_headroom=\(resources.headroom) physical_ram=\(ProcessInfo.processInfo.physicalMemory) system_vm_available=\(resources.available & 128 != 0) free=\(resources.system_free) speculative=\(resources.system_speculative) purgeable=\(resources.system_purgeable) compressor=\(resources.system_compressed) wired=\(resources.system_wired) active=\(resources.system_active) inactive=\(resources.system_inactive) external=\(resources.system_external) internal=\(resources.system_internal) (raw system categories in bytes; categories can overlap; not an allocatable-RAM sum or process allowance)")
 +        guard observed else {
 +            previous=nil;nextDeadline=min(end,now+5)
 +            if now>=end { stop() }
@@ -22750,10 +22853,10 @@ index 0000000..26b72af
 +    subprocess.run([str(path/'check')],check=True,timeout=20)
 diff --git a/tests/test_desktop_fx.m b/tests/test_desktop_fx.m
 new file mode 100644
-index 0000000..686ffe6
+index 0000000..40af138
 --- /dev/null
 +++ b/tests/test_desktop_fx.m
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,192 @@
 +/* Executes the production pool and compositor against recording objects. This
 +   proves routing/lifetime/cache behavior, NOT MetalFX image quality or GPU time. */
 +#import <Foundation/Foundation.h>
@@ -22863,6 +22966,17 @@ index 0000000..686ffe6
 +        [pool trim];a=nil;assert(!oldLease);b=nil;c=nil;
 +    }
 +    assert(!oldFrame); // strong property getters may autorelease until this drain
++    @autoreleasepool {
++        HvDesktopFXPool *budget=[[HvDesktopFXPool alloc]initWithDevice:(id)device];
++        HvDesktopFXLease *a=[budget acquireWidth:16 height:12 outputWidth:32 outputHeight:24];
++        HvDesktopFXLease *b=[budget acquireWidth:16 height:12 outputWidth:32 outputHeight:24];
++        HvDesktopFXLease *c=[budget acquireWidth:16 height:12 outputWidth:32 outputHeight:24];assert(a&&b&&c);
++        [budget setLimit:2];assert(![budget acquireWidth:16 height:12 outputWidth:32 outputHeight:24]);
++        a=nil;assert([[budget valueForKey:@"_created"]unsignedIntegerValue]==2);
++        b=nil;HvDesktopFXLease *d=[budget acquireWidth:16 height:12 outputWidth:32 outputHeight:24];assert(d&&d.frame!=c.frame);
++        assert(![budget acquireWidth:16 height:12 outputWidth:32 outputHeight:24]);
++        [budget setLimit:3];assert([budget acquireWidth:16 height:12 outputWidth:32 outputHeight:24]);
++    }
 +    supported=NO;assert(![[HvDesktopFXPool alloc]initWithDevice:(id)device]);supported=YES;
 +    HvDesktopFXPool *pool=[[HvDesktopFXPool alloc]initWithDevice:(id)device];failTextures=YES;
 +    assert(![pool acquireWidth:16 height:12 outputWidth:32 outputHeight:24]);failTextures=NO;
@@ -22917,10 +23031,23 @@ index 0000000..686ffe6
 +    failCompiler=NO;[retryScreen setFXCacheAdmission:NO];[retryScreen setFXCacheAdmission:YES];[events removeAllObjects];
 +    HvMetal4Job *compilerRecovery=[retryScreen encode:source target:target half:NO mode:0 cursor:nil rect:NULL sharp:NO imageEpoch:2 upscale:YES];
 +    assert(compilerRecovery && [events containsObject:@"FX"] && compilerCreations==attempted+1);[retryScreen didCommit:NO];[compilerRecovery->keep removeAllObjects];
++    HvMetal4Screen *softScreen=[[HvMetal4Screen alloc]initWithRuntime:(id)runtime device:(id)device library:nil bundle:nil];assert(softScreen);
++    [softScreen setFXCacheLimit:2];[events removeAllObjects];
++    HvMetal4Job *softFirst=[softScreen encode:source target:target half:NO mode:0 cursor:nil rect:NULL sharp:NO imageEpoch:1 upscale:YES];
++    assert(softFirst && [events containsObject:@"FX"]);[softScreen didCommit:YES];[softFirst->keep removeAllObjects];[events removeAllObjects];
++    HvMetal4Job *softNext=[softScreen encode:source target:target half:NO mode:0 cursor:nil rect:NULL sharp:NO imageEpoch:2 upscale:YES];
++    assert(softNext && [events containsObject:@"FX"]);[softScreen didCommit:YES];[softNext->keep removeAllObjects];[events removeAllObjects];
++    HvMetal4Job *softCursor=[softScreen encode:source target:target half:NO mode:0 cursor:cursor rect:NULL sharp:NO imageEpoch:2 upscale:YES];
++    assert(softCursor && ![events containsObject:@"FX"] && atomic_load(&softScreen->fx_reused)==1);[softScreen didCommit:YES];
++    [softScreen setFXCacheLimit:0];[events removeAllObjects];
++    HvMetal4Job *critical=[softScreen encode:source target:target half:NO mode:0 cursor:nil rect:NULL sharp:NO imageEpoch:3 upscale:YES];
++    assert(critical && ![events containsObject:@"FX"] && atomic_load(&softScreen->fx_pressure_fallback)==1);
++    assert(softCursor->keep.count);[softScreen didCommit:NO];[softCursor->keep removeAllObjects];[critical->keep removeAllObjects];
 +    puts("PASS Desktop MetalFX production routing: Metal4 encode, low-input colour pass, post-upscale cursor, committed-image reuse and rejected-image retry (recording objects; no GPU pixel claim)");
 +    puts("PASS Desktop MetalFX resource lifetime: three distinct bounded leases, declared texture usage, in-flight pressure protection, allocation failure and recovery");
 +    puts("PASS Desktop MetalFX pressure policy: repeated disabled frames do not retrim resources; pressure and geometry fallbacks independently attributed");
 +    puts("PASS Desktop MetalFX compiler recovery: failed initial pool creation retries after pressure recovery without per-frame compiler retries");
++    puts("PASS Desktop MetalFX moderate pressure: two-lease cap reclaims spare and retiring frames, keeps new-image upscaling and cached cursor output, critical pressure still falls back safely");
 +}}
 diff --git a/tests/test_desktop_fx_gpu.m b/tests/test_desktop_fx_gpu.m
 new file mode 100644
@@ -22997,27 +23124,34 @@ index 0000000..85c5b38
 +}
 diff --git a/tests/test_diagnostic_capture.swift b/tests/test_diagnostic_capture.swift
 new file mode 100644
-index 0000000..f3ca503
+index 0000000..0888b87
 --- /dev/null
 +++ b/tests/test_diagnostic_capture.swift
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,108 @@
 +import Foundation
 +
 +private final class CaptureState: @unchecked Sendable {
 +    let lock=NSLock(), release=DispatchSemaphore(value:0)
 +    private var reads=0
++    private var systemAvailable=true
++    private var observationAvailable=true
 +    var logs:[String]=[]
 +    var timing:[Int32]=[]
 +    func read(_ output:inout HengeVmResources) {
 +        precondition(!Thread.isMainThread)
-+        lock.lock();reads+=1;let n=reads;lock.unlock()
++        lock.lock();reads+=1;let n=reads,system=systemAvailable;lock.unlock()
 +        if n==1 {precondition(release.wait(timeout:.now()+5) == .success)}
-+        output.generation=1;output.epoch=1;output.state=1;output.available=127
++        output.generation=1;output.epoch=1;output.state=1;output.available=system ? 255 : 127
 +        output.process_cpu_us=UInt64(n)*1_000_000;output.replay_gpu_ns=UInt64(n)*1_000_000
 +        output.replay_gpu_completed=UInt64(n);output.metal4_gpu_ns=UInt64(n)*10_000_000
 +        output.metal4_gpu_completed=UInt64(n);output.metal_allocated=123456
++        output.headroom=UInt64(n)*1000
++        if system {output.system_free=4096;output.system_compressed=8192}
 +    }
 +    var count:Int {lock.lock();defer{lock.unlock()};return reads}
++    func restrictSystemRead(){lock.lock();systemAvailable=false;lock.unlock()}
++    func restrictVMObservation(){lock.lock();observationAvailable=false;lock.unlock()}
++    var observed:Bool {lock.lock();defer{lock.unlock()};return observationAvailable}
 +}
 +private let fixture=CaptureState()
 +struct HengeVmCounters {var generation:UInt64=0,epoch:UInt64=0,blocks:UInt64=0,gpu_frames:UInt64=0,tx:UInt64=0,rx:UInt64=0;var state:Int32=0}
@@ -23028,6 +23162,8 @@ index 0000000..f3ca503
 +    var mouse_delivered:UInt64=0,mouse_dropped:UInt64=0,mouse_queued:UInt64=0
 +    var replay_gpu_completed:UInt64=0,replay_gpu_ns:UInt64=0,replay_gpu_max_ns:UInt64=0,replay_gpu_unavailable:UInt64=0
 +    var metal_allocated:UInt64=0,metal4_gpu_completed:UInt64=0,metal4_gpu_ns:UInt64=0,metal4_gpu_max_ns:UInt64=0
++    var system_free:UInt64=0,system_speculative:UInt64=0,system_purgeable:UInt64=0,system_compressed:UInt64=0
++    var system_wired:UInt64=0,system_active:UInt64=0,system_inactive:UInt64=0,system_external:UInt64=0,system_internal:UInt64=0
 +    var disk=((UInt64(0),UInt64(0),UInt64(0),UInt64(0),UInt64(0),UInt64(0)),(UInt64(0),UInt64(0),UInt64(0),UInt64(0),UInt64(0),UInt64(0)))
 +    var disk_timing_enabled=(Int32(0),Int32(0));var detailed_counters:Int32=0
 +    var available:UInt32=0,generation:UInt64=0,epoch:UInt64=0;var state:Int32=0
@@ -23035,7 +23171,7 @@ index 0000000..f3ca503
 +func henge_vm_capture_timing(_ on:Int32){fixture.timing.append(on)}
 +func henge_vm_try_observation(_ out:inout HengeVmObservation)->Int32 {
 +    precondition(!Thread.isMainThread)
-+    out.counters.generation=1;out.counters.epoch=1;out.counters.state=1;return 1
++    out.counters.generation=1;out.counters.epoch=1;out.counters.state=1;return fixture.observed ? 1 : 0
 +}
 +func henge_vm_resources(_ out:inout HengeVmResources){fixture.read(&out)}
 +func henge_vm_log_cache(){precondition(!Thread.isMainThread)}
@@ -23080,12 +23216,24 @@ index 0000000..f3ca503
 +        // The stale background read must not turn capture timing back on.
 +        precondition(fixture.timing==[1,0,1])
 +        precondition(fixture.logs.contains{$0.contains("metal_allocated=123456")})
++        precondition(fixture.logs.contains{$0.contains("system_vm_available=true free=4096") && $0.contains("compressor=8192")})
 +        // The second accepted sample provides interval deltas, kept separate.
 +        try? await Task.sleep(nanoseconds:300_000_000)
 +        capture.event("fresh2");capture.sample()
 +        await until("separate backend interval deltas") {fixture.logs.contains{$0.contains("replay_gpu_scope=classic_only") && $0.contains("metal4_gpu_ms=10.000")}}
++        fixture.restrictSystemRead()
++        try? await Task.sleep(nanoseconds:300_000_000)
++        capture.event("system_access_restricted");capture.sample()
++        await until("restricted system counters labelled unavailable") {fixture.logs.contains{$0.contains("system_vm_available=false")}}
++        let beforeVM=fixture.logs.filter{$0.contains("state=1 generation=1")}.count
++        fixture.restrictVMObservation()
++        try? await Task.sleep(nanoseconds:300_000_000)
++        capture.event("lifecycle_writer");capture.sample()
++        await until("process memory survives a busy lifecycle writer") {fixture.logs.contains{$0.contains("capture-memory:") && $0.contains("process_headroom=5000")}}
++        precondition(fixture.logs.filter{$0.contains("state=1 generation=1")}.count==beforeVM)
 +        capture.stop();precondition(fixture.timing==[1,0,1,0])
 +        print("PASS production capture: off-main native reads, bounded admission, stale stop/restart rejection, no timing resurrection and separate classic/Metal4 deltas")
++        print("PASS production memory capture: raw system categories, restricted-read availability and process memory during VM lifecycle writers without mixed VM rates")
 +    }
 +}
 diff --git a/tests/test_disk_recovery_macos.py b/tests/test_disk_recovery_macos.py
@@ -27399,10 +27547,10 @@ index 0000000..f8aee69
 +}
 diff --git a/tests/test_resource_policy.c b/tests/test_resource_policy.c
 new file mode 100644
-index 0000000..be71a93
+index 0000000..ab4f71d
 --- /dev/null
 +++ b/tests/test_resource_policy.c
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,29 @@
 +#include "resource_policy.h"
 +#include <assert.h>
 +#include <stdio.h>
@@ -27423,7 +27571,14 @@ index 0000000..be71a93
 +    b=hv_resource_budget_profile(2ull<<30,0,1);assert(b.library_entries==128);
 +    b=hv_resource_budget_profile(4ull<<30,1,1);assert(b.library_entries==8 && b.library_bytes==2ull<<20);
 +    b=hv_resource_budget_profile(64ull<<20,0,1);assert(!b.library_entries);
++    assert(hv_desktop_fx_limit(UINT64_MAX,0)==3);
++    assert(hv_desktop_fx_limit(4ull<<30,0)==3);
++    assert(hv_desktop_fx_limit(4ull<<30,1)==2);
++    assert(hv_desktop_fx_limit(4ull<<30,2)==0);
++    assert(hv_desktop_fx_limit((512ull<<20)-1,0)==0);
++    assert(hv_desktop_fx_limit(512ull<<20,1)==2);
 +    puts("resource budget: dynamic headroom, pressure precedence, boundaries and recovery passed");
++    puts("PASS MetalFX budget: nominal three leases, moderate two, critical/low allowance zero; warning is not confused with process headroom");
 +}
 diff --git a/tests/test_restore_archive.py b/tests/test_restore_archive.py
 new file mode 100644
@@ -28103,6 +28258,31 @@ index 01aead4..b1daca1 100644
 +''')
 +subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-O2','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-o',str(b/'test_surface_hash')],check=True)
 +subprocess.run([str(b/'test_surface_hash')],check=True)
+diff --git a/tests/test_system_memory.c b/tests/test_system_memory.c
+new file mode 100644
+index 0000000..24bccce
+--- /dev/null
++++ b/tests/test_system_memory.c
+@@ -0,0 +1,19 @@
++#include "system_memory.h"
++#include <assert.h>
++#include <stdio.h>
++int main(void) {
++    assert(!hv_system_memory_read(NULL));
++    host_t host=mach_host_self();
++    mach_port_urefs_t before=0,after=0;
++    vm_size_t page=0;
++    assert(host_page_size(host,&page)==KERN_SUCCESS && page);
++    assert(mach_port_get_refs(mach_task_self(),host,MACH_PORT_RIGHT_SEND,&before)==KERN_SUCCESS);
++    HvSystemMemory info;
++    for(unsigned i=0;i<8;i++){
++        assert(hv_system_memory_read(&info));
++        assert(info.free%page==0 && info.wired%page==0 && info.compressed%page==0);
++    }
++    assert(mach_port_get_refs(mach_task_self(),host,MACH_PORT_RIGHT_SEND,&after)==KERN_SUCCESS && before==after);
++    mach_port_deallocate(mach_task_self(),host);
++    puts("PASS system memory: real HOST_VM_INFO64 reads, page units, null handling and bounded Mach send-right lifetime; raw categories are not allocatable headroom");
++}
 diff --git a/tests/test_translation_race.py b/tests/test_translation_race.py
 index b65c694..58fb79f 100644
 --- a/tests/test_translation_race.py
@@ -29071,7 +29251,7 @@ index 0000000..e1f8457
 +if __name__ == '__main__':
 +    main()
 diff --git a/tools/check_host_scheduling.sh b/tools/check_host_scheduling.sh
-index 509bce1..9e99fb0 100755
+index 509bce1..785463c 100755
 --- a/tools/check_host_scheduling.sh
 +++ b/tools/check_host_scheduling.sh
 @@ -2,6 +2,28 @@
@@ -29103,17 +29283,19 @@ index 509bce1..9e99fb0 100755
  mkdir -p build/scheduling-check
  task_out="$PWD/build/scheduling-check"
  exec > >(tee "$task_out/checks.log") 2>&1
-@@ -9,6 +31,9 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
+@@ -9,6 +31,11 @@ trap 'task_rc=$?; echo "Scheduling check failed: exit=$task_rc line=$LINENO comm
  set -x
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread -Ihost \
      host/scheduling.c tests/test_scheduling.c -o "$task_out/test_scheduling"
 +xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ihost \
 +    tests/test_resource_policy.c -o "$task_out/test_resource_policy"
 +"$task_out/test_resource_policy"
++xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Ihost tests/test_system_memory.c -o "$task_out/test_system_memory"
++"$task_out/test_system_memory"
  "$task_out/test_scheduling"
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O2 -Ihost -c host/scheduling.c -o "$task_out/scheduling.o"
  swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h \
-@@ -16,6 +41,18 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
+@@ -16,6 +43,18 @@ swiftc -parse-as-library -swift-version 5 -import-objc-header host/scheduling.h
  "$task_out/test_host_bridge"
  swiftc -parse-as-library -swift-version 5 ios/Henge/SessionStatistics.swift tests/test_session_statistics.swift -o "$task_out/test_session_statistics"
  "$task_out/test_session_statistics"
@@ -29132,7 +29314,7 @@ index 509bce1..9e99fb0 100755
  xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -DHV_PROF_TEST -Icore -Ihost -Idevices \
      host/prof_ios.c host/scheduling.c tests/test_prof_ios.c -o "$task_out/test_prof_ios"
  "$task_out/test_prof_ios"
-@@ -25,18 +62,24 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=addres
+@@ -25,18 +64,24 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=addres
  xcrun --sdk macosx clang -fobjc-arc -std=c11 -Wall -Wextra -Werror -O2 -Idevices \
      tests/test_display_settings.m -framework Foundation -o "$task_out/test_display_settings"
  "$task_out/test_display_settings"
