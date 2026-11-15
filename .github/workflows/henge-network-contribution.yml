@@ -1,0 +1,65 @@
+name: Upstream network batching checks
+'on':
+  push:
+    branches:
+    - contributions/prepare-upstream
+    paths:
+    - contributions/network-rx-batching.patch
+    - .github/workflows/henge-network-contribution.yml
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: henge-network-contribution-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  network:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: request
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Henge
+        ref: e98920ce3b108d17f98acaff87f74e5a477ec4b2
+        path: Henge
+        persist-credentials: false
+    - name: Check actual virtqueue batching and compile the slirp consumer
+      working-directory: Henge
+      shell: bash
+      run: 'set -euo pipefail
+
+        xcodebuild -version
+
+        git apply --check ../request/contributions/network-rx-batching.patch
+
+        git apply ../request/contributions/network-rx-batching.patch
+
+        git diff --check
+
+        mkdir -p build
+
+        xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -O1 -Icore -Ihost
+        -Idevices -fsanitize=address,undefined tests/test_net_batch.c devices/virtio_net.c
+        devices/virtio.c -o build/test_net_batch
+
+        build/test_net_batch
+
+        if ! pkg-config --exists slirp; then brew install libslirp; fi
+
+        make -j4 build/test_devices build/net_slirp.o 2>&1 | tee build/network-contribution-build.log
+
+        build/test_devices 2>&1 | tee build/network-contribution-test.log
+
+        '
+    - name: Retain actual device and network compile evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: network-contribution-${{ github.sha }}
+        path: Henge/build/network-contribution-*.log
+        if-no-files-found: warn
+        retention-days: 14
