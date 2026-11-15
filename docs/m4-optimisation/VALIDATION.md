@@ -1,6 +1,6 @@
 # Exact-source desktop upscaler validation
 
-Source `4678636973855ad0b9a0f4de43fa11526d74ac1b`, patch `79c00f1eac73cdb7e9dac5b9663edd83a27dc3f11cca24ad867f5046bc2ffd12`. Full run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43657238549; focused https://github.com/stride-praline-2f-ai/henge-/actions/runs/43657238631.
+Source `38729d557ff6d979cfbd80c49b5b5456801668eb`, patch `79c00f1eac73cdb7e9dac5b9663edd83a27dc3f11cca24ad867f5046bc2ffd12`. Full run https://github.com/stride-praline-2f-ai/henge-/actions/runs/43658710042; focused https://github.com/stride-praline-2f-ai/henge-/actions/runs/43658710069.
 
 Passed: native JIT/MMU/VM/audio/input/network/storage/Link/snapshot/clipboard regression suite, sanitizers/concurrency, complete iOS Release compilation, production Metal4 SDK checks, actual VirtualMac upscaler policy, legacy/native snapshot defaults, exact saved presentation scale, fixed output geometry, production MetalFX routing via recording objects, post-scale cursor ordering, epoch cache reuse/rejected-job invalidation, bounded leases and memory-pressure recovery. Real classic Metal GPU readback and existing component benchmarks remain in the focused receipt.
 
