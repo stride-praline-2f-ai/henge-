@@ -1,8 +1,8 @@
-name: Cancel verified obsolete Duo builds once
+name: Force-cancel verified obsolete Duo builds
 'on':
   push:
     branches:
-    - feature/metal4-pipeline-efficiency
+    - maintenance/legacy-duo-cancellation-116
     paths:
     - .github/workflows/henge-release-cleanup.yml
   workflow_dispatch: {}
@@ -24,12 +24,17 @@ jobs:
         base=os.environ['GITHUB_API_URL']+'/repos/'+os.environ['GITHUB_REPOSITORY']+'/actions/runs/'\nheaders={'Authorization':'Bearer\
         \ '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}\n\
         def get(run):\n    with urllib.request.urlopen(urllib.request.Request(base+str(run),headers=headers),timeout=30)\
-        \ as r:return json.load(r)\nfor run,sha in expected.items():\n    item=get(run)\n    assert item['id']!=int(os.environ['GITHUB_RUN_ID'])\n\
-        \    assert item['head_branch']=='feature/duo-efficiency' and item['head_sha']==sha\n    assert item['path']=='.github/workflows/henge-duo-checks.yml'\
-        \ and item['event']=='push'\n    assert item['created_at']<'2026-11-12T00:00:00Z'\n    if item['status']=='completed':\n\
-        \        print(json.dumps({'run':run,'action':'already_completed','conclusion':item.get('conclusion')}));continue\n\
+        \ as r:return json.load(r)\nfailures=[]\nfor run,sha in expected.items():\n    item=get(run)\n    assert\
+        \ item['id']!=int(os.environ['GITHUB_RUN_ID'])\n    assert item['head_branch']=='feature/duo-efficiency'\
+        \ and item['head_sha']==sha\n    assert item['path']=='.github/workflows/henge-duo-checks.yml' and item['event']=='push'\n\
+        \    assert item['created_at']<'2026-11-12T00:00:00Z'\n    if item['status']=='completed':\n        print(json.dumps({'run':run,'action':'already_completed','conclusion':item.get('conclusion')}));continue\n\
         \    assert item['status'] in ('queued','in_progress','waiting','pending','requested')\n    try:\n     \
         \   with urllib.request.urlopen(urllib.request.Request(base+str(run)+'/cancel',data=b'',headers=headers,method='POST'),timeout=30)\
-        \ as r:\n            assert r.status==202\n    except urllib.error.HTTPError as error:\n        if error.code!=409\
-        \ or get(run)['status']!='completed':raise\n    print(json.dumps({'run':run,'action':'cancel_requested','only_verified_obsolete_run':True}))\n\
-        PY\n"
+        \ as r:\n            assert r.status==202\n    except urllib.error.HTTPError as error:\n        if error.code!=409:raise\n\
+        \        if get(run)['status']=='completed':\n            print(json.dumps({'run':run,'action':'completed_during_cancel'}));continue\n\
+        \        # Official force-cancel operation for a run that refuses normal cancel.\n        # The exact ID/SHA/path/branch/date\
+        \ guards above apply unchanged.\n        try:\n            with urllib.request.urlopen(urllib.request.Request(base+str(run)+'/force-cancel',data=b'',headers=headers,method='POST'),timeout=30)\
+        \ as r:\n                assert r.status==202\n        except urllib.error.HTTPError as forced:\n      \
+        \      print(json.dumps({'run':run,'normal_http':409,'force_http':forced.code,'reason':forced.read().decode()[:800]}))\n\
+        \            failures.append(run);continue\n    print(json.dumps({'run':run,'action':'cancel_requested','only_verified_obsolete_run':True}))\n\
+        assert not failures, 'GitHub refused normal and force cancellation: '+str(failures)\nPY\n"
