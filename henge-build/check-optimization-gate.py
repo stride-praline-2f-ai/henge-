@@ -139,4 +139,8 @@ if pressurefx:
     for key in ('budget','pool','accounting','lifecycle_telemetry','ios_integration'):
         assert pressurefx.get(key)=='passed_cloud', 'Memory-pressure/FX check incomplete: '+key
     assert pressurefx.get('evidence'), 'Missing memory-pressure/FX evidence'
+engine=state.get('engine_memory_dispatch',{})
+assert engine.get('complete') and engine.get('source_commit')==validation.get('source_commit'), 'Engine implementation needs exact-source proof'
+assert all(engine.get(k)=='passed' for k in ('checked_reuse','lookup_trials','selective_eviction','nonmoving_retention','branch_dispatch','faults_simd_sanitizers','ios_integration')), 'Engine regression checks incomplete'
+assert engine.get('evidence') and engine.get('performance_rejections'), 'Engine defaults require concrete measurement evidence'
 print('PASS complete implementation gate:', manifest['audit_repairs_sha256'])

@@ -242,6 +242,13 @@ if follow116:
     assert 'diagnosticFileURLs' in log_source and 'ShareLink(items: HengeLog.diagnosticFileURLs)' in settings_source, 'Previous-session diagnostic sharing not wired'
     data['physical116_followup']=dict(follow116,runtime_markers_verified=True,physical_performance_verified=False)
 
+# New engine paths must survive Release linking in the actual device binary.
+engine=state.get('engine_memory_dispatch',{})
+assert engine.get('complete') and engine.get('source_commit')==state['final_validation']['source_commit'], 'Engine memory/dispatch source validation missing'
+for marker in (b'engine-paths: interleaved-groups=', b'jit-branch-preservation:', b'branch-dispatch: paired-load=', b'jit-retention: enabled='):
+    assert marker in app_executable, 'Engine integration missing from IPA: '+repr(marker)
+data['engine_memory_dispatch']=dict(engine,runtime_markers_verified=True,physical_performance_verified=False)
+
 # Correct legacy metadata: verify the real configured default in the reconstructed source.
 assert 'as? Bool ?? true' in Path('Henge/ios/Henge/EngineTuning.swift').read_text()
 data['fastmem_default']=True
