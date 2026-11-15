@@ -121,3 +121,6 @@ Wider checked interleaved memory reuse and selective IJC preservation are enable
 ## Engine117 shipped
 
 All implementation, native/sanitizer/app and final IPA gates passed. Release c7a115cfa93f8650a8e61144a19280096b82d5f1; run43720699793; artifact14164727662. Drive upload and full-byte SHA256 readback passed. See ENGINE-IMPLEMENTATION.md and ENGINE-117-VALIDATION.json. No source changes after validation; remaining FPS/energy comparisons require physical M4/Duo.
+
+
+Build118 Safari follow-up: source `763e02fd4b114737af093f683b01d5ecd421df3a`, patch `53b3f15acb3c4a75fa42f96ee0ddf7e78732852472dda92aeecb7e39ab4673ef`, full native/app validation [43741006562](https://github.com/stride-praline-2f-ai/henge-/actions/runs/43741006562) passed. Focused GPU proof43736645861 includes exact pixels,4097->1 Mach remaps and full-byte reference equality. Existing CPU/JIT unchanged from117. Version0.3.17(118); final IPA is still subject to packaging and artifact inspection. Device Safari FPS/heat unmeasured.
