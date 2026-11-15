@@ -1,0 +1,144 @@
+name: Safari replay efficiency source checks
+'on':
+  push:
+    branches:
+    - perf/safari-compositing
+    paths:
+    - henge-build/**
+    - .github/workflows/henge-safari-checks.yml
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: henge-safari-source-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  replay:
+    runs-on: xcode-27
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: build-request
+        persist-credentials: false
+    - name: Select newest installed Xcode for native touch
+      run: "python3 - <<'PYSDK'\nimport glob, os, re, subprocess\nassert subprocess.check_output(['uname',\
+        \ '-m'], text=True).strip() == 'arm64', 'This Henge runner requires native\
+        \ arm64 macOS'\ncandidates = []\nfor app in glob.glob('/Applications/Xcode*.app'):\n\
+        \    developer = app + '/Contents/Developer'\n    try:\n        version =\
+        \ subprocess.check_output(['xcodebuild', '-version'], env={**os.environ, 'DEVELOPER_DIR':\
+        \ developer}, text=True)\n        match = re.search(r'Xcode (\\d+(?:\\.\\\
+        d+)*)', version)\n        if match: candidates.append((tuple(map(int, match[1].split('.'))),\
+        \ developer, version))\n    except subprocess.CalledProcessError:\n      \
+        \  pass\nif not candidates: raise SystemExit('No installed Xcode found')\n\
+        _, developer, version = max(candidates)\nprint(version + developer)\nwith\
+        \ open(os.environ['GITHUB_ENV'], 'a') as f: f.write('DEVELOPER_DIR=' + developer\
+        \ + '\\n')\nPYSDK\n"
+    - id: pins
+      run: "python3 - <<'PYPIN'\nimport json,os\nm=json.load(open('build-request/henge-build/manifest.json'))\n\
+        with open(os.environ['GITHUB_OUTPUT'],'a') as f:\n    f.write('henge='+m['henge_sha']+'\\\
+        n')\n    f.write('preview='+str(m.get('ui_preview_requested',True)).lower()+'\\\
+        n')\nPYPIN"
+    - uses: actions/checkout@v4
+      with:
+        repository: Leviidev/Henge
+        ref: ${{ steps.pins.outputs.henge }}
+        path: Henge
+        persist-credentials: false
+    - name: Reconstruct exact pinned and patched source
+      run: 'set -euo pipefail
+
+        python3 - <<''PYPATCH''
+
+        from pathlib import Path
+
+        import hashlib,json,subprocess
+
+        root=Path(''build-request/henge-build'');m=json.loads((root/''manifest.json'').read_text());p=root/''henge.patch''
+
+        assert hashlib.sha256(p.read_bytes()).hexdigest()==m[''patch_sha256'']
+
+        subprocess.run([''git'',''-C'',''Henge'',''apply'',''--check'',str(p.resolve())],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''apply'',str(p.resolve())],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''add'',''-A''],check=True)
+
+        subprocess.run([''git'',''-C'',''Henge'',''-c'',''user.name=Henge CI'',''-c'',''user.email=henge-ci@users.noreply.github.com'',''commit'',''-m'',''Apply
+        pinned custom source for controller review''],check=True)
+
+        PYPATCH
+
+        bash build-request/henge-build/integrate-upstream.sh
+
+        '
+      id: reconstruct
+    - name: Native replay metadata, remap and exact-surface checks
+      working-directory: Henge
+      run: 'set -euo pipefail
+
+        mkdir -p build/safari
+
+        mkdir -p build/safari
+
+        exec > >(tee build/safari/metadata.log) 2>&1
+
+        python3 tests/test_gpu_page_reuse.py
+
+        python3 tests/test_surface_sync.py
+
+        python3 tests/test_surface_hash_limit.py
+
+        python3 tests/test_gpu_object_cache.py
+
+        cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Idevices
+        tests/test_gpu_epoch.c -o build/safari/test_gpu_epoch
+
+        build/safari/test_gpu_epoch
+
+        '
+      if: ${{ !cancelled() && steps.reconstruct.outcome == 'success' }}
+    - name: Real Metal4 bridge and pipeline state recording
+      working-directory: Henge
+      run: "set -euo pipefail\nmkdir -p build/safari\nexec > >(tee build/safari/real.log)\
+        \ 2>&1\nfor test in test_metal4_ordering test_metal4_compilation test_metal4_arguments;\
+        \ do\n xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined\
+        \ tests/$test.m -framework Foundation -framework Metal -o build/safari/$test\n\
+        \ build/safari/$test\ndone\n"
+      if: ${{ !cancelled() && steps.reconstruct.outcome == 'success' }}
+    - name: Exact pixels and allocation ownership on host GPU
+      working-directory: Henge
+      run: "set -euo pipefail\nmkdir -p build/safari\nexec > >(tee build/safari/exact.log)\
+        \ 2>&1\nxcrun -sdk macosx metal -c devices/pvg_screen.metal -o build/safari/screen.air\n\
+        xcrun -sdk macosx metallib build/safari/screen.air -o build/safari/screen.metallib\n\
+        for test in test_native_metal test_planar_registry; do\n xcrun --sdk macosx\
+        \ clang -fobjc-arc -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined\
+        \ -Idevices tests/$test.m -framework Foundation -framework Metal -framework\
+        \ IOSurface -o build/safari/$test\n build/safari/$test build/safari/screen.metallib\n\
+        done\n"
+      if: ${{ !cancelled() && steps.reconstruct.outcome == 'success' }}
+    - name: Compile real production replay for macOS and iOS
+      working-directory: Henge
+      run: 'set -euo pipefail
+
+        mkdir -p build/safari
+
+        exec > >(tee build/safari/compile.log) 2>&1
+
+        xcrun --sdk macosx clang -std=c11 -fobjc-arc -Wall -Wextra -Wno-unused-parameter
+        -Wno-deprecated-declarations -O2 -Icore -Ihost -Idevices -c devices/pvg_metal.m
+        -o build/safari/pvg-macos.o
+
+        xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -std=c11
+        -fobjc-arc -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations
+        -O2 -Icore -Ihost -Idevices -c devices/pvg_metal.m -o build/safari/pvg-ios.o
+
+        '
+      if: ${{ !cancelled() && steps.reconstruct.outcome == 'success' }}
+    - if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: safari-replay-checks-${{ github.sha }}
+        path: Henge/build/safari/*.log
+        if-no-files-found: warn
+        retention-days: 7
