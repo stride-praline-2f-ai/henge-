@@ -315,7 +315,7 @@ s=s.replace(anchor,anchor+'''
                 encoding:NSUTF8StringEncoding error:nil];
             if (!recorded || !latestSaved)
                 [report appendString:@"Warning: Apply succeeded but restore history "
-                    "could not be saved completely. Preserve the app and its backup folder.\\n"];
+                    @"could not be saved completely. Preserve the app and its backup folder.\\n"];
 ''',1)
 p.write_text(s)
 
