@@ -75,9 +75,9 @@ static NSString *DuoSDKChooseSigningGroup(NSString **reason) {
     if (signedGroups.count == 0) {
         if (reason) *reason =
             @"No App Group entitlement exists in this installed app's signature. "
-             "The provisioning profile alone does not grant it. "
-             "Signulous must include an authorised App Group when signing the IPA. "
-             "No changes made.";
+             @"The provisioning profile alone does not grant it. "
+             @"Signulous must include an authorised App Group when signing the IPA. "
+             @"No changes made.";
         return nil;
     }
     NSUInteger accessible = 0, unused = 0;
@@ -93,8 +93,8 @@ static NSString *DuoSDKChooseSigningGroup(NSString **reason) {
     if (reason) {
         *reason = [NSString stringWithFormat:
             @"The signature declares %lu App Group(s); %lu container(s) were accessible. "
-             "None is safely unused, so DuoSDK will not replace an existing "
-             "App Group cache. No changes made.",
+             @"None is safely unused, so DuoSDK will not replace an existing "
+             @"App Group cache. No changes made.",
              (unsigned long)signedGroups.count, (unsigned long)accessible];
     }
     return nil;
