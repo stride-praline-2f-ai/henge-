@@ -265,7 +265,7 @@ static NSString *duoRestoreSelected(int dir, NSString *support, NSString *select
 }
 
 '''
-anchor="// Selection is checked against a freshly parsed live cache, never against"
+anchor="NSString *DuoSDKMaintenanceForSelection(NSInteger action, NSString *selectedIDsJSON) {"
 assert s.count(anchor)==1
 s=s.replace(anchor,helpers+anchor,1)
 
