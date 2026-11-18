@@ -388,7 +388,7 @@ private struct DuoSDKView: View {
                     }
                 }
                 if !restoreCandidates.isEmpty {
-                    Section("Recorded changes to restore") {
+                    Section {
                         ForEach(restoreCandidates) { item in
                             Toggle(isOn: Binding(
                                 get: { restoreIDs.contains(item.id) },
@@ -409,6 +409,8 @@ private struct DuoSDKView: View {
                         Button("Restore \(restoreIDs.count) selected app(s)", role: .destructive) {
                             confirmRestore = true
                         }.disabled(restoreIDs.isEmpty)
+                    } header: {
+                        Text("Recorded changes to restore")
                     } footer: {
                         Text("Only changes recorded by this version are listed. Restore checks each app's live cache record before writing.")
                     }
