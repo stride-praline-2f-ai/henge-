@@ -1,0 +1,104 @@
+name: Build DuoSDK IPA (not Henge)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'duosdk-build/**'
+      - '.github/workflows/duosdk-ipa.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-duosdk:
+    name: Compile and package DuoSDK
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify native iOS build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          test "$(uname -m)" = "arm64"
+
+      - name: Extract uploaded DuoSDK source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p duosdk-src
+          base64 --decode -i duosdk-build/source.tar.xz.b64 > "$RUNNER_TEMP/duosdk-source.tar.xz"
+          tar -xJf "$RUNNER_TEMP/duosdk-source.tar.xz" -C duosdk-src
+          test -f duosdk-src/XFlagProbe.xcodeproj/project.pbxproj
+          test -f duosdk-src/Sources/App.swift
+          test -f duosdk-src/Sources/XFlags.m
+          sips --resampleHeightWidth 1024 1024 duosdk-src/Sources/DuoSDKAssets.xcassets/AppIcon.appiconset/DuoSDK.png
+          plutil -lint duosdk-src/GestaltX.entitlements
+          echo "DuoSDK source archive verified. Henge source is not built."
+
+      - name: Build unsigned iOS app with Xcode 27
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -list -project duosdk-src/XFlagProbe.xcodeproj
+          xcodebuild \
+            -project duosdk-src/XFlagProbe.xcodeproj \
+            -target XFlagProbe \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$GITHUB_WORKSPACE/derived-data" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS='' \
+            DEVELOPMENT_TEAM='' \
+            REGISTER_APP_GROUPS=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            build 2>&1 | tee "$RUNNER_TEMP/duosdk-build.log"
+
+      - name: Package and validate IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$GITHUB_WORKSPACE/derived-data/Build/Products/Release-iphoneos/XFlagProbe.app"
+          test -f "$app/Info.plist"
+          test -f "$app/XFlagProbe"
+          xcrun lipo -info "$app/XFlagProbe"
+          plutil -extract CFBundleIdentifier raw "$app/Info.plist"
+          mkdir -p output/Payload
+          ditto "$app" output/Payload/XFlagProbe.app
+          ( cd output && zip -q -r -X DuoSDK-unsigned.ipa Payload )
+          unzip -t output/DuoSDK-unsigned.ipa | tail -n 2
+          python3 - <<'PY'
+          import plistlib, zipfile
+          with zipfile.ZipFile('output/DuoSDK-unsigned.ipa') as z:
+              assert z.testzip() is None
+              plist = plistlib.loads(z.read('Payload/XFlagProbe.app/Info.plist'))
+              assert plist['CFBundleExecutable'] == 'XFlagProbe'
+              assert plist['CFBundleIdentifier'] == 'dev.aritzmendez.sirireadprobe'
+              assert len(z.read('Payload/XFlagProbe.app/XFlagProbe')) > 4096
+              print('Verified unsigned IPA: ' + plist['CFBundleDisplayName'])
+          PY
+
+      - name: Upload DuoSDK IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: DuoSDK-unsigned-IPA
+          path: output/DuoSDK-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log if the build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DuoSDK-build-logs
+          path: |
+            duosdk-src/*.buildlog
+            derived-data/Logs/Build/**
+          if-no-files-found: ignore
+          retention-days: 7
