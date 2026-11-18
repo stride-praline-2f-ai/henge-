@@ -51,6 +51,11 @@ replacement='''            NSMutableSet<NSString *> *wanted = [NSMutableSet set]
                         (i == 0 && [target[i] unsignedLongLongValue] == 0))
                         return @"Invalid target SDK. No changes made.";
                 }
+                if ([target[0] integerValue] != os.majorVersion ||
+                    [target[1] integerValue] > os.minorVersion ||
+                    ([target[1] integerValue] == os.minorVersion &&
+                     [target[2] integerValue] > os.patchVersion))
+                    return @"Target SDK must use an installed iOS SDK release. Nothing changed.";
                 [wanted addObject:identifier];
                 targets[identifier] = target;
             }
@@ -195,6 +200,11 @@ private struct DuoSDKView: View {
               let patch = pieces.count == 3 ? Int(pieces[2]) : Optional(0),
               (1...99).contains(major), (0...99).contains(minor),
               (0...99).contains(patch) else { return nil }
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        guard major == os.majorVersion,
+              minor <= os.minorVersion,
+              minor != os.minorVersion || patch <= os.patchVersion
+        else { return nil }
         return [major, minor, patch]
     }
     private func target(_ item: DuoSDKCandidate) -> String {
@@ -264,7 +274,7 @@ private struct DuoSDKView: View {
                         }
                         .disabled(!canApply)
                     } footer: {
-                        Text("Enter a target such as 27.2 or 27.2.1. If Apply is disabled, a target is invalid or already matches the installed app.")
+                        Text("Enter a target such as 27.1 or 27.2.1, up to your installed iOS version. An invalid or unchanged target cannot be applied.")
                     }
                 }
                 if !restoreCandidates.isEmpty {
