@@ -75,9 +75,9 @@ NSString *DuoSDKPlanLayoutReport(NSData *store) {
         [sizeCounts addObject:[NSString stringWithFormat:@"%@:%@", key, sizes[key]]];
     return [NSString stringWithFormat:
         @"Catalog entries %lu; Bundle entries %lu; string entries %lu. "
-         "Bundle record sizes: 604=%lu, other=%lu (%@). "
-         "Expected field pattern=%lu, Apple/TestFlight signer=%lu, "
-         "placeholder pattern=%lu. No private bundle IDs collected.",
+         @"Bundle record sizes: 604=%lu, other=%lu (%@). "
+         @"Expected field pattern=%lu, Apple/TestFlight signer=%lu, "
+         @"placeholder pattern=%lu. No private bundle IDs collected.",
          (unsigned long)catalog.count,
          (unsigned long)bundles.count, (unsigned long)strings.count,
          (unsigned long)expectedSize, (unsigned long)otherSize,
