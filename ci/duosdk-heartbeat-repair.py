@@ -211,7 +211,7 @@ s=s.replace(anchor,anchor+'''
 
 anchor='''                if !changedPreferences.isEmpty {'''
 assert s.count(anchor)==1
-s=s.replace(anchor,'''                Section("Recovery heartbeat") {
+s=s.replace(anchor,'''                Section {
                     HStack {
                         Image(systemName: heartbeatChecking ? "arrow.triangle.2.circlepath" : "heart.text.square")
                             .foregroundStyle(.secondary)
@@ -225,6 +225,8 @@ s=s.replace(anchor,'''                Section("Recovery heartbeat") {
                         Text("Last checked: \\(time, format: .dateTime.hour().minute().second())")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
+                } header: {
+                    Text("Recovery heartbeat")
                 } footer: {
                     Text("Checks and safely repairs DuoSDK's local journal on the foreground heartbeat. "
                          + "System-cache writes still require confirmation.")
