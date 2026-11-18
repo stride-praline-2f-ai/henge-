@@ -79,6 +79,19 @@ b='''        if (action == 1) {
             return report;
         }'''
 s=s.replace(a,b,1)
+# The number reported after Apply must describe the selected apps, not the
+# total candidate count from the broader review.
+counter = '        [report appendFormat:rows.count == 1 ?'
+begin = s.index(counter)
+assert begin > 0
+end = s.index(';\n', begin) + 2
+count_report = s[begin:end]
+s = s[:begin] + s[end:]
+before_count = '            rows = filtered;\n        }\n        for (NSDictionary *row in rows)'
+assert s.count(before_count) == 1
+s = s.replace(before_count,
+    '            rows = filtered;\n        }\n' + count_report +
+    '\n        for (NSDictionary *row in rows)', 1)
 s+='''
 
 // Legacy callers can only review or restore. Never apply to all by default.
