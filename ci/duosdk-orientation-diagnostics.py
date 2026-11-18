@@ -79,6 +79,7 @@ ui=r'''
                             Text("Left-half window").tag("Left-half window")
                             Text("Centred portrait bars").tag("Centred portrait bars")
                             Text("Full-width correct").tag("Full-width correct")
+                            Text("Full-width and smooth rotation").tag("Full-width and smooth rotation")
                             Text("Unexpected forced portrait").tag("Unexpected forced portrait")
                             Text("App crashed").tag("App crashed")
                         }
@@ -110,17 +111,35 @@ ui=r'''
                         }
                     }
 
-                    if layoutTrials.contains(where: {
-                        $0.path == "Outer landscape: unfold while app open" &&
-                        $0.result == "Full-width correct"
-                    }) && layoutTrials.contains(where: {
-                        $0.path == "Inner display: direct launch" &&
-                        $0.result != "Full-width correct"
+                    if layoutTrials.contains(where: { good in
+                        good.path == "Outer landscape: unfold while app open" &&
+                        (good.result == "Full-width correct" ||
+                         good.result == "Full-width and smooth rotation") &&
+                        layoutTrials.contains(where: { bad in
+                            bad.appID == good.appID &&
+                            bad.path == "Inner display: direct launch" &&
+                            bad.result != "Full-width correct" &&
+                            bad.result != "Full-width and smooth rotation"
+                        })
                     }) {
                         Text("A fold-transition success alongside a direct-launch failure "
                              + "is evidence of a scene/window-initialisation difference, "
                              + "not evidence that the saved SDK value reverted. "
                              + "Do not reapply an unchanged SDK.")
+                            .font(.callout)
+                    }
+
+                    if layoutTrials.contains(where: {
+                        $0.result == "Full-width and smooth rotation"
+                    }) && layoutTrials.contains(where: {
+                        $0.result == "Left-half window" ||
+                        $0.result == "Centred portrait bars" ||
+                        $0.result == "Unexpected forced portrait"
+                    }) {
+                        Text("Some apps rotate normally while others do not. " +
+                             "Compare the same rotation-lock setting and launch path " +
+                             "before blaming global Rotation Lock. App-specific " +
+                             "scene handling is a stronger hypothesis.")
                             .font(.callout)
                     }
 
