@@ -17,11 +17,27 @@ insertion = r'''
 // Every caller uses a value from the app's *effective code-signature entitlements*.
 // A group appearing in a provisioning profile alone is NOT enough.
 static NSArray<NSString *> *DuoSDKSignedGroups(void) {
-    SecTaskRef task = SecTaskCreateFromSelf(kCFAllocatorDefault);
-    if (!task) return @[];
-    CFTypeRef value = SecTaskCopyValueForEntitlement(
-        task, CFSTR("com.apple.security.application-groups"), NULL);
-    CFRelease(task);
+    // SecTask is intentionally not declared in the public iOS SDK headers.
+    // Resolve it at runtime, and fail closed if iOS doesn't export it.
+    typedef void *(*DuoTaskCreate)(CFAllocatorRef);
+    typedef CFTypeRef (*DuoTaskEntitlement)(void *, CFStringRef, CFErrorRef *);
+    void *security = dlopen("/System/Library/Frameworks/Security.framework/Security",
+                            RTLD_LAZY | RTLD_LOCAL);
+    DuoTaskCreate makeTask = (DuoTaskCreate)dlsym(security ?: RTLD_DEFAULT, "SecTaskCreateFromSelf");
+    DuoTaskEntitlement lookup = (DuoTaskEntitlement)dlsym(security ?: RTLD_DEFAULT,
+                                                         "SecTaskCopyValueForEntitlement");
+    if (!makeTask || !lookup) {
+        if (security) dlclose(security);
+        return @[];
+    }
+    void *task = makeTask(kCFAllocatorDefault);
+    if (!task) {
+        if (security) dlclose(security);
+        return @[];
+    }
+    CFTypeRef value = lookup(task, CFSTR("com.apple.security.application-groups"), NULL);
+    CFRelease((CFTypeRef)task);
+    if (security) dlclose(security);
     if (!value) return @[];
     if (CFGetTypeID(value) != CFArrayGetTypeID()) {
         CFRelease(value);
