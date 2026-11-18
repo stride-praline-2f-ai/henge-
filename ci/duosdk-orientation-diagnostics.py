@@ -39,6 +39,8 @@ s=s.replace(anchor,anchor+'''
     @State private var layoutLock = "Unknown"
     @State private var rotationAnimation = "Unknown"
     @State private var selfSceneReport = "No scene geometry sample recorded."
+    @State private var sensorReport = "Rotate the Duo while this screen is visible."
+    @State private var sensorEvents = 0
     @State private var layoutTrials: [DuoLayoutTrial] = {
         guard let data = UserDefaults.standard.data(forKey: "duosdk.layoutTrials.v1"),
               let trials = try? JSONDecoder().decode([DuoLayoutTrial].self, from: data)
@@ -60,6 +62,11 @@ ui=r'''
                     Button("Sample DuoSDK window and orientation") {
                         sampleSelfScene()
                     }
+                    Text("Physical rotation sensor: \(sensorReport)")
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                    Text("Physical orientation events: \(sensorEvents)")
+                        .font(.caption2).foregroundStyle(.secondary)
                     Text(selfSceneReport)
                         .font(.caption.monospaced())
                         .textSelection(.enabled)
@@ -158,6 +165,10 @@ ui=r'''
                              "system-wide Rotation Lock failure.")
                             .font(.callout)
                     }
+                    Text("Rotate the phone with DuoSDK foregrounded: the sensor " +
+                         "reports the physical pose while scene geometry shows " +
+                         "the current window's dimensions. No other app's scene is accessible.")
+                        .font(.caption).foregroundStyle(.secondary)
                     Text("Rotation Lock is user-reported: iOS does not offer a public API "
                          + "for third-party apps to read the global Control Centre lock. "
                          + "On the inner display, orientation and window aspect ratio "
@@ -176,6 +187,22 @@ s=s.replace(anchor,ui+anchor,1)
 anchor='''    private func checkHeartbeat() {'''
 assert s.count(anchor)==1
 methods=r'''
+    private func captureRotationSignal() {
+        let physical: String
+        switch UIDevice.current.orientation {
+        case .portrait: physical = "portrait"
+        case .portraitUpsideDown: physical = "upside down"
+        case .landscapeLeft: physical = "landscape left"
+        case .landscapeRight: physical = "landscape right"
+        case .faceUp: physical = "face up"
+        case .faceDown: physical = "face down"
+        default: physical = "unknown"
+        }
+        sensorEvents += 1
+        sensorReport = "\(physical), event \(sensorEvents)"
+        sampleSelfScene()
+    }
+
     private func sampleSelfScene() {
         guard let scene = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene })
@@ -216,6 +243,22 @@ methods=r'''
 
 '''
 s=s.replace(anchor,methods+anchor,1)
+# Subscribe while DuoSDK is visible; this reads the phone's own physical
+# orientation signal and the tool's scene geometry. No other app is modified.
+assert s.count(".task(id: scenePhase)") == 1
+s=s.replace(".task(id: scenePhase)", '''.onAppear {
+                UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+                captureRotationSignal()
+            }
+            .onReceive(NotificationCenter.default.publisher(
+                for: UIDevice.orientationDidChangeNotification)) { _ in
+                captureRotationSignal()
+            }
+            .onDisappear {
+                UIDevice.current.endGeneratingDeviceOrientationNotifications()
+            }
+            .task(id: scenePhase)''', 1)
+
 
 # Diagnosis must not force an SDK re-apply. The existing user-confirmed manual
 # Apply operation is unchanged and must continue to reject unchanged targets.
