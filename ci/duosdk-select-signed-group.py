@@ -9,8 +9,8 @@ import sys
 src = Path(sys.argv[1]).resolve() / "Sources"
 p = src / "XCacheTransaction.m"
 s = p.read_text(encoding="utf-8")
-assert '#import "worse_query.h"' in s
-s = s.replace('#import "worse_query.h"',
+assert '#include "worse_query.h"' in s
+s = s.replace('#include "worse_query.h"',
               '#import "worse_query.h"\n#import <Security/Security.h>', 1)
 
 insertion = r'''
