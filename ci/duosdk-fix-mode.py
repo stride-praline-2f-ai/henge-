@@ -70,7 +70,7 @@ once('''        if (action == 5)
 
 # Core binary-checksum transaction and validation untouched. Make this
 # explicit in CI by asserting anchors still exist after patching.
-assert 'lsRunBatch(dir,privateDir,folder,@"batch-upgrade"' in s
+assert 'lsRunBatch(dir,privateDir,folder,@"batch-upgrade-reverse"' in s
 assert 'maintenanceCandidate(original, rows, folder, report, NO)' in s
 p.write_text(s)
 
