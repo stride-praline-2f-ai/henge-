@@ -254,11 +254,11 @@ static NSString *duoRestoreSelected(int dir, NSString *support, NSString *select
         }
         if (duoWriteHistory(support,updated)) {
             [report appendFormat:@"Restored SDK metadata for %lu selected app(s). "
-                "Other recorded changes are retained. Restart affected apps if needed.\n",
+                @"Other recorded changes are retained. Restart affected apps if needed.\n",
                 (unsigned long)wanted.count];
         } else {
             [report appendString:@"Cache change was verified, but history could not be updated. "
-                "Do not repeat the restore without reviewing the live cache.\n"];
+                @"Do not repeat the restore without reviewing the live cache.\n"];
         }
     }
     return report.length ? report : @"Selected restore was refused. No changes made.";
