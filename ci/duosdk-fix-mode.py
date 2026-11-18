@@ -83,6 +83,7 @@ def once(old,new):
 
 once('''    @State private var showRawOutput = false''','''    @State private var showRawOutput = false
     @State private var showFixMode = false
+    @State private var fixAppID = ""
     @State private var fixStrategy = "27.1.0"
     @State private var verifiedPriorSDK = ""
     @State private var verifiedBackupConfirmed = false
@@ -91,6 +92,16 @@ once('''    @State private var showRawOutput = false''','''    @State private va
 ui=r'''
                 Section {
                     DisclosureGroup("Fix Mode", isExpanded: $showFixMode) {
+                        if !candidates.isEmpty {
+                            Picker("App to repair", selection: $fixAppID) {
+                                Text("Select an app").tag("")
+                                ForEach(candidates.sorted {
+                                    $0.name.localizedStandardCompare($1.name) == .orderedAscending
+                                }) { row in
+                                    Text(row.name).tag(row.id)
+                                }
+                            }
+                        }
                         if let app = oneFixApp {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(app.name).fontWeight(.semibold)
@@ -133,8 +144,8 @@ ui=r'''
                             }
                             .disabled(!fixIsValid)
                         } else {
-                            Text("Select exactly one app above, then choose a recovery "
-                                 + "strategy. Other apps will not be modified.")
+                            Text("Find apps first, then choose one here. "
+                                 + "Other apps will not be modified.")
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         Text("Restart the whole iPhone after a successful change. "
@@ -148,9 +159,9 @@ ui=r'''
                 }
 
 '''
-once('''                if !selectedIDs.isEmpty {
-                    Section {''',ui+'''                if !selectedIDs.isEmpty {
-                    Section {''')
+once('''                if !candidates.isEmpty {
+                    Section("Apps") {''',ui+'''                if !candidates.isEmpty {
+                    Section("Apps") {''')
 
 once('''            .confirmationDialog("Apply SDK changes?", isPresented: $confirmApply) {''',
      '''            .confirmationDialog("Apply this compatibility trial?",
@@ -169,8 +180,8 @@ once('''            .confirmationDialog("Apply SDK changes?", isPresented: $conf
 needle='''    private func compactAppRow(_ item: DuoSDKCandidate) -> some View {'''
 methods=r'''
     private var oneFixApp: DuoSDKCandidate? {
-        guard selectedIDs.count == 1, let id = selectedIDs.first else { return nil }
-        return candidates.first(where: { $0.id == id })
+        guard !fixAppID.isEmpty else { return nil }
+        return candidates.first(where: { $0.id == fixAppID })
     }
 
     private func parseVerifiedSDK(_ raw: String) -> [Int]? {
@@ -217,6 +228,7 @@ methods=r'''
             return
         }
         if fixStrategy != "prior" {
+            selectedIDs = Set([app.id])
             targets[app.id] = version.map(String.init).joined(separator: ".")
             run(1)
             return
