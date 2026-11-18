@@ -93,9 +93,10 @@ p=src/"XCacheTransaction.m"
 s=p.read_text()
 old='if (!rows || matched < 10 || rows.count > 400) return @"This cache layout could not be verified. No changes made.";'
 assert s.count(old)==1,(s.count(old),"Layout validation anchor changed")
-new='''if (!rows || matched < 10 || rows.count > 400) {
+new='''if (!rows || matched == 0 || rows.count > matched || rows.count > 400) {
             NSString *why = !rows ? @"Parser rejected one or more structural checks" :
-                matched < 10 ? @"Fewer than 10 recognised installed-app records" :
+                matched == 0 ? @"No verified eligible app records" :
+                rows.count > matched ? @"Proposed changes exceed verified eligible records" :
                 @"More than 400 proposed modifications";
             NSString *details = DuoSDKPlanLayoutReport(original);
             return [NSString stringWithFormat:
@@ -105,4 +106,4 @@ new='''if (!rows || matched < 10 || rows.count > 400) {
         }'''
 s=s.replace(old,new,1)
 p.write_text(s)
-print("Added aggregate, read-only iOS 27.2.1 LaunchServices layout diagnostics. Validation unchanged.")
+print("Added aggregate layout diagnostics and replaced arbitrary ten-app floor with consistency limits.")
