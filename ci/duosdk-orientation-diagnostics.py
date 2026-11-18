@@ -23,6 +23,7 @@ private struct DuoLayoutTrial: Codable, Identifiable {
     var path: String
     var result: String
     var rotationLock: String
+    var rotationAnimation: String?
     var recordedAt: Date
 }
 
@@ -36,6 +37,7 @@ s=s.replace(anchor,anchor+'''
     @State private var layoutPath = "Inner display: direct launch"
     @State private var layoutResult = "Left-half window"
     @State private var layoutLock = "Unknown"
+    @State private var rotationAnimation = "Unknown"
     @State private var selfSceneReport = "No scene geometry sample recorded."
     @State private var layoutTrials: [DuoLayoutTrial] = {
         guard let data = UserDefaults.standard.data(forKey: "duosdk.layoutTrials.v1"),
@@ -88,6 +90,12 @@ ui=r'''
                             Text("Off in Control Centre").tag("Off")
                             Text("On in Control Centre").tag("On")
                         }
+                        Picker("Rotation animation", selection: $rotationAnimation) {
+                            Text("Unknown").tag("Unknown")
+                            Text("Smooth animated rotation").tag("Smooth")
+                            Text("Abrupt jump / no animation").tag("Abrupt jump")
+                            Text("Flicker / multiple resizes").tag("Flicker")
+                        }
                         Button("Save this observation") { saveLayoutTrial() }
                             .disabled(layoutAppID.isEmpty)
                     } else {
@@ -101,7 +109,7 @@ ui=r'''
                                 Text(trial.appName).fontWeight(.medium)
                                 Text("\(trial.path) · \(trial.result)")
                                     .font(.caption)
-                                Text("Recorded SDK \(trial.recordedSDK), rotation lock \(trial.rotationLock)")
+                                Text("Recorded SDK \(trial.recordedSDK), rotation lock \(trial.rotationLock), animation \(trial.rotationAnimation ?? "not recorded")")
                                     .font(.caption2).foregroundStyle(.secondary)
                             }
                         }
@@ -143,6 +151,13 @@ ui=r'''
                             .font(.callout)
                     }
 
+                    if layoutTrials.contains(where: { $0.rotationAnimation == "Abrupt jump" }) &&
+                       layoutTrials.contains(where: { $0.rotationAnimation == "Smooth" }) {
+                        Text("Some apps rotate smoothly and others abruptly. This supports an " +
+                             "app-specific scene/compatibility difference, not a proven " +
+                             "system-wide Rotation Lock failure.")
+                            .font(.callout)
+                    }
                     Text("Rotation Lock is user-reported: iOS does not offer a public API "
                          + "for third-party apps to read the global Control Centre lock. "
                          + "On the inner display, orientation and window aspect ratio "
@@ -192,7 +207,7 @@ methods=r'''
             appID: candidate.id, appName: candidate.name,
             recordedSDK: candidate.fromVersion,
             path: layoutPath, result: layoutResult,
-            rotationLock: layoutLock, recordedAt: Date()), at: 0)
+            rotationLock: layoutLock, rotationAnimation: rotationAnimation, recordedAt: Date()), at: 0)
         layoutTrials = Array(layoutTrials.prefix(60))
         if let data = try? JSONEncoder().encode(layoutTrials) {
             UserDefaults.standard.set(data, forKey: "duosdk.layoutTrials.v1")
