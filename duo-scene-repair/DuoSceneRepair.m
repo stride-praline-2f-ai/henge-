@@ -29,7 +29,7 @@ NSNotificationName const DuoSceneRepairGeometryDidChange = @"DuoSceneRepairGeome
     NSAssert(NSThread.isMainThread, @"Use on the main thread");
     if (self.started) return;
     self.started = YES;
-    UIDevice.currentDevice.beginGeneratingDeviceOrientationNotifications();
+    [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
     NSArray<NSNotificationName> *names = @[
         UIDeviceOrientationDidChangeNotification,
         UIApplicationDidBecomeActiveNotification,
@@ -57,7 +57,7 @@ NSNotificationName const DuoSceneRepairGeometryDidChange = @"DuoSceneRepairGeome
         [NSNotificationCenter.defaultCenter removeObserver:token];
     [self.observers removeAllObjects];
     [self.priorSizes removeAllObjects];
-    UIDevice.currentDevice.endGeneratingDeviceOrientationNotifications();
+    [UIDevice.currentDevice endGeneratingDeviceOrientationNotifications];
     self.lastStatus = @"Stopped";
 }
 - (void)queueRefresh {
