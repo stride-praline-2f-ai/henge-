@@ -123,12 +123,9 @@ new=r'''    private var canApply: Bool {
     }'''
 s=repl(s,old,new)
 
-old=r'''        if action == 1 && !canApply { return }
-        if action == 2 && restoreIDs.isEmpty { return }'''
+old=r'''        if action == 1 && !canApply { return }'''
 new=r'''        if action == 1 && !canApply { return }
-        if action == 2 && restoreIDs.isEmpty { return }
-        // The main editor must use the same action-7 backend as Fix Mode,
-        // rather than passing 27.3 to normal action 1, which rejects it.
+        // The main editor must use action 7 when submitting SDK 27.3.
         let actualAction = action == 1 && changes.count == 1 &&
             (changes.first?["after"] as? [Int]) == [27, 3, 0] ? 7 : action'''
 s=repl(s,old,new)
