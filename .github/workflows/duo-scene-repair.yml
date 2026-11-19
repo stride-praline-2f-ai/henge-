@@ -1,0 +1,67 @@
+name: Build Duo Scene Repair prototype
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'duo-scene-repair/**'
+      - '.github/workflows/duo-scene-repair.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 35
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile app-level scene repair and on-device probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p output/Frameworks output/Payload/DuoSceneProbe.app/Frameworks
+          clang -arch arm64 -target arm64-apple-ios17.0 -isysroot "$sdk" \
+            -fobjc-arc -O2 -dynamiclib \
+            -Wl,-install_name,@executable_path/Frameworks/DuoSceneRepair.dylib \
+            -framework UIKit -framework Foundation \
+            -Iduo-scene-repair duo-scene-repair/DuoSceneRepair.m \
+            -o output/Frameworks/DuoSceneRepair.dylib
+          clang -arch arm64 -target arm64-apple-ios17.0 -isysroot "$sdk" \
+            -fobjc-arc -O2 -framework UIKit -framework Foundation \
+            -Iduo-scene-repair duo-scene-repair/Probe.m \
+            -Loutput/Frameworks -lDuoSceneRepair \
+            -Wl,-rpath,@executable_path/Frameworks \
+            -o output/Payload/DuoSceneProbe.app/DuoSceneProbe
+          cp output/Frameworks/DuoSceneRepair.dylib output/Payload/DuoSceneProbe.app/Frameworks/
+          cp duo-scene-repair/Probe-Info.plist output/Payload/DuoSceneProbe.app/Info.plist
+          plutil -lint output/Payload/DuoSceneProbe.app/Info.plist
+          xcrun lipo -info output/Frameworks/DuoSceneRepair.dylib
+          xcrun otool -L output/Payload/DuoSceneProbe.app/DuoSceneProbe
+          (cd output && zip -X -q -r DuoSceneProbe-unsigned.ipa Payload)
+          unzip -t output/DuoSceneProbe-unsigned.ipa | tail -2
+          python3 - <<'PY'
+          import zipfile, plistlib
+          p='output/DuoSceneProbe-unsigned.ipa'
+          with zipfile.ZipFile(p) as z:
+              assert z.testzip() is None
+              info=plistlib.loads(z.read('Payload/DuoSceneProbe.app/Info.plist'))
+              assert info['CFBundleIdentifier']=='dev.duoscene.probe'
+              assert 'DuoSceneRepair.dylib' in str(z.namelist())
+          print('Probe IPA structure checked')
+          PY
+          (cd output && zip -X -q DuoSceneRepair-dylib.zip Frameworks/DuoSceneRepair.dylib)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DuoSceneProbe-unsigned-IPA
+          path: output/DuoSceneProbe-unsigned.ipa
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DuoSceneRepair-library
+          path: output/DuoSceneRepair-dylib.zip
+          retention-days: 14
