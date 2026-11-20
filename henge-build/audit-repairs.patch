@@ -1632,7 +1632,7 @@ index 3a4ee8f..5f6d500 100644
     can be read before the page ends. On a fault, the instruction abort is taken
     and NULL is returned. */
 diff --git a/core/translate.c b/core/translate.c
-index cebfb7d..5655176 100644
+index cebfb7d..d9b135a 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -48,6 +48,8 @@ typedef struct {
@@ -1644,9 +1644,12 @@ index cebfb7d..5655176 100644
      uint64_t site;      /* guest PC of the instruction that branches out of line */
      uint32_t retry;     /* loads and stores: where their translation starts, to run again after a refill */
      uint32_t rflags;    /* hv_tlb_refill's flags for it (0: no refill, straight to the helper) */
-@@ -64,13 +66,22 @@ typedef struct {
+@@ -63,14 +65,25 @@ typedef struct {
+ #define MAX_GROUPS 8
  #define GROUP_SLOTS 4
  #define GROUP_SPAN 4096   /* bytes one group may cover */
++#define REGISTER_GROUP_SPAN 512
++#define REGISTER_GROUP_INSNS 32
  #define GROUP_INSNS 48    /* and instructions */
 +#ifndef HV_GROUP_INTERLEAVE
 +#define HV_GROUP_INTERLEAVE 1 /* 0 keeps the previously shipped planner for A/B */
@@ -1668,7 +1671,7 @@ index cebfb7d..5655176 100644
  typedef struct {
      uint32_t hot[MAX_WORDS], cold[MAX_WORDS];
      uint32_t *w;        /* the part being written */
-@@ -83,6 +94,9 @@ typedef struct {
+@@ -83,6 +96,9 @@ typedef struct {
      uint32_t nhot, ncold; /* the finished block's parts in words, ncold with the pool */
      uint64_t pool[MAX_LITS];
      uint32_t npool;
@@ -1678,7 +1681,7 @@ index cebfb7d..5655176 100644
      LitFix fix[MAX_LITS];
      uint32_t nfix;
      Ool ool[MAX_OOL];
-@@ -105,6 +119,7 @@ typedef struct {
+@@ -105,6 +121,7 @@ typedef struct {
      int32_t goff[HV_MAX_BLOCK_INSNS];   /* the access's address minus the base at the group's first */
      uint32_t after[HV_MAX_BLOCK_INSNS]; /* where each instruction's translation ends */
      uint32_t cur_i;
@@ -1686,7 +1689,7 @@ index cebfb7d..5655176 100644
      int nogroup;                        /* translating plain (copies, or the retry when they do not fit) */
      int u_live, u_prev;                 /* slot + 1 when x15 holds that group's addend after the last instruction */
      int overflow;
-@@ -224,8 +239,20 @@ static int put_mov_imm(Emit *e, int reg, uint64_t value, int max) {
+@@ -224,8 +241,20 @@ static int put_mov_imm(Emit *e, int reg, uint64_t value, int max) {
     (off: no measured gain on the Mac mix, 2026-11-08). */
  static void put_lit(Emit *e, int reg, uint64_t value) {
      if (hv_knob[HV_K_MOVIMM] && put_mov_imm(e, reg, value, 3)) return;
@@ -1709,7 +1712,7 @@ index cebfb7d..5655176 100644
      put(e, 0x58000000u | reg);
  }
  
-@@ -247,6 +274,15 @@ static void put_ool(Emit *e, Ool o) {
+@@ -247,6 +276,15 @@ static void put_ool(Emit *e, Ool o) {
     block's flags. Guest x0/x1 stay in their registers on the hit path, and
     nothing is stored: the target block just runs. A miss (or exit_req) saves
     x0/x1 and pc and leaves for the dispatcher, which fills the cache. */
@@ -1725,7 +1728,7 @@ index cebfb7d..5655176 100644
  static void put_ijc_jump(Emit *e, int check) {
      if (e->no_ijc) {
          put(e, STP_X(0, 1, 28, 0));
-@@ -263,29 +299,42 @@ static void put_ijc_jump(Emit *e, int check) {
+@@ -263,29 +301,42 @@ static void put_ijc_jump(Emit *e, int check) {
          to_exit = e->n;
          put(e, 0x35000000u | 6);                            /* cbnz w6, exit (x15 still the VA) */
      }
@@ -1777,7 +1780,7 @@ index cebfb7d..5655176 100644
      put(e, BR_X(6));
      patch_branch(&e->w[to_miss], (int64_t)e->n - to_miss);  /* miss: x15 is the tag, so the VA is x15 ^ salt */
      put(e, LDR_X(7, 28, salt));
-@@ -293,7 +342,8 @@ static void put_ijc_jump(Emit *e, int check) {
+@@ -293,7 +344,8 @@ static void put_ijc_jump(Emit *e, int check) {
      put(e, STR_X(30, 28, HV_CPU_X(30)));
      put(e, LDR_X(15, 28, HV_CPU_IJC_THUNK));
      put(e, BLR_X(15));                                      /* the block exists? then the thunk goes there */
@@ -1787,7 +1790,7 @@ index cebfb7d..5655176 100644
      put(e, STP_X(0, 1, 28, 0));
      put(e, MOV_X(0, 7));
      if (check) {
-@@ -398,9 +448,18 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
+@@ -398,9 +450,18 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
      uint32_t slot_index = ~0u;
      int same_page = (target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) == e->page;
      uint64_t xa = same_page ? 0 : cross_addend(e, target);
@@ -1809,7 +1812,7 @@ index cebfb7d..5655176 100644
      }
      if (slot_index == ~0u) {
          /* Another page may be remapped under us, so look it up by VA instead of chaining. */
-@@ -435,9 +494,10 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
+@@ -435,9 +496,10 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
          to_miss = e->n;
          put(e, CBNZ_X(7));                                      /* not mapped so now: the branch cache */
      }
@@ -1823,7 +1826,7 @@ index cebfb7d..5655176 100644
      uint32_t site_at = e->n;
      put(e, B_OP | 1);
      if (!p0) cold_on(e);
-@@ -453,15 +513,28 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
+@@ -453,15 +515,28 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
          e->site[e->nsite++].stub_cold = (uint8_t)(e->in_cold && !e->flat);
          e->site_direct = !check && !xa;
      }
@@ -1861,7 +1864,7 @@ index cebfb7d..5655176 100644
      if (xa) {
          link_here(e, to_miss, p0);
          if (use_xjump()) put_xjump(e, target, 0); /* exit_req was checked above if it had to be */
-@@ -483,6 +556,7 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
+@@ -483,6 +558,7 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
     from where the helper would resume (bits 31..19, in words). */
  static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rflags, uint32_t retry) {
      put_helper(e, pc, insn, HV_OP_MEM);
@@ -1869,7 +1872,7 @@ index cebfb7d..5655176 100644
      uint32_t resume = e->n - 1; /* the ldr x0, [x28] the helper comes back to */
      uint32_t back = resume - retry;
      if (back < (1u << 13) && rflags < (1u << 11)) e->pool[e->npool - 1] = (uint64_t)insn | (uint64_t)(HV_OP_MEM | rflags << 8 | back << 19) << 32;
-@@ -491,6 +565,7 @@ static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rfla
+@@ -491,6 +567,7 @@ static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rfla
  /* The return address is where it goes back to, so the thunk's RET goes where the CPU expects
     and leaves its stack of return addresses as it was. The HvHelperInfo is in the pool. */
  static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
@@ -1877,7 +1880,7 @@ index cebfb7d..5655176 100644
      uint32_t info = e->npool;
      e->pool[info] = pc;
      e->pool[info + 1] = (uint64_t)insn | (uint64_t)op << 32;
-@@ -503,7 +578,8 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
+@@ -503,7 +580,8 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
      put(e, LDR_X(0, 28, 0));
  }
  
@@ -1887,7 +1890,7 @@ index cebfb7d..5655176 100644
  static void put_add_imm(Emit *e, int d, int n, int64_t imm) {
      if (imm == 0) {
          if (d != n) put(e, MOV_X(d, n));
-@@ -811,7 +887,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
+@@ -811,7 +889,7 @@ static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t
  /* Ends the block (returns 1), or 0 for a conditional branch the block goes on past. */
  static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
      if ((insn & 0x7c000000) == 0x14000000) { /* B, BL */
@@ -1896,7 +1899,7 @@ index cebfb7d..5655176 100644
          if (insn >> 31) {
              if (use_ras(e)) put_call(e, pc + 4);
              else put_const_to(e, 30, pc + 4);
-@@ -820,7 +896,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -820,7 +898,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
          return 1;
      }
      if ((insn & 0xff000000) == 0x54000000) { /* B.cond, BC.cond */
@@ -1905,7 +1908,7 @@ index cebfb7d..5655176 100644
          uint32_t cond = insn & 0xf;
          if (cond >= 14) {
              put_branch_exit(e, target, 1);
-@@ -836,7 +912,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -836,7 +914,7 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
      }
      /* CBZ/CBNZ (imm19) and TBZ/TBNZ (imm14) */
      int tb = (insn & 0x7e000000) == 0x36000000;
@@ -1914,7 +1917,7 @@ index cebfb7d..5655176 100644
      uint32_t bare = tb ? insn & ~(0x3fffu << 5) : insn & ~(0x7ffffu << 5);
      int rt = insn & 0x1f;
      if (!is_stolen(rt)) {
-@@ -956,6 +1032,53 @@ static void put_fastmem_count(Emit *e, int scratch, uint32_t offset) {
+@@ -956,6 +1034,53 @@ static void put_fastmem_count(Emit *e, int scratch, uint32_t offset) {
      put(e, STR_X(scratch, 28, offset));
  }
  
@@ -1968,7 +1971,7 @@ index cebfb7d..5655176 100644
  static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      HvMemOp op;
      if (hv_mem_decode(insn, &op) != 0) {
-@@ -1020,21 +1143,23 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1020,21 +1145,23 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
              ch = op.rn;
          }
          uint32_t gtlb = put_tlb_slot(e, T, ch, g_el);
@@ -2001,7 +2004,7 @@ index cebfb7d..5655176 100644
  
      /* Effective address into A, or used where it is: a guest base register with nothing added. */
      int sp_base = !literal && op.rn == 31; /* the guest SP, which is the host SP while blocks run */
-@@ -1047,6 +1172,13 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1047,6 +1174,13 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
          /* the address is in A already */
      } else if (literal) {
          put_lit(e, A, pc + op.imm);
@@ -2015,7 +2018,7 @@ index cebfb7d..5655176 100644
      } else {
          if (base_stolen) {
              put(e, sp_base ? ADD_SP_TO(A) : LDR_X(A, 28, slot_of(op.rn)));
-@@ -1080,42 +1212,12 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1080,42 +1214,12 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      /* Opt-in LUT fastmem for plain scalar kernel loads only. Every failed
         guard falls through to the existing TLB, including allocation failure.
         Like the TLB, leave the final 15 bytes to the helper. No NZCV changes. */
@@ -2063,7 +2066,7 @@ index cebfb7d..5655176 100644
      uint32_t tlb = put_tlb_slot(e, T, addr, el_idx);
      /* Both CPU-owned fields share a cache line. Issue independent loads
         before checking the tag, instead of serializing the addend load behind
-@@ -1148,9 +1250,10 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1148,9 +1252,10 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
                       .recheck = hv_knob[HV_K_RECHECK] && !(op.align && op.bytes > 1) && op.bytes < HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
                       .t = (uint8_t)T, .u = (uint8_t)U, .bytes = (uint8_t)op.bytes,
                       .tag_off = tlb + (op.store ? 8 : 0), .retry = retry, .rflags = rflags,
@@ -2075,7 +2078,7 @@ index cebfb7d..5655176 100644
      if (fm_done != ~0u) patch_branch(&e->w[fm_done], (int64_t)e->n - fm_done);
      }
      /* Single loads and stores take [addr, addend] directly; the rest want the host address in A. */
-@@ -1253,7 +1356,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1253,7 +1358,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      unspill(e, s, 3);
      if (slow != ~0u) e->ool[slow].join = e->n;
      /* Stand-ins for x18/x28 and writeback may have used U. */
@@ -2084,7 +2087,7 @@ index cebfb7d..5655176 100644
  }
  
  /* DC ZVA: zero the 64-byte block holding Xt, on the host's own copy when the
-@@ -1638,6 +1741,8 @@ static int is_fp_insn(uint32_t insn) {
+@@ -1638,6 +1743,8 @@ static int is_fp_insn(uint32_t insn) {
  /* Returns 1 if the instruction ends the block. */
  static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
      HvInsnKind kind = hv_classify(insn);
@@ -2093,7 +2096,7 @@ index cebfb7d..5655176 100644
      if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) {
          put_helper(e, pc, insn, HV_OP_FPTRAP);
          return 1;
-@@ -1844,8 +1949,9 @@ static void emit_ool(Emit *e) {
+@@ -1844,8 +1951,9 @@ static void emit_ool(Emit *e) {
              plink(e, retry, 1, o->retry, 0);
          }
          uint32_t site_at = link_site(e, o->at);
@@ -2104,7 +2107,7 @@ index cebfb7d..5655176 100644
              int check = o->preloaded ? o->t : o->u;
              put(e, LDR_X(check, o->t, o->tag_off));
              put(e, SUB_X(check, o->addr, check));
-@@ -1900,6 +2006,55 @@ static int group_op(const HvMemOp *op) {
+@@ -1900,6 +2008,55 @@ static int group_op(const HvMemOp *op) {
             (op->rn == 31 || !is_stolen(op->rn)) && op->bytes <= 64;
  }
  
@@ -2116,7 +2119,7 @@ index cebfb7d..5655176 100644
 +    /* Retain the checked host address across longer pure-ALU/object sequences.
 +       Every intervening instruction is still verified below; this does not
 +       cross a helper, branch, barrier, scratch clobber or changed base. */
-+    if (hv_knob[HV_K_TEST3] || g->last-g->first > 32 || g->hi-g->lo > 512) return 0;
++    if (hv_knob[HV_K_TEST3] || g->last-g->first > REGISTER_GROUP_INSNS || g->hi-g->lo > REGISTER_GROUP_SPAN) return 0;
 +    unsigned count=0;
 +    for (unsigned i=g->first;i<=g->last;i++) {
 +        uint32_t insn=code[i];
@@ -2160,7 +2163,7 @@ index cebfb7d..5655176 100644
  static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va) {
      e->ngrp = 0;
      memset(e->gid, -1, sizeof e->gid);
-@@ -1914,7 +2069,62 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1914,7 +2071,62 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
          HvInsnKind kind = hv_classify(insn);
          if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) break;
          if (kind == HV_INSN_COPY && (insn & 0xfffff01fu) == 0xd503201fu) continue; /* hints (NOP, BTI): no register */
@@ -2223,7 +2226,7 @@ index cebfb7d..5655176 100644
              KILL(insn);
              continue;
          }
-@@ -1923,18 +2133,29 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1923,18 +2135,29 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
              continue;
          }
          if (kind == HV_INSN_PREFETCH) continue;
@@ -2247,15 +2250,15 @@ index cebfb7d..5655176 100644
              if (g) {
                  int64_t lo = off < g->lo ? off : g->lo, hi = off + op.bytes > g->hi ? off + op.bytes : g->hi;
 -                if (hi - lo > GROUP_SPAN || i - g->first > GROUP_INSNS) g = NULL;
-+                if (hi - lo > (hv_knob[HV_K_GROUPS] == 2 ? 256 : GROUP_SPAN) ||
-+                    i - g->first > (hv_knob[HV_K_GROUPS] == 2 ? 16 : GROUP_INSNS)) g = NULL;
++                if (hi - lo > (hv_knob[HV_K_GROUPS] == 2 ? REGISTER_GROUP_SPAN : GROUP_SPAN) ||
++                    i - g->first > (hv_knob[HV_K_GROUPS] == 2 ? REGISTER_GROUP_INSNS : GROUP_INSNS)) g = NULL;
                  else {
                      g->lo = (int32_t)lo, g->hi = (int32_t)hi, g->last = (uint16_t)i, g->store |= op.store;
 +                    g->writeback |= op.mode != HV_ADDR_OFFSET; g->accesses++;
                      e->gid[i] = (int8_t)cur[b], e->grole[i] = 2, e->goff[i] = (int32_t)off;
                  }
              }
-@@ -1943,6 +2164,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1943,6 +2166,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
                  delta[b] = 0;
                  off = op.mode == HV_ADDR_POST ? 0 : op.imm;
                  e->grp[e->ngrp++] = (Group){.lo = (int32_t)off, .hi = (int32_t)(off + op.bytes), .store = op.store,
@@ -2263,7 +2266,7 @@ index cebfb7d..5655176 100644
                                              .base = (uint8_t)b, .first = (uint16_t)i, .last = (uint16_t)i};
                  e->gid[i] = (int8_t)cur[b], e->grole[i] = 1, e->goff[i] = (int32_t)off;
              } else if (!g) {
-@@ -1966,8 +2188,14 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1966,8 +2190,14 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
      uint16_t slot_free[GROUP_SLOTS] = {0};
      for (uint32_t k = 0; k < e->ngrp; k++) {
          Group *g = &e->grp[k];
@@ -2279,7 +2282,7 @@ index cebfb7d..5655176 100644
          for (int s = 0; s < GROUP_SLOTS; s++)
              if (slot_free[s] <= g->first) {
                  g->slot = (uint8_t)s, g->live = 1;
-@@ -1975,6 +2203,16 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1975,6 +2205,16 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
                  break;
              }
      }
@@ -2296,7 +2299,7 @@ index cebfb7d..5655176 100644
      /* A failed group runs its instructions plain, through its last access and
         through every later-starting group that runs on past it (whose first
         access the plain copy then makes too). */
-@@ -1986,7 +2224,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1986,7 +2226,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
              again = 0;
              for (uint32_t j = 0; j < e->ngrp; j++) {
                  Group *h = &e->grp[j];
@@ -2305,7 +2308,7 @@ index cebfb7d..5655176 100644
              }
          }
          g->end = end;
-@@ -1996,13 +2234,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1996,13 +2236,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
  /* After the block: each live group's plain copy. Returns -1 if they do not fit. */
  static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_t ntrans) {
      e->nogroup = 1;
@@ -2333,7 +2336,7 @@ index cebfb7d..5655176 100644
              e->cur_pc = va + 4ull * i;
              e->cur_i = i;
              e->u_prev = e->u_live = 0;
-@@ -2017,8 +2269,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
+@@ -2017,8 +2271,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
  static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup);
  
  int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
@@ -2345,7 +2348,7 @@ index cebfb7d..5655176 100644
      if (hv_knob[HV_K_GROUPS] && translate_emit(m, b, code, avail, 0) == 0) return 0;
      return translate_emit(m, b, code, avail, 1);
  }
-@@ -2026,6 +2279,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
+@@ -2026,6 +2281,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
  static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup) {
      Emit *e = &E;
      e->n = e->other_n = e->npool = e->nfix = e->nool = e->nsite = e->nrel = 0;
@@ -2353,7 +2356,7 @@ index cebfb7d..5655176 100644
      e->w = e->hot;
      e->in_cold = 0;
      e->flat = hv_knob[HV_K_TEST2];
-@@ -2113,13 +2367,20 @@ static __thread struct {
+@@ -2113,13 +2369,20 @@ static __thread struct {
      HvMachine *m;
      uint64_t gen;
      uint32_t *hot, *cold;
@@ -2376,7 +2379,7 @@ index cebfb7d..5655176 100644
          if (want < (size_t)hot + cold) want = (size_t)hot + cold;
          uint32_t *p = hv_jit_reserve(&m->jit, want);
          if (!p && m->jit_tail_enabled && want > (size_t)hot + cold) {
-@@ -2131,6 +2392,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
+@@ -2131,6 +2394,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
          }
          if (!p) { chunk.hot = NULL; return -1; }
          chunk.m = m, chunk.gen = gen, chunk.hot = p, chunk.cold = p + ((want + 1) & ~(size_t)1);
@@ -26853,10 +26856,10 @@ index 0000000..70db131
 +print('PASS APFS expansion preparation: read-only inspection, Recovery NX checksum/type guards, verified nonoverlapping aligned copy, UUID/data preservation, both GPT CRCs, atomic backup, idempotence')
 diff --git a/tests/test_display_pulses.py b/tests/test_display_pulses.py
 new file mode 100644
-index 0000000..9c872cc
+index 0000000..ca0260d
 --- /dev/null
 +++ b/tests/test_display_pulses.py
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,201 @@
 +"""Run production Metal display-link arming/callbacks with controlled queues.
 +The macOS fixture supplies UIKit visibility and a display-link stand-in; queue
 +ordering, generation checks, coalescing and production pacing are exercised.
@@ -26878,6 +26881,7 @@ index 0000000..9c872cc
 +#include <assert.h>
 +#include <math.h>
 +#include "frame_pacing.h"
++#include "presentation_clock.h"
 +static NSMutableArray *presenterTasks, *mainTasks;
 +static dispatch_queue_t presenterQueue;
 +static void enqueue(dispatch_queue_t queue, dispatch_block_t task) {
@@ -26926,6 +26930,7 @@ index 0000000..9c872cc
 +@end
 +@interface TestUpdate : NSObject
 +@property (nonatomic, strong) id drawable;
++@property double targetPresentationTimestamp;
 +@end
 +@implementation TestUpdate @end
 +@interface HvReplay : NSObject {
@@ -26945,6 +26950,8 @@ index 0000000..9c872cc
 +    __weak CAMetalLayer *display_link_layer;
 +    TestLink *display_link;
 +    id display_delegate, display_drawable;
++    double display_target_time;
++    HvDisplayClock display_clock;
 +    int pacing_fps, presents, preflights;
 +    HvFramePacing frame_pacing;
 +}
@@ -26994,6 +27001,7 @@ index 0000000..9c872cc
 +    assert(r->display_link.preferredFrameRateRange.maximum==120);
 +    assert(r->layer.drawableSize.width==2752 && old.drawableSize.width==2752);
 +    TestLink *current=r->display_link;TestUpdate *update=[TestUpdate new];update.drawable=[NSObject new];
++    update.targetPresentationTimestamp=1.0;
 +    [r displayPulse:[TestLink new] update:update];assert(!r->presents);
 +    r->display_quiesced=YES;[r displayPulse:current update:update];assert(!r->presents);
 +    r->display_quiesced=NO;r->display_scene_active=NO;
@@ -27002,6 +27010,7 @@ index 0000000..9c872cc
 +    [r displayPulse:current update:update];assert(!r->presents);
 +    r->display_link_generation=r->layer_generation;
 +    [r displayPulse:current update:update];assert(r->presents==1 && r->display_drawable==update.drawable);
++    assert(r->display_target_time==update.targetPresentationTimestamp);
 +    [r displayPulse:current update:update];assert(r->presents==1); // no damage, no duplicate
 +    // Replacing a layer retires the link and honours the new screen's maximum.
 +    r->screen_dirty=YES;r->layer=[CAMetalLayer layer];r->layer.delegate=(id)view;r->layer_generation++;
