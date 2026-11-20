@@ -4,6 +4,7 @@ name: Safari replay efficiency source checks
     branches:
     - perf/safari-compositing
     - perf/replay-mapping-sync
+    - test/desktop120-wireless-proof
     paths:
     - henge-build/**
     - '!henge-build/optimization-state.json'
@@ -141,6 +142,29 @@ jobs:
         xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -std=c11 -fobjc-arc -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -O2 -Icore -Ihost -Idevices -c devices/pvg_metal.m -o build/safari/pvg-ios.o
 
         '
+      if: ${{ !cancelled() && steps.reconstruct.outcome == 'success' }}
+    - name: Verify M4 desktop video and reconnect while mirror remains enabled
+      working-directory: Henge
+      run: |
+        set -euo pipefail
+        python3 - <<'PYWIRELESS'
+        from pathlib import Path
+        p=Path('tests/test_link.swift');s=p.read_text();needle='            try hardware(mode)'
+        assert needle in s
+        s=s.replace(needle,needle+'\n            try hardware(LinkMode(width:2560,height:1920,widthMM:260,heightMM:195,hz:60))',1);p.write_text(s)
+        p=Path('tests/test_link_control_services.swift');s=p.read_text();needle='        viewer.setMirror(false)'
+        assert s.count(needle)==1
+        s=s.replace(needle,"""        let beforeReconnectPixels=pixels
+                viewer.setForeground(false)
+                await wait("video background did not disconnect") { !host.connected && !host.mirrorActive }
+                viewer.setForeground(true)
+                await wait("video did not reconnect automatically") { viewer.ready && viewer.videoActive && host.mirrorActive }
+                precondition(host.key==pairingKey && host.port==listenerPort && test_control_displays()==0)
+                test_control_frame(Unmanaged.passUnretained(texture as AnyObject).toOpaque(),Unmanaged.passUnretained(queue as AnyObject).toOpaque())
+                await wait("reconnected video did not decode") { pixels>beforeReconnectPixels }
+        """+needle,1).replace('test_control_video()==1','test_control_video()==2');p.write_text(s)
+        PYWIRELESS
+        bash tools/link/check.sh 2>&1 | tee build/safari/wireless-m4-reconnect.log
       if: ${{ !cancelled() && steps.reconstruct.outcome == 'success' }}
     - name: Focused copy and snapshot allocation comparisons
       if: ${{ !cancelled() && steps.reconstruct.outcome == 'success' }}
