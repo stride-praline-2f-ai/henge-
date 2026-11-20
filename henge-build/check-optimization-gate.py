@@ -155,4 +155,10 @@ if manifest.get('replay_followup'):
     assert all(replay.get(k)=='passed_cloud' for k in ('mapping','copy_correctness','snapshot_storage','concurrency','lease_pressure','sdk')), 'Replay correctness checks incomplete'
     assert replay.get('partial_copy_default') is False and replay.get('cost_rejection'), 'Retain measured-safe copy default and concrete rejection evidence'
     assert isinstance(replay.get('focused_validation_run'),int) and isinstance(replay.get('native_cost_run'),int), 'Missing executed replay evidence'
+desktop=state.get('desktop_interactivity',{})
+if manifest.get('desktop_interactivity'):
+    assert desktop.get('complete') and desktop.get('source_commit')==validation.get('source_commit'), 'Desktop120 workstreams need exact-source validation'
+    assert desktop.get('patch_sha256')==manifest['audit_repairs_sha256'], 'Desktop120 validation used another patch'
+    assert all(desktop.get(k)=='passed_cloud' for k in ('command_reuse','memory_policy','presentation_clock','archive_retention','surface_hash','expanded_groups','touch_rebind','fx_clarity','sdk')), 'Desktop120 correctness checks incomplete'
+    assert desktop.get('physical_performance_verified') is False, 'Cloud cannot claim physical performance'
 print('PASS complete implementation gate:', manifest['audit_repairs_sha256'])

@@ -1632,7 +1632,7 @@ index 3a4ee8f..5f6d500 100644
     can be read before the page ends. On a fault, the instruction abort is taken
     and NULL is returned. */
 diff --git a/core/translate.c b/core/translate.c
-index cebfb7d..48e9269 100644
+index cebfb7d..5655176 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -48,6 +48,8 @@ typedef struct {
@@ -2104,7 +2104,7 @@ index cebfb7d..48e9269 100644
              int check = o->preloaded ? o->t : o->u;
              put(e, LDR_X(check, o->t, o->tag_off));
              put(e, SUB_X(check, o->addr, check));
-@@ -1900,6 +2006,52 @@ static int group_op(const HvMemOp *op) {
+@@ -1900,6 +2006,55 @@ static int group_op(const HvMemOp *op) {
             (op->rn == 31 || !is_stolen(op->rn)) && op->bytes <= 64;
  }
  
@@ -2113,7 +2113,10 @@ index cebfb7d..48e9269 100644
 +   intervene. No helper, alternate group, address writeback or scratch-register
 +   rename is allowed. The ordinary range guard and full plain fallback remain. */
 +static int register_group(const Emit *e, const Group *g, unsigned id, const uint32_t *code) {
-+    if (hv_knob[HV_K_TEST3] || g->last-g->first > 16 || g->hi-g->lo > 256) return 0;
++    /* Retain the checked host address across longer pure-ALU/object sequences.
++       Every intervening instruction is still verified below; this does not
++       cross a helper, branch, barrier, scratch clobber or changed base. */
++    if (hv_knob[HV_K_TEST3] || g->last-g->first > 32 || g->hi-g->lo > 512) return 0;
 +    unsigned count=0;
 +    for (unsigned i=g->first;i<=g->last;i++) {
 +        uint32_t insn=code[i];
@@ -2157,7 +2160,7 @@ index cebfb7d..48e9269 100644
  static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va) {
      e->ngrp = 0;
      memset(e->gid, -1, sizeof e->gid);
-@@ -1914,7 +2066,62 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1914,7 +2069,62 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
          HvInsnKind kind = hv_classify(insn);
          if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) break;
          if (kind == HV_INSN_COPY && (insn & 0xfffff01fu) == 0xd503201fu) continue; /* hints (NOP, BTI): no register */
@@ -2220,7 +2223,7 @@ index cebfb7d..48e9269 100644
              KILL(insn);
              continue;
          }
-@@ -1923,18 +2130,29 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1923,18 +2133,29 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
              continue;
          }
          if (kind == HV_INSN_PREFETCH) continue;
@@ -2252,7 +2255,7 @@ index cebfb7d..48e9269 100644
                      e->gid[i] = (int8_t)cur[b], e->grole[i] = 2, e->goff[i] = (int32_t)off;
                  }
              }
-@@ -1943,6 +2161,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1943,6 +2164,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
                  delta[b] = 0;
                  off = op.mode == HV_ADDR_POST ? 0 : op.imm;
                  e->grp[e->ngrp++] = (Group){.lo = (int32_t)off, .hi = (int32_t)(off + op.bytes), .store = op.store,
@@ -2260,7 +2263,7 @@ index cebfb7d..48e9269 100644
                                              .base = (uint8_t)b, .first = (uint16_t)i, .last = (uint16_t)i};
                  e->gid[i] = (int8_t)cur[b], e->grole[i] = 1, e->goff[i] = (int32_t)off;
              } else if (!g) {
-@@ -1966,8 +2185,14 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1966,8 +2188,14 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
      uint16_t slot_free[GROUP_SLOTS] = {0};
      for (uint32_t k = 0; k < e->ngrp; k++) {
          Group *g = &e->grp[k];
@@ -2276,7 +2279,7 @@ index cebfb7d..48e9269 100644
          for (int s = 0; s < GROUP_SLOTS; s++)
              if (slot_free[s] <= g->first) {
                  g->slot = (uint8_t)s, g->live = 1;
-@@ -1975,6 +2200,16 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1975,6 +2203,16 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
                  break;
              }
      }
@@ -2293,7 +2296,7 @@ index cebfb7d..48e9269 100644
      /* A failed group runs its instructions plain, through its last access and
         through every later-starting group that runs on past it (whose first
         access the plain copy then makes too). */
-@@ -1986,7 +2221,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1986,7 +2224,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
              again = 0;
              for (uint32_t j = 0; j < e->ngrp; j++) {
                  Group *h = &e->grp[j];
@@ -2302,7 +2305,7 @@ index cebfb7d..48e9269 100644
              }
          }
          g->end = end;
-@@ -1996,13 +2231,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1996,13 +2234,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
  /* After the block: each live group's plain copy. Returns -1 if they do not fit. */
  static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_t ntrans) {
      e->nogroup = 1;
@@ -2330,7 +2333,7 @@ index cebfb7d..48e9269 100644
              e->cur_pc = va + 4ull * i;
              e->cur_i = i;
              e->u_prev = e->u_live = 0;
-@@ -2017,8 +2266,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
+@@ -2017,8 +2269,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
  static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup);
  
  int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
@@ -2342,7 +2345,7 @@ index cebfb7d..48e9269 100644
      if (hv_knob[HV_K_GROUPS] && translate_emit(m, b, code, avail, 0) == 0) return 0;
      return translate_emit(m, b, code, avail, 1);
  }
-@@ -2026,6 +2276,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
+@@ -2026,6 +2279,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
  static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup) {
      Emit *e = &E;
      e->n = e->other_n = e->npool = e->nfix = e->nool = e->nsite = e->nrel = 0;
@@ -2350,7 +2353,7 @@ index cebfb7d..48e9269 100644
      e->w = e->hot;
      e->in_cold = 0;
      e->flat = hv_knob[HV_K_TEST2];
-@@ -2113,13 +2364,20 @@ static __thread struct {
+@@ -2113,13 +2367,20 @@ static __thread struct {
      HvMachine *m;
      uint64_t gen;
      uint32_t *hot, *cold;
@@ -2373,7 +2376,7 @@ index cebfb7d..48e9269 100644
          if (want < (size_t)hot + cold) want = (size_t)hot + cold;
          uint32_t *p = hv_jit_reserve(&m->jit, want);
          if (!p && m->jit_tail_enabled && want > (size_t)hot + cold) {
-@@ -2131,6 +2389,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
+@@ -2131,6 +2392,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
          }
          if (!p) { chunk.hot = NULL; return -1; }
          chunk.m = m, chunk.gen = gen, chunk.hot = p, chunk.cold = p + ((want + 1) & ~(size_t)1);
@@ -2925,10 +2928,10 @@ index 0000000..43bf5d2
 +#endif
 diff --git a/devices/gpu_command_storage.h b/devices/gpu_command_storage.h
 new file mode 100644
-index 0000000..e5107f4
+index 0000000..3fa7d34
 --- /dev/null
 +++ b/devices/gpu_command_storage.h
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,100 @@
 +#pragma once
 +#import <Foundation/Foundation.h>
 +#include <stdatomic.h>
@@ -2971,17 +2974,23 @@ index 0000000..e5107f4
 +@end
 +@interface HvCommandPool : NSObject { @public
 +    NSMutableArray<HvCommandOwner *> *cached;
-+    uint64_t allocations,reuses,views,captured_bytes,independent_buffers,small_batches;
++    uint64_t allocations,reuses,views,captured_bytes,independent_buffers,small_batches,pinned_replacements;
++    NSUInteger budget;
 +    BOOL suspended;
 +}
-+- (HvCommandLease *)acquire:(NSUInteger)bytes;
++- (HvCommandLease *)acquire:(NSUInteger)bytes NS_RETURNS_RETAINED;
++- (void)setBudget:(NSUInteger)bytes;
 +- (NSUInteger)cachedBytes;
 +- (void)trim;
 +@end
 +@implementation HvCommandPool
-+- (instancetype)init {if((self=[super init]))cached=[NSMutableArray new];return self;}
++- (instancetype)init {if((self=[super init])){cached=[NSMutableArray new];budget=16u<<20;}return self;}
 +- (NSUInteger)cachedBytes {NSUInteger total=0;for(HvCommandOwner *o in cached)total+=o->capacity;return total;}
 +- (void)trim {[cached removeAllObjects];}
++- (void)setBudget:(NSUInteger)bytes {
++    budget=MIN(bytes,16u<<20);suspended=!budget;
++    while(cached.count && [self cachedBytes]>budget)[cached removeObjectAtIndex:0];
++}
 +- (HvCommandLease *)acquire:(NSUInteger)bytes {
 +    if(!bytes||bytes>(64u<<20))return nil;
 +    if(bytes<4096){small_batches++;return nil;}
@@ -2993,23 +3002,28 @@ index 0000000..e5107f4
 +    if(selected)reuses++;
 +    else {
 +        NSUInteger capacity=bytes;
-+        if(!suspended&&bytes<=(8u<<20)) {
++        if(!suspended&&bytes<=MIN(budget,8u<<20)) {
 +            capacity=4096;while(capacity<bytes)capacity*=2;
 +        }
 +        selected=[HvCommandOwner new];if(!selected)return nil;
 +        void *memory=NULL;if(posix_memalign(&memory,16,capacity))return nil;
 +        selected->memory=memory;
 +        selected->capacity=capacity;atomic_init(&selected->users,0);allocations++;
-+        if(!suspended&&capacity<=(8u<<20)) {
-+            /* Replace idle, smaller cache entries rather than accumulate them.
-+               Active views own their retired allocation independently. */
-+            for(NSInteger i=(NSInteger)cached.count-1;i>=0;i--) {
-+                if(cached.count<2&&[self cachedBytes]+capacity<=(16u<<20))break;
-+                HvCommandOwner *o=cached[(NSUInteger)i];
-+                if(!atomic_load_explicit(&o->users,memory_order_acquire))
-+                    [cached removeObjectAtIndex:(NSUInteger)i];
++        if(!suspended&&capacity<=MIN(budget,8u<<20)) {
++            /* A long-lived immutable view must not pin a CACHE SLOT forever.
++               Retire cache ownership, never its bytes: all views/leases retain
++               the old owner independently. Prefer idle owners, then oldest. */
++            while(cached.count && (cached.count>=2||[self cachedBytes]>budget-capacity)) {
++                NSUInteger victim=0;
++                for(NSUInteger i=0;i<cached.count;i++) {
++                    HvCommandOwner *candidate=cached[i];
++                    if(!atomic_load_explicit(&candidate->users,memory_order_acquire)){victim=i;break;}
++                }
++                HvCommandOwner *retired=cached[victim];
++                if(atomic_load_explicit(&retired->users,memory_order_acquire))pinned_replacements++;
++                [cached removeObjectAtIndex:victim];
 +            }
-+            if(cached.count<2&&[self cachedBytes]+capacity<=(16u<<20))[cached addObject:selected];
++            [cached addObject:selected];
 +        }
 +    }
 +    atomic_fetch_add_explicit(&selected->users,1,memory_order_relaxed);
@@ -4058,10 +4072,10 @@ index 0000000..b12dd17
 +}
 diff --git a/devices/metal4_runtime.h b/devices/metal4_runtime.h
 new file mode 100644
-index 0000000..c817cb2
+index 0000000..4e931ae
 --- /dev/null
 +++ b/devices/metal4_runtime.h
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,404 @@
 +#pragma once
 +/* Supported Metal 4 submission, shared by guest replay and native presentation.
 + * Classic/Metal4 queues are joined with a shared event in BOTH directions.
@@ -4076,6 +4090,7 @@ index 0000000..c817cb2
 +#include "pipeline_bundle.h"
 +#include "metal4_arguments.h"
 +#include "metal4_compile_queue.h"
++#include "presentation_clock.h"
 +
 +API_AVAILABLE(macos(26.0),ios(26.0))
 +@interface HvMetal4Job : NSObject {
@@ -4111,6 +4126,8 @@ index 0000000..c817cb2
 +    id<MTL4PipelineDataSetSerializer> _capture;
 +    NSURL *_cacheDirectory;
 +    NSArray<id<MTL4Archive>> *_archives;
++    NSArray<NSURL *> *_archiveURLs,*_loadedArchiveURLs;
++    NSMutableSet<NSURL *> *_touchedArchiveURLs;
 +    BOOL _cacheAdmission,_saveScheduled,_urgentSaveScheduled;
 +    NSUInteger _pendingPipelines;
 +@public
@@ -4118,6 +4135,7 @@ index 0000000..c817cb2
 +    _Atomic uint64_t submitted, completed, failed, unavailable;
 +    _Atomic uint64_t pipeline_cache_hits,pipeline_cache_misses,pipeline_cache_writes;
 +    _Atomic uint64_t pipeline_compile_ns,pipeline_compile_max_ns;
++    _Atomic uint64_t archive_cold_hits,archive_open_failures;
 +    _Atomic uint64_t gpu_duration_ns,gpu_max_ns;
 +}
 +@property(nonatomic,readonly) id<MTL4Compiler> compiler;
@@ -4131,6 +4149,9 @@ index 0000000..c817cb2
 +- (BOOL)commit:(HvMetal4Job *)job classicQueue:(id<MTLCommandQueue>)classic
 +          lock:(os_unfair_lock *)lock drawable:(id<MTLDrawable>)drawable
 +    completion:(void(^)(BOOL))completion;
++- (BOOL)commit:(HvMetal4Job *)job classicQueue:(id<MTLCommandQueue>)classic
++          lock:(os_unfair_lock *)lock drawable:(id<MTLDrawable>)drawable
++    presentTime:(double)target completion:(void(^)(BOOL))completion;
 +@end
 +
 +@implementation HvMetal4Runtime
@@ -4190,22 +4211,55 @@ index 0000000..c817cb2
 +    _compiler=[_device newCompilerWithDescriptor:compiler error:nil];
 +}
 +- (void)loadArchives {
-+    if(!_cacheAdmission){_archives=@[];return;}
++    if(!_cacheAdmission){_archives=@[];_archiveURLs=@[];_loadedArchiveURLs=@[];return;}
 +    NSFileManager *fm=NSFileManager.defaultManager;
 +    NSArray<NSURL *> *files=[fm contentsOfDirectoryAtURL:_cacheDirectory includingPropertiesForKeys:@[NSURLFileSizeKey,NSURLContentModificationDateKey] options:0 error:nil];
 +    files=[files sortedArrayUsingComparator:^NSComparisonResult(NSURL *a,NSURL *b){
 +        NSDate *ad=nil,*bd=nil;[a getResourceValue:&ad forKey:NSURLContentModificationDateKey error:nil];[b getResourceValue:&bd forKey:NSURLContentModificationDateKey error:nil];return [bd compare:ad];
 +    }];
-+    NSMutableArray *loaded=[NSMutableArray new];NSUInteger total=0;
++    NSMutableArray *loaded=[NSMutableArray new],*urls=[NSMutableArray new],*resident=[NSMutableArray new];NSUInteger total=0;
 +    for(NSURL *url in files){
 +        if(![url.pathExtension isEqual:@"mtl4a"])continue;
 +        NSNumber *size=nil;[url getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
-+        if(!size||!size.unsignedLongLongValue||size.unsignedLongLongValue>(64u<<20)||loaded.count==16||total>(64u<<20)-size.unsignedLongLongValue){[fm removeItemAtURL:url error:nil];continue;}
++        if(!size||size.unsignedLongLongValue<256||size.unsignedLongLongValue>(64u<<20)){[fm removeItemAtURL:url error:nil];continue;}
++        [urls addObject:url];
++        // Residency is not the disk budget. Older valid archives remain
++        // available for a utility-worker miss instead of being deleted at16.
++        if(loaded.count>=16||total>(64u<<20)-size.unsignedLongLongValue)continue;
 +        id<MTL4Archive> archive=[_device newArchiveWithURL:url error:nil];
-+        if(archive){[loaded addObject:archive];total+=size.unsignedIntegerValue;}
-+        else [fm removeItemAtURL:url error:nil]; /* disposable, exact OS/GPU-scoped cache */
++        if(archive){[loaded addObject:archive];[resident addObject:url];total+=size.unsignedIntegerValue;}
++        else atomic_fetch_add(&archive_open_failures,1); // transient/OOM is not permission to delete a valid cache
 +    }
 +    _archives=[loaded copy];
++    _archiveURLs=[urls copy];_loadedArchiveURLs=[resident copy];
++    if(!_touchedArchiveURLs)_touchedArchiveURLs=[NSMutableSet new];
++}
++- (void)noteArchiveHit:(NSURL *)url {
++    if(!url||[_touchedArchiveURLs containsObject:url])return;
++    if(_touchedArchiveURLs.count>=64)[_touchedArchiveURLs removeAllObjects];
++    [_touchedArchiveURLs addObject:url];
++    // One recency write per archive per launch, never a render-thread wait.
++    dispatch_async(_archiveQueue,^{[NSFileManager.defaultManager setAttributes:@{NSFileModificationDate:NSDate.date} ofItemAtPath:url.path error:nil];});
++}
++- (id)archivedPipeline:(id)descriptor tag:(uint32_t)tag {
++    for(NSUInteger i=0;i<_archives.count;i++) {
++        id<MTL4Archive> archive=_archives[i];
++        id state=tag==0xe?[archive newRenderPipelineStateWithDescriptor:descriptor error:nil]:[archive newComputePipelineStateWithDescriptor:descriptor error:nil];
++        if(state){[self noteArchiveHit:_loadedArchiveURLs[i]];return state;}
++    }
++    // Optional guest variants run on the existing utility compiler worker.
++    // Search cold valid files before compiling again; hold at most one extra
++    // archive during this lookup, outside the resident-handle budget.
++    for(NSURL *url in _archiveURLs) {
++        if([_loadedArchiveURLs containsObject:url])continue;
++        @autoreleasepool {
++            id<MTL4Archive> archive=[_device newArchiveWithURL:url error:nil];
++            if(!archive){atomic_fetch_add(&archive_open_failures,1);continue;}
++            id state=tag==0xe?[archive newRenderPipelineStateWithDescriptor:descriptor error:nil]:[archive newComputePipelineStateWithDescriptor:descriptor error:nil];
++            if(state){atomic_fetch_add(&archive_cold_hits,1);[self noteArchiveHit:url];return state;}
++        }
++    }
++    return nil;
 +}
 +- (void)flushPipelines {
 +    [_compileLock lock];_saveScheduled=NO;
@@ -4246,14 +4300,7 @@ index 0000000..c817cb2
 +    @try {
 +    [self applyArchiveAdmissionLocked];
 +    id state=nil;
-+    for(NSArray *list in @[_archives?:@[]]){
-+        for(id<MTL4Archive> a in list){
-+            if(tag==0xe)state=[a newRenderPipelineStateWithDescriptor:descriptor error:nil];
-+            else state=[a newComputePipelineStateWithDescriptor:descriptor error:nil];
-+            if(state)break;
-+        }
-+        if(state)break;
-+    }
++    state=[self archivedPipeline:descriptor tag:tag];
 +    if(state){atomic_fetch_add(&pipeline_cache_hits,1);if(bundle)bundle->hits++;}
 +    else{
 +        atomic_fetch_add(&pipeline_cache_misses,1);if(bundle)bundle->misses++;
@@ -4368,6 +4415,11 @@ index 0000000..c817cb2
 +- (BOOL)commit:(HvMetal4Job *)job classicQueue:(id<MTLCommandQueue>)classic
 +          lock:(os_unfair_lock *)lock drawable:(id<MTLDrawable>)drawable
 +    completion:(void(^)(BOOL))completion {
++    return [self commit:job classicQueue:classic lock:lock drawable:drawable presentTime:0 completion:completion];
++}
++- (BOOL)commit:(HvMetal4Job *)job classicQueue:(id<MTLCommandQueue>)classic
++          lock:(os_unfair_lock *)lock drawable:(id<MTLDrawable>)drawable
++    presentTime:(double)target completion:(void(^)(BOOL))completion {
 +    [job->residency commit];[job->buffer useResidencySet:job->residency];[job->buffer endCommandBuffer];
 +    MTL4CommitOptions *options=[MTL4CommitOptions new];
 +    [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
@@ -4412,7 +4464,11 @@ index 0000000..c817cb2
 +    id<MTL4CommandBuffer> buffers[]={job->buffer};
 +    [_queue commit:buffers count:1 options:options];
 +    [_queue signalEvent:_bridge value:output];
-+    if(drawable){[_queue signalDrawable:drawable];[drawable present];}
++    if(drawable){
++        [_queue signalDrawable:drawable];
++        // Caller validates the media-clock deadline just before this commit.
++        if(isfinite(target)&&target>0)[drawable presentAtTime:target];else [drawable present];
++    }
 +    [after commit];
 +    atomic_fetch_add(&submitted,1);
 +    os_unfair_lock_unlock(lock);return YES;
@@ -4426,10 +4482,10 @@ index 0000000..c817cb2
 +}
 diff --git a/devices/metal4_screen.h b/devices/metal4_screen.h
 new file mode 100644
-index 0000000..a3a4e8a
+index 0000000..0c18111
 --- /dev/null
 +++ b/devices/metal4_screen.h
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,166 @@
 +#pragma once
 +#include "metal4_runtime.h"
 +#include "pipeline_bundle.h"
@@ -4439,7 +4495,7 @@ index 0000000..a3a4e8a
 +@interface HvMetal4Screen : NSObject {
 +    HvMetal4Runtime *_runtime;
 +    id<MTLDevice> _device;
-+    id<MTLRenderPipelineState> _plain,_linear,_cursor;
++    id<MTLRenderPipelineState> _plain,_linear,_cursor,_clarity;
 +    id<MTLSamplerState> _smooth,_sharp;
 +    HvDesktopFXPool *_fxPool;
 +    HvDesktopFXLease *_cachedFX,*_pendingFX;
@@ -4465,9 +4521,9 @@ index 0000000..a3a4e8a
 +@implementation HvMetal4Screen
 +- (instancetype)initWithRuntime:(HvMetal4Runtime *)runtime device:(id<MTLDevice>)device library:(id<MTLLibrary>)library bundle:(HvPipelineBundle *)bundle {
 +    if(!(self=[super init]))return nil;_runtime=runtime;_device=device;_fxCacheEnabled=YES;_fxLimit=3;
-+    id<MTLRenderPipelineState> states[3];
-+    NSArray *names=@[@"screen_plain",@"screen_linear",@"screen_cursor"];
-+    for(unsigned i=0;i<3;i++){
++    id<MTLRenderPipelineState> states[4];
++    NSArray *names=@[@"screen_plain",@"screen_linear",@"screen_cursor",@"screen_fx"];
++    for(unsigned i=0;i<4;i++){
 +        MTL4RenderPipelineDescriptor *d=[MTL4RenderPipelineDescriptor new];
 +        d.vertexFunctionDescriptor=hv_metal4_function(library,@"screen_v");
 +        d.fragmentFunctionDescriptor=hv_metal4_function(library,names[i]);
@@ -4480,14 +4536,15 @@ index 0000000..a3a4e8a
 +        states[i]=[runtime pipeline:d tag:0xe bundle:bundle];
 +        if(!states[i])return nil;
 +    }
-+    _plain=states[0];_linear=states[1];_cursor=states[2];
++    _plain=states[0];_linear=states[1];_cursor=states[2];_clarity=states[3];
 +    MTLSamplerDescriptor *sampler=[MTLSamplerDescriptor new];sampler.supportArgumentBuffers=YES;
++    sampler.sAddressMode=sampler.tAddressMode=MTLSamplerAddressModeClampToEdge;
 +    sampler.minFilter=sampler.magFilter=MTLSamplerMinMagFilterLinear;
 +    _smooth=[device newSamplerStateWithDescriptor:sampler];sampler.minFilter=sampler.magFilter=MTLSamplerMinMagFilterNearest;
 +    _sharp=[device newSamplerStateWithDescriptor:sampler];if(!_smooth||!_sharp)return nil;
 +    return self;
 +}
-+- (BOOL)draw:(id<MTLTexture>)source target:(id<MTLTexture>)target half:(BOOL)half cursor:(id<MTLTexture>)cursor rect:(const float *)rect sharp:(BOOL)sharp
++- (BOOL)draw:(id<MTLTexture>)source target:(id<MTLTexture>)target half:(BOOL)half clarity:(BOOL)clarity cursor:(id<MTLTexture>)cursor rect:(const float *)rect sharp:(BOOL)sharp
 +         job:(HvMetal4Job *)job vertex:(HvMetal4Arguments *)vertex fragment:(HvMetal4Arguments *)fragment {
 +    MTL4RenderPassDescriptor *pass=[MTL4RenderPassDescriptor new];
 +    pass.colorAttachments[0].texture=target;pass.colorAttachments[0].loadAction=MTLLoadActionDontCare;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
@@ -4497,7 +4554,7 @@ index 0000000..a3a4e8a
 +    [vertex setAddress:job->uniforms.gpuAddress atIndex:0];[fragment setAddress:job->uniforms.gpuAddress+16 atIndex:0];
 +    [fragment setTexture:source.gpuResourceID atIndex:0];[fragment setSamplerState:_smooth.gpuResourceID atIndex:0];
 +    [e setArgumentTable:vertex.table atStages:MTLRenderStageVertex];[e setArgumentTable:fragment.table atStages:MTLRenderStageFragment];
-+    [e setRenderPipelineState:half?_linear:_plain];[e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
++    [e setRenderPipelineState:clarity?_clarity:half?_linear:_plain];[e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 +    if(cursor&&rect){
 +        [vertex setAddress:job->uniforms.gpuAddress+32 atIndex:0];[fragment setTexture:cursor.gpuResourceID atIndex:0];
 +        [fragment setSamplerState:(sharp?_sharp:_smooth).gpuResourceID atIndex:0];
@@ -4545,8 +4602,9 @@ index 0000000..a3a4e8a
 +    float full[]={-1,-1,2,2};memcpy(job->uniforms.contents,full,sizeof full);
 +    memcpy((uint8_t *)job->uniforms.contents+16,&mode,sizeof mode);
 +    if(rect)memcpy((uint8_t *)job->uniforms.contents+32,rect,16);
-+    for(id resource in @[source,target,job->uniforms,_plain,_linear,_cursor,_smooth,_sharp])[_runtime retainResource:resource job:job];
++    for(id resource in @[source,target,job->uniforms,_plain,_linear,_cursor,_clarity,_smooth,_sharp])[_runtime retainResource:resource job:job];
 +    if(cursor)[_runtime retainResource:cursor job:job];
++    BOOL appliedFX=NO;
 +    BOOL wantsFX=upscale && source.width<target.width && source.height<target.height;
 +    if(wantsFX && _fxCacheEnabled){
 +        uint32_t key=mode | (half?0x80000000u:0);
@@ -4566,14 +4624,14 @@ index 0000000..a3a4e8a
 +            if(!reuse){
 +                // Normalize the existing half-float/encoded colour policy at the
 +                // LOW input size. No full-size downsample or CPU pixel copy.
-+                if(![self draw:source target:frame->input half:half cursor:nil rect:NULL sharp:NO job:job vertex:vertex fragment:fragment]){
++                if(![self draw:source target:frame->input half:half clarity:NO cursor:nil rect:NULL sharp:NO job:job vertex:vertex fragment:fragment]){
 +                    [_runtime discard:job];return nil;
 +                }
 +                [frame->scaler encodeToCommandBuffer:job->buffer];
-+                if(atomic_fetch_add(&fx_encoded,1)==0)fprintf(stderr,"hengevm: desktop-metalfx: active=1 input=%lux%lu output=%lux%lu mode=Metal4-spatial/perceptual cursor=post-upscale native-detail=reconstructed\n",(unsigned long)source.width,(unsigned long)source.height,(unsigned long)target.width,(unsigned long)target.height);
++                if(atomic_fetch_add(&fx_encoded,1)==0)fprintf(stderr,"hengevm: desktop-metalfx: active=1 input=%lux%lu output=%lux%lu mode=Metal4-spatial/perceptual/text-clarity cursor=post-upscale native-detail=reconstructed\n",(unsigned long)source.width,(unsigned long)source.height,(unsigned long)target.width,(unsigned long)target.height);
 +            }else atomic_fetch_add(&fx_reused,1);
 +            _pendingFX=lease;_pendingSource=source;_pendingEpoch=epoch;_pendingMode=key;
-+            source=frame->output;half=NO;
++            source=frame->output;half=NO;appliedFX=YES;
 +        }else{
 +            atomic_fetch_add(&fx_fallback,1);
 +            atomic_fetch_add(&fx_resource_fallback,1);
@@ -4588,7 +4646,7 @@ index 0000000..a3a4e8a
 +        atomic_fetch_add(&fx_size_fallback,1);
 +        if(!_fxSourceSizeLogged){_fxSourceSizeLogged=YES;fprintf(stderr,"hengevm: desktop-metalfx: active=0 reason=input-not-smaller input=%lux%lu output=%lux%lu; choose macOS Displays default to reduce backing pixels\n",(unsigned long)source.width,(unsigned long)source.height,(unsigned long)target.width,(unsigned long)target.height);}
 +    }
-+    if(![self draw:source target:target half:half cursor:cursor rect:rect sharp:sharp job:job vertex:vertex fragment:fragment]){
++    if(![self draw:source target:target half:half clarity:appliedFX cursor:cursor rect:rect sharp:sharp job:job vertex:vertex fragment:fragment]){
 +        [self didCommit:NO];[_runtime discard:job];return nil;
 +    }
 +    return job;
@@ -4980,6 +5038,27 @@ index eaa5879..b1c4c28 100644
 +    if(entry && entry->mapping_users)entry->mapping_users--;
 +    /* The weak entry disappears only when texture/surface owners are gone. */
  }
+diff --git a/devices/presentation_clock.h b/devices/presentation_clock.h
+new file mode 100644
+index 0000000..ec683ed
+--- /dev/null
++++ b/devices/presentation_clock.h
+@@ -0,0 +1,15 @@
++#pragma once
++#include <math.h>
++#include <stdint.h>
++/* Core Animation media time throughout. A late or stale display-link target
++   must present immediately, not queue a frame behind an obsolete deadline. */
++static inline double hv_present_deadline(double target,double now) {
++    return isfinite(target)&&isfinite(now)&&now>0&&target>now&&target-now<=0.1 ? target : 0;
++}
++typedef struct { double last,intervals;uint64_t count; } HvDisplayClock;
++static inline void hv_display_clock_tick(HvDisplayClock *clock,double target) {
++    if(!isfinite(target)||target<=0)return;
++    double dt=target-clock->last;
++    if(clock->last>0&&dt>0&&dt<=0.1){clock->intervals+=dt;clock->count++;}
++    clock->last=target;
++}
 diff --git a/devices/pvg.h b/devices/pvg.h
 index 3afe521..981c205 100644
 --- a/devices/pvg.h
@@ -5265,7 +5344,7 @@ index 87728e2..bc7aa34 100644
 +    return 0;
 +}
 diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
-index 9073d22..108b0ce 100644
+index 9073d22..bef0738 100644
 --- a/devices/pvg_metal.m
 +++ b/devices/pvg_metal.m
 @@ -8,6 +8,11 @@
@@ -5423,7 +5502,7 @@ index 9073d22..108b0ce 100644
      BOOL tess_factors; /* so is a tessellation factor buffer */
      uint32_t pre_raster_samples, pre_imageblock, pre_threadgroup, pre_tile_w, pre_tile_h; /* for the next pass */
      BOOL tracing; /* HV_PVG_TRACE_FILE exists: say what each exec draws */
-@@ -193,10 +266,40 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -193,10 +266,42 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      uint64_t frames, frames_shot;
      /* Showing frames with the GPU: a layer the app gave us. No copies, no conversion on a CPU. */
      CAMetalLayer *layer; /* screen_lock protects the target and its generation */
@@ -5437,6 +5516,8 @@ index 9073d22..108b0ce 100644
 +    __weak CAMetalLayer *display_link_layer;
 +    uint64_t display_link_generation;
 +    id<CAMetalDrawable> display_drawable;
++    double display_target_time;
++    HvDisplayClock display_clock;
 +#endif
      uint64_t layer_generation;
      __weak CAMetalLayer *prepared_layer; /* presenter only: each target needs its own setup */
@@ -5464,7 +5545,7 @@ index 9073d22..108b0ce 100644
      id<MTLTexture> cursor_tex;
      id<MTLSamplerState> screen_sampler, cursor_sampler;
      uint64_t on_screen; /* the mapping showing */
-@@ -206,7 +309,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -206,7 +311,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      BOOL link_cursor_shown;
      _Atomic int link_cursor_queued;
      _Atomic uint64_t gpu_frames;
@@ -5475,7 +5556,7 @@ index 9073d22..108b0ce 100644
      os_unfair_lock frame_metrics_lock;
      struct HvFrameMetrics frame_metrics;
      dispatch_queue_t presenter;
-@@ -216,6 +321,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -216,6 +323,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
      BOOL drawable_retry_pending;
      double drawable_retry_cooldown; /* fresh work coalesces one wake at its expiry */
      uint64_t screen_requests; /* fresh frames/cursor changes, not automatic retries */
@@ -5485,7 +5566,7 @@ index 9073d22..108b0ce 100644
      double drawable_retry_deadline; /* at most two seconds of retrying an unavailable target */
      uint32_t screen_w, screen_h;
      id<MTLBuffer> test_readback; /* HV_PVG_GPU_TEST: the drawable's pixels for screenshots */
-@@ -227,12 +335,39 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+@@ -227,12 +337,39 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
  - (void)complain:(NSString *)what;
  - (HvObject *)object:(uint32_t)ref task:(uint32_t)task;
  - (void)drawCursor;
@@ -5526,7 +5607,7 @@ index 9073d22..108b0ce 100644
  
  /* What Metal asks while it reads a serialized pipeline. */
  @interface HvContext : NSObject {
-@@ -256,9 +391,9 @@ static NSUInteger pixel_bytes(MTLPixelFormat f) {
+@@ -256,9 +393,9 @@ static NSUInteger pixel_bytes(MTLPixelFormat f) {
      case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
      case MTLPixelFormatRGBA8Snorm: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
      case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGB9E5Float:
@@ -5538,7 +5619,7 @@ index 9073d22..108b0ce 100644
      case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: case MTLPixelFormatRGBA32Float: return 16;
      default: return 0;
      }
-@@ -270,7 +405,7 @@ static BOOL linear_texture_fits(id<MTLDevice> device, MTLTextureDescriptor *t, u
+@@ -270,7 +407,7 @@ static BOOL linear_texture_fits(id<MTLDevice> device, MTLTextureDescriptor *t, u
      NSUInteger bpp = pixel_bytes(t.pixelFormat);
      if (!bpp) return YES; /* not checked: as before */
      NSUInteger align = [device minimumLinearTextureAlignmentForPixelFormat:t.pixelFormat];
@@ -5547,7 +5628,7 @@ index 9073d22..108b0ce 100644
      if (!ok) {
          static int told;
          if (told++ < 8) fprintf(stderr, "hengevm: pvg-metal: a %lux%lu format %lu texture can't sit on rows of %llu bytes at %llu in %lu: left empty\n",
-@@ -310,33 +445,71 @@ static float hv_half_shown(float v, int mode) { /* what the screen shows for a h
+@@ -310,33 +447,71 @@ static float hv_half_shown(float v, int mode) { /* what the screen shows for a h
     pages when the buffer is made, so a mapping never changes under a buffer: when
     the guest's pages change there is a new mapping and a new buffer. (A GPU still
     writing to pages the guest has freed and used again would corrupt its memory.) */
@@ -5642,7 +5723,7 @@ index 9073d22..108b0ce 100644
  
  /* A buffer over the mapping, that frees it when the last user is done. */
  static id<MTLBuffer> buffer_over_mapping(HvReplay *r, HvObject *o) {
-@@ -356,13 +529,15 @@ static void refresh_pages(HvReplay *r, uint32_t task, HvObject *o) {
+@@ -356,13 +531,15 @@ static void refresh_pages(HvReplay *r, uint32_t task, HvObject *o) {
      uint64_t n = (o->length + 0x3fff) >> 14;
      uint32_t stack[256];
      uint32_t *now = n <= 256 ? stack : malloc(n * 4);
@@ -5661,7 +5742,7 @@ index 9073d22..108b0ce 100644
      if (!old_in_buffer) vm_deallocate(mach_task_self(), (vm_address_t)old, n << 14);
      o->mapping_in_buffer = NO;
      o->generation++;
-@@ -447,9 +622,13 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+@@ -447,9 +624,13 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
  - (BOOL)hadLookupFailure { return failure != nil; }
  - (NSString *)firstFailureReason { return failure; }
  - (id)functionWithFunctionRef:(unsigned long long)ref {
@@ -5677,7 +5758,7 @@ index 9073d22..108b0ce 100644
          return standIn;
      }
      return o->object;
-@@ -457,6 +636,49 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
+@@ -457,6 +638,47 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
  @end
  
  @implementation HvReplay
@@ -5691,9 +5772,7 @@ index 9073d22..108b0ce 100644
 +       after UIKit warnings; recover on later misses without a polling timer. */
 +    if (now_seconds() < cache_warning_until && pressure < 1) pressure = 1;
 +    if(command_pool) {
-+        BOOL suspend=pressure>0||available<(512ull<<20);
-+        if(suspend&&!command_pool->suspended)[command_pool trim];
-+        command_pool->suspended=suspend;
++        [command_pool setBudget:(NSUInteger)hv_command_cache_budget(available,pressure)];
 +    }
 +    if (pressure >= 2 || available < (512ull << 20)) {
 +        [self dropArchiveMemory]; archive_pressure_suspended=YES;
@@ -6997,12 +7076,12 @@ index 9073d22..108b0ce 100644
 +                if(queued){
 +                    if(!metal4_replayed)fprintf(stderr,"hengevm: metal4-first-guest: task=%u draws=%llu; native host GPU render/compute replay active\n",task,(unsigned long long)(draws-oldDraws));
 +                    metal4_replayed++;
-                 }
--                p += size;
++                }
 +                else{
 +                    metal4_bridge_rejected++;used4=NO;atomic_fetch_sub(&inflight,1);dispatch_group_leave(completions);draws=oldDraws;
 +                    pre_raster_samples=oldSamples;pre_imageblock=oldImage;pre_threadgroup=oldMemory;pre_tile_w=oldW;pre_tile_h=oldH;
-+                }
+                 }
+-                p += size;
 +            }else{
 +                [metal4 discard:job];draws=oldDraws;
 +                pre_raster_samples=oldSamples;pre_imageblock=oldImage;pre_threadgroup=oldMemory;pre_tile_w=oldW;pre_tile_h=oldH;
@@ -7050,7 +7129,7 @@ index 9073d22..108b0ce 100644
          }
          [back endEncoding];
      }
-@@ -2263,30 +2955,70 @@ typedef struct {
+@@ -2263,30 +2955,71 @@ typedef struct {
      [self commit:cb channel:ch stamp:stamp complete:YES];
      double t2 = now_seconds();
      encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
@@ -7083,6 +7162,7 @@ index 9073d22..108b0ce 100644
 +            fprintf(stderr,"hengevm: metal4-rejection-hotspot: rank=%u count=%llu reason=%u type=%u tag=%u min_bytes=%zu max_bytes=%zu unclassified=%llu (cumulative rejected runs; classic GPU replay retained, not lost draws)\n",rank+1,(unsigned long long)b->count,b->reason,b->type,b->tag,b->min_bytes,b->max_bytes,(unsigned long long)metal4_reject_stats.overflow);
 +        }
 +        if(metal4)fprintf(stderr,"hengevm: metal4-runtime: GPU_ms=%.2f max_ms=%.2f pipeline_hits=%llu pipeline_compiles=%llu archive_writes=%llu presentation_backpressure=%llu (GPU replay and display combined; CPU emulation stays on CPU)\n",atomic_load(&m4->gpu_duration_ns)/1e6,atomic_load(&m4->gpu_max_ns)/1e6,(unsigned long long)atomic_load(&m4->pipeline_cache_hits),(unsigned long long)atomic_load(&m4->pipeline_cache_misses),(unsigned long long)atomic_load(&m4->pipeline_cache_writes),(unsigned long long)atomic_load(&presentation_backpressure));
++        if(metal4)fprintf(stderr,"hengevm: metal4-archive-retention: cold_hits=%llu open_failures=%llu (valid disk files survive resident-handle limits; transient open failures are retained)\n",(unsigned long long)atomic_load(&m4->archive_cold_hits),(unsigned long long)atomic_load(&m4->archive_open_failures));
 +        if(metal4)fprintf(stderr,"hengevm: metal4-pipeline-timing: compile_attempts=%llu compile_ms=%.2f max_ms=%.2f (host elapsed time inside compiler calls; excludes archive lookup and GPU execution; no draw-time sampling)\n",(unsigned long long)atomic_load(&m4->pipeline_cache_misses),atomic_load(&m4->pipeline_compile_ns)/1e6,atomic_load(&m4->pipeline_compile_max_ns)/1e6);
 +        if(metal4)fprintf(stderr,"hengevm: metal4-pipeline-warmup: admitted=%llu completed=%llu deferred=%llu cancelled=%llu classic_while_warming=%llu (bounded utility worker; frames retain original pipelines; no FPS claim)\n",(unsigned long long)atomic_load(&m4->pipelineQueue->admitted),(unsigned long long)atomic_load(&m4->pipelineQueue->completed),(unsigned long long)atomic_load(&m4->pipelineQueue->deferred),(unsigned long long)atomic_load(&m4->pipelineQueue->cancelled),(unsigned long long)metal4_warming);
 +        }
@@ -7096,7 +7176,7 @@ index 9073d22..108b0ce 100644
 -        fprintf(stderr, "hengevm: gpu-libraries: hits=%llu loads=%llu retained=%lu bytes=%lu load_ms=%.2f worst_ms=%.2f (exact bytes; session-only; limits 32 libraries/8MiB binary keys)\n",
 +        fprintf(stderr,"gpu-submission-reuse: empty_classic_before_metal4_avoided=%llu (runtime queue signal/wait and guest completion retained)\n",(unsigned long long)classic_empty_avoided);
 +        fprintf(stderr,"gpu-buffer-mapping: allocations=%llu pages=%llu remap_calls=%llu checked_snapshots_reused=%llu (immutable buffer backing; single-page fallback retained)\n",(unsigned long long)buffer_map_allocations,(unsigned long long)buffer_map_pages,(unsigned long long)buffer_map_calls,(unsigned long long)buffer_map_snapshot_reuses);
-+        if(command_pool)fprintf(stderr,"gpu-command-storage: enabled=1 arena_allocations=%llu arena_reuses=%llu published_views=%llu captured_bytes=%llu independent_buffers=%llu small_reference_batches=%llu cached_bytes=%lu suspended=%d (bounded CPU snapshot storage; all active views retain immutable bytes)\n",(unsigned long long)command_pool->allocations,(unsigned long long)command_pool->reuses,(unsigned long long)command_pool->views,(unsigned long long)command_pool->captured_bytes,(unsigned long long)command_pool->independent_buffers,(unsigned long long)command_pool->small_batches,(unsigned long)[command_pool cachedBytes],command_pool->suspended);
++        if(command_pool)fprintf(stderr,"gpu-command-storage: enabled=1 arena_allocations=%llu arena_reuses=%llu published_views=%llu captured_bytes=%llu independent_buffers=%llu small_reference_batches=%llu cached_bytes=%lu suspended=%d pinned_slots_replaced=%llu budget_bytes=%lu (bounded CPU snapshot storage; all active views retain immutable bytes)\n",(unsigned long long)command_pool->allocations,(unsigned long long)command_pool->reuses,(unsigned long long)command_pool->views,(unsigned long long)command_pool->captured_bytes,(unsigned long long)command_pool->independent_buffers,(unsigned long long)command_pool->small_batches,(unsigned long)[command_pool cachedBytes],command_pool->suspended,(unsigned long long)command_pool->pinned_replacements,(unsigned long)command_pool->budget);
 +        else fprintf(stderr,"gpu-command-storage: enabled=0 reference=independent-buffers\n");
 +        fprintf(stderr,"gpu-surface-copy: full_reference=%d hashed_bytes=%llu candidate_bytes=%llu copied_bytes=%llu unchanged_bytes=%llu chunks=%llu writes=%llu dense_probes=%llu (all skipped bytes compared exactly; dense updates use full copies)\n",copy_full,(unsigned long long)surface_hash_bytes,(unsigned long long)surface_copy.candidate_bytes,(unsigned long long)surface_copy.copied_bytes,(unsigned long long)surface_copy.skipped_bytes,(unsigned long long)surface_copy.chunks,(unsigned long long)surface_copy.writes,(unsigned long long)surface_copy.probes);
 +        fprintf(stderr, "hengevm: gpu-libraries: hits=%llu loads=%llu retained=%lu bytes=%lu load_ms=%.2f worst_ms=%.2f (exact bytes; session-only; limits %lu libraries/%.1fMiB binary keys)\n",
@@ -7126,7 +7206,7 @@ index 9073d22..108b0ce 100644
      }
      return YES;
  }
-@@ -2319,14 +3051,27 @@ static const uint8_t *half_to_byte(void) {
+@@ -2319,14 +3052,27 @@ static const uint8_t *half_to_byte(void) {
      memcpy(&hx, (const uint8_t *)a + 0x24, 2), memcpy(&hy, (const uint8_t *)a + 0x26, 2);
      if (!w || !h || w > 512 || h > 512 || stride < (uint64_t)w * 4 || stride > 8192) return;
      uint8_t *bits = malloc((size_t)stride * h);
@@ -7154,7 +7234,7 @@ index 9073d22..108b0ce 100644
      [glyph replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
      if (a[0] == 1) {
          link_cursor=glyph;link_cw=w;link_ch=h;link_hx=hx;link_hy=hy;
-@@ -2336,21 +3081,22 @@ static const uint8_t *half_to_byte(void) {
+@@ -2336,21 +3082,22 @@ static const uint8_t *half_to_byte(void) {
      os_unfair_lock_lock(&screen_lock);
      cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
      cursor_tex = glyph;
@@ -7180,7 +7260,7 @@ index 9073d22..108b0ce 100644
          [self screenChanged];
          return;
      }
-@@ -2368,7 +3114,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2368,7 +3115,7 @@ static const uint8_t *half_to_byte(void) {
      }
      if (where == 0xffffffff) return;
      /* Bigger than the guest draws it. The hot spot stays where it points. */
@@ -7189,7 +7269,11 @@ index 9073d22..108b0ce 100644
      /* The pointer's place is in the display mode's pixels; a scaled resolution's frame is smaller than the mode. */
      uint32_t mw = w, mh = h;
      hv_pvg_lite_mode(&mw, &mh);
-@@ -2405,6 +3151,14 @@ static const uint8_t *half_to_byte(void) {
+@@ -2402,9 +3149,18 @@ static const uint8_t *half_to_byte(void) {
+         BOOL bundled = lib && [lib newFunctionWithName:@"screen_v"]
+             && [lib newFunctionWithName:@"screen_plain"]
+             && [lib newFunctionWithName:@"screen_linear"]
++            && [lib newFunctionWithName:@"screen_fx"]
              && [lib newFunctionWithName:@"screen_cursor"];
          if (!bundled) lib = [device newLibraryWithSource:screen_shaders options:nil error:&err];
          if (!lib) { [self complain:[NSString stringWithFormat:@"screen shaders: %@", err.localizedDescription]]; return NO; }
@@ -7204,7 +7288,16 @@ index 9073d22..108b0ce 100644
          screen_pipe = hv_screen_pipeline(device, lib, @"screen_plain", NO, &err);
          linear_pipe = hv_screen_pipeline(device, lib, @"screen_linear", NO, &err);
          cursor_pipe = hv_screen_pipeline(device, lib, @"screen_cursor", YES, &err);
-@@ -2439,27 +3193,120 @@ static const uint8_t *half_to_byte(void) {
+@@ -2425,7 +3181,7 @@ static const uint8_t *half_to_byte(void) {
+         target.pixelFormat = MTLPixelFormatBGRA8Unorm;
+         target.framebufferOnly = !(getenv("HV_PVG_GPU_TEST") || getenv("HV_COLOR_PROBE")); /* the probe copies the drawable out */
+         target.allowsNextDrawableTimeout = YES;
+-        target.maximumDrawableCount = 3;
++        target.maximumDrawableCount = getenv("HV_PVG_DRAWABLES") && !strcmp(getenv("HV_PVG_DRAWABLES"),"3") ? 3 : 2;
+         [CATransaction commit];
+         prepared_layer = target;
+         fprintf(stderr, "hengevm: pvg-metal: half-float display surfaces are shown %s (HV_PVG_HALF=%s)\n",
+@@ -2439,27 +3195,124 @@ static const uint8_t *half_to_byte(void) {
     refresh, so that happens on a thread of its own and never holds up the guest's GPU work:
     this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
  - (void)updatePacingPolicy {
@@ -7312,7 +7405,11 @@ index 9073d22..108b0ce 100644
 +    // Keep one active stream of pulses while damaged; pause on the first idle
 +    // pulse, and never acquire another drawable while one is being encoded.
 +    if(atomic_load(&presentation_inflight)>=2)atomic_fetch_add(&presentation_backpressure,1);
-+    if(!presenter_running && !display_drawable && atomic_load(&presentation_inflight)<2){display_drawable=update.drawable;[self kickPresenter:NO];}
++    hv_display_clock_tick(&display_clock,update.targetPresentationTimestamp);
++    if(!presenter_running && !display_drawable && atomic_load(&presentation_inflight)<2){
++        display_target_time=update.targetPresentationTimestamp;
++        display_drawable=update.drawable;[self kickPresenter:NO];
++    }
 +    os_unfair_lock_unlock(&screen_lock);
  }
 +#endif
@@ -7336,7 +7433,7 @@ index 9073d22..108b0ce 100644
      [self updatePacingPolicy];
      double now = now_seconds();
      double delay = hv_pacing_delay(&frame_pacing, now, pacing_fps);
-@@ -2520,12 +3367,35 @@ static const uint8_t *half_to_byte(void) {
+@@ -2520,12 +3373,35 @@ static const uint8_t *half_to_byte(void) {
      const uint8_t *page=hv_pvg_lite_display_page_for_port(lite,1);
      uint32_t at=page ? __atomic_load_n((const uint32_t *)(page+0xe00),__ATOMIC_ACQUIRE) : UINT32_MAX;
      BOOL shown=page && at!=UINT32_MAX && (link_cursor_shown || page[0xe04]);
@@ -7373,7 +7470,7 @@ index 9073d22..108b0ce 100644
  - (void)showOnLayer:(uint64_t)mapping {
      HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]); /* not met yet: a resumed machine's screen */
      if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
-@@ -2544,36 +3414,62 @@ static const uint8_t *half_to_byte(void) {
+@@ -2544,36 +3420,64 @@ static const uint8_t *half_to_byte(void) {
      }
      os_unfair_lock_lock(&screen_lock);
      screen_tex = surface->scanout, screen_half = half, screen_w = surface->surface_w, screen_h = surface->surface_h;
@@ -7415,8 +7512,10 @@ index 9073d22..108b0ce 100644
          }
 +#if TARGET_OS_IPHONE
 +        id<CAMetalDrawable> supplied = nil;
++        double targetTime=0;
 +        if (display_driven) {
 +            supplied = display_drawable; display_drawable = nil;
++            targetTime=display_target_time;display_target_time=0;
 +            if (!supplied) {
 +                presenter_running = NO;
 +                [self requestDisplayPulse];
@@ -7439,7 +7538,7 @@ index 9073d22..108b0ce 100644
          screen_dirty = NO;
          CAMetalLayer *target = layer; // retained across nextDrawable and a concurrent disconnect
          uint64_t generation = layer_generation, requests = screen_requests;
-@@ -2590,14 +3486,20 @@ static const uint8_t *half_to_byte(void) {
+@@ -2590,14 +3494,20 @@ static const uint8_t *half_to_byte(void) {
              if (changed) continue;
              return;
          }
@@ -7462,7 +7561,7 @@ index 9073d22..108b0ce 100644
          if (!drawable) {
              os_unfair_lock_lock(&screen_lock);
              screen_dirty = YES;
-@@ -2633,9 +3535,11 @@ static const uint8_t *half_to_byte(void) {
+@@ -2633,9 +3543,11 @@ static const uint8_t *half_to_byte(void) {
          /* Something newer came during the wait? Then that is the frame to show. */
          os_unfair_lock_lock(&screen_lock);
          tex = screen_tex, half = screen_half, ctex = cursor_tex, shown = cursor_shown;
@@ -7474,7 +7573,7 @@ index 9073d22..108b0ce 100644
          if (same_target && same_size) {
              screen_dirty = NO;
              drawable_retry_deadline = 0;
-@@ -2647,9 +3551,39 @@ static const uint8_t *half_to_byte(void) {
+@@ -2647,9 +3559,39 @@ static const uint8_t *half_to_byte(void) {
              os_unfair_lock_unlock(&screen_lock);
              continue;
          }
@@ -7515,7 +7614,7 @@ index 9073d22..108b0ce 100644
              if (done.status == MTLCommandBufferStatusError)
                  fprintf(stderr, "hengevm: native-metal: display command failed: %s\n", done.error.description.UTF8String);
          }];
-@@ -2668,47 +3602,32 @@ static const uint8_t *half_to_byte(void) {
+@@ -2668,47 +3610,32 @@ static const uint8_t *half_to_byte(void) {
              [e setFragmentBytes:&half_mode length:sizeof half_mode atIndex:0];
          }
          [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -7574,7 +7673,7 @@ index 9073d22..108b0ce 100644
                      self->frames++;
                  });
              }];
-@@ -2717,19 +3636,38 @@ static const uint8_t *half_to_byte(void) {
+@@ -2717,19 +3644,42 @@ static const uint8_t *half_to_byte(void) {
          // Serialize the final check and commit with set_layer: a switch that has
          // returned must not be followed by a commit to its old target.
          os_unfair_lock_lock(&screen_lock);
@@ -7601,8 +7700,12 @@ index 9073d22..108b0ce 100644
 +            atomic_fetch_add(&presentation_inflight,1);
 +            dispatch_group_enter(completions);
 +            BOOL committed=YES;
++            double presentTime=0;
++#if TARGET_OS_IPHONE
++            presentTime=hv_present_deadline(targetTime,CACurrentMediaTime());
++#endif
 +            if(displayJob){
-+                BOOL queued=[metal4 commit:displayJob classicQueue:queue lock:&submission_lock drawable:drawable completion:^(BOOL ok){
++                BOOL queued=[metal4 commit:displayJob classicQueue:queue lock:&submission_lock drawable:drawable presentTime:presentTime completion:^(BOOL ok){
 +                    if(!ok)atomic_fetch_add(&self->failed,1);
 +                    atomic_fetch_sub(&self->presentation_inflight,1);
 +                    dispatch_group_leave(self->completions);
@@ -7611,7 +7714,7 @@ index 9073d22..108b0ce 100644
 +                if(@available(macOS 26.0,iOS 26.0,*))[metal4_screen didCommit:queued];
 +                if(!queued){committed=NO;atomic_fetch_sub(&presentation_inflight,1);dispatch_group_leave(completions);screen_dirty=YES;}
 +            }else{
-+                [cb presentDrawable:drawable];
++                if(presentTime)[cb presentDrawable:drawable atTime:presentTime];else [cb presentDrawable:drawable];
 +                os_unfair_lock_lock(&submission_lock);[cb commit];os_unfair_lock_unlock(&submission_lock);
 +            }
 +            if(committed){gpu_frames++;hv_pacing_presented(&frame_pacing,now_seconds(),pacing_fps);}
@@ -7620,7 +7723,7 @@ index 9073d22..108b0ce 100644
              screen_dirty = YES;
          }
          os_unfair_lock_unlock(&screen_lock);
-@@ -2741,7 +3679,7 @@ static const uint8_t *half_to_byte(void) {
+@@ -2741,7 +3691,7 @@ static const uint8_t *half_to_byte(void) {
      if (atomic_load(&stopping)) return;
      double now = now_seconds();
      on_screen = mapping;
@@ -7629,7 +7732,7 @@ index 9073d22..108b0ce 100644
          late = NO;
          [self showOnLayer:mapping];
          return;
-@@ -2831,23 +3769,61 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2831,23 +3781,61 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
          if (proto) class_addProtocol([HvContext class], proto);
          HvReplay *r = [HvReplay new];
          r->lite = lite;
@@ -7695,7 +7798,7 @@ index 9073d22..108b0ce 100644
          r->shot = getenv("HV_PVG_SHOT");
          cp_start(r);
  #if !TARGET_OS_IPHONE
-@@ -2864,6 +3840,32 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+@@ -2864,6 +3852,32 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
              r->shot_timer = timer;
          }
  #endif
@@ -7728,7 +7831,7 @@ index 9073d22..108b0ce 100644
          fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
          return (HvPvgMetal *)CFBridgingRetain(r);
      }
-@@ -2874,23 +3876,41 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
+@@ -2874,23 +3888,41 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
      @autoreleasepool {
          HvReplay *r = CFBridgingRelease(m);
          atomic_store(&r->stopping, 1);
@@ -7773,7 +7876,7 @@ index 9073d22..108b0ce 100644
              r->lite = NULL;
              r->tasks = nil;
              r->surfaces = nil;
-@@ -2915,10 +3935,10 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
+@@ -2915,10 +3947,10 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
      HvReplay *r = (__bridge HvReplay *)m;
      dispatch_async(r->worker, ^{
          @autoreleasepool {
@@ -7788,7 +7891,7 @@ index 9073d22..108b0ce 100644
              uint32_t op = cmd[0] & 0xffff, skip = (cmd[0] >> 16) * 8; /* the barriers come first */
              const uint32_t *args = (const uint32_t *)((const uint8_t *)cmd + 12 + skip);
              uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
-@@ -2951,7 +3971,8 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
+@@ -2951,7 +3983,8 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                      /* "May be thrown away": Apple's host only marks it purgeable, and the bytes stay
                         until the system needs the memory. Here they just stay. */
                  } else if (op == 0x20 && n >= 4) {
@@ -7798,7 +7901,7 @@ index 9073d22..108b0ce 100644
                  } else {
                      hv_pvg_lite_command(lite, cmd, len);
                      if (op == 8 && n >= 16) {
-@@ -2998,24 +4019,97 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
+@@ -2998,24 +4031,97 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
      }
      r->pacing_pending = NO; r->frame_pacing.next = 0; /* reattaching the same layer also wakes a stopped presenter */
      r->layer = l;
@@ -7897,7 +8000,7 @@ index 9073d22..108b0ce 100644
          [r screenChanged];
          return;
      }
-@@ -3030,8 +4124,8 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
+@@ -3030,8 +4136,8 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
  void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
      HvReplay *r = (__bridge HvReplay *)m;
      dispatch_async(r->worker, ^{
@@ -7908,7 +8011,7 @@ index 9073d22..108b0ce 100644
          HvObject *s = r->surfaces[@(mapping)];
          if(s && s->planar_entry){
              hv_planar_release_mapping(r->planar,s->planar_key,s->planar_entry);
-@@ -3096,14 +4190,26 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
+@@ -3096,14 +4202,32 @@ void hv_pvg_metal_log_metrics(HvPvgMetal *metal) {
      if (!r->frame_metrics_enabled) return;
      os_unfair_lock_lock(&r->frame_metrics_lock);
      struct HvFrameMetrics m = r->frame_metrics;
@@ -7917,6 +8020,12 @@ index 9073d22..108b0ce 100644
 +        fprintf(stderr,"desktop-metalfx: encoded=%llu cursor_cache_reuses=%llu fallbacks=%llu pressure_fallbacks=%llu resource_fallbacks=%llu geometry_fallbacks=%llu (presentation only; not game FPS or measured speedup)\n",(unsigned long long)atomic_load(&screen->fx_encoded),(unsigned long long)atomic_load(&screen->fx_reused),(unsigned long long)atomic_load(&screen->fx_fallback),(unsigned long long)atomic_load(&screen->fx_pressure_fallback),(unsigned long long)atomic_load(&screen->fx_resource_fallback),(unsigned long long)atomic_load(&screen->fx_size_fallback));
 +    }}
      os_unfair_lock_unlock(&r->frame_metrics_lock);
++#if TARGET_OS_IPHONE
++    os_unfair_lock_lock(&r->screen_lock);
++    HvDisplayClock observed=r->display_clock;
++    os_unfair_lock_unlock(&r->screen_lock);
++    fprintf(stderr,"display-clock: active_intervals=%llu observed_hz=%.3f drawable_slots=%u target=display-link (actual callback targets; idle gaps excluded; not guest FPS)\n",(unsigned long long)observed.count,observed.intervals>0?observed.count/observed.intervals:0,getenv("HV_PVG_DRAWABLES")&&!strcmp(getenv("HV_PVG_DRAWABLES"),"3")?3u:2u);
++#endif
      fprintf(stderr, "frame-presented: epoch=%llu frames=%llu intervals=%llu elapsed_s=%.6f average_fps=%.3f p95_ms_upper=%.3f p99_ms_upper=%.3f low1_fps_estimate=%.3f max_ms=%.3f overflow=%llu invalid=%llu (host presentation incl cursor; 0.25ms bins; not game FPS)\n",
          (unsigned long long)m.generation, (unsigned long long)m.frames, (unsigned long long)m.intervals,
          m.last-m.first, m.total_ms ? 1000*m.intervals/m.total_ms : 0,
@@ -7935,7 +8044,7 @@ index 9073d22..108b0ce 100644
  void hv_pvg_metal_link_connected(HvPvgMetal *m,int connected){
      if(!m)return;HvReplay *r=(__bridge HvReplay *)m;
      dispatch_async(r->worker,^{
-@@ -3117,25 +4223,46 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
+@@ -3117,25 +4241,46 @@ void hv_pvg_metal_link_cursor_moved(HvPvgMetal *m){
      if(atomic_exchange(&r->link_cursor_queued,1))return;
      dispatch_async(r->worker,^{atomic_store(&r->link_cursor_queued,0);if (!atomic_load(&r->stopping)) [r sendLinkMapping:r->link_mapping];});
  }
@@ -7986,7 +8095,7 @@ index 9073d22..108b0ce 100644
              for (NSNumber *task in r->tasks) {
                  NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
                  for (NSNumber *ref in objs) {
-@@ -3143,79 +4270,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+@@ -3143,79 +4288,99 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
                      if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
                      if (o->parent && o->parent->heap_whole) continue;
                      if (!cb) cb = [r->queue commandBuffer];
@@ -8124,6 +8233,60 @@ index 9073d22..108b0ce 100644
 +    if (failed) free(copy);
 +    return failed ? -1 : 0;
  }
+diff --git a/devices/pvg_screen.h b/devices/pvg_screen.h
+index 1f9c4f9..699d3af 100644
+--- a/devices/pvg_screen.h
++++ b/devices/pvg_screen.h
+@@ -10,6 +10,22 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
+     "  V o; o.at = float4(rect.xy + c * rect.zw, 0, 1); o.uv = float2(c.x, 1 - c.y); return o; }\n"
+     "fragment float4 screen_plain(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
+     "  return float4(t.sample(s, v.uv).rgb, 1); }\n"
++    "// Desktop-only clarity in the existing composition pass. Preserve flat\n"
++    "// colours and bound enhancement to the local range: no bright/dark halos,\n"
++    "// colour-space conversion or change to native Retina and cursor rendering.\n"
++    "fragment float4 screen_fx(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
++    "  float2 step=1.0/float2(t.get_width(),t.get_height());\n"
++    "  float3 c=t.sample(s,v.uv).rgb;\n"
++    "  float3 n=t.sample(s,v.uv+float2(0,step.y)).rgb;\n"
++    "  float3 b=t.sample(s,v.uv-float2(0,step.y)).rgb;\n"
++    "  float3 e=t.sample(s,v.uv+float2(step.x,0)).rgb;\n"
++    "  float3 w=t.sample(s,v.uv-float2(step.x,0)).rgb;\n"
++    "  float3 lo=min(c,min(min(n,b),min(e,w))), hi=max(c,max(max(n,b),max(e,w)));\n"
++    "  float3 luma=float3(0.2126,0.7152,0.0722);\n"
++    "  float contrast=dot(hi-lo,luma);\n"
++    "  float detail=dot(c-(n+b+e+w)*0.25,luma);\n"
++    "  float delta=clamp(detail*0.35*smoothstep(0.02,0.15,contrast),-0.04,0.04);\n"
++    "  return float4(clamp(c+delta,lo,hi),1); }\n"
+     "fragment float4 screen_linear(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant uint &mode [[buffer(0)]]) {\n"
+     "  float3 c = saturate(t.sample(s, v.uv).rgb);\n"
+     "  if (mode == 1) c = select(1.055 * powr(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308);\n"
+diff --git a/devices/pvg_screen.metal b/devices/pvg_screen.metal
+index c07e86a..d546564 100644
+--- a/devices/pvg_screen.metal
++++ b/devices/pvg_screen.metal
+@@ -6,6 +6,22 @@ vertex V screen_v(uint i [[vertex_id]], constant float4 &rect [[buffer(0)]]) {
+   V o; o.at = float4(rect.xy + c * rect.zw, 0, 1); o.uv = float2(c.x, 1 - c.y); return o; }
+ fragment float4 screen_plain(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {
+   return float4(t.sample(s, v.uv).rgb, 1); }
++// Desktop-only clarity in the existing composition pass. Preserve flat
++// colours and bound enhancement to the local range: no bright/dark halos,
++// colour-space conversion or change to native Retina and cursor rendering.
++fragment float4 screen_fx(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {
++  float2 step=1.0/float2(t.get_width(),t.get_height());
++  float3 c=t.sample(s,v.uv).rgb;
++  float3 n=t.sample(s,v.uv+float2(0,step.y)).rgb;
++  float3 b=t.sample(s,v.uv-float2(0,step.y)).rgb;
++  float3 e=t.sample(s,v.uv+float2(step.x,0)).rgb;
++  float3 w=t.sample(s,v.uv-float2(step.x,0)).rgb;
++  float3 lo=min(c,min(min(n,b),min(e,w))), hi=max(c,max(max(n,b),max(e,w)));
++  float3 luma=float3(0.2126,0.7152,0.0722);
++  float contrast=dot(hi-lo,luma);
++  float detail=dot(c-(n+b+e+w)*0.25,luma);
++  float delta=clamp(detail*0.35*smoothstep(0.02,0.15,contrast),-0.04,0.04);
++  return float4(clamp(c+delta,lo,hi),1); }
+ fragment float4 screen_linear(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant uint &mode [[buffer(0)]]) {
+   float3 c = saturate(t.sample(s, v.uv).rgb);
+   if (mode == 1) c = select(1.055 * powr(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308);
 diff --git a/devices/pvg_store_action.h b/devices/pvg_store_action.h
 new file mode 100644
 index 0000000..9316eb3
@@ -8191,17 +8354,17 @@ index 0000000..9316eb3
 +#endif
 diff --git a/devices/surface_hash.h b/devices/surface_hash.h
 new file mode 100644
-index 0000000..c550603
+index 0000000..ed34d05
 --- /dev/null
 +++ b/devices/surface_hash.h
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,48 @@
 +#ifndef HENGE_SURFACE_HASH_H
 +#define HENGE_SURFACE_HASH_H
 +#include <stdint.h>
 +#include <string.h>
 +/* Full-byte content signature. Independent lanes avoid one serial multiply
 +   per word. Unaligned reads and tails are safe; never sample/skip pixels. */
-+static uint64_t hv_surface_hash(const uint8_t *p, uint64_t n) {
++static inline uint64_t hv_surface_hash_reference(const uint8_t *p, uint64_t n) {
 +    uint64_t a=0xcbf29ce484222325ull, b=0x9e3779b97f4a7c15ull;
 +    uint64_t c=0x94d049bb133111ebull, d=0x2545f4914f6cdd1dull;
 +    uint64_t left=n;
@@ -8213,6 +8376,33 @@ index 0000000..c550603
 +    }
 +    uint64_t h=a ^ (b<<13|b>>51) ^ (c<<29|c>>35) ^ (d<<47|d>>17) ^ n;
 +    while (left--) h=(h^*p++)*0x100000001b3ull;
++    return h;
++}
++/* Same full-byte signature, unrolled in128-byte units. Independent loads can
++   overlap; bulk scans execute one loop branch per128 bytes rather than32.
++   No sampled pixels, dirty-flag assumptions or changed hash semantics. */
++static inline uint64_t hv_surface_hash(const uint8_t *p,uint64_t n) {
++    uint64_t a=0xcbf29ce484222325ull,b=0x9e3779b97f4a7c15ull;
++    uint64_t c=0x94d049bb133111ebull,d=0x2545f4914f6cdd1dull,left=n;
++    while(left>=128) {
++#if defined(__clang__)
++#pragma clang loop unroll(full)
++#endif
++        for(unsigned i=0;i<4;i++) {
++            uint64_t v[4];memcpy(v,p+i*32,32);
++            a=(a^v[0])*0x100000001b3ull;b=(b^v[1])*0x100000001b3ull;
++            c=(c^v[2])*0x100000001b3ull;d=(d^v[3])*0x100000001b3ull;
++        }
++        p+=128;left-=128;
++    }
++    while(left>=32) {
++        uint64_t v[4];memcpy(v,p,32);
++        a=(a^v[0])*0x100000001b3ull;b=(b^v[1])*0x100000001b3ull;
++        c=(c^v[2])*0x100000001b3ull;d=(d^v[3])*0x100000001b3ull;
++        p+=32;left-=32;
++    }
++    uint64_t h=a^(b<<13|b>>51)^(c<<29|c>>35)^(d<<47|d>>17)^n;
++    while(left--)h=(h^*p++)*0x100000001b3ull;
 +    return h;
 +}
 +#endif
@@ -14389,10 +14579,10 @@ index 0000000..ef1d8a6
 +#endif
 diff --git a/host/resource_policy.h b/host/resource_policy.h
 new file mode 100644
-index 0000000..acc334a
+index 0000000..2d42ca7
 --- /dev/null
 +++ b/host/resource_policy.h
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,38 @@
 +#ifndef HENGE_RESOURCE_POLICY_H
 +#define HENGE_RESOURCE_POLICY_H
 +#include <stdint.h>
@@ -14423,6 +14613,12 @@ index 0000000..acc334a
 +static inline unsigned hv_desktop_fx_limit(uint64_t available,int pressure) {
 +    if(pressure>=2 || available<(512ull<<20))return 0;
 +    return pressure>0 ? 2 : 3;
++}
++/* Useful command snapshots are tiny relative to resident guest pages. Keep a
++   strictly bounded working set at WARN; CRITICAL still releases every owner. */
++static inline uint64_t hv_command_cache_budget(uint64_t available,int pressure) {
++    if(pressure>=2||available<(128ull<<20))return 0;
++    return pressure>0||available<(512ull<<20) ? 256ull<<10 : 16ull<<20;
 +}
 +#endif
 diff --git a/host/scheduling.c b/host/scheduling.c
@@ -19896,7 +20092,7 @@ index c0f52d6..0d81556 100644
                          .frame(maxWidth: .infinity, alignment: .leading)
                          .padding(.horizontal, 4).padding(.bottom, 12)
 diff --git a/ios/Henge/MacSettingsView.swift b/ios/Henge/MacSettingsView.swift
-index 800c854..517c154 100644
+index 800c854..f53cb50 100644
 --- a/ios/Henge/MacSettingsView.swift
 +++ b/ios/Henge/MacSettingsView.swift
 @@ -5,8 +5,10 @@ struct MacSettingsView: View {
@@ -19940,7 +20136,7 @@ index 800c854..517c154 100644
                              .font(.system(size: 13)).foregroundStyle(Desk.dim)
                      }
                      .padding(17)
-@@ -47,20 +57,33 @@ struct MacSettingsView: View {
+@@ -47,20 +57,46 @@ struct MacSettingsView: View {
                      HStack(alignment: .firstTextBaseline) {
                          Text("\(mac.ramMB / 1024) GB").font(.system(size: 26, weight: .bold))
                          Spacer()
@@ -19957,6 +20153,19 @@ index 800c854..517c154 100644
 +                    }
                      Stepper("Memory", value: Binding(get: { mac.ramMB / 1024 }, set: { mac.ramMB = $0 * 1024; save() }), in: Device.memoryChoices)
                          .font(.system(size: 16))
++                    if GuestMemory.lastPressureMiB(mac.id) > 0 {
++                        Text("iPadOS reported memory pressure with \(GuestMemory.lastPressureMiB(mac.id) / 1024) GB assigned to this Mac. A large process allowance does not prevent system compression or paging.")
++                            .font(.footnote).foregroundStyle(.orange)
++                    }
++                    if mac.ramMB > Device.suggestedRAMGB * 1024 {
++                        Button("Use recommended \(Device.suggestedRAMGB) GB memory") {
++                            mac.ramMB = Device.suggestedRAMGB * 1024
++                            save()
++                        }
++                        .font(.system(size: 15, weight: .semibold))
++                        Text("Changes only guest memory. Fully shut down macOS and start again to apply it; Save & Leave preserves the RAM of the saved session. Your screen, CPU and refresh settings stay as selected.")
++                            .font(.footnote).foregroundStyle(Desk.dim)
++                    }
                      if let note = Device.memoryNote(mac.ramMB / 1024) {
                          Text(note).font(.system(size: 13)).foregroundStyle(Desk.dim)
                      }
@@ -19976,7 +20185,7 @@ index 800c854..517c154 100644
                      HStack {
                          Text("CPUs").font(.system(size: 16))
                          Spacer()
-@@ -75,6 +98,7 @@ struct MacSettingsView: View {
+@@ -75,6 +111,7 @@ struct MacSettingsView: View {
                      DeskHeading("Screen")
                      VStack(alignment: .leading, spacing: 12) {
                          Picker("Screen", selection: Binding(get: {
@@ -19984,7 +20193,7 @@ index 800c854..517c154 100644
                              if mac.isRetina { return "retina" }
                              if mac.fitsDeviceScreen { return "fit" }
                              if mac.screen.width == Device.performanceScreen.width,
-@@ -82,24 +106,39 @@ struct MacSettingsView: View {
+@@ -82,24 +119,39 @@ struct MacSettingsView: View {
                              if mac.screen.width == 1920, mac.screen.height == 1080 { return "wide" }
                              return "fit"
                          }, set: { choice in
@@ -20018,7 +20227,7 @@ index 800c854..517c154 100644
 +                        .pickerStyle(.menu)
 +                        if mac.desktopLayout == true {
 +                            if mac.desktopMetalFX == true {
-+                                Text("Same default desktop workspace as Desktop Retina: 1280 points across. Render at 1× and reconstruct a 2× output (iPad 2560 × 1920) using MetalFX with Metal 4. This reduces source pixels by 75%, not all emulation work. Text may look softer. No macOS scaling change is needed at the default resolution. Requires a full macOS shutdown and fresh start; saved sessions keep their original mode. Native Retina is used on unsupported hardware or the Compatibility backend.")
++                                Text("Same default desktop workspace as Desktop Retina: 1280 points across. Render at 1× and reconstruct a 2× output (iPad 2560 × 1920) using MetalFX with Metal 4. This reduces source pixels by 75%, not all emulation work. Edge-aware text clarity is applied in the existing compositor, with the cursor kept separate. Fine detail is reconstructed rather than native Retina. No macOS scaling change is needed at the default resolution. Requires a full macOS shutdown and fresh start; saved sessions keep their original mode. Native Retina is used on unsupported hardware or the Compatibility backend.")
 +                                    .font(.system(size: 13)).foregroundStyle(Desk.dim)
 +                            } else {
 +                                Text("Like the mirrored Mac layout: 1280 points across with a sharp 2× backing. The iPad keeps its panel's proportions when Henge's window changes; Duo uses its current screen. Fit follows the window instead. Native Retina remains available for every panel pixel. A saved Mac keeps its original display: shut down macOS and start again to apply this layout.")
@@ -20028,7 +20237,7 @@ index 800c854..517c154 100644
                          if Device.largeScreen {
                              Toggle("Fill the whole screen", isOn: Binding(get: { mac.fillScreen ?? true }, set: { value in
                                  mac.fillScreen = value
-@@ -125,6 +164,7 @@ struct MacSettingsView: View {
+@@ -125,6 +177,7 @@ struct MacSettingsView: View {
                          Text("of \(ByteText.string(UInt64(max(mac.diskBytes, 0))))").font(.system(size: 16)).foregroundStyle(Desk.dim)
                      }
                      DeskBar(fraction: Double(mac.bytesUsed) / Double(max(mac.diskBytes, 1)))
@@ -20036,7 +20245,7 @@ index 800c854..517c154 100644
                  }
                  .padding(17)
                  .deskCard()
-@@ -139,6 +179,7 @@ struct MacSettingsView: View {
+@@ -139,6 +192,7 @@ struct MacSettingsView: View {
          .background(Desk.page)
          .navigationTitle(mac.name)
          .navigationBarTitleDisplayMode(.inline)
@@ -20044,7 +20253,7 @@ index 800c854..517c154 100644
          .onDisappear(perform: save)
          .fileMover(isPresented: $movingExport, file: machines.lastExport) { result in
              switch result {
-@@ -146,6 +187,7 @@ struct MacSettingsView: View {
+@@ -146,6 +200,7 @@ struct MacSettingsView: View {
              case .failure(let error): machines.lastError = error.localizedDescription
              }
          }
@@ -20053,7 +20262,7 @@ index 800c854..517c154 100644
              Button("Delete", role: .destructive) {
                  machines.delete(mac.id)
 diff --git a/ios/Henge/Machines.swift b/ios/Henge/Machines.swift
-index 29c8b3b..1cf7b46 100644
+index 29c8b3b..143b9b7 100644
 --- a/ios/Henge/Machines.swift
 +++ b/ios/Henge/Machines.swift
 @@ -3,7 +3,7 @@ import UIKit
@@ -20102,7 +20311,7 @@ index 29c8b3b..1cf7b46 100644
          if isRetina {
              let size = Device.retinaScreen
              return GuestScreenSize(width: size.width, height: size.height)
-@@ -55,8 +73,8 @@ struct VirtualMac: Identifiable, Codable, Hashable {
+@@ -55,9 +73,16 @@ struct VirtualMac: Identifiable, Codable, Hashable {
  }
  
  /// How much RAM a Mac gets. The engine first asks the kernel to leave it out of Henge's footprint,
@@ -20111,9 +20320,17 @@ index 29c8b3b..1cf7b46 100644
 +/// which the kernel may allow after JIT setup. If refused, it attempts file backing
 +/// beside the disk. Neither method guarantees unlimited resident RAM or immunity to jetsam.
  enum GuestMemory {
++    static func pressureKey(_ id: UUID) -> String { "henge.memoryPressureMiB." + id.uuidString }
++    static func recordPressure(_ id: UUID, bytes: UInt64) {
++        UserDefaults.standard.set(Int(bytes >> 20), forKey: pressureKey(id))
++    }
++    static func lastPressureMiB(_ id: UUID) -> Int {
++        UserDefaults.standard.integer(forKey: pressureKey(id))
++    }
      /// Points the engine at the file (it is unlinked as soon as it is open) and returns the size that fits.
      static func prepare(_ mac: VirtualMac) -> UInt64 {
-@@ -68,6 +86,10 @@ enum GuestMemory {
+         let file = mac.directory.appendingPathComponent("ram.tmp")
+@@ -68,6 +93,10 @@ enum GuestMemory {
          let reach = henge_largest_mapping_mb()
          let ram = min(UInt64(mac.ramMB), room, reach > 512 ? reach - 512 : 0) / 512 * 512
          HengeLog.log("session", "guest RAM \(ram) MB (asked \(mac.ramMB), disk room \(room), largest mapping \(reach))")
@@ -20124,7 +20341,7 @@ index 29c8b3b..1cf7b46 100644
          return ram
      }
  }
-@@ -90,7 +112,7 @@ final class Machines: ObservableObject {
+@@ -90,7 +119,7 @@ final class Machines: ObservableObject {
  
      /// The files an exported machine folder holds; its disk is disk.img, or disk.img.hvsparse (tools/export_ios.sh packs it).
      static let required = ["AVPBooter.vmapple2.bin", "auxiliary.bin", "machine.json"]
@@ -20133,7 +20350,7 @@ index 29c8b3b..1cf7b46 100644
  
      nonisolated static func hasDisk(_ folder: URL) -> Bool {
          let fm = FileManager.default
-@@ -236,7 +258,7 @@ final class Machines: ObservableObject {
+@@ -236,7 +265,7 @@ final class Machines: ObservableObject {
      /// in Documents/Exports, which the Files app can reach. Deleting Henge deletes that folder too,
      /// so it has to be moved out of Henge before a reinstall that replaces the app's data.
      func export(_ mac: VirtualMac) {
@@ -20142,7 +20359,7 @@ index 29c8b3b..1cf7b46 100644
          exporting = mac.name
          exported = 0
          lastExport = nil
-@@ -323,6 +345,7 @@ final class Machines: ObservableObject {
+@@ -323,6 +352,7 @@ final class Machines: ObservableObject {
      }
  
      func delete(_ id: UUID) {
@@ -21905,7 +22122,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..92a1bbf 100644
+index f84465e..bbaec9a 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,18 @@ struct SessionView: View {
@@ -22015,7 +22232,7 @@ index f84465e..92a1bbf 100644
              HardwareMouse.shared.setAcceptsInput(phase == .active && !pointerNeeded)
              guard phase != .active else {
                  display.refresh()
-@@ -211,13 +243,78 @@ struct SessionView: View {
+@@ -211,13 +243,79 @@ struct SessionView: View {
                  return
              }
              nativeTouch.stop()
@@ -22071,6 +22288,7 @@ index f84465e..92a1bbf 100644
 +            diagnosticCapture.event("memory_warning"); wakeups.signal()
 +            var allocation=HengeGuestMemoryStatus()
 +            henge_vm_guest_memory(&allocation)
++            GuestMemory.recordPressure(mac.id, bytes: allocation.bytes)
 +            HengeLog.log("memory","System pressure warning; actual_guest_bytes=\(allocation.bytes) memory_state=\(allocation.state) requested_guest_mib=\(mac.ramMB). Process headroom excludes some guest pages; physical memory remains shared. Compare the 8 GiB baseline after shutdown; no live RAM change.")
 +            henge_vm_trim_memory()
 +            LinkHostService.shared.trimMemory()
@@ -22096,7 +22314,7 @@ index f84465e..92a1bbf 100644
              if showing {
                  refreshDetails()
                  HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll()
-@@ -228,35 +325,45 @@ struct SessionView: View {
+@@ -228,35 +326,45 @@ struct SessionView: View {
          }
          .onAppear {
              UIApplication.shared.isIdleTimerDisabled = true
@@ -22158,7 +22376,7 @@ index f84465e..92a1bbf 100644
  
      // A fold/rotation after boot must fit the mode the guest actually received,
      // rather than stretch it by recalculating only the host view's aspect.
-@@ -411,6 +518,9 @@ struct SessionView: View {
+@@ -411,6 +519,9 @@ struct SessionView: View {
          .labelStyle(.iconOnly)
          .buttonBorderShape(.circle)
          .tint(Desk.raised)
@@ -22168,7 +22386,7 @@ index f84465e..92a1bbf 100644
      }
  
      /// An iPhone's large screen: an iPhone Duo unfolded, regular both ways.
-@@ -485,6 +595,32 @@ struct SessionView: View {
+@@ -485,6 +596,32 @@ struct SessionView: View {
      /// The controls a column has too.
      @ViewBuilder private var floatingTools: some View {
          tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
@@ -22201,7 +22419,7 @@ index f84465e..92a1bbf 100644
          pasteTool
          tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
          tool("info.circle", "Details", tint: .white) { showDetails = true }
-@@ -513,12 +649,19 @@ struct SessionView: View {
+@@ -513,12 +650,19 @@ struct SessionView: View {
      }
  
      /// Keeps the pointer in view: the view moves when the pointer nears its edge.
@@ -22222,7 +22440,7 @@ index f84465e..92a1bbf 100644
              }
              if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / displayAspect)) { map = UIImage(cgImage: image) }
              tick += 1
-@@ -541,10 +684,70 @@ struct SessionView: View {
+@@ -541,10 +685,70 @@ struct SessionView: View {
  
      // MARK: Status
  
@@ -22293,7 +22511,7 @@ index f84465e..92a1bbf 100644
              Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
          }
          .padding(18)
-@@ -577,13 +780,29 @@ struct SessionView: View {
+@@ -577,13 +781,29 @@ struct SessionView: View {
          NavigationStack {
              List {
                  Section(phase) {
@@ -22310,7 +22528,7 @@ index f84465e..92a1bbf 100644
 +                        LabeledContent("Current guest pixels", value: "\(screen.width) × \(screen.height)")
 +                        if bootConfiguration?.presentationScale == 2 {
 +                            LabeledContent("MetalFX output target", value: "\(screen.width * 2) × \(screen.height * 2)")
-+                            Text("Reconstructed desktop, same logical workspace as Desktop Retina. The cursor is composed after upscaling. Native Retina has more source detail; game FPS is not guaranteed.")
++                            Text("Reconstructed desktop with edge-aware text clarity and the same logical workspace as Desktop Retina. The cursor is composed separately after upscaling. Native Retina retains more source detail; game FPS is not guaranteed.")
 +                                .font(.footnote).foregroundStyle(.secondary)
 +                        }
 +                        if mac.desktopLayout == true {
@@ -22324,7 +22542,7 @@ index f84465e..92a1bbf 100644
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
                              .font(.footnote).foregroundStyle(.secondary)
-@@ -599,6 +818,7 @@ struct SessionView: View {
+@@ -599,6 +819,7 @@ struct SessionView: View {
                  }
                  Section("Pointer") {
                      Picker("Size", selection: $cursorScale) {
@@ -22332,7 +22550,7 @@ index f84465e..92a1bbf 100644
                          Text("1×").tag(1)
                          Text("2×").tag(2)
                          Text("3×").tag(3)
-@@ -608,7 +828,7 @@ struct SessionView: View {
+@@ -608,7 +829,7 @@ struct SessionView: View {
                      LabeledContent("Magic Keyboard / mouse scroll speed", value: String(format: "%.2f×", scrollSpeed))
                      Slider(value: $scrollSpeed, in: HardwareScroll.minimumSpeed...HardwareScroll.maximumSpeed)
                      Button("Reset hardware scroll speed") { scrollSpeed = HardwareScroll.defaultSpeed }
@@ -22341,7 +22559,7 @@ index f84465e..92a1bbf 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  Section("Touch input") {
-@@ -618,16 +838,18 @@ struct SessionView: View {
+@@ -618,16 +839,18 @@ struct SessionView: View {
                          Text("Enable Guest sharing in Henge Settings and reopen Henge to use native touch.")
                              .font(.footnote).foregroundStyle(.secondary)
                      }
@@ -22367,7 +22585,7 @@ index f84465e..92a1bbf 100644
                      }
                      Button("Type the Helper Update Command") {
                          showDetails = false
-@@ -640,8 +862,11 @@ struct SessionView: View {
+@@ -640,8 +863,11 @@ struct SessionView: View {
                  }
                  Section("Sharing") {
                      LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
@@ -22381,7 +22599,7 @@ index f84465e..92a1bbf 100644
                              showDetails = false
                              Task {
                                  try? await Task.sleep(nanoseconds: 600_000_000)
-@@ -680,6 +905,8 @@ struct SessionView: View {
+@@ -680,6 +906,8 @@ struct SessionView: View {
      }
  
      private func run(viewport: CGSize) async {
@@ -22390,7 +22608,7 @@ index f84465e..92a1bbf 100644
          error = nil
          state = 0
          userCode = false
-@@ -693,65 +920,112 @@ struct SessionView: View {
+@@ -693,65 +921,112 @@ struct SessionView: View {
          zoomCentre = CGPoint(x: 0.5, y: 0.5)
          map = nil
          showWallpaperTip = false
@@ -22548,7 +22766,7 @@ index f84465e..92a1bbf 100644
              if state == 2 {
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
-@@ -769,38 +1043,58 @@ struct SessionView: View {
+@@ -769,38 +1044,58 @@ struct SessionView: View {
                  }
                  break
              }
@@ -23856,6 +24074,30 @@ index 0000000..244a767
 +    printf("stack-group-bench: round=%u writeback=%d ns_per_frame=%.3f inline_words=%llu result=correct\n",round,hv_translate_writeback_groups(),ns/500000,(unsigned long long)machine.stats.words_inline);
 +    hv_machine_free(&machine);free(stack);return 0;
 +}
+diff --git a/tests/bench_surface_hash.c b/tests/bench_surface_hash.c
+new file mode 100644
+index 0000000..64a9b31
+--- /dev/null
++++ b/tests/bench_surface_hash.c
+@@ -0,0 +1,18 @@
++#define _POSIX_C_SOURCE 200809L
++#include "surface_hash.h"
++#include <assert.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <time.h>
++static double now(void){struct timespec t;assert(!clock_gettime(CLOCK_MONOTONIC,&t));return t.tv_sec+t.tv_nsec*1e-9;}
++__attribute__((noinline)) static uint64_t reference(const uint8_t *p,size_t n){return hv_surface_hash_reference(p,n);}
++__attribute__((noinline)) static uint64_t bulk(const uint8_t *p,size_t n){return hv_surface_hash(p,n);}
++int main(void){
++ size_t n=4u<<20;uint8_t *p=malloc(n);assert(p);for(size_t i=0;i<n;i++)p[i]=(uint8_t)(i*37+(i>>8));
++ for(unsigned round=0;round<5;round++)for(unsigned k=0;k<2;k++){
++  unsigned mode=k^(round&1);double start=now();volatile uint64_t result=0;
++  for(unsigned i=0;i<40;i++){p[i]++;result^=mode?bulk(p,n):reference(p,n);}
++  printf("surface-hash-bench: round=%u bulk=%u ms=%.3f bytes=%zu checksum=%llu (same full-byte signature; host fixture)\n",round,mode,1000*(now()-start),n*40,(unsigned long long)result);
++ }
++ free(p);return 0;
++}
 diff --git a/tests/benchmark_fastmem.sh b/tests/benchmark_fastmem.sh
 index 3b77608..686ce65 100755
 --- a/tests/benchmark_fastmem.sh
@@ -24652,7 +24894,7 @@ index c682d62..8d8dc78 100644
 +
 +enum HostScheduling { static var isDuo:Bool { false } }
 diff --git a/tests/mem_programs.S b/tests/mem_programs.S
-index bcbed3f..cdd3965 100644
+index bcbed3f..783116d 100644
 --- a/tests/mem_programs.S
 +++ b/tests/mem_programs.S
 @@ -355,6 +355,87 @@ PROGRAM groups
@@ -24743,7 +24985,7 @@ index bcbed3f..cdd3965 100644
  PROGRAM mmio
      str w1, [x0]
      ldr w2, [x0, #4]
-@@ -368,5 +449,139 @@ PROGRAM mmio
+@@ -368,5 +449,159 @@ PROGRAM mmio
      ldr x28, [x18, #8]
  END mmio
  
@@ -24852,6 +25094,26 @@ index bcbed3f..cdd3965 100644
 +    str x1,[x17,#8]
 +END groups_slot_pressure
 +
++PROGRAM groups_register_long
++    ldr x1,[x0]
++    .rept 28
++    add x10,x10,#1
++    .endr
++    ldr x2,[x0,#504]
++    add x3,x1,x2
++END groups_register_long
++
++PROGRAM groups_register_long_cross
++    add x12,x0,#4,lsl#12
++    sub x12,x12,#256
++    ldr x1,[x12]
++    .rept 28
++    add x10,x10,#1
++    .endr
++    ldr x2,[x12,#504]
++    str x10,[x0,#512]
++END groups_register_long_cross
++
 +PROGRAM bench_interleaved_groups
 +    add x12,x0,#512
 +    add x13,x0,#1024
@@ -24885,10 +25147,10 @@ index bcbed3f..cdd3965 100644
  _mem_programs_finish:
 diff --git a/tests/run_lifecycle_sanitizers.sh b/tests/run_lifecycle_sanitizers.sh
 new file mode 100755
-index 0000000..e435679
+index 0000000..07e20e5
 --- /dev/null
 +++ b/tests/run_lifecycle_sanitizers.sh
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,78 @@
 +#!/bin/bash
 +# Collect independent failures in one diagnostic pass; any failure blocks the IPA.
 +set -uo pipefail
@@ -24926,6 +25188,7 @@ index 0000000..e435679
 +check python3 tests/test_simulator_profiles.py
 +check python3 tests/test_gpu_upload.py
 +check python3 tests/test_surface_hash_limit.py
++if check cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Idevices tests/test_presentation_clock.c -o build/test_presentation_clock; then check build/test_presentation_clock; fi
 +# Replay reuse and surface mappings must remain checked in the release gate,
 +# not only in the focused Safari development workflow.
 +check python3 tests/test_gpu_page_reuse.py
@@ -24934,6 +25197,8 @@ index 0000000..e435679
 +check python3 tests/test_surface_mapping.py
 +check python3 tests/test_surface_copy.py
 +check python3 tests/test_gpu_command_storage.py
++check python3 tests/test_metal4_archive_retention.py
++check python3 tests/test_native_touch_mapping.py
 +check env HENGE_COMMAND_TSAN=1 python3 tests/test_gpu_command_storage.py
 +if check cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Idevices tests/test_gpu_dirty_copy.c -o build/test_gpu_dirty_copy; then check build/test_gpu_dirty_copy; fi
 +for helper in gpu_epoch surface_pages; do
@@ -27564,10 +27829,10 @@ index 0000000..c69b750
 +}
 diff --git a/tests/test_gpu_command_storage.py b/tests/test_gpu_command_storage.py
 new file mode 100644
-index 0000000..eb3cd5b
+index 0000000..a75eef4
 --- /dev/null
 +++ b/tests/test_gpu_command_storage.py
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,136 @@
 +"""Exercise the production snapshot helper and actual Foundation byte owners."""
 +from pathlib import Path
 +import subprocess,tempfile,os
@@ -27659,6 +27924,25 @@ index 0000000..eb3cd5b
 + assert(snapshot_commands(r,7,(const uint8_t *)small,2,128).count==2&&r->command_pool->allocations==allocated&&r->command_pool->small_batches);
 +
 + r->command_pool=nil;NSArray *reference=capture(r,4096);assert(reference.count==3);
++ // Production-shaped lifetime: two early commands survive arbitrarily long.
++ // Their bytes must remain valid without permanently occupying cache slots.
++ HvCommandPool *pinned=[HvCommandPool new];NSMutableArray *pins=[NSMutableArray new];
++ for(unsigned i=0;i<2;i++){@autoreleasepool{
++  HvCommandLease *lease=[pinned acquire:4096u<<i];memset(lease->owner->memory,0x61+i,lease->limit);
++  [pins addObject:[lease viewAt:0 length:lease->limit]];
++ }}
++ uint64_t first=pinned->allocations;
++ for(unsigned i=0;i<10000;i++){@autoreleasepool{
++  HvCommandLease *lease=[pinned acquire:4096+(i%3)*1024];assert(lease);
++  memset(lease->owner->memory,(uint8_t)i,lease->limit);
++  NSData *view=[lease viewAt:0 length:lease->limit];assert(((const uint8_t *)view.bytes)[0]==(uint8_t)i);
++ }}
++ assert(pinned->allocations-first<=3&&pinned->reuses>=9997&&pinned->pinned_replacements);
++ assert(((const uint8_t *)[pins[0] bytes])[4095]==0x61&&((const uint8_t *)[pins[1] bytes])[8191]==0x62);
++ [pinned setBudget:256u<<10];assert(!pinned->suspended&&[pinned cachedBytes]<=(256u<<10));
++ [pinned setBudget:0];assert(pinned->suspended&&![pinned cachedBytes]);
++ assert(((const uint8_t *)[pins[0] bytes])[0]==0x61);
++ [pinned setBudget:16u<<20];assert(!pinned->suspended);
 + HvCommandPool *pool=[HvCommandPool new];
 + NSMutableArray *held=[NSMutableArray new];
 + for(int i=0;i<5;i++){
@@ -29000,10 +29284,10 @@ index 0000000..58bc0e1
 +    }
 +}
 diff --git a/tests/test_mem.c b/tests/test_mem.c
-index 35ecb46..e2f6d14 100644
+index 35ecb46..65bd803 100644
 --- a/tests/test_mem.c
 +++ b/tests/test_mem.c
-@@ -16,13 +16,26 @@ DECLARE_PROGRAM(epilogue);
+@@ -16,13 +16,29 @@ DECLARE_PROGRAM(epilogue);
  DECLARE_PROGRAM(dczva);
  DECLARE_PROGRAM(pageend);
  DECLARE_PROGRAM(groups);
@@ -29012,6 +29296,8 @@ index 35ecb46..e2f6d14 100644
 +DECLARE_PROGRAM(groups_interleaved);
 +DECLARE_PROGRAM(groups_interleaved_cross);
 +DECLARE_PROGRAM(groups_slot_pressure);
++DECLARE_PROGRAM(groups_register_long);
++DECLARE_PROGRAM(groups_register_long_cross);
 +DECLARE_PROGRAM(groups_register);
 +DECLARE_PROGRAM(groups_two);
 +DECLARE_PROGRAM(groups_stack_frame);
@@ -29028,10 +29314,11 @@ index 35ecb46..e2f6d14 100644
 +    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups), TEST_PROGRAM(groups_increment), TEST_PROGRAM(groups_shared), TEST_PROGRAM(groups_interleaved), TEST_PROGRAM(groups_interleaved_cross), TEST_PROGRAM(groups_register), TEST_PROGRAM(groups_two),
 +    TEST_PROGRAM(groups_stack_frame), TEST_PROGRAM(groups_writeback_cross), TEST_PROGRAM(groups_writeback_negative), TEST_PROGRAM(groups_writeback_scratch),
 +    TEST_PROGRAM(groups_slot_pressure),
++    TEST_PROGRAM(groups_register_long),TEST_PROGRAM(groups_register_long_cross),
  };
  
  #define DATA_SIZE 65536
-@@ -36,6 +49,7 @@ static uint64_t data_seed;
+@@ -36,6 +52,7 @@ static uint64_t data_seed;
  static uint64_t ttbr0, ttbr0_el0, pt_next, map_ap;
  
  static void reset_data(void) {
@@ -29039,7 +29326,7 @@ index 35ecb46..e2f6d14 100644
      uint64_t s = data_seed * 0x2545f4914f6cdd1dull + 7;
      for (size_t i = 0; i < DATA_SIZE; i += 8) {
          s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-@@ -164,6 +178,9 @@ int main(void) {
+@@ -164,6 +181,9 @@ int main(void) {
      setvbuf(stdout, NULL, _IONBF, 0);
      static HvMachine m;
      if (hv_machine_init(&m, 8 << 20) != 0) return 1;
@@ -29049,7 +29336,7 @@ index 35ecb46..e2f6d14 100644
      data = aligned_alloc(16384, DATA_SIZE);
      stack = aligned_alloc(16384, STACK_SIZE);
      pt = aligned_alloc(16384, PT_SIZE);
-@@ -180,6 +197,7 @@ int main(void) {
+@@ -180,6 +200,7 @@ int main(void) {
      size_t count = sizeof programs / sizeof programs[0];
      int failed = 0;
      static uint8_t native_data[DATA_SIZE];
@@ -29057,7 +29344,7 @@ index 35ecb46..e2f6d14 100644
      for (int mode = 0; mode < 4; mode++) {
          m.slow_mem = mode == 0;
          hv_flush_blocks(&m);
-@@ -192,6 +210,7 @@ int main(void) {
+@@ -192,6 +213,7 @@ int main(void) {
              data_seed = i + 3;
              run_native(p, &init, &native, reset_data);
              memcpy(native_data, data, DATA_SIZE);
@@ -29065,7 +29352,7 @@ index 35ecb46..e2f6d14 100644
              reset_data();
              m.stat_slow_mem = 0;
              int bad = run_jit(&m, p, &init, &jit, mode == 2 ? mmu_on : mode == 3 ? mmu_on_el0 : NULL);
-@@ -205,6 +224,16 @@ int main(void) {
+@@ -205,6 +227,16 @@ int main(void) {
                             (unsigned long long)b);
                      bad = 1;
                  }
@@ -29082,6 +29369,80 @@ index 35ecb46..e2f6d14 100644
              printf("%-11s %-18s: %-4s (%llu slow-path accesses)\n", p->name, mode_names[mode], bad ? "FAIL" : "ok",
                     (unsigned long long)m.stat_slow_mem);
              failed += bad != 0;
+diff --git a/tests/test_metal4_archive_retention.py b/tests/test_metal4_archive_retention.py
+new file mode 100644
+index 0000000..83cfc55
+--- /dev/null
++++ b/tests/test_metal4_archive_retention.py
+@@ -0,0 +1,68 @@
++"""Production archive retention/cold lookup policy with real filesystem/ARC.
++The archive boundary records calls; this does not claim GPU archive support.
++"""
++from pathlib import Path
++import subprocess,tempfile
++r=Path(__file__).resolve().parents[1]
++s=(r/'devices/metal4_runtime.h').read_text()
++methods=s[s.index('- (void)loadArchives {'):s.index('- (void)flushPipelines {')]
++prefix=r'''
++#import <Foundation/Foundation.h>
++#include <stdatomic.h>
++#include <assert.h>
++#include <dispatch/dispatch.h>
++@protocol MTL4Archive
++- (id)newRenderPipelineStateWithDescriptor:(id)d error:(NSError **)error;
++- (id)newComputePipelineStateWithDescriptor:(id)d error:(NSError **)error;
++@end
++@interface Archive:NSObject<MTL4Archive>
++@property(copy) NSString *name;
++@end
++@implementation Archive
++- (id)newRenderPipelineStateWithDescriptor:(id)d error:(NSError **)e {(void)e;return [_name isEqual:d]?@"hit":nil;}
++- (id)newComputePipelineStateWithDescriptor:(id)d error:(NSError **)e {return [self newRenderPipelineStateWithDescriptor:d error:e];}
++@end
++@interface Device:NSObject
++@property(copy) NSString *failName;
++@end
++@implementation Device
++- (id)newArchiveWithURL:(NSURL *)url error:(NSError **)e {(void)e;if([url.lastPathComponent isEqual:_failName])return nil;Archive *a=[Archive new];a.name=url.lastPathComponent;return a;}
++@end
++@interface Runtime:NSObject { @public
++ BOOL _cacheAdmission;Device *_device;NSURL *_cacheDirectory;
++ NSArray *_archives,*_archiveURLs,*_loadedArchiveURLs;NSMutableSet *_touchedArchiveURLs;
++ dispatch_queue_t _archiveQueue;_Atomic uint64_t archive_open_failures,archive_cold_hits;
++}
++@end
++@implementation Runtime
++'''
++main=r'''
++@end
++int main(void){@autoreleasepool{
++ NSURL *dir=[NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString]];
++ NSFileManager *fm=NSFileManager.defaultManager;assert([fm createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:NULL]);
++ Runtime *r=[Runtime new];r->_cacheAdmission=YES;r->_device=[Device new];r->_device.failName=@"20.mtl4a";
++ r->_archiveQueue=dispatch_queue_create("retention.test",DISPATCH_QUEUE_SERIAL);r->_cacheDirectory=dir;
++ for(unsigned i=0;i<23;i++){
++  NSURL *file=[dir URLByAppendingPathComponent:[NSString stringWithFormat:@"%u.mtl4a",i]];
++  assert([[NSMutableData dataWithLength:512]writeToURL:file atomically:YES]);
++  assert([fm setAttributes:@{NSFileModificationDate:[NSDate dateWithTimeIntervalSince1970:i+1]} ofItemAtPath:file.path error:NULL]);
++ }
++ [r loadArchives];assert(r->_archives.count==16&&r->_archiveURLs.count==23);
++ assert([fm contentsOfDirectoryAtPath:dir.path error:NULL].count==23);
++ assert(atomic_load(&r->archive_open_failures)==1);
++ assert([r archivedPipeline:@"0.mtl4a" tag:14]);assert(atomic_load(&r->archive_cold_hits)==1);
++ dispatch_sync(r->_archiveQueue,^{});
++ r->_device.failName=nil;[r loadArchives];assert([r->_loadedArchiveURLs containsObject:[dir URLByAppendingPathComponent:@"0.mtl4a"]]);
++ assert([r archivedPipeline:@"0.mtl4a" tag:11]);
++ assert(![r archivedPipeline:@"absent" tag:14]);
++ assert([fm contentsOfDirectoryAtPath:dir.path error:NULL].count==23);
++ r->_cacheAdmission=NO;[r loadArchives];assert(!r->_archives.count&&!r->_archiveURLs.count);
++ dispatch_sync(r->_archiveQueue,^{});assert([fm removeItemAtURL:dir error:NULL]);
++ puts("Metal4 archive retention:23 files survive16-handle budget, cold hit before compile, transient-open preservation, recency and pressure release passed");
++}}
++'''
++with tempfile.TemporaryDirectory(prefix='henge-m4-retention-') as d:
++ p=Path(d)/'retention.m';p.write_text(prefix+methods+main);b=p.with_suffix('')
++ subprocess.run(['xcrun','--sdk','macosx','clang','-fobjc-arc','-Wall','-Wextra','-Werror','-Wno-incompatible-pointer-types','-O1','-g','-fsanitize=address,undefined',str(p),'-framework','Foundation','-o',str(b)],check=True)
++ subprocess.run([str(b)],check=True,timeout=30)
 diff --git a/tests/test_metal4_arguments.m b/tests/test_metal4_arguments.m
 new file mode 100644
 index 0000000..03b97d3
@@ -29930,6 +30291,66 @@ index 3f46cf5..d231f2a 100644
      /* 4 KB granule, 39-bit TTBR0 (levels 1-3): pages, 2 MB and 1 GB blocks. */
      pt_next = 2 * 65536;
      uint64_t r4 = alloc_table();
+diff --git a/tests/test_native_metal.m b/tests/test_native_metal.m
+index 51fe0de..47d6e6e 100644
+--- a/tests/test_native_metal.m
++++ b/tests/test_native_metal.m
+@@ -2,11 +2,12 @@
+ #include <assert.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <math.h>
+ 
+ static NSData *render(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib,
+                       id<MTLTexture> input, BOOL half, uint32_t mode, BOOL cursor) {
+     NSError *error = nil;
+-    id<MTLRenderPipelineState> pipe = hv_screen_pipeline(device, lib, half ? @"screen_linear" : @"screen_plain", NO, &error);
++    id<MTLRenderPipelineState> pipe = hv_screen_pipeline(device, lib, half ? @"screen_linear" : mode==2 ? @"screen_fx" : @"screen_plain", NO, &error);
+     assert(pipe && !error);
+     NSUInteger width = input.width, height = input.height;
+     NSUInteger row = (width * 4 + 255) & ~(NSUInteger)255;
+@@ -23,6 +24,7 @@ static NSData *render(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLib
+     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:pass];
+     MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+     sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
++    sd.sAddressMode=sd.tAddressMode=MTLSamplerAddressModeClampToEdge;
+     id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:sd];
+     float rect[4] = {-1,-1,2,2};
+     [e setRenderPipelineState:pipe];
+@@ -101,8 +103,33 @@ int main(int argc, const char **argv) { @autoreleasepool {
+         }
+         [input replaceRegion:MTLRegionMake2D(0,0,1920,1350) mipmapLevel:0 withBytes:bytes bytesPerRow:1920*4];
+         assert([render(device,queue,lib,input,NO,0,NO) isEqualToData:full]);
++        // Desktop clarity is opt-in to reconstructed FX content. Verify the
++        // actual shader against bounded scalar colour math, including edges.
++        td.width=64;td.height=32;input=[device newTextureWithDescriptor:td];
++        uint8_t glyph[64*32*4];
++        for(unsigned y=0;y<32;y++)for(unsigned x=0;x<64;x++){
++            unsigned at=(y*64+x)*4;unsigned v=(x%8<3?70:x%8==3?100:x%8==4?150:180);
++            glyph[at]=glyph[at+1]=glyph[at+2]=v;glyph[at+3]=255;
++        }
++        [input replaceRegion:MTLRegionMake2D(0,0,64,32) mipmapLevel:0 withBytes:glyph bytesPerRow:64*4];
++        NSData *clear=render(device,queue,lib,input,NO,2,NO);const uint8_t *got=clear.bytes;unsigned changed=0;
++        for(unsigned y=0;y<32;y++)for(unsigned x=0;x<64;x++){
++            unsigned at=(y*64+x)*4,lo=glyph[at],hi=lo;float average=0;
++            const unsigned positions[]={y*64+(x?x-1:x),y*64+(x<63?x+1:x),(y?y-1:y)*64+x,(y<31?y+1:y)*64+x};
++            for(unsigned i=0;i<4;i++){unsigned v=glyph[positions[i]*4];lo=MIN(lo,v);hi=MAX(hi,v);average+=v*0.25f;}
++            float t=fminf(1,fmaxf(0,((hi-lo)/255.0f-0.02f)/0.13f));t=t*t*(3-2*t);
++            float delta=fmaxf(-0.04f,fminf(0.04f,((glyph[at]-average)/255.0f)*0.35f*t));
++            int expected=(int)lroundf(fmaxf(lo,fminf(hi,glyph[at]+255*delta)));
++            assert(abs((int)got[at]-expected)<=2&&got[at]==got[at+1]&&got[at]==got[at+2]&&got[at+3]==255);
++            assert(got[at]>=lo&&got[at]<=hi);changed+=got[at]!=glyph[at];
++        }
++        assert(changed>0);
++        memset(glyph,120,sizeof glyph);for(unsigned i=3;i<sizeof glyph;i+=4)glyph[i]=255;
++        [input replaceRegion:MTLRegionMake2D(0,0,64,32) mipmapLevel:0 withBytes:glyph bytesPerRow:64*4];
++        assert([render(device,queue,lib,input,NO,2,NO) isEqualToData:[NSData dataWithBytes:glyph length:sizeof glyph]]);
+     }
+     puts("native Metal exact-fit: 1920x1350 non-eight-aligned height, every pixel and final row preserved");
++    puts("MetalFX desktop clarity: actual bundled/fallback GPU pixels, flat colours unchanged, bounded edges/no overshoot, native path unchanged");
+     printf("native Metal GPU pixels: bundled and fallback libraries, BGRA orientation/colours, half-float encoded/linear and premultiplied cursor passed on %s\n",device.name.UTF8String);
+     return 0;
+ } }
 diff --git a/tests/test_native_report_pump.swift b/tests/test_native_report_pump.swift
 new file mode 100644
 index 0000000..949fca4
@@ -30221,6 +30642,67 @@ index 0000000..e975d65
 +    hv_native_touch_set_usb(NULL);
 +    puts("PASS host USB touch: direct delivery, stale-report rejection, non-disconnecting handoff, neutral drain and idle suppression");
 +}
+diff --git a/tests/test_native_touch_mapping.py b/tests/test_native_touch_mapping.py
+new file mode 100644
+index 0000000..062fbea
+--- /dev/null
++++ b/tests/test_native_touch_mapping.py
+@@ -0,0 +1,55 @@
++"""Execute production USB mapping retry methods with a recording IOKit edge."""
++from pathlib import Path
++import subprocess,tempfile
++r=Path(__file__).resolve().parents[1]
++s=(r/'tools/native-touch/USBTouchTransport.swift').read_text()
++bind=s[s.index('    private func bindDevice('):s.index('\n    var devicePresent:',s.index('    private func bindDevice('))]
++bind=bind.replace('private func bindDevice','func bindDevice')
++prefix='''import Foundation
++import CoreFoundation
++typealias io_service_t=UInt32
++typealias kern_return_t=Int32
++let KERN_SUCCESS:Int32=0
++let kIOMainPortDefault:UInt32=0
++@MainActor var attempts=0
++@MainActor var releases=0
++@MainActor var failFirst=true
++@MainActor var present=true
++@MainActor var property:String?
++@MainActor func IORegistryEntrySetCFProperty(_ device:UInt32,_ key:CFString,_ value:CFString)->Int32 {
++ attempts += 1
++ if failFirst { failFirst=false;return 5 }
++ property=value as String;return 0
++}
++@MainActor func IORegistryEntryGetRegistryEntryID(_ device:UInt32,_ value:inout UInt64){value=UInt64(device)}
++@MainActor func IOServiceGetMatchingService(_ port:UInt32,_ match:Int)->UInt32{present ? 1 : 0}
++@MainActor func IOObjectRelease(_ device:UInt32){releases += 1}
++@MainActor final class Mapper {
++ var mappedRegistryID:UInt64=0
++ var lastBindAttempt:TimeInterval=0
++ var lastError:Int32=0
++ let displayUUID="expected-display"
++ var mapped:Bool { mappedRegistryID != 0 && property==displayUUID }
++ static func matching(_ name:String)->Int{1}
++'''
++main='''
++}
++@main enum Tests {
++ @MainActor static func main(){
++  let m=Mapper();m.bindDevice(1);precondition(attempts==1 && !m.mapped)
++  precondition(!m.reconcileMapping() && attempts==1,"Transient failure must respect retry budget")
++  m.lastBindAttempt=0
++  precondition(m.reconcileMapping() && attempts==2 && releases==1,"A failed publication write must recover without a second publication")
++  for _ in 0..<100 {precondition(m.reconcileMapping())}
++  precondition(attempts==2,"Ready mappings must not be rewritten")
++  m.mappedRegistryID=0;property=nil;present=false;m.lastBindAttempt=0
++  precondition(!m.reconcileMapping() && attempts==2)
++  present=true;precondition(m.reconcileMapping() && attempts==3 && releases==2)
++  print("USB display mapping: transient publish failure, bounded retry without a second notification, ready reuse and absent device passed")
++ }
++}
++'''
++with tempfile.TemporaryDirectory(prefix='henge-usb-mapping-') as d:
++ p=Path(d)/'Mapping.swift';p.write_text(prefix+bind+main);b=p.with_suffix('')
++ subprocess.run(['xcrun','--sdk','macosx','swiftc','-parse-as-library','-swift-version','6',str(p),'-o',str(b)],check=True)
++ subprocess.run([str(b)],check=True,timeout=15)
 diff --git a/tests/test_native_touch_packaging.py b/tests/test_native_touch_packaging.py
 new file mode 100644
 index 0000000..2c357bc
@@ -30730,7 +31212,7 @@ index 0000000..f37f7bd
 +}}
 diff --git a/tests/test_pipeline_bundle_plan.py b/tests/test_pipeline_bundle_plan.py
 new file mode 100644
-index 0000000..444226d
+index 0000000..71f0c37
 --- /dev/null
 +++ b/tests/test_pipeline_bundle_plan.py
 @@ -0,0 +1,15 @@
@@ -30742,12 +31224,12 @@ index 0000000..444226d
 +spec.loader.exec_module(module)
 +plan = module.configuration('/tmp/screen.metallib')
 +pipes = plan['pipeline_descriptors']['render_pipeline_descriptors']
-+assert len(pipes) == 3
++assert len(pipes) == 4
 +assert all(p['raster_sample_count'] == 1 and p['color_attachments'][0]['pixel_format'] == 'BGRA8Unorm' for p in pipes)
-+assert [p['fragment_function_descriptor'] for p in pipes] == ['fnd:screen_plain', 'fnd:screen_linear', 'fnd:screen_cursor']
-+assert [p['color_attachments'][0]['blending_state'] for p in pipes] == ['Disabled', 'Disabled', 'Enabled']
++assert [p['fragment_function_descriptor'] for p in pipes] == ['fnd:screen_plain', 'fnd:screen_linear', 'fnd:screen_cursor', 'fnd:screen_fx']
++assert [p['color_attachments'][0]['blending_state'] for p in pipes] == ['Disabled', 'Disabled', 'Enabled', 'Disabled']
 +assert pipes[2]['color_attachments'][0]['destination_rgb_blend_factor'] == 'OneMinusSourceAlpha'
-+assert len(plan['function_descriptors']['library_function_descriptors']) == 4
++assert len(plan['function_descriptors']['library_function_descriptors']) == 5
 +print('PASS offline pipeline plan: exact plain/half-float/cursor shaders and premultiplied blending')
 diff --git a/tests/test_planar_registry.m b/tests/test_planar_registry.m
 index 942c4d7..ed28519 100644
@@ -30775,6 +31257,28 @@ index 942c4d7..ed28519 100644
 - puts("planar registry: full page/layout identity, 1001 aliases -> 1 allocation, preserved host pixels, Metal texture view, retained ownership, failed-create retry, last-mapping release and stale-unmap guard passed");
 + puts("planar registry: full page/layout identity, 1001 aliases -> 1 allocation, preserved host pixels, Metal texture view, retained ownership, failed-create retry, weak identity follows texture ownership and stale-unmap guard passed");
  }}
+diff --git a/tests/test_presentation_clock.c b/tests/test_presentation_clock.c
+new file mode 100644
+index 0000000..ad4a261
+--- /dev/null
++++ b/tests/test_presentation_clock.c
+@@ -0,0 +1,16 @@
++#include "presentation_clock.h"
++#include <assert.h>
++#include <stdio.h>
++int main(void) {
++    assert(hv_present_deadline(1.01,1)==1.01);
++    assert(!hv_present_deadline(1,1.01)&&!hv_present_deadline(10,1));
++    assert(!hv_present_deadline(NAN,1)&&!hv_present_deadline(INFINITY,1));
++    assert(!hv_present_deadline(1,NAN)&&!hv_present_deadline(1,0));
++    HvDisplayClock clock={0};
++    for(unsigned i=0;i<121;i++)hv_display_clock_tick(&clock,1+i/120.0);
++    assert(clock.count==120&&fabs(clock.count/clock.intervals-120)<0.0001);
++    hv_display_clock_tick(&clock,10);assert(clock.count==120);
++    hv_display_clock_tick(&clock,NAN);assert(clock.last==10);
++    hv_display_clock_tick(&clock,10+1/60.0);assert(clock.count==121);
++    puts("Presentation clock: actual60/120Hz targets, idle gaps, stale/deadline rejection and immediate fallback passed");
++}
 diff --git a/tests/test_prof_ios.c b/tests/test_prof_ios.c
 index 553c4b6..64d0cb9 100644
 --- a/tests/test_prof_ios.c
@@ -31376,10 +31880,10 @@ index 0000000..60d7847
 +}
 diff --git a/tests/test_register_groups.c b/tests/test_register_groups.c
 new file mode 100644
-index 0000000..6742ecb
+index 0000000..d060d2a
 --- /dev/null
 +++ b/tests/test_register_groups.c
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,47 @@
 +#include "translate.h"
 +#include <assert.h>
 +#include <stdio.h>
@@ -31420,15 +31924,19 @@ index 0000000..6742ecb
 +    const uint32_t barrier[]={0xf9400001,0xf9400402,0xf9400803,0xd5033bbf,
 +                              0xf9400001,0xf9400402,0xf9400803,0xd65f03c0};
 +    assert(hot(2,barrier,8)+12<hot(0,barrier,8)); /* independent groups on both sides of DMB */
++    uint32_t longer[31];longer[0]=0xf9400001;
++    for(unsigned i=1;i<29;i++)longer[i]=0x9100054a; /* add x10,x10,#1 */
++    longer[29]=0xf940fc02;longer[30]=0xd65f03c0; /* second field at504 */
++    assert(hot(2,longer,31)+6<hot(0,longer,31));
 +    hv_machine_free(&machine);
 +    puts("PASS register groups: real inline-path reduction; two-field reuse, scratch clobber safety and three-access reference policy");
 +}
 diff --git a/tests/test_resource_policy.c b/tests/test_resource_policy.c
 new file mode 100644
-index 0000000..ab4f71d
+index 0000000..c3af49f
 --- /dev/null
 +++ b/tests/test_resource_policy.c
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,34 @@
 +#include "resource_policy.h"
 +#include <assert.h>
 +#include <stdio.h>
@@ -31455,6 +31963,11 @@ index 0000000..ab4f71d
 +    assert(hv_desktop_fx_limit(4ull<<30,2)==0);
 +    assert(hv_desktop_fx_limit((512ull<<20)-1,0)==0);
 +    assert(hv_desktop_fx_limit(512ull<<20,1)==2);
++    assert(hv_command_cache_budget(4ull<<30,0)==16ull<<20);
++    assert(hv_command_cache_budget(4ull<<30,1)==256ull<<10);
++    assert(!hv_command_cache_budget(4ull<<30,2));
++    assert(!hv_command_cache_budget((128ull<<20)-1,0));
++    assert(hv_command_cache_budget(256ull<<20,0)==256ull<<10);
 +    puts("resource budget: dynamic headroom, pressure precedence, boundaries and recovery passed");
 +    puts("PASS MetalFX budget: nominal three leases, moderate two, critical/low allowance zero; warning is not confused with process headroom");
 +}
@@ -32166,10 +32679,10 @@ index 0000000..515d888
 + subprocess.run(['xcrun','--sdk','macosx','clang','-fobjc-arc','-Wall','-Wextra','-Werror','-O1','-g','-fsanitize=address,undefined','-I'+str(r/'devices'),str(p),'-framework','Foundation','-framework','Metal','-framework','IOSurface','-o',str(binary)],check=True)
 + subprocess.run([str(binary)],check=True,timeout=90)
 diff --git a/tests/test_surface_hash_limit.py b/tests/test_surface_hash_limit.py
-index 01aead4..b1daca1 100644
+index 01aead4..a69a38b 100644
 --- a/tests/test_surface_hash_limit.py
 +++ b/tests/test_surface_hash_limit.py
-@@ -1,22 +1,23 @@
+@@ -1,22 +1,28 @@
 -"""Reproduce an inherited sampled-hash limitation; this is not a rendering correctness pass."""
 +"""Regression for formerly invisible pixel/tail changes; production full hash."""
  from pathlib import Path
@@ -32203,10 +32716,15 @@ index 01aead4..b1daca1 100644
 + uint8_t *p=calloc(1,65536+8);assert(p);
 + for(unsigned off=0;off<8;off++)for(unsigned n=0;n<260;n++) {
 +  uint64_t before=hv_surface_hash(p+off,n);
++  assert(before==hv_surface_hash_reference(p+off,n));
 +  for(unsigned i=0;i<n;i++) {p[off+i]=1;assert(hv_surface_hash(p+off,n)!=before);p[off+i]=0;}
 + }
 + uint64_t before=hv_surface_hash(p,65536);
++ assert(before==hv_surface_hash_reference(p,65536));
 + for(unsigned i=0;i<65536;i+=17){p[i]=0x80;assert(hv_surface_hash(p,65536)!=before);p[i]=0;}
++ for(unsigned i=0;i<65536+8;i++)p[i]=(uint8_t)(i*37+(i>>8));
++ for(unsigned off=0;off<8;off++)for(unsigned n=0;n<=65536;n+=17)
++  assert(hv_surface_hash(p+off,n)==hv_surface_hash_reference(p+off,n));
 + free(p);puts("Full surface hash: every byte/tail/alignment mutation detected; former byte9 regression fixed");
 +}
 +''')
@@ -33386,7 +33904,7 @@ index 70d7ccb..e4f9089 100755
  ls -la "$BUILD/libhengerestore.a"
 diff --git a/tools/build_pipeline_bundle.py b/tools/build_pipeline_bundle.py
 new file mode 100644
-index 0000000..e1f8457
+index 0000000..80799c5
 --- /dev/null
 +++ b/tools/build_pipeline_bundle.py
 @@ -0,0 +1,95 @@
@@ -33406,7 +33924,7 @@ index 0000000..e1f8457
 +
 +
 +def configuration(library):
-+    names = ('screen_v', 'screen_plain', 'screen_linear', 'screen_cursor')
++    names = ('screen_v', 'screen_plain', 'screen_linear', 'screen_cursor', 'screen_fx')
 +    functions = [{'label': name, 'library': 'lib:screen', 'name': name} for name in names]
 +    pipelines = []
 +    for fragment in names[1:]:
@@ -34415,10 +34933,10 @@ index 7f9c3b6..bc7c405 100644
          bytes.append(UInt8(occupied.count))
 diff --git a/tools/native-touch/USBTouchTransport.swift b/tools/native-touch/USBTouchTransport.swift
 new file mode 100644
-index 0000000..db52b28
+index 0000000..f33d5de
 --- /dev/null
 +++ b/tools/native-touch/USBTouchTransport.swift
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,245 @@
 +import AppKit
 +import Foundation
 +import IOKit
@@ -34432,6 +34950,7 @@ index 0000000..db52b28
 +    private var displayUUID = ""
 +    private(set) var lastError: kern_return_t = KERN_SUCCESS
 +    private var mappedRegistryID: UInt64 = 0
++    private var lastBindAttempt: TimeInterval = 0
 +
 +    static func matching(_ serviceClass: String) -> CFDictionary {
 +        let matching = IOServiceMatching(serviceClass)! as NSMutableDictionary
@@ -34465,10 +34984,28 @@ index 0000000..db52b28
 +        while true {
 +            let device = IOIteratorNext(iterator)
 +            guard device != 0 else { return }
-+            lastError = IORegistryEntrySetCFProperty(device, "displayUUID" as CFString, displayUUID as CFString)
-+            if lastError == KERN_SUCCESS { IORegistryEntryGetRegistryEntryID(device, &mappedRegistryID) }
++            bindDevice(device)
 +            IOObjectRelease(device)
 +        }
++    }
++
++    private func bindDevice(_ device: io_service_t) {
++        lastBindAttempt = ProcessInfo.processInfo.systemUptime
++        lastError = IORegistryEntrySetCFProperty(device, "displayUUID" as CFString, displayUUID as CFString)
++        if lastError == KERN_SUCCESS { IORegistryEntryGetRegistryEntryID(device, &mappedRegistryID) }
++    }
++
++    /// Publication can precede a writable display property. A failed first
++    /// write has no second publication notification; retry while setup is
++    /// already waiting, bounded to10Hz and its existing cancellation/deadline.
++    func reconcileMapping() -> Bool {
++        if mapped { return true }
++        guard ProcessInfo.processInfo.systemUptime-lastBindAttempt >= 0.1 else { return false }
++        let device=IOServiceGetMatchingService(kIOMainPortDefault, Self.matching("IOHIDDevice"))
++        guard device != 0 else { return false }
++        defer { IOObjectRelease(device) }
++        bindDevice(device)
++        return mapped
 +    }
 +
 +    var devicePresent: Bool {
@@ -34489,7 +35026,7 @@ index 0000000..db52b28
 +        return identifier == mappedRegistryID && value as? String == displayUUID
 +    }
 +
-+    func prepareAttachment() { mappedRegistryID = 0; lastError = KERN_SUCCESS }
++    func prepareAttachment() { mappedRegistryID = 0; lastError = KERN_SUCCESS; lastBindAttempt = 0 }
 +
 +    func isAssociated() -> Bool {
 +        let service = IOServiceGetMatchingService(kIOMainPortDefault, Self.matching("IOHIDEventService"))
@@ -34582,9 +35119,9 @@ index 0000000..db52b28
 +            try await setConnected(true)
 +            setupPhase=3
 +            if reportsProgress { deadline=ProcessInfo.processInfo.systemUptime+5 }
-+            while !mapper.mapped {
++            while !mapper.reconcileMapping() {
 +                guard ProcessInfo.processInfo.systemUptime < deadline else { throw URLError(.timedOut) }
-+                try await Task.sleep(for: .milliseconds(10))
++                try await Task.sleep(for: .milliseconds(25))
 +            }
 +            // The Report Rate feature query holds event-driver initialization
 +            // until this acknowledgement, closing the publication/cache race.

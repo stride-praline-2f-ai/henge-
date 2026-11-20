@@ -269,6 +269,14 @@ if manifest.get('replay_followup'):
         assert marker in app_executable, 'Post118 replay fix missing: '+repr(marker)
     data['replay_followup']=dict(replay,runtime_markers_verified=True,physical_Safari_gain_measured=False)
 
+if manifest.get('desktop_interactivity'):
+    desktop=state['desktop_interactivity']
+    assert desktop['complete'] and desktop['source_commit']==state['final_validation']['source_commit']
+    assert desktop['patch_sha256']==manifest['audit_repairs_sha256']
+    for marker in (b'pinned_slots_replaced=',b'display-clock:',b'text-clarity',b'metal4-archive-retention:'):
+        assert marker in app_executable,'Desktop120 change missing from IPA: '+repr(marker)
+    data['desktop_interactivity']=dict(desktop,runtime_markers_verified=True)
+
 # Correct legacy metadata: verify the real configured default in the reconstructed source.
 assert 'as? Bool ?? true' in Path('Henge/ios/Henge/EngineTuning.swift').read_text()
 data['fastmem_default']=True
