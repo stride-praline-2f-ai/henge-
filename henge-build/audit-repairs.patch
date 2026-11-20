@@ -4072,10 +4072,10 @@ index 0000000..b12dd17
 +}
 diff --git a/devices/metal4_runtime.h b/devices/metal4_runtime.h
 new file mode 100644
-index 0000000..4e931ae
+index 0000000..6e0f2bd
 --- /dev/null
 +++ b/devices/metal4_runtime.h
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,408 @@
 +#pragma once
 +/* Supported Metal 4 submission, shared by guest replay and native presentation.
 + * Classic/Metal4 queues are joined with a shared event in BOTH directions.
@@ -4244,7 +4244,9 @@ index 0000000..4e931ae
 +- (id)archivedPipeline:(id)descriptor tag:(uint32_t)tag {
 +    for(NSUInteger i=0;i<_archives.count;i++) {
 +        id<MTL4Archive> archive=_archives[i];
-+        id state=tag==0xe?[archive newRenderPipelineStateWithDescriptor:descriptor error:nil]:[archive newComputePipelineStateWithDescriptor:descriptor error:nil];
++        id state=nil;
++        if(tag==0xe)state=[archive newRenderPipelineStateWithDescriptor:descriptor error:nil];
++        else state=[archive newComputePipelineStateWithDescriptor:descriptor error:nil];
 +        if(state){[self noteArchiveHit:_loadedArchiveURLs[i]];return state;}
 +    }
 +    // Optional guest variants run on the existing utility compiler worker.
@@ -4255,7 +4257,9 @@ index 0000000..4e931ae
 +        @autoreleasepool {
 +            id<MTL4Archive> archive=[_device newArchiveWithURL:url error:nil];
 +            if(!archive){atomic_fetch_add(&archive_open_failures,1);continue;}
-+            id state=tag==0xe?[archive newRenderPipelineStateWithDescriptor:descriptor error:nil]:[archive newComputePipelineStateWithDescriptor:descriptor error:nil];
++            id state=nil;
++        if(tag==0xe)state=[archive newRenderPipelineStateWithDescriptor:descriptor error:nil];
++        else state=[archive newComputePipelineStateWithDescriptor:descriptor error:nil];
 +            if(state){atomic_fetch_add(&archive_cold_hits,1);[self noteArchiveHit:url];return state;}
 +        }
 +    }
@@ -13460,6 +13464,57 @@ index 0000000..d1b38e0
 +int hv_disk_expansion_info(const char *path,HvDiskExpansionInfo *info,char *error,size_t error_bytes);
 +int hv_disk_prepare_apfs(const char *path,HvDiskExpansionInfo *info,char *error,size_t error_bytes);
 +#endif
+diff --git a/host/dns_proxy.c b/host/dns_proxy.c
+index bae8ff4..0fe111f 100644
+--- a/host/dns_proxy.c
++++ b/host/dns_proxy.c
+@@ -50,8 +50,9 @@ typedef struct {
+ } Query;
+ 
+ static atomic_int inflight, unanswered_in_a_row, resolver_backoff;
++static atomic_llong resolver_retry_ms;
+ static atomic_ullong answered, handed_back, timed_out;
+-#define GIVE_UP 8 /* lookups in a row the resolver took but never answered: back to libslirp for the session */
++#define GIVE_UP 8 /* consecutive failures: use libslirp during a bounded cooldown */
+ static atomic_int stopping;
+ static pthread_mutex_t lifecycle_mu = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t lifecycle_cv = PTHREAD_COND_INITIALIZER;
+@@ -71,6 +72,7 @@ void hv_dns_proxy_start(void) {
+     atomic_store(&timed_out, 0);
+     atomic_store(&unanswered_in_a_row, 0);
+     atomic_store(&resolver_backoff, 0);
++    atomic_store(&resolver_retry_ms, 0);
+     pthread_mutex_unlock(&lifecycle_mu);
+ }
+ 
+@@ -258,6 +260,7 @@ static void *lookup(void *arg) {
+             if (!q->done || q->failed) {
+                 atomic_fetch_add(&timed_out, 1);
+                 if (atomic_fetch_add(&unanswered_in_a_row, 1) + 1 == GIVE_UP) {
++                    atomic_store(&resolver_retry_ms, now_ms() + 30000);
+                     atomic_store(&resolver_backoff, 1);
+                     fprintf(stderr, "hengevm: dns: system resolver unanswered; falling back to libslirp\n");
+                 }
+@@ -278,9 +281,19 @@ static void *lookup(void *arg) {
+ void hv_dns_proxy_reset(void) {
+     atomic_store(&resolver_backoff, 0);
+     atomic_store(&unanswered_in_a_row, 0);
++    atomic_store(&resolver_retry_ms, 0);
+ }
+ 
+ int hv_dns_proxy_on(void) {
++    if(hv_knob[HV_K_DNSPROXY] && atomic_load(&resolver_backoff)) {
++        long long deadline=atomic_load(&resolver_retry_ms);
++        if(deadline>0 && now_ms()>=deadline &&
++           atomic_compare_exchange_strong(&resolver_retry_ms,&deadline,0)) {
++            atomic_store(&unanswered_in_a_row,0);
++            atomic_store(&resolver_backoff,0);
++            fprintf(stderr,"hengevm: dns: retrying system resolver after cooldown (traffic-driven; no polling timer)\n");
++        }
++    }
+     return hv_knob[HV_K_DNSPROXY] != 0 && !atomic_load(&resolver_backoff); /* HV_DNS_PROXY, on unless 0 (machine.c) */
+ }
+ 
 diff --git a/host/enter.S b/host/enter.S
 index cc902ed..d7fdd39 100644
 --- a/host/enter.S
@@ -27141,6 +27196,20 @@ index 0000000..7b09ed0
 +                    '-I'+str(root/'devices'),str(c),'-o',str(binary)],check=True)
 +    subprocess.run([str(binary)],check=True)
 +print('Display snapshot parser: two ports, all header mutations and truncations passed ASan/UBSan')
+diff --git a/tests/test_dns_proxy.c b/tests/test_dns_proxy.c
+index 4a5a6ea..f482ec7 100644
+--- a/tests/test_dns_proxy.c
++++ b/tests/test_dns_proxy.c
+@@ -97,6 +97,9 @@ int main(void) {
+     fixture=TIMEOUT;hv_dns_proxy_reset();
+     for(int i=0;i<GIVE_UP;i++){assert(hv_dns_proxy_take(p,n,output));wait_idle();assert(!delivered_to_guest);}
+     assert(!hv_dns_proxy_on() && hv_knob[HV_K_DNSPROXY]==1);reject(p,n); // atomic backoff, knob preserved
++    atomic_store(&resolver_retry_ms,now_ms()-1);fixture=ANSWER;
++    assert(hv_dns_proxy_on()&&!atomic_load(&unanswered_in_a_row));
++    assert(hv_dns_proxy_take(p,n,output));wait_idle();assert(delivered_to_guest);
+     hv_dns_proxy_reset();fixture=ANSWER;int before=atomic_load(&callbacks);
+     for(int i=0;i<10;i++){assert(hv_dns_proxy_take(p,n,output));}
+     wait_idle();assert(atomic_load(&callbacks)==before+10);
 diff --git a/tests/test_engine_tuning.swift b/tests/test_engine_tuning.swift
 new file mode 100644
 index 0000000..6ba87be
@@ -29371,7 +29440,7 @@ index 35ecb46..65bd803 100644
              failed += bad != 0;
 diff --git a/tests/test_metal4_archive_retention.py b/tests/test_metal4_archive_retention.py
 new file mode 100644
-index 0000000..83cfc55
+index 0000000..a62b9a8
 --- /dev/null
 +++ b/tests/test_metal4_archive_retention.py
 @@ -0,0 +1,68 @@
@@ -29430,7 +29499,7 @@ index 0000000..83cfc55
 + assert(atomic_load(&r->archive_open_failures)==1);
 + assert([r archivedPipeline:@"0.mtl4a" tag:14]);assert(atomic_load(&r->archive_cold_hits)==1);
 + dispatch_sync(r->_archiveQueue,^{});
-+ r->_device.failName=nil;[r loadArchives];assert([r->_loadedArchiveURLs containsObject:[dir URLByAppendingPathComponent:@"0.mtl4a"]]);
++ r->_device.failName=nil;[r loadArchives];assert([[r->_loadedArchiveURLs valueForKey:@"path"] containsObject:[dir URLByAppendingPathComponent:@"0.mtl4a"].path]);
 + assert([r archivedPipeline:@"0.mtl4a" tag:11]);
 + assert(![r archivedPipeline:@"absent" tag:14]);
 + assert([fm contentsOfDirectoryAtPath:dir.path error:NULL].count==23);
