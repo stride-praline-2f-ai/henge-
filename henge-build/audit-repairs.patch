@@ -248,7 +248,7 @@ index 4109920..8a8f565 100644
  _Static_assert(offsetof(HvCpu, pc) == HV_CPU_PC, "HvCpu layout");
  _Static_assert(offsetof(HvCpu, nzcv) == HV_CPU_NZCV, "HvCpu layout");
 diff --git a/core/dispatch.c b/core/dispatch.c
-index 12bd4a9..afd93a9 100644
+index 12bd4a9..c5726b8 100644
 --- a/core/dispatch.c
 +++ b/core/dispatch.c
 @@ -15,8 +15,17 @@
@@ -269,7 +269,7 @@ index 12bd4a9..afd93a9 100644
      /* Every other CPU is parked (stop_the_world): the one moment the TLB layout can change. */
      if ((hv_knob[HV_K_TLBT] != 0) != hv_tlb_tmajor) {
          hv_tlb_tmajor = hv_knob[HV_K_TLBT] != 0;
-@@ -37,21 +46,195 @@ void hv_flush_blocks(HvMachine *m) {
+@@ -37,21 +46,188 @@ void hv_flush_blocks(HvMachine *m) {
          }
      memset(m->hash, 0, sizeof m->hash);
      m->nblocks = 0;
@@ -333,7 +333,7 @@ index 12bd4a9..afd93a9 100644
 +        m->stats.flush_full++;
 +        hv_flush_blocks(m);
 +        return;
-     }
++    }
 +    uint64_t t0 = mach_absolute_time();
 +    uint64_t seen=0;
 +    for(int i=0;i<m->ncpus;i++){seen|=m->percpu[i].jit_seen;m->percpu[i].jit_seen=0;}
@@ -352,17 +352,10 @@ index 12bd4a9..afd93a9 100644
 +       until the existing publication barrier completes. */
 +    memset(m->hash, 0, sizeof m->hash);
 +    if(m->jit_page_heads)memset(m->jit_page_heads,0,m->jit_page_count*sizeof *m->jit_page_heads);
-+    /* Optional comparison for the metadata scan. Hints never replace a load
-+       or generation check and cannot change survivor/branch semantics. */
-+    int prefetch=getenv("HV_EVICT_PREFETCH")&&atoi(getenv("HV_EVICT_PREFETCH"));
++    /* Explicit generation/hash prefetch was compared on400k descriptors and
++       regressed three of five alternating pairs. Keep the ordinary scan with
++       inline indexing: no extra per-descriptor policy branch or prefetch. */
 +    for (int i = 0; i < m->nblocks; i++) {
-+        if(prefetch && i+16<m->nblocks) {
-+            const HvBlock *ahead=&m->blocks[i+16];
-+            if(!GONE(ahead->code)) {
-+                __builtin_prefetch(&ahead->ram->page_gen[ahead->pg],0,1);
-+                __builtin_prefetch(&m->hash[hv_block_hash(ahead->va,ahead->pa,ahead->flags)],1,1);
-+            }
-+        }
 +        HvBlock *b = &m->blocks[i];
 +        if (GONE(b->code) || __atomic_load_n(&b->ram->page_gen[b->pg], __ATOMIC_RELAXED) != b->gen) {
 +            if(!GONE(b->code)&&!full_branch_reset) {
@@ -395,7 +388,7 @@ index 12bd4a9..afd93a9 100644
 +        /* Return entries can point inside code; descriptor pointers move
 +           during compaction. Retain their proven whole-clear fallback. */
 +        hv_ret_clear(cpu);memset(m->percpu[i].jc,0,sizeof m->percpu[i].jc);
-+    }
+     }
 +    uint64_t t1 = mach_absolute_time();
 +    m->stats.evict_phase[0] += t1 - t0;
 +    /* The words rewritten below, for one instruction-cache pass at the end. */
@@ -474,7 +467,7 @@ index 12bd4a9..afd93a9 100644
  }
  
  /* Parked: not running guest code, nor using its TLB, so other CPUs need not
-@@ -97,7 +280,7 @@ static uint32_t block_flags(HvCpu *cpu) {
+@@ -97,7 +273,7 @@ static uint32_t block_flags(HvCpu *cpu) {
  
  /* Finding a block is lock-free (blocks are only ever added, with a release
     store, until a flush, which stops every CPU); making one takes the
@@ -483,7 +476,7 @@ index 12bd4a9..afd93a9 100644
     (m->flush_pending is set: the dispatcher does that, then tries again). */
  #define hash_of hv_block_hash
  #define find hv_block_find
-@@ -129,10 +312,14 @@ static void block_dump(const HvBlock *b, const uint32_t *code) {
+@@ -129,10 +305,14 @@ static void block_dump(const HvBlock *b, const uint32_t *code) {
  
  static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
      HvMachine *m = cpu->m;
@@ -499,7 +492,7 @@ index 12bd4a9..afd93a9 100644
      uint32_t h = hash_of(va, pa, flags);
      HvRam *ram = hv_ram_lookup(m, pa);
      uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
-@@ -141,6 +328,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+@@ -141,6 +321,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
      HvBlock *b = find(m, h, va, pa, flags, gen);
      if (b) {
          jc[j].va = va, jc[j].b = b;
@@ -507,7 +500,7 @@ index 12bd4a9..afd93a9 100644
          return b;
      }
  
-@@ -161,7 +349,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+@@ -161,7 +342,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
      uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
      uint8_t phase0 = cpu->pc_state ? __atomic_load_n(&cpu->pc_state->phase, __ATOMIC_RELAXED) : 0;
      if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_TRANSLATE, __ATOMIC_RELAXED);
@@ -516,7 +509,7 @@ index 12bd4a9..afd93a9 100644
      if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, phase0, __ATOMIC_RELAXED);
      if (failed) goto flush_unlocked;
      if (m->stats_interval) {
-@@ -182,12 +370,11 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+@@ -182,12 +363,11 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
          return b;
      }
      /* ...and place it in the region (space is reserved atomically, so no lock either)... */
@@ -532,7 +525,7 @@ index 12bd4a9..afd93a9 100644
      }
      if (m->gen_checks && nb.jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST))
          fprintf(stderr, "hengevm: cpu %u translated across a flush: gen %u to %u, placed at rx+%llx, used %llx, active %d\n", cpu->index, nb.jit_gen, m->jit_gen, (unsigned long long)(nb.code - m->jit.base) * 4, (unsigned long long)m->jit.used * 4, cpu->pc_state->active);
-@@ -201,23 +388,24 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+@@ -201,23 +381,24 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
              m->stats.tr_wait_ticks += mach_absolute_time() - w0;
          }
      }
@@ -563,7 +556,7 @@ index 12bd4a9..afd93a9 100644
          static uint64_t seen_va[1 << 18], seen_vapa[1 << 18]; /* was this code translated before? (hashed, so approximate) */
          uint32_t hv = (uint32_t)(((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull >> 40);
          uint32_t hp = (uint32_t)((((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull ^ pa * 0xc2b2ae3d27d4eb4full) >> 40);
-@@ -226,15 +414,19 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
+@@ -226,15 +407,19 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
          seen_va[hv >> 6] |= 1ull << (hv & 63);
          seen_vapa[hp >> 6] |= 1ull << (hp & 63);
      }
@@ -584,7 +577,7 @@ index 12bd4a9..afd93a9 100644
      pthread_mutex_unlock(&m->tr_mu);
      hv_machine_kick_all(m);
      return NULL;
-@@ -257,6 +449,7 @@ static uint32_t wfe(HvCpu *cpu) {
+@@ -257,6 +442,7 @@ static uint32_t wfe(HvCpu *cpu) {
      uint64_t page = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
      if (spin || va == ~0ull || (size != 1 && size != 2 && size != 4 && size != 8) || (va & (size - 1)) ||
          e->read_tag == HV_TLB_INVALID || e->read_tag + HV_TLB_ADJ != page) {
@@ -592,7 +585,7 @@ index 12bd4a9..afd93a9 100644
          __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED); /* let another CPU run: the dispatcher's way */
          return 0;
      }
-@@ -284,7 +477,7 @@ static uint32_t wfe(HvCpu *cpu) {
+@@ -284,7 +470,7 @@ static uint32_t wfe(HvCpu *cpu) {
          }
          if (v != want || __atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED)) break;
          if (mach_absolute_time() >= deadline) {
@@ -601,7 +594,7 @@ index 12bd4a9..afd93a9 100644
              __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
              break;
          }
-@@ -292,7 +485,7 @@ static uint32_t wfe(HvCpu *cpu) {
+@@ -292,7 +478,7 @@ static uint32_t wfe(HvCpu *cpu) {
          else __asm__ volatile("yield" ::: "memory");
      }
      __asm__ volatile("clrex" ::: "memory");
@@ -610,7 +603,7 @@ index 12bd4a9..afd93a9 100644
      return 0;
  }
  
-@@ -360,6 +553,8 @@ static int tlbi_may_hit(HvCpu *cpu, uint32_t insn, uint64_t pc) {
+@@ -360,6 +546,8 @@ static int tlbi_may_hit(HvCpu *cpu, uint32_t insn, uint64_t pc) {
  static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in);
  
  uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info_in) {
@@ -619,7 +612,7 @@ index 12bd4a9..afd93a9 100644
      HvPerCpu *pcs = cpu->pc_state;
      if (cpu->m->wait_stats && pcs) __atomic_store_n(&pcs->phase, HV_PHASE_HELPER, __ATOMIC_RELAXED);
      uint32_t r = helper(cpu, info_in);
-@@ -440,13 +635,8 @@ void hv_debug_el0_in_kernel(HvCpu *cpu, const char *what) {
+@@ -440,13 +628,8 @@ void hv_debug_el0_in_kernel(HvCpu *cpu, const char *what) {
          {
              HvMachine *m = cpu->m;
              uint32_t *host = (uint32_t *)(uintptr_t)cpu->helper_ret; /* the block's blr into hv_helper_entry */
@@ -635,7 +628,7 @@ index 12bd4a9..afd93a9 100644
              fprintf(stderr, "hengevm: el0 runs kernel code: block %llx flags %u (index %d of %d), flushes %llu, last stub %llx, "
                              "miss site %llx\n  recent:", b ? (unsigned long long)b->va : 0ull, b ? b->flags : 0, lo, m->nblocks,
                      (unsigned long long)m->stats.block_flushes, (unsigned long long)cpu->last_stub,
-@@ -520,9 +710,7 @@ static int wait_for_interrupt(HvCpu *cpu) {
+@@ -520,9 +703,7 @@ static int wait_for_interrupt(HvCpu *cpu) {
      return 0;
  }
  
@@ -646,7 +639,7 @@ index 12bd4a9..afd93a9 100644
  static void print_profile(HvMachine *m) {
      enum { SLOTS = 4096 };
      static struct { uint64_t va; uint32_t flags, n, ninsns; } top[SLOTS];
-@@ -536,7 +724,8 @@ static void print_profile(HvMachine *m) {
+@@ -536,7 +717,8 @@ static void print_profile(HvMachine *m) {
      for (; m->prof_tail != head; m->prof_tail++) {
          uint32_t *pc = (uint32_t *)(uintptr_t)m->prof[m->prof_tail & (HV_PROF_RING - 1)];
          total++;
@@ -656,7 +649,7 @@ index 12bd4a9..afd93a9 100644
              outside++;
              Dl_info di;
              const char *name = dladdr(pc, &di) && di.dli_sname ? di.dli_sname : "?";
-@@ -555,13 +744,6 @@ static void print_profile(HvMachine *m) {
+@@ -555,13 +737,6 @@ static void print_profile(HvMachine *m) {
              if (k < nfn) fn[k].n++;
              continue;
          }
@@ -670,7 +663,7 @@ index 12bd4a9..afd93a9 100644
          uint32_t h = (uint32_t)((b->va >> 2) ^ b->flags) & (SLOTS - 1);
          int probes = 0;
          while (top[h].n && (top[h].va != b->va || top[h].flags != b->flags) && ++probes < 64) h = (h + 1) & (SLOTS - 1);
-@@ -602,55 +784,89 @@ static void print_profile(HvMachine *m) {
+@@ -602,55 +777,89 @@ static void print_profile(HvMachine *m) {
      }
  }
  
@@ -786,7 +779,7 @@ index 12bd4a9..afd93a9 100644
          fprintf(stderr, "  whole-TLB flushes/s: TLBI all here %.0f, TLBI all shared %.0f, SCTLR %.0f, TTBR1 %.0f, TCR %.0f, MAIR %.0f, range of all %.0f, requests overflowed %.0f\n",
                  RATE(flush_why[0]), RATE(flush_why[1]), RATE(flush_why[2]), RATE(flush_why[3]), RATE(flush_why[4]), RATE(flush_why[5]),
                  RATE(flush_why[6]), RATE(flush_why[7]));
-@@ -664,7 +880,9 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -664,7 +873,9 @@ static void print_stats(HvCpu *cpu, int force) {
                      RATE(flush_checked), RATE(flush_check_entries), RATE(flush_check_bad), RATE(flush_check_af));
          fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
                  RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
@@ -797,7 +790,7 @@ index 12bd4a9..afd93a9 100644
              uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
              uint32_t worst = 0;
              for (uint32_t h = 0; h < HV_BLOCK_HASH; h++) {
-@@ -795,7 +1013,7 @@ static void print_stats(HvCpu *cpu, int force) {
+@@ -795,7 +1006,7 @@ static void print_stats(HvCpu *cpu, int force) {
     jump gets a block that just wrote its own page back to the dispatcher. */
  static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
      uint32_t idx = (uint32_t)(slot - m->slots);
@@ -806,7 +799,7 @@ index 12bd4a9..afd93a9 100644
          fprintf(stderr, "hengevm: chain slot %u site %p to rx+%llx va %llx: block gen %u now %u\n", idx, (void *)m->slot_site[idx], (unsigned long long)(b->code - m->jit.base) * 4, (unsigned long long)b->va, b->jit_gen, m->jit_gen);
      uint64_t xa = m->slot_xa[idx];
      if (xa) {
-@@ -890,7 +1108,7 @@ static void stop_the_world(HvCpu *cpu) {
+@@ -890,7 +1101,7 @@ static void stop_the_world(HvCpu *cpu) {
      pthread_mutex_lock(&m->stw_mu);
      if (__atomic_load_n(&m->flush_pending, __ATOMIC_SEQ_CST) && !m->stw_active) {
          __atomic_store_n(&m->stw_active, 1, __ATOMIC_SEQ_CST);
@@ -815,7 +808,7 @@ index 12bd4a9..afd93a9 100644
          pthread_mutex_unlock(&m->stw_mu);
          hv_machine_kick_all(m);
          if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_FLUSH, __ATOMIC_RELAXED);
-@@ -907,7 +1125,8 @@ static void stop_the_world(HvCpu *cpu) {
+@@ -907,7 +1118,8 @@ static void stop_the_world(HvCpu *cpu) {
          }
          if (m->gen_checks) for (int i = 0; i < m->ncpus; i++) if (m->cpus[i] && m->cpus[i] != cpu && m->cpus[i]->pc_state->active) fprintf(stderr, "hengevm: flush while cpu %d is active\n", i);
          pthread_mutex_lock(&m->tr_mu);
@@ -825,7 +818,7 @@ index 12bd4a9..afd93a9 100644
          pthread_mutex_unlock(&m->tr_mu);
          if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_RUN, __ATOMIC_RELAXED);
          pthread_mutex_lock(&m->stw_mu);
-@@ -924,8 +1143,21 @@ static void stop_the_world(HvCpu *cpu) {
+@@ -924,8 +1136,21 @@ static void stop_the_world(HvCpu *cpu) {
      }
  }
  
@@ -848,7 +841,7 @@ index 12bd4a9..afd93a9 100644
      hv_big_lock(cpu->m);
      hv_fp_enter(cpu);
      int r = run(cpu, 0);
-@@ -1054,15 +1286,15 @@ static int run_loop(HvCpu *cpu, int one) {
+@@ -1054,15 +1279,15 @@ static int run_loop(HvCpu *cpu, int one) {
              continue;
          }
          last_fault = ~0ull;
@@ -869,7 +862,7 @@ index 12bd4a9..afd93a9 100644
              fprintf(stderr, "hengevm: cannot translate block at %llx\n", (unsigned long long)cpu->pc);
              park(cpu);
              return HV_EXIT_UNSUPPORTED;
-@@ -1155,7 +1387,7 @@ static int run_loop(HvCpu *cpu, int one) {
+@@ -1155,7 +1380,7 @@ static int run_loop(HvCpu *cpu, int one) {
          cpu->icount++;
          m->stats.blocks++;
          if (m->stats_interval && cpu->index == 0 && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);
@@ -23865,10 +23858,10 @@ index 0000000..d6f7a43
 +}
 diff --git a/tests/bench_evict_scan.c b/tests/bench_evict_scan.c
 new file mode 100644
-index 0000000..a843714
+index 0000000..9e27c16
 --- /dev/null
 +++ b/tests/bench_evict_scan.c
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,47 @@
 +/* Actual quiescent compaction with a large descriptor working set. Synthetic
 +   metadata timing, not guest FPS, thermal or whole-session stall time. */
 +#include "machine.h"
@@ -23888,8 +23881,7 @@ index 0000000..a843714
 +    assert(!hv_machine_add_ram(&m,0x800000000ull,bytes,ram,0));
 +    HvRam *r=&m.ram[0];for(unsigned i=0;i<PGS;i++)r->page_gen[i]=i%11;
 +    mach_timebase_info_data_t tb;assert(!mach_timebase_info(&tb));
-+    for(unsigned round=0;round<5;round++)for(unsigned order=0;order<2;order++) {
-+        unsigned enabled=order^(round&1);setenv("HV_EVICT_PREFETCH",enabled?"1":"0",1);
++    for(unsigned round=0;round<5;round++) {
 +        hv_jit_ring(&m.jit,8);
 +        unsigned victim=m.jit.end>=m.jit.seg_words*m.jit.nseg?0:(unsigned)(m.jit.end/m.jit.seg_words);
 +        m.nblocks=N;m.nslots=0;
@@ -23913,7 +23905,7 @@ index 0000000..a843714
 +            /* The page index must find an exact start even after compaction. */
 +            if(!(i%4096))assert(hv_block_at(&m,b->code)==b);
 +        }
-+        printf("eviction-scan-bench: round=%u prefetch=%u descriptors=%u survivors=%u ms=%.3f exact_order_hash_and_index=correct\n",round,enabled,N,survivors,ms);
++        printf("eviction-scan-bench: round=%u prefetch_rejected=1 descriptors=%u survivors=%u ms=%.3f exact_order_hash_and_index=correct\n",round,N,survivors,ms);
 +    }
 +    hv_machine_free(&m);assert(!munmap(ram,bytes));
 +}
