@@ -1486,7 +1486,7 @@ index bfbac5e..80e65ef 100644
              for (uint32_t off = 0; off < chunk && !rc; off += 8) { /* MMIO: at most 8 bytes at a time */
                  uint32_t piece = chunk - off < 8 ? chunk - off : 8;
 diff --git a/core/mmu.c b/core/mmu.c
-index dc7cabd..a25675e 100644
+index dc7cabd..9c16167 100644
 --- a/core/mmu.c
 +++ b/core/mmu.c
 @@ -581,13 +581,13 @@ static void write_hint(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code) {
@@ -1606,7 +1606,7 @@ index dc7cabd..a25675e 100644
  void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
      return ijc_resolve(cpu, va, flags);
  }
-@@ -1051,22 +1130,45 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
+@@ -1051,22 +1130,46 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
          if (w.fsc || e->exec_tag != hv_exec_key(va & ~(uint64_t)PAGE_MASK, e->addend)) FAIL(2);
          if (m->stats_interval) m->stats.light_walks++;
      }
@@ -1638,18 +1638,19 @@ index dc7cabd..a25675e 100644
 +            front=1;
 +            /* Preserve the reference's LAST matching region for aliased host
 +               RAM (used by differential tests). A later alias must win. */
-+            for(HvRam *later=r+1;later<m->ram+m->nram;later++) {
-+                if(m->stats_interval)m->stats.light_ram_probes++;
++            HvRam *later=r+1,*last=m->ram+m->nram;
++            for(;later<last;later++) {
 +                if(host-(uintptr_t)later->host<later->size){front=0;break;}
 +            }
++            if(m->stats_interval)m->stats.light_ram_probes+=(uint64_t)(later-(r+1))+(later<last);
 +            if(front)front=__atomic_load_n(&r->page_gen[b->pg],__ATOMIC_ACQUIRE)==b->gen;
 +        }
      }
 +    if(front) { if(m->stats_interval)m->stats.light_front_hits++; }
 +    else {
 +        HvRam *ram=NULL;
++        if(m->stats_interval)m->stats.light_ram_probes+=(unsigned)m->nram;
 +        for(int i=0;i<m->nram;i++) {
-+            if(m->stats_interval)m->stats.light_ram_probes++;
 +            if(host-(uintptr_t)m->ram[i].host<m->ram[i].size)ram=&m->ram[i];
 +        }
 +        if(!ram)return 0;
@@ -1665,7 +1666,7 @@ index dc7cabd..a25675e 100644
      if (m->stats_interval) { /* what the fill replaces, as the dispatcher counts it */
          uint64_t *t = pcs->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
          uint64_t tag = b->va ^ cpu->ijc_salt[kernel];
-@@ -1082,6 +1184,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
+@@ -1082,6 +1185,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
      }
      /* Cached only while the TLB still maps it, inside ijc_seq (see hv_ijc_fill_checked). */
      if (!hv_ijc_fill_checked(cpu, b)) return 0;
@@ -23864,10 +23865,10 @@ index 0000000..d6f7a43
 +}
 diff --git a/tests/bench_evict_scan.c b/tests/bench_evict_scan.c
 new file mode 100644
-index 0000000..78d067b
+index 0000000..a843714
 --- /dev/null
 +++ b/tests/bench_evict_scan.c
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,48 @@
 +/* Actual quiescent compaction with a large descriptor working set. Synthetic
 +   metadata timing, not guest FPS, thermal or whole-session stall time. */
 +#include "machine.h"
@@ -23889,7 +23890,8 @@ index 0000000..78d067b
 +    mach_timebase_info_data_t tb;assert(!mach_timebase_info(&tb));
 +    for(unsigned round=0;round<5;round++)for(unsigned order=0;order<2;order++) {
 +        unsigned enabled=order^(round&1);setenv("HV_EVICT_PREFETCH",enabled?"1":"0",1);
-+        hv_jit_ring(&m.jit,8); /* the next victim is segment1 */
++        hv_jit_ring(&m.jit,8);
++        unsigned victim=m.jit.end>=m.jit.seg_words*m.jit.nseg?0:(unsigned)(m.jit.end/m.jit.seg_words);
 +        m.nblocks=N;m.nslots=0;
 +        unsigned survivors=0;
 +        for(unsigned i=0;i<N;i++) {
@@ -23897,13 +23899,13 @@ index 0000000..78d067b
 +            uint64_t pa=r->pa+(uint64_t)pg*16384+(i&1023)*4;
 +            m.blocks[i]=(HvBlock){.va=pa,.pa=pa,.ram=r,.pg=pg,.gen=r->page_gen[pg]+(i%31==0),
 +                .code=m.jit.base+(size_t)seg*m.jit.seg_words+(i/8)*4,.ninsns=1};
-+            if(seg!=1&&i%31)survivors++;
++            if(seg!=victim&&i%31)survivors++;
 +        }
 +        uint64_t start=mach_absolute_time();hv_evict_blocks(&m);
 +        double ms=(double)(mach_absolute_time()-start)*tb.numer/tb.denom/1e6;
 +        assert(m.nblocks==(int)survivors);
 +        unsigned next=0;
-+        for(unsigned i=0;i<N;i++)if((i&7)!=1&&i%31) {
++        for(unsigned i=0;i<N;i++)if((i&7)!=victim&&i%31) {
 +            HvBlock *b=&m.blocks[next++];unsigned pg=(i*2654435761u)&(PGS-1);
 +            uint64_t pa=r->pa+(uint64_t)pg*16384+(i&1023)*4;
 +            assert(b->va==pa&&b->pa==pa&&b->gen==r->page_gen[pg]);
