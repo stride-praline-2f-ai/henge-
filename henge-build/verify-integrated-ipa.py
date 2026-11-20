@@ -273,7 +273,7 @@ if manifest.get('desktop_interactivity'):
     desktop=state['desktop_interactivity']
     assert desktop['complete'] and desktop['source_commit']==state['final_validation']['source_commit']
     assert desktop['patch_sha256']==manifest['audit_repairs_sha256']
-    for marker in (b'pinned_slots_replaced=',b'display-clock:',b'text-clarity',b'metal4-archive-retention:'):
+    for marker in (b'pinned_slots_replaced=',b'display-clock:',b'text-clarity',b'metal4-archive-retention:',b'branch-front:'):
         assert marker in app_executable,'Desktop120 change missing from IPA: '+repr(marker)
     data['desktop_interactivity']=dict(desktop,runtime_markers_verified=True)
 

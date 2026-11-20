@@ -159,6 +159,6 @@ desktop=state.get('desktop_interactivity',{})
 if manifest.get('desktop_interactivity'):
     assert desktop.get('complete') and desktop.get('source_commit')==validation.get('source_commit'), 'Desktop120 workstreams need exact-source validation'
     assert desktop.get('patch_sha256')==manifest['audit_repairs_sha256'], 'Desktop120 validation used another patch'
-    assert all(desktop.get(k)=='passed_cloud' for k in ('command_reuse','memory_policy','presentation_clock','archive_retention','surface_hash','expanded_groups','touch_rebind','fx_clarity','sdk')), 'Desktop120 correctness checks incomplete'
+    assert all(desktop.get(k)=='passed_cloud' for k in ('command_reuse','memory_policy','presentation_clock','archive_retention','surface_hash','expanded_groups','touch_rebind','fx_clarity','sdk','dns_recovery','cpu_dispatch','eviction_index')), 'Desktop120 correctness checks incomplete'
     assert desktop.get('physical_performance_verified') is False, 'Cloud cannot claim physical performance'
 print('PASS complete implementation gate:', manifest['audit_repairs_sha256'])
