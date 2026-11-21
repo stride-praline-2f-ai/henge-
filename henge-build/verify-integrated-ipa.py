@@ -148,7 +148,7 @@ missing=[repr(marker) for marker in markers if marker not in app_executable]
 assert not missing,'Missing review runtime markers: '+', '.join(missing)
 hooks=(b'_hv_vm_test_network_token',b'_hv_vm_test_network_apply')
 assert all(hook not in app_executable for hook in hooks),'Network test hooks leaked into production'
-assert plist.get('HengeTestDiagnostics') is manifest.get('test_diagnostics') is True
+assert plist.get('HengeTestDiagnostics') is manifest.get('test_diagnostics'), 'Unexpected diagnostics default'
 for marker in review['required_markers']:
     assert any(marker in line for line in review['native_check_lines']),marker
 # Keep the actual iOS image's symbols outside the distributable IPA. They turn
