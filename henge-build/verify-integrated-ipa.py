@@ -289,6 +289,16 @@ if manifest.get('cpu_heavy_followup'):
         assert marker in app_executable, 'CPU-heavy follow-up missing from IPA: ' + repr(marker)
     data['cpu_heavy_followup'] = dict(cpu_heavy, runtime_markers_verified=True)
 
+if manifest.get('sustained_cpu_pass'):
+    sustained = state['sustained_cpu_pass']
+    assert sustained['source_commit'] == state['final_validation']['source_commit']
+    assert sustained['patch_sha256'] == manifest['audit_repairs_sha256']
+    for marker in (b'henge: cpu-work: indexed-exits=', b'HV_FIXED_ORIGIN_GROUPS',
+                   b'HV_HOT_GROUP_RETRANSLATION', b'jit-cpu-work: exit_slots_examined=',
+                   b'_hv_translate_emit_profiled', b'_hv_disk_writev'):
+        assert marker in app_executable, 'Sustained CPU pass missing from IPA: ' + repr(marker)
+    data['sustained_cpu_pass'] = dict(sustained, runtime_markers_verified=True)
+
 # Correct legacy metadata: verify the real configured default in the reconstructed source.
 assert 'as? Bool ?? true' in Path('Henge/ios/Henge/EngineTuning.swift').read_text()
 data['fastmem_default']=True
