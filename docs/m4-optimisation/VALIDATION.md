@@ -133,3 +133,6 @@ Build120 replay follow-up: source `c147294bba935d6fc6153aa7bad9f962d5942c4d`, pa
 
 
 Build 122 starts from build 120. It restores immediate drawable presentation, retains display-link cadence, and lowers an oversized cold-boot RAM request without modifying saved sessions. Diagnostics are opt-in. Native, sanitizer and full app validation passed in [44937838375](https://github.com/stride-praline-2f-ai/henge-/actions/runs/44937838375). GPU and CPU component checks passed in [44937838353](https://github.com/stride-praline-2f-ai/henge-/actions/runs/44937838353). An iPadOS crash or termination report was unavailable. Physical startup remains to be verified.
+
+
+Build 123 passed exact-source native, sanitizer and iOS Release checks in [45003021668](https://github.com/stride-praline-2f-ai/henge-/actions/runs/45003021668). The native disk tests include 4096 raced completions, ordering, partial DMA, and stability of the captured request header. The ARM64 JIT component check [45003021661](https://github.com/stride-praline-2f-ai/henge-/actions/runs/45003021661) retired a 400,000-descriptor fixture in 10.396 ms reference and 7.466 ms indexed median across three alternating rounds per configuration and verified survivor indexes. Physical Xcode extraction, install, sustained build, and thermal performance are unmeasured.
