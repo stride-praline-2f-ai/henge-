@@ -66,3 +66,10 @@ at 8 GiB with the same display and power settings. Compare 6/8 vCPUs, default
 versus indexed eviction, and thermal policy on/off independently. Use elapsed
 extraction/compile/pack time, duration at Serious/Critical, and Safari
 input-active frame times. Run timing passes with session diagnostics off.
+
+The cold emitter also omits the exact-tail slow-path check for PC-relative
+literals whose address is known to be outside the tail. The exact check stays
+for true tail literals, with native tests for emitted words and guest results.
+Thermal event logs include one resource snapshot when continuous diagnostics
+are disabled. They record cumulative CPU time and resource accounting, not the
+guest process that caused a thermal transition.

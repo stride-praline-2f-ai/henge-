@@ -1889,7 +1889,7 @@ index ed831ed..ff893a5 100644
          return;
      }
 diff --git a/core/translate.c b/core/translate.c
-index cebfb7d..4361f75 100644
+index cebfb7d..ec867ad 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -48,6 +48,8 @@ typedef struct {
@@ -2323,8 +2323,20 @@ index cebfb7d..4361f75 100644
      uint32_t tlb = put_tlb_slot(e, T, addr, el_idx);
      /* Both CPU-owned fields share a cache line. Issue independent loads
         before checking the tag, instead of serializing the addend load behind
-@@ -1148,9 +1252,10 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
-                      .recheck = hv_knob[HV_K_RECHECK] && !(op.align && op.bytes > 1) && op.bytes < HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
+@@ -1140,17 +1244,21 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+     /* Writeback forms change their base, and the retry recomputes it: those
+        (and RMW, exclusive and vector forms) go straight to the helper. */
+     int can_refill = !vec_kind && !rmw && op.mode != HV_ADDR_PRE && op.mode != HV_ADDR_POST && op.bytes <= 64 && !e->slow_mem;
++    /* A literal's offset within the 16 KiB page is known when translated.
++       The conservative guard already admits it when it cannot hit the tail. */
++    int can_hit_tail = !literal || ((pc + op.imm) & ((1u << HV_TLB_PAGE_BITS) - 1)) >= (1u << HV_TLB_PAGE_BITS) - HV_TLB_ADJ;
+     /* hv_tlb_refill's flags: bit 9 set (so never 0), bit 0 write, bits 2..1 the table, 8..3 bytes - 1 */
+     uint32_t rflags = can_refill ? 1u << 9 | (uint32_t)(op.store ? 1 : 0) | (uint32_t)el_idx << 1 | (op.bytes - 1) << 3 : 0;
+     put_ool(e, (Ool){.kind = OOL_SLOW, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U},
+                      /* The exact recheck for a page's last 15 bytes costs 6 words in every access's slow path; without it
+                         (HV_RECHECK=0) such an access takes the refill, which sends it to the helper. */
+-                     .recheck = hv_knob[HV_K_RECHECK] && !(op.align && op.bytes > 1) && op.bytes < HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
++                     .recheck = hv_knob[HV_K_RECHECK] && can_hit_tail && !(op.align && op.bytes > 1) && op.bytes < HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
                       .t = (uint8_t)T, .u = (uint8_t)U, .bytes = (uint8_t)op.bytes,
                       .tag_off = tlb + (op.store ? 8 : 0), .retry = retry, .rflags = rflags,
 -                     .preloaded = preloaded, .table = el_idx});
@@ -2335,7 +2347,7 @@ index cebfb7d..4361f75 100644
      if (fm_done != ~0u) patch_branch(&e->w[fm_done], (int64_t)e->n - fm_done);
      }
      /* Single loads and stores take [addr, addend] directly; the rest want the host address in A. */
-@@ -1253,7 +1358,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1253,7 +1361,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
      unspill(e, s, 3);
      if (slow != ~0u) e->ool[slow].join = e->n;
      /* Stand-ins for x18/x28 and writeback may have used U. */
@@ -2344,7 +2356,7 @@ index cebfb7d..4361f75 100644
  }
  
  /* DC ZVA: zero the 64-byte block holding Xt, on the host's own copy when the
-@@ -1638,6 +1743,8 @@ static int is_fp_insn(uint32_t insn) {
+@@ -1638,6 +1746,8 @@ static int is_fp_insn(uint32_t insn) {
  /* Returns 1 if the instruction ends the block. */
  static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
      HvInsnKind kind = hv_classify(insn);
@@ -2353,7 +2365,7 @@ index cebfb7d..4361f75 100644
      if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) {
          put_helper(e, pc, insn, HV_OP_FPTRAP);
          return 1;
-@@ -1844,8 +1951,9 @@ static void emit_ool(Emit *e) {
+@@ -1844,8 +1954,9 @@ static void emit_ool(Emit *e) {
              plink(e, retry, 1, o->retry, 0);
          }
          uint32_t site_at = link_site(e, o->at);
@@ -2364,7 +2376,7 @@ index cebfb7d..4361f75 100644
              int check = o->preloaded ? o->t : o->u;
              put(e, LDR_X(check, o->t, o->tag_off));
              put(e, SUB_X(check, o->addr, check));
-@@ -1900,10 +2008,70 @@ static int group_op(const HvMemOp *op) {
+@@ -1900,10 +2011,70 @@ static int group_op(const HvMemOp *op) {
             (op->rn == 31 || !is_stolen(op->rn)) && op->bytes <= 64;
  }
  
@@ -2436,7 +2448,7 @@ index cebfb7d..4361f75 100644
      int cur[32];
      int64_t delta[32];
      for (int r = 0; r < 32; r++) cur[r] = -1, delta[r] = 0;
-@@ -1914,7 +2082,62 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1914,7 +2085,62 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
          HvInsnKind kind = hv_classify(insn);
          if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) break;
          if (kind == HV_INSN_COPY && (insn & 0xfffff01fu) == 0xd503201fu) continue; /* hints (NOP, BTI): no register */
@@ -2499,7 +2511,7 @@ index cebfb7d..4361f75 100644
              KILL(insn);
              continue;
          }
-@@ -1923,18 +2146,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1923,18 +2149,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
              continue;
          }
          if (kind == HV_INSN_PREFETCH) continue;
@@ -2531,7 +2543,7 @@ index cebfb7d..4361f75 100644
                      e->gid[i] = (int8_t)cur[b], e->grole[i] = 2, e->goff[i] = (int32_t)off;
                  }
              }
-@@ -1943,6 +2175,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1943,6 +2178,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
                  delta[b] = 0;
                  off = op.mode == HV_ADDR_POST ? 0 : op.imm;
                  e->grp[e->ngrp++] = (Group){.lo = (int32_t)off, .hi = (int32_t)(off + op.bytes), .store = op.store,
@@ -2539,7 +2551,7 @@ index cebfb7d..4361f75 100644
                                              .base = (uint8_t)b, .first = (uint16_t)i, .last = (uint16_t)i};
                  e->gid[i] = (int8_t)cur[b], e->grole[i] = 1, e->goff[i] = (int32_t)off;
              } else if (!g) {
-@@ -1966,8 +2199,14 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1966,8 +2202,14 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
      uint16_t slot_free[GROUP_SLOTS] = {0};
      for (uint32_t k = 0; k < e->ngrp; k++) {
          Group *g = &e->grp[k];
@@ -2555,7 +2567,7 @@ index cebfb7d..4361f75 100644
          for (int s = 0; s < GROUP_SLOTS; s++)
              if (slot_free[s] <= g->first) {
                  g->slot = (uint8_t)s, g->live = 1;
-@@ -1975,6 +2214,16 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1975,6 +2217,16 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
                  break;
              }
      }
@@ -2572,7 +2584,7 @@ index cebfb7d..4361f75 100644
      /* A failed group runs its instructions plain, through its last access and
         through every later-starting group that runs on past it (whose first
         access the plain copy then makes too). */
-@@ -1986,7 +2235,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1986,7 +2238,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
              again = 0;
              for (uint32_t j = 0; j < e->ngrp; j++) {
                  Group *h = &e->grp[j];
@@ -2581,7 +2593,7 @@ index cebfb7d..4361f75 100644
              }
          }
          g->end = end;
-@@ -1996,13 +2245,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+@@ -1996,13 +2248,27 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
  /* After the block: each live group's plain copy. Returns -1 if they do not fit. */
  static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_t ntrans) {
      e->nogroup = 1;
@@ -2609,7 +2621,7 @@ index cebfb7d..4361f75 100644
              e->cur_pc = va + 4ull * i;
              e->cur_i = i;
              e->u_prev = e->u_live = 0;
-@@ -2017,8 +2280,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
+@@ -2017,8 +2283,9 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
  static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup);
  
  int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
@@ -2621,7 +2633,7 @@ index cebfb7d..4361f75 100644
      if (hv_knob[HV_K_GROUPS] && translate_emit(m, b, code, avail, 0) == 0) return 0;
      return translate_emit(m, b, code, avail, 1);
  }
-@@ -2026,6 +2290,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
+@@ -2026,6 +2293,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
  static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup) {
      Emit *e = &E;
      e->n = e->other_n = e->npool = e->nfix = e->nool = e->nsite = e->nrel = 0;
@@ -2629,7 +2641,7 @@ index cebfb7d..4361f75 100644
      e->w = e->hot;
      e->in_cold = 0;
      e->flat = hv_knob[HV_K_TEST2];
-@@ -2113,13 +2378,20 @@ static __thread struct {
+@@ -2113,13 +2381,20 @@ static __thread struct {
      HvMachine *m;
      uint64_t gen;
      uint32_t *hot, *cold;
@@ -2652,7 +2664,7 @@ index cebfb7d..4361f75 100644
          if (want < (size_t)hot + cold) want = (size_t)hot + cold;
          uint32_t *p = hv_jit_reserve(&m->jit, want);
          if (!p && m->jit_tail_enabled && want > (size_t)hot + cold) {
-@@ -2131,6 +2403,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
+@@ -2131,6 +2406,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
          }
          if (!p) { chunk.hot = NULL; return -1; }
          chunk.m = m, chunk.gen = gen, chunk.hot = p, chunk.cold = p + ((want + 1) & ~(size_t)1);
@@ -22397,10 +22409,10 @@ index 0000000..1b65c83
 +}
 diff --git a/ios/Henge/SessionDiagnosticCapture.swift b/ios/Henge/SessionDiagnosticCapture.swift
 new file mode 100644
-index 0000000..b941ce4
+index 0000000..3572524
 --- /dev/null
 +++ b/ios/Henge/SessionDiagnosticCapture.swift
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,144 @@
 +import Foundation
 +import Combine
 +
@@ -22443,6 +22455,18 @@ index 0000000..b941ce4
 +        guard active else { return }
 +        HengeLog.log("capture-event",name)
 +        nextDeadline = ProcessInfo.processInfo.systemUptime
++    }
++
++    /// One reading per transition gives a hot session context even when the
++    /// continuous sampler and generated diagnostic counters are disabled.
++    func thermalTransition(_ category: Int) {
++        guard !active else { return }
++        let reportedAt = ProcessInfo.processInfo.systemUptime
++        samplingQueue.async {
++            var resources = HengeVmResources()
++            henge_vm_resources(&resources)
++            HengeLog.log("thermal-work", "category=\(category) reported_uptime=\(reportedAt) sampled_uptime=\(ProcessInfo.processInfo.systemUptime) vm_state=\(resources.state) epoch=\(resources.epoch) available=\(resources.available) process_cpu_us=\(resources.process_cpu_us) footprint=\(resources.footprint) headroom=\(resources.headroom) system_compressed=\(resources.system_compressed) jit_bytes=\(resources.jit_used) metal_bytes=\(resources.metal_allocated) (cumulative CPU time; one reading; no guest task names)")
++        }
 +    }
 +    func sample() {
 +        guard active else { return }
@@ -22610,7 +22634,7 @@ index 520f70e..4f247af 100644
      }
  }
 diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
-index f84465e..42073b9 100644
+index f84465e..9e0800d 100644
 --- a/ios/Henge/SessionView.swift
 +++ b/ios/Henge/SessionView.swift
 @@ -9,6 +9,18 @@ struct SessionView: View {
@@ -22682,7 +22706,7 @@ index f84465e..42073b9 100644
                      } else {
                          Trackpad()
                      }
-@@ -190,34 +210,114 @@ struct SessionView: View {
+@@ -190,34 +210,115 @@ struct SessionView: View {
          } message: {
              Text("This turns the Mac off at once. Anything not saved on it is lost.")
          }
@@ -22795,6 +22819,7 @@ index f84465e..42073b9 100644
 +            if thermalState != next {
 +                thermalState = next
 +                diagnosticCapture.event("thermal=\(next.rawValue)")
++                diagnosticCapture.thermalTransition(next.rawValue)
 +                wakeups.signal()
 +                HengeLog.log("session", "thermal state: \(Self.thermalLabel(next))")
 +            }
@@ -22804,7 +22829,7 @@ index f84465e..42073b9 100644
              if showing {
                  refreshDetails()
                  HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll()
-@@ -228,35 +328,46 @@ struct SessionView: View {
+@@ -228,35 +329,46 @@ struct SessionView: View {
          }
          .onAppear {
              UIApplication.shared.isIdleTimerDisabled = true
@@ -22867,7 +22892,7 @@ index f84465e..42073b9 100644
  
      // A fold/rotation after boot must fit the mode the guest actually received,
      // rather than stretch it by recalculating only the host view's aspect.
-@@ -411,6 +522,9 @@ struct SessionView: View {
+@@ -411,6 +523,9 @@ struct SessionView: View {
          .labelStyle(.iconOnly)
          .buttonBorderShape(.circle)
          .tint(Desk.raised)
@@ -22877,7 +22902,7 @@ index f84465e..42073b9 100644
      }
  
      /// An iPhone's large screen: an iPhone Duo unfolded, regular both ways.
-@@ -485,6 +599,32 @@ struct SessionView: View {
+@@ -485,6 +600,32 @@ struct SessionView: View {
      /// The controls a column has too.
      @ViewBuilder private var floatingTools: some View {
          tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
@@ -22910,7 +22935,7 @@ index f84465e..42073b9 100644
          pasteTool
          tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
          tool("info.circle", "Details", tint: .white) { showDetails = true }
-@@ -513,12 +653,19 @@ struct SessionView: View {
+@@ -513,12 +654,19 @@ struct SessionView: View {
      }
  
      /// Keeps the pointer in view: the view moves when the pointer nears its edge.
@@ -22931,7 +22956,7 @@ index f84465e..42073b9 100644
              }
              if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / displayAspect)) { map = UIImage(cgImage: image) }
              tick += 1
-@@ -541,10 +688,70 @@ struct SessionView: View {
+@@ -541,10 +689,70 @@ struct SessionView: View {
  
      // MARK: Status
  
@@ -23002,7 +23027,7 @@ index f84465e..42073b9 100644
              Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
          }
          .padding(18)
-@@ -577,13 +784,29 @@ struct SessionView: View {
+@@ -577,13 +785,29 @@ struct SessionView: View {
          NavigationStack {
              List {
                  Section(phase) {
@@ -23033,7 +23058,7 @@ index f84465e..42073b9 100644
                      if LinkHostService.shared.active {
                          Text("Main desktop on iPad: in macOS System Settings → Displays, select the iPad display and choose Use as → Main Display. Leave the Duo as an extended display. This Mac saves that choice.")
                              .font(.footnote).foregroundStyle(.secondary)
-@@ -599,6 +822,7 @@ struct SessionView: View {
+@@ -599,6 +823,7 @@ struct SessionView: View {
                  }
                  Section("Pointer") {
                      Picker("Size", selection: $cursorScale) {
@@ -23041,7 +23066,7 @@ index f84465e..42073b9 100644
                          Text("1×").tag(1)
                          Text("2×").tag(2)
                          Text("3×").tag(3)
-@@ -608,7 +832,7 @@ struct SessionView: View {
+@@ -608,7 +833,7 @@ struct SessionView: View {
                      LabeledContent("Magic Keyboard / mouse scroll speed", value: String(format: "%.2f×", scrollSpeed))
                      Slider(value: $scrollSpeed, in: HardwareScroll.minimumSpeed...HardwareScroll.maximumSpeed)
                      Button("Reset hardware scroll speed") { scrollSpeed = HardwareScroll.defaultSpeed }
@@ -23050,7 +23075,7 @@ index f84465e..42073b9 100644
                          .font(.footnote).foregroundStyle(.secondary)
                  }
                  Section("Touch input") {
-@@ -618,16 +842,18 @@ struct SessionView: View {
+@@ -618,16 +843,18 @@ struct SessionView: View {
                          Text("Enable Guest sharing in Henge Settings and reopen Henge to use native touch.")
                              .font(.footnote).foregroundStyle(.secondary)
                      }
@@ -23076,7 +23101,7 @@ index f84465e..42073b9 100644
                      }
                      Button("Type the Helper Update Command") {
                          showDetails = false
-@@ -640,8 +866,11 @@ struct SessionView: View {
+@@ -640,8 +867,11 @@ struct SessionView: View {
                  }
                  Section("Sharing") {
                      LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
@@ -23090,7 +23115,7 @@ index f84465e..42073b9 100644
                              showDetails = false
                              Task {
                                  try? await Task.sleep(nanoseconds: 600_000_000)
-@@ -680,6 +909,8 @@ struct SessionView: View {
+@@ -680,6 +910,8 @@ struct SessionView: View {
      }
  
      private func run(viewport: CGSize) async {
@@ -23099,7 +23124,7 @@ index f84465e..42073b9 100644
          error = nil
          state = 0
          userCode = false
-@@ -693,65 +924,112 @@ struct SessionView: View {
+@@ -693,65 +925,112 @@ struct SessionView: View {
          zoomCentre = CGPoint(x: 0.5, y: 0.5)
          map = nil
          showWallpaperTip = false
@@ -23257,7 +23282,7 @@ index f84465e..42073b9 100644
              if state == 2 {
                  LinkHostService.shared.stop()
                  nativeTouch.stop()
-@@ -769,38 +1047,58 @@ struct SessionView: View {
+@@ -769,38 +1048,58 @@ struct SessionView: View {
                  }
                  break
              }
@@ -33809,6 +33834,38 @@ index 0000000..24bccce
 +    mach_port_deallocate(mach_task_self(),host);
 +    puts("PASS system memory: real HOST_VM_INFO64 reads, page units, null handling and bounded Mach send-right lifetime; raw categories are not allocatable headroom");
 +}
+diff --git a/tests/test_tail_recheck.c b/tests/test_tail_recheck.c
+index 14d3f32..360b8ef 100644
+--- a/tests/test_tail_recheck.c
++++ b/tests/test_tail_recheck.c
+@@ -58,6 +58,27 @@ int main(void) {
+             }
+         }
+     }
++    for (int tail = 0; tail < 2; tail++) {
++        unsigned word = tail ? 4094 : 16;
++        code[0] = 0x58000001u | word << 5; /* LDR X1, immutable PC-relative address */
++        code[word] = 5; code[word+1] = 0;
++        uint64_t reference_words = 0;
++        for (int precise = 0; precise < 2; precise++) {
++            hv_knob[HV_K_RECHECK] = precise;
++            hv_flush_blocks(&m);
++            hv_cpu_reset(&cpu, &m);
++            cpu.pc = (uintptr_t)code;
++            cpu.x[3] = 1000;
++            m.stat_slow_mem = 0;
++            uint64_t before = code_words();
++            assert(hv_run(&cpu) == HV_EXIT_HALT);
++            assert(cpu.x[2] == 5000 && cpu.x[3] == 0);
++            uint64_t words = code_words() - before;
++            if (!precise) reference_words = words;
++            if (precise) assert(tail ? words > reference_words : words == reference_words);
++            if (tail) assert(precise ? m.stat_slow_mem <= 1 : m.stat_slow_mem == 1000);
++        }
++    }
+     hv_machine_free(&m);
+     free(data);
+     puts("tail recheck: identical guest results, valid page-tail helpers removed, real page crossing preserved");
 diff --git a/tests/test_translation_race.py b/tests/test_translation_race.py
 index b65c694..d17d474 100644
 --- a/tests/test_translation_race.py
