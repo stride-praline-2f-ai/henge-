@@ -91,7 +91,7 @@ check that workers honor the admitted opcode and sector.
 
 - Build 123 baseline 0678d03be53946b3e579db8ec81f23695abe6631.
 - Segment-specific exit retirement keeps the existing physical-page invalidation lists and repairs only live links affected by eviction. The scanner remains an A/B reference with HV_JIT_INDEXED_EXITS=0.
-- Checked register spans keep a fixed host origin across verified immediate base updates and writeback. HV_FIXED_ORIGIN_GROUPS=0 selects the former code generator.
+- Checked register spans keep a fixed host origin across verified immediate base updates. The native cursor loop favored this in five of seven pairs (3.122 to 2.658 ns median). HV_FIXED_ORIGIN_GROUPS=0 selects the reference. Pre/post-indexed writeback retains the existing checked addend default after a slower paired trial. HV_FIXED_ORIGIN_GROUPS=1 also admits the fixed-origin writeback trial.
 - Opt-in HV_HOT_GROUP_RETRANSLATION=1 uses an exact per-vCPU key and a bounded wider compile when a previously observed block needs retranslation. It replaces no live block and adds no execution sampling by default.
 - Small and medium vectored I/O requests can pass validated vectors through directly. Short transfers, overflow, EINTR, and flush order retain coverage.
 - Release gate requires the exact pinned patch, cloud native and iOS validation, and a verified single package. Physical extraction, install, clean-build, and thermal comparisons are open.

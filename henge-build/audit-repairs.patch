@@ -1131,7 +1131,7 @@ index a41d6d2..520748f 100644
              m->fastmem_enabled ? "on" : "off", m->fastmem_diagnostics ? "on" : "off");
      if (m->fastmem_enabled) fprintf(out, "fastmem-layout: tagged-multiwindow entries=262144 per-PAN bytes-per-CPU=10485760 (bounded allocation; exact VA tags; all kernel windows)\n");
 diff --git a/core/machine.c b/core/machine.c
-index 7a01fdc..201e31e 100644
+index 7a01fdc..428682c 100644
 --- a/core/machine.c
 +++ b/core/machine.c
 @@ -12,6 +12,8 @@
@@ -1198,7 +1198,7 @@ index 7a01fdc..201e31e 100644
      /* The exact check for an access in a page's last 15 bytes, in the access's out-of-line path (code size only):
         on the phone, Golden Gate's boot and login send 80-240K such accesses a second to the helper without it. It
         costs ~13% of the code (Mac 2026-11-09: 296-300 against 259-261 bytes a block), and the phone's code cache
-@@ -124,10 +140,32 @@ static int init_rest(HvMachine *m) {
+@@ -124,10 +140,35 @@ static int init_rest(HvMachine *m) {
      m->max_blocks = (uint32_t)(bytes / 160 < 4096 ? 4096 : bytes / 160);
      m->max_slots = m->max_blocks * 2;
      m->blocks = calloc(m->max_blocks, sizeof(HvBlock));
@@ -1209,6 +1209,9 @@ index 7a01fdc..201e31e 100644
 +    m->jit_indexed_blocks = m->jit_page_heads && (indexed ? !strcmp(indexed, "1") : hv_host_is_m4_16gb());
 +    const char *fixed_origin = getenv("HV_FIXED_ORIGIN_GROUPS");
 +    m->fixed_origin_groups = !fixed_origin || !strcmp(fixed_origin, "1");
++    /* The paired native stack-loop trial did not justify replacing the
++       checked addend path for pre/post-indexed instructions by default. */
++    m->fixed_writeback_groups = fixed_origin && !strcmp(fixed_origin, "1");
 +    const char *hot_groups = getenv("HV_HOT_GROUP_RETRANSLATION");
 +    m->hot_group_retranslation = hot_groups && !strcmp(hot_groups, "1");
      m->stop_pc = ~0ull;
@@ -1231,7 +1234,7 @@ index 7a01fdc..201e31e 100644
      m->slots = calloc(m->max_slots, sizeof *m->slots);
      m->slot_site = calloc(m->max_slots, sizeof *m->slot_site);
      m->slot_stub = calloc(m->max_slots, sizeof *m->slot_stub);
-@@ -139,6 +177,14 @@ static int init_rest(HvMachine *m) {
+@@ -139,6 +180,14 @@ static int init_rest(HvMachine *m) {
      m->quiesce_initialized=hv_quiesce_init(&m->quiesce)==0;
      m->quiesce_enabled=m->quiesce_initialized && (!getenv("HV_STW_WAIT") || strcmp(getenv("HV_STW_WAIT"),"0"));
      fprintf(stderr,"henge: flush-wait: mode=%s; short spin then event wake, own requests serviced, 100us missed-wake fallback; guest WFE/timers unchanged\n",m->quiesce_enabled?"event":"legacy-yield");
@@ -1240,13 +1243,13 @@ index 7a01fdc..201e31e 100644
 +    const char *index_exits = getenv("HV_JIT_INDEXED_EXITS");
 +    if (index_exits ? !strcmp(index_exits, "1") : hv_host_is_m4_16gb())
 +        m->slot_segments = calloc(hv_slot_group_count(m->max_slots), sizeof *m->slot_segments);
-+    fprintf(stderr, "henge: cpu-work: indexed-exits=%d fixed-origin-spans=%d hot-retranslation=%d\n",
-+            m->slot_segments != NULL, m->fixed_origin_groups, m->hot_group_retranslation);
++    fprintf(stderr, "henge: cpu-work: indexed-exits=%d fixed-origin-spans=%d fixed-writeback=%d hot-retranslation=%d\n",
++            m->slot_segments != NULL, m->fixed_origin_groups, m->fixed_writeback_groups, m->hot_group_retranslation);
 +    hv_jit_ring(&m->jit, hv_knob[HV_K_JITSEGS] ? (uint32_t)hv_knob[HV_K_JITSEGS] : 8);
      for (int i = 0; i < HV_MAX_CPUS; i++) { /* untouched pages cost nothing, so every CPU gets its tables now */
          HvPerCpu *p = &m->percpu[i];
          p->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
-@@ -219,10 +265,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+@@ -219,10 +268,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
  #define HV_ULF_WAKE_ALL 0x100u
  #define HV_ULF_NO_ERRNO 0x1000000u
  
@@ -1264,7 +1267,7 @@ index 7a01fdc..201e31e 100644
  }
  
  void hv_cpu_ack_wake(HvCpu *cpu) {
-@@ -262,6 +312,13 @@ void hv_cpu_process_requests(HvCpu *cpu) {
+@@ -262,6 +315,13 @@ void hv_cpu_process_requests(HvCpu *cpu) {
  
  void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
      HvPerCpu *t = target->pc_state, *s = self ? self->pc_state : NULL;
@@ -1278,7 +1281,7 @@ index 7a01fdc..201e31e 100644
      HvMachine *mm = target->m;
      uint64_t t0 = mm->stats_interval ? mach_absolute_time() : 0;
      if (s) {
-@@ -271,6 +328,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -271,6 +331,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
      int sleep = hv_knob[HV_K_SYNCWAIT], probed = !t0 || !mm->wait_stats, probed_long = !t0 || !mm->wait_stats;
      if (s && mm->wait_stats) __atomic_store_n(&s->phase, HV_PHASE_SYNC, __ATOMIC_RELAXED);
      for (uint32_t spins = 0;; spins++) {
@@ -1286,7 +1289,7 @@ index 7a01fdc..201e31e 100644
          uint64_t ack = __atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE);
          if (ack >= seq) break;
          if (!probed && !(spins & 63) && mach_absolute_time() - t0 >= 2400) { /* 100 us: what is it doing? */
-@@ -295,10 +353,12 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -295,10 +356,12 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
          if (self) hv_cpu_process_requests(self);
          if (sleep && spins >= 64) {
              __atomic_add_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
@@ -1301,7 +1304,7 @@ index 7a01fdc..201e31e 100644
                  if (rc == -ETIMEDOUT && s) __atomic_add_fetch(&s->sync_timeouts, 1, __ATOMIC_RELAXED);
                  if (rc < 0 && rc != -ETIMEDOUT && rc != -EINTR) {
                      if (s) __atomic_add_fetch(&s->sync_errors, 1, __ATOMIC_RELAXED);
-@@ -396,18 +456,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
+@@ -396,18 +459,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
      return marked;
  }
  
@@ -1330,7 +1333,7 @@ index 7a01fdc..201e31e 100644
      if (marked) __asm__ volatile("sev" ::: "memory");
      return marked;
  }
-@@ -444,10 +511,12 @@ void hv_machine_free(HvMachine *m) {
+@@ -444,10 +514,12 @@ void hv_machine_free(HvMachine *m) {
          free(m->ram[i].ijc_va);
      }
      free(m->blocks);
@@ -1343,7 +1346,7 @@ index 7a01fdc..201e31e 100644
          free(m->percpu[i].ucode);
          free(m->percpu[i].cid_chunks);
          for (int k = 0; k < HV_STASHES; k++) {
-@@ -467,6 +536,9 @@ void hv_machine_free(HvMachine *m) {
+@@ -467,6 +539,9 @@ void hv_machine_free(HvMachine *m) {
      free(m->slot_xa);
      free(m->slot_xpa);
      free(m->xchained);
@@ -1353,7 +1356,7 @@ index 7a01fdc..201e31e 100644
      if (m->locks_initialized) {
          pthread_mutex_destroy(&m->big_mu);
          pthread_cond_destroy(&m->big_cv);
-@@ -514,6 +586,33 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
+@@ -514,6 +589,33 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
      return NULL;
  }
  
@@ -1387,7 +1390,7 @@ index 7a01fdc..201e31e 100644
  uint32_t *hv_smc_counts;
  uint64_t *hv_smc_last;
  uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
-@@ -527,7 +626,11 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
+@@ -527,7 +629,11 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
         retranslated the next time it is looked up. The block running now may
         finish with the old code, as it would with a real instruction pipeline. */
      r->code_pages[pg] = 0;
@@ -1400,7 +1403,7 @@ index 7a01fdc..201e31e 100644
      m->stats.flush_smc++;
      if (hv_smc_counts && pg < hv_smc_pages) {
          hv_smc_counts[pg]++;
-@@ -622,6 +725,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
+@@ -622,6 +728,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
  
  /* MMIO is accessed in naturally sized pieces of at most 8 bytes. */
  int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
@@ -1408,7 +1411,7 @@ index 7a01fdc..201e31e 100644
      void *p = hv_phys_ptr(m, pa, len);
      if (p) {
          memcpy(buf, p, len);
-@@ -640,8 +744,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
+@@ -640,8 +747,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
  }
  
  int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
@@ -1419,7 +1422,7 @@ index 7a01fdc..201e31e 100644
          if (r->readonly) return 0; /* ROM: writes are ignored */
          uint64_t off = pa - r->pa;
          uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
-@@ -674,6 +779,15 @@ void hv_cpu_reset(HvCpu *cpu, HvMachine *m) {
+@@ -674,6 +782,15 @@ void hv_cpu_reset(HvCpu *cpu, HvMachine *m) {
      hv_cpu_reset_index(cpu, m, 0);
  }
  
@@ -1435,7 +1438,7 @@ index 7a01fdc..201e31e 100644
  void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
      /* Everything but m and pc_state: other CPUs' TLBIs read those of a CPU
         being started (PSCI CPU_ON) at any time. */
-@@ -690,6 +804,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
+@@ -690,6 +807,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
      if (m->ncpus <= (int)index) m->ncpus = (int)index + 1;
      if (index == 0) m->cpu = cpu;
      HvPerCpu *p = cpu->pc_state;
@@ -1444,7 +1447,7 @@ index 7a01fdc..201e31e 100644
      /* Ids start over, so entries tagged with the old ones must go. */
      for (int t = 0; t < HV_IJC_TABLES; t++)
          if (p->ijc_tables_used >> t & 1) memset(p->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8), 0, HV_IJC_TABLE_BYTES);
-@@ -699,6 +815,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
+@@ -699,6 +818,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
      memset(p->ijc_pages, 0, sizeof p->ijc_pages);
      memset(p->ijc_hint, 0, sizeof p->ijc_hint);
      memset(p->jc, 0, sizeof p->jc);
@@ -1454,7 +1457,7 @@ index 7a01fdc..201e31e 100644
      cpu->lines_ptr = (uint64_t)(uintptr_t)&p->irq_line;
      for (int t = 0; t < HV_IJC_TABLES; t++) cpu->ijc_tab[t] = (uint64_t)(uintptr_t)(p->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8));
 diff --git a/core/machine.h b/core/machine.h
-index cafe156..a6e2469 100644
+index cafe156..4137f83 100644
 --- a/core/machine.h
 +++ b/core/machine.h
 @@ -39,6 +39,7 @@ typedef struct HvMmio {
@@ -1597,7 +1600,7 @@ index cafe156..a6e2469 100644
      int wait_stats;
      int jit_tail_enabled;
      int chain;               /* block chaining and the indirect-branch cache are enabled */
-@@ -282,6 +321,27 @@ typedef struct HvMachine {
+@@ -282,6 +321,28 @@ typedef struct HvMachine {
      uint32_t xchain_heads[HV_XCHAIN_BUCKETS];
      uint64_t xchain_examined, xchain_removed;
      uint32_t nslots;
@@ -1610,7 +1613,8 @@ index cafe156..a6e2469 100644
 +    uint32_t blocks_wrap;
 +    uint32_t block_high_water, block_free_head;
 +    int jit_indexed_blocks;
-+    int fixed_origin_groups; /* retain a checked x6 across known base increments and writeback */
++    int fixed_origin_groups; /* retain a checked x6 across known base increments */
++    int fixed_writeback_groups; /* explicit trial for pre/post-indexed access groups */
 +    int hot_group_retranslation; /* compare wider checked groups when a hot block naturally returns */
 +    uint64_t hot_groups_emitted;
 +    int branch_site_hints;
@@ -1625,7 +1629,7 @@ index cafe156..a6e2469 100644
      HvCpu *cpu;              /* CPU 0: the one that polls devices */
      HvCpu *cpus[HV_MAX_CPUS]; /* every CPU, so device and invalidation code can ask them to leave */
      int ncpus;
-@@ -311,12 +371,33 @@ typedef struct HvMachine {
+@@ -311,12 +372,33 @@ typedef struct HvMachine {
      uint32_t prof_head, prof_tail;
  } HvMachine;
  
@@ -1660,7 +1664,7 @@ index cafe156..a6e2469 100644
  static inline HvBlock *hv_block_find(HvMachine *m, uint32_t h, uint64_t va, uint64_t pa, uint32_t flags, uint32_t gen) {
      for (HvBlock *b = __atomic_load_n(&m->hash[h], __ATOMIC_ACQUIRE); b; b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE))
          if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return b;
-@@ -333,6 +414,45 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
+@@ -333,6 +415,45 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
                          void (*write)(void *, uint64_t, uint64_t, unsigned), const char *name);
  
  HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa);
@@ -1706,7 +1710,7 @@ index cafe156..a6e2469 100644
  /* Drop the translations made from the RAM page holding pa (it was written, or the guest invalidated it). */
  void hv_invalidate_code(HvMachine *m, uint64_t pa);
  void hv_ret_clear(HvCpu *cpu);
-@@ -340,7 +460,7 @@ int hv_ic_ivau_drops(void);
+@@ -340,7 +461,7 @@ int hv_ic_ivau_drops(void);
  /* Settings that say how to translate or wait, to compare ways of doing it in one running guest
     ("knob NAME VALUE" in HV_INPUT_FILE; a new way starts from an empty code cache). Each starts
     from the environment variable named in hv_knob_names. */
@@ -2074,7 +2078,7 @@ index ed831ed..ff893a5 100644
          return;
      }
 diff --git a/core/translate.c b/core/translate.c
-index cebfb7d..4d10ab0 100644
+index cebfb7d..9e22c08 100644
 --- a/core/translate.c
 +++ b/core/translate.c
 @@ -48,6 +48,8 @@ typedef struct {
@@ -2604,7 +2608,7 @@ index cebfb7d..4d10ab0 100644
 +        if (kind == HV_INSN_MEMORY) {
 +            HvMemOp op;
 +            if (e->gid[i] != (int)id || hv_mem_decode(insn, &op) || !group_op(&op) ||
-+                (op.mode != HV_ADDR_OFFSET && !e->m->fixed_origin_groups)) return 0;
++                (op.mode != HV_ADDR_OFFSET && !e->m->fixed_writeback_groups)) return 0;
 +            int64_t offset = (int64_t)e->goff[i] - g->lo, scale = 1ll << op.size;
 +            int fits=op.kind==HV_MEM_PAIR ? offset%scale==0 && offset/scale>=-64 && offset/scale<64
 +                : (offset>=0 && offset%scale==0 && offset/scale<4096) || (offset>=-256 && offset<256);
@@ -2770,7 +2774,7 @@ index cebfb7d..4d10ab0 100644
 +        g->live = g->register_only = 0;
          if (g->last == g->first) continue;
 +        if (hv_knob[HV_K_GROUPS] == 2) {
-+            if ((!g->writeback || e->m->fixed_origin_groups) && register_group(e,g,k,code))g->register_only=1;
++            if ((!g->writeback || e->m->fixed_writeback_groups) && register_group(e,g,k,code))g->register_only=1;
 +            else if(HV_GROUP_INTERLEAVE) {
 +                if (g->last - g->first > REGISTER_GROUP_INSNS || g->hi - g->lo > REGISTER_GROUP_SPAN ||
 +                    !cached_group(e,g,code)) continue;
@@ -33184,10 +33188,10 @@ index 0000000..60d7847
 +}
 diff --git a/tests/test_register_groups.c b/tests/test_register_groups.c
 new file mode 100644
-index 0000000..7d6f9e0
+index 0000000..5facf3f
 --- /dev/null
 +++ b/tests/test_register_groups.c
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,93 @@
 +#include "translate.h"
 +#include <assert.h>
 +#include <stdio.h>
@@ -33246,12 +33250,15 @@ index 0000000..7d6f9e0
 +    assert(hot(2,stolen_pcrel,4)<hot(0,stolen_pcrel,4)); /* guest x6 is spilled via host x15 */
 +    const uint32_t cursor_walk[] = {0xf9400001, 0x91002000, 0xf9400002,
 +                                   0xd1000800, 0x39400003, 0xd65f03c0};
-+    machine.fixed_origin_groups = 0;
++    machine.fixed_origin_groups = machine.fixed_writeback_groups = 0;
 +    unsigned cursor_reference = hot(2, cursor_walk, 6);
 +    unsigned frame_reference = hot(2, stack_frame, 7);
 +    machine.fixed_origin_groups = 1;
 +    unsigned cursor_fixed = hot(2, cursor_walk, 6);
++    assert(hot(2, stack_frame, 7) == frame_reference);
++    machine.fixed_writeback_groups = 1;
 +    unsigned frame_fixed = hot(2, stack_frame, 7);
++    machine.fixed_writeback_groups = 0;
 +    assert(cursor_fixed + 3 < cursor_reference && frame_fixed + 6 < frame_reference);
 +    printf("fixed-origin-groups: cursor_inline_words=%u->%u frame_inline_words=%u->%u\n",
 +           cursor_reference, cursor_fixed, frame_reference, frame_fixed);
