@@ -1,12 +1,8 @@
-name: Safari replay efficiency source checks
+name: Build 124 ARM64 cursor-walking comparison
 'on':
   push:
     branches:
-    - perf/safari-compositing
-    - perf/replay-mapping-sync
-    - fix/desktop120-launch
-    - perf/tlbi-range-batch
-    - engine/sustained-124
+    - engine/sustained-124-pointer-measure
     paths:
     - henge-build/**
     - '!henge-build/optimization-state.json'
@@ -63,114 +59,62 @@ jobs:
 
         '
       id: reconstruct
-    - name: Checked CPU group and branch dispatch comparisons
+    - name: Paired execution of translated ARM64 pointer walks
       working-directory: Henge
       run: |
         set -euo pipefail
-        mkdir -p build/safari
-        exec > >(tee build/safari/cpu-cost.log) 2>&1
-        make -j4 build/test_register_groups build/test_ijc_front build/bench_evict_scan build/test_mem
-        build/test_register_groups
-        python3 tests/test_chain_index.py
-        build/test_ijc_front
-        HV_JIT_SPLIT=1 build/test_ijc_front
-        build/bench_evict_scan
-        HV_GROUPS=0 build/test_mem
-        HV_GROUPS=2 HV_FIXED_ORIGIN_GROUPS=0 build/test_mem
-        HV_GROUPS=2 build/test_mem
-      if: ${{ !cancelled() && steps.reconstruct.outcome == 'success' }}
-    - name: Native replay metadata, remap and exact-surface checks
-      working-directory: Henge
-      run: 'set -euo pipefail
-
-        mkdir -p build/safari
-
-        exec > >(tee build/safari/metadata.log) 2>&1
-
-        bash -n tests/run_lifecycle_sanitizers.sh
-
-        python3 tests/test_gpu_page_reuse.py
-
-        python3 tests/test_surface_sync.py
-
-        python3 tests/test_surface_hash_limit.py
-
-        python3 tests/test_gpu_object_cache.py
-
-        cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Idevices tests/test_gpu_epoch.c -o build/safari/test_gpu_epoch
-
-        build/safari/test_gpu_epoch
-
-
-        cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Idevices tests/test_surface_pages.c -o build/safari/test_surface_pages
-
-        build/safari/test_surface_pages
-
-
-        python3 tests/test_gpu_command_storage.py
-
-        HENGE_COMMAND_TSAN=1 python3 tests/test_gpu_command_storage.py
-
-        python3 tests/test_metal4_archive_retention.py
-
-        python3 tests/test_native_touch_mapping.py
-
-        cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Idevices tests/test_presentation_clock.c -o build/safari/test_presentation_clock
-
-        build/safari/test_presentation_clock
-
-        cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Idevices tests/test_gpu_dirty_copy.c -o build/safari/test_gpu_dirty_copy
-
-        build/safari/test_gpu_dirty_copy
-
-        '
-      if: ${{ !cancelled() && steps.reconstruct.outcome == 'success' }}
-    - name: Real Metal4 bridge and pipeline state recording
-      working-directory: Henge
-      run: "set -euo pipefail\nmkdir -p build/safari\nexec > >(tee build/safari/real.log) 2>&1\nfor test in test_metal4_ordering test_metal4_compilation test_metal4_arguments; do\n xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -Wno-deprecated-declarations -O1 -g -fsanitize=address,undefined tests/$test.m -framework Foundation -framework Metal -o build/safari/$test\n build/safari/$test\ndone\n"
-      if: ${{ !cancelled() && steps.reconstruct.outcome == 'success' }}
-    - name: Exact pixels and allocation ownership on host GPU
-      working-directory: Henge
-      run: "set -euo pipefail\nmkdir -p build/safari\nexec > >(tee build/safari/exact.log) 2>&1\nxcrun -sdk macosx metal -c devices/pvg_screen.metal -o build/safari/screen.air\nxcrun -sdk macosx metallib build/safari/screen.air -o build/safari/screen.metallib\nfor test in test_native_metal test_planar_registry; do\n xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -Idevices tests/$test.m -framework Foundation -framework Metal -framework IOSurface -o build/safari/$test\n build/safari/$test build/safari/screen.metallib\ndone\n\npython3 tests/test_surface_mapping.py\n\npython3 tests/test_surface_copy.py\n"
-      if: ${{ !cancelled() && steps.reconstruct.outcome == 'success' }}
-    - name: Compile real production replay for macOS and iOS
-      working-directory: Henge
-      run: 'set -euo pipefail
-
-        mkdir -p build/safari
-
-        exec > >(tee build/safari/compile.log) 2>&1
-
-        xcrun --sdk macosx clang -std=c11 -fobjc-arc -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -O2 -Icore -Ihost -Idevices -c devices/pvg_metal.m -o build/safari/pvg-macos.o
-
-        xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -std=c11 -fobjc-arc -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -O2 -Icore -Ihost -Idevices -c devices/pvg_metal.m -o build/safari/pvg-ios.o
-
-        '
-      if: ${{ !cancelled() && steps.reconstruct.outcome == 'success' }}
-    - name: Focused copy and snapshot allocation comparisons
-      if: ${{ !cancelled() && steps.reconstruct.outcome == 'success' }}
-      working-directory: Henge
-      run: 'set -euo pipefail
-
-        mkdir -p build/safari
-
-        exec > >(tee build/safari/copy-allocation-bench.log) 2>&1
-
-        cc -std=c11 -Wall -Wextra -Werror -O3 -Idevices tests/bench_gpu_dirty_copy.c -o build/safari/bench_gpu_dirty_copy
-
-        build/safari/bench_gpu_dirty_copy
-
-        HENGE_COMMAND_BENCH=1 python3 tests/test_gpu_command_storage.py
-
-        cc -std=c11 -Wall -Wextra -Werror -O3 -Idevices tests/bench_surface_hash.c -o build/safari/bench_surface_hash
-
-        build/safari/bench_surface_hash
-
-        '
-    - if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: safari-replay-checks-${{ github.sha }}
-        path: Henge/build/safari/*.log
-        if-no-files-found: warn
-        retention-days: 7
+        mkdir -p build/measure
+        python3 - <<'PYTEST'
+        from pathlib import Path
+        path=Path('tests/bench_stack_groups.c')
+        source=path.read_text()
+        assert source.count('500000')==2
+        source=source.replace('500000','24000000')
+        source=source.replace('cpu.x[19]=19;', 'cpu.x[26]=cpu.x[0]=initial_sp-8192;cpu.x[19]=19;',1)
+        source=source.replace('assert(!cpu.x[2]', 'assert(cpu.x[8]==0x5a5a5a5a5a5a5a5aull && cpu.x[9]==cpu.x[8] && cpu.x[10]==0x5a);\n    assert(!cpu.x[2]',1)
+        path.write_text(source)
+        source=Path('tests/mem_programs.S')
+        words=source.read_text()
+        first=words.index('Lbench_stack_groups_loop:')
+        last=words.index('END bench_stack_groups',first)
+        loop="""Lbench_stack_groups_loop:
+            ldr x8,[x0]
+            add x0,x0,#16
+            ldr x9,[x0]
+            sub x0,x0,#8
+            ldrb w10,[x0]
+            add x0,x0,#24
+            sub x11,x0,x26
+            and x11,x11,#0x1fe0
+            add x0,x26,x11
+            subs x2,x2,#1
+            b.ne Lbench_stack_groups_loop
+        """
+        words=words[:first]+loop+words[last:]
+        source.write_text(words)
+        PYTEST
+        make -j4 build/bench_stack_groups
+        for round in 0 1 2 3 4 5 6; do
+          for first in 0 1; do
+            mode=$(( (round + first) % 2 ))
+            printf 'fixed-origin-run mode=%d ' "$mode"
+            HV_FIXED_ORIGIN_GROUPS="$mode" build/bench_stack_groups "$round"
+          done
+        done | tee build/measure/stack.log
+        python3 - <<'PYCOST'
+        from pathlib import Path
+        from statistics import median
+        import re
+        lines=Path('build/measure/stack.log').read_text().splitlines()
+        pattern=r'fixed-origin-run mode=(\d) stack-group-bench: round=(\d) writeback=1 ns_per_frame=([0-9.]+) inline_words=(\d+) result=correct'
+        pairs={}
+        for line in lines:
+            match=re.fullmatch(pattern,line)
+            assert match,line
+            mode,round_,time,words=match.groups()
+            pairs.setdefault(int(round_),{})[int(mode)]=(float(time),int(words))
+        assert set(pairs)==set(range(7)) and all(set(pair)=={0,1} for pair in pairs.values())
+        for mode in (0,1):
+            print(f'fixed-origin-sustained: mode={mode} median_ns_per_frame={median(x[mode][0] for x in pairs.values()):.3f} result=correct')
+        print(f'fixed-origin-sustained: lower_pairs={sum(x[1][0] < x[0][0] for x in pairs.values())}/7 scope=production-translated-synthetic-cursor-loop')
+        PYCOST
