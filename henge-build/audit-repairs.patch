@@ -1024,18 +1024,19 @@ index a41d6d2..a329fb1 100644
              m->fastmem_enabled ? "on" : "off", m->fastmem_diagnostics ? "on" : "off");
      if (m->fastmem_enabled) fprintf(out, "fastmem-layout: tagged-multiwindow entries=262144 per-PAN bytes-per-CPU=10485760 (bounded allocation; exact VA tags; all kernel windows)\n");
 diff --git a/core/machine.c b/core/machine.c
-index 7a01fdc..1ad298e 100644
+index 7a01fdc..cd2864e 100644
 --- a/core/machine.c
 +++ b/core/machine.c
-@@ -12,6 +12,7 @@
+@@ -12,6 +12,8 @@
  #include "mmu.h"
  #include "fastmem.h"
  #include "sysreg.h"
 +#include "translate.h"
++#include "scheduling.h"
  
  extern void hv_exit(void);
  extern void hv_helper_entry(void);
-@@ -23,7 +24,7 @@ extern void hv_xjump_thunk(void);
+@@ -23,7 +25,7 @@ extern void hv_xjump_thunk(void);
  static int init_rest(HvMachine *m);
  
  int hv_knob[HV_K_COUNT];
@@ -1044,7 +1045,7 @@ index 7a01fdc..1ad298e 100644
  
  static void knobs_init(void) {
      for (int i = 0; i < HV_K_COUNT; i++)
-@@ -33,6 +34,10 @@ static void knobs_init(void) {
+@@ -33,6 +35,10 @@ static void knobs_init(void) {
         since 2026-11-09: a checked skip on the phone found a kept user entry out of date (a stack page, no mapping),
         the stale state that flush exists to retire (xnu reusing a hardware ASID, which can leave every process's kept
         entries stale, not just the incoming one's). It was worth ~3% on a process-spawn loop; not worth guest memory. */
@@ -1055,7 +1056,7 @@ index 7a01fdc..1ad298e 100644
      if (!getenv("HV_IJC_PAGES")) hv_knob[HV_K_IJCPAGES] = 1;
      if (!getenv("HV_DNS_PROXY")) hv_knob[HV_K_DNSPROXY] = 1;
  }
-@@ -84,17 +89,26 @@ static int init_rest(HvMachine *m) {
+@@ -84,17 +90,26 @@ static int init_rest(HvMachine *m) {
      const char *tail = getenv("HV_JIT_TAIL");
      m->jit_tail_enabled = !tail || strcmp(tail, "0");
      m->fastmem_enabled = getenv("HV_FASTMEM") && atoi(getenv("HV_FASTMEM")) == 1;
@@ -1082,7 +1083,7 @@ index 7a01fdc..1ad298e 100644
      /* HV_MOVIMM=1: constants built in registers instead of loaded from the pool (translate.c put_lit). Off: no
         measured gain (Mac mix 24.1 s either way, 2026-11-08); the tests pass with it on (HV_MOVIMM=1 make test). */
      hv_knob[HV_K_MOVIMM] = getenv("HV_MOVIMM") ? atoi(getenv("HV_MOVIMM")) : 0;
-@@ -110,6 +124,7 @@ static int init_rest(HvMachine *m) {
+@@ -110,6 +125,7 @@ static int init_rest(HvMachine *m) {
      /* So the tests can run the translator these ways too (the iOS and --phone paths read them in knobs_init). */
      hv_knob[HV_K_SUPERBLOCKS] = getenv("HV_SUPERBLOCKS") ? atoi(getenv("HV_SUPERBLOCKS")) : 0;
      fprintf(stderr, "efficiency-v3: superblocks=%d (experimental) wait-probes=%d jit-finish=batched branch-patch=full-barrier (relaxed request falls back safely); indexed chain repair and full invalidation barriers retained\n", hv_knob[HV_K_SUPERBLOCKS] != 0, m->wait_stats);
@@ -1090,7 +1091,7 @@ index 7a01fdc..1ad298e 100644
      /* The exact check for an access in a page's last 15 bytes, in the access's out-of-line path (code size only):
         on the phone, Golden Gate's boot and login send 80-240K such accesses a second to the helper without it. It
         costs ~13% of the code (Mac 2026-11-09: 296-300 against 259-261 bytes a block), and the phone's code cache
-@@ -124,10 +139,28 @@ static int init_rest(HvMachine *m) {
+@@ -124,10 +140,28 @@ static int init_rest(HvMachine *m) {
      m->max_blocks = (uint32_t)(bytes / 160 < 4096 ? 4096 : bytes / 160);
      m->max_slots = m->max_blocks * 2;
      m->blocks = calloc(m->max_blocks, sizeof(HvBlock));
@@ -1098,7 +1099,7 @@ index 7a01fdc..1ad298e 100644
 +    m->jit_page_heads=calloc(m->jit_page_count,sizeof *m->jit_page_heads);
      if (!m->blocks) return -1;
 +    const char *indexed = getenv("HV_JIT_INDEXED_BLOCKS");
-+    m->jit_indexed_blocks = m->jit_page_heads && indexed && !strcmp(indexed, "1");
++    m->jit_indexed_blocks = m->jit_page_heads && (indexed ? !strcmp(indexed, "1") : hv_host_is_m4_16gb());
      m->stop_pc = ~0ull;
      m->stop_pc2 = ~0ull;
      m->chain = 1;
@@ -1119,7 +1120,7 @@ index 7a01fdc..1ad298e 100644
      m->slots = calloc(m->max_slots, sizeof *m->slots);
      m->slot_site = calloc(m->max_slots, sizeof *m->slot_site);
      m->slot_stub = calloc(m->max_slots, sizeof *m->slot_stub);
-@@ -139,6 +172,9 @@ static int init_rest(HvMachine *m) {
+@@ -139,6 +173,9 @@ static int init_rest(HvMachine *m) {
      m->quiesce_initialized=hv_quiesce_init(&m->quiesce)==0;
      m->quiesce_enabled=m->quiesce_initialized && (!getenv("HV_STW_WAIT") || strcmp(getenv("HV_STW_WAIT"),"0"));
      fprintf(stderr,"henge: flush-wait: mode=%s; short spin then event wake, own requests serviced, 100us missed-wake fallback; guest WFE/timers unchanged\n",m->quiesce_enabled?"event":"legacy-yield");
@@ -1129,7 +1130,7 @@ index 7a01fdc..1ad298e 100644
      for (int i = 0; i < HV_MAX_CPUS; i++) { /* untouched pages cost nothing, so every CPU gets its tables now */
          HvPerCpu *p = &m->percpu[i];
          p->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
-@@ -219,10 +255,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+@@ -219,10 +256,14 @@ extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
  #define HV_ULF_WAKE_ALL 0x100u
  #define HV_ULF_NO_ERRNO 0x1000000u
  
@@ -1147,7 +1148,7 @@ index 7a01fdc..1ad298e 100644
  }
  
  void hv_cpu_ack_wake(HvCpu *cpu) {
-@@ -262,6 +302,13 @@ void hv_cpu_process_requests(HvCpu *cpu) {
+@@ -262,6 +303,13 @@ void hv_cpu_process_requests(HvCpu *cpu) {
  
  void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
      HvPerCpu *t = target->pc_state, *s = self ? self->pc_state : NULL;
@@ -1161,7 +1162,7 @@ index 7a01fdc..1ad298e 100644
      HvMachine *mm = target->m;
      uint64_t t0 = mm->stats_interval ? mach_absolute_time() : 0;
      if (s) {
-@@ -271,6 +318,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -271,6 +319,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
      int sleep = hv_knob[HV_K_SYNCWAIT], probed = !t0 || !mm->wait_stats, probed_long = !t0 || !mm->wait_stats;
      if (s && mm->wait_stats) __atomic_store_n(&s->phase, HV_PHASE_SYNC, __ATOMIC_RELAXED);
      for (uint32_t spins = 0;; spins++) {
@@ -1169,7 +1170,7 @@ index 7a01fdc..1ad298e 100644
          uint64_t ack = __atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE);
          if (ack >= seq) break;
          if (!probed && !(spins & 63) && mach_absolute_time() - t0 >= 2400) { /* 100 us: what is it doing? */
-@@ -295,10 +343,12 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+@@ -295,10 +344,12 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
          if (self) hv_cpu_process_requests(self);
          if (sleep && spins >= 64) {
              __atomic_add_fetch(&t->ack_waiters, 1, __ATOMIC_SEQ_CST);
@@ -1184,7 +1185,7 @@ index 7a01fdc..1ad298e 100644
                  if (rc == -ETIMEDOUT && s) __atomic_add_fetch(&s->sync_timeouts, 1, __ATOMIC_RELAXED);
                  if (rc < 0 && rc != -ETIMEDOUT && rc != -EINTR) {
                      if (s) __atomic_add_fetch(&s->sync_errors, 1, __ATOMIC_RELAXED);
-@@ -396,18 +446,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
+@@ -396,18 +447,25 @@ unsigned hv_machine_kick_active(HvMachine *m) {
      return marked;
  }
  
@@ -1213,7 +1214,7 @@ index 7a01fdc..1ad298e 100644
      if (marked) __asm__ volatile("sev" ::: "memory");
      return marked;
  }
-@@ -444,10 +501,12 @@ void hv_machine_free(HvMachine *m) {
+@@ -444,10 +502,12 @@ void hv_machine_free(HvMachine *m) {
          free(m->ram[i].ijc_va);
      }
      free(m->blocks);
@@ -1226,7 +1227,7 @@ index 7a01fdc..1ad298e 100644
          free(m->percpu[i].ucode);
          free(m->percpu[i].cid_chunks);
          for (int k = 0; k < HV_STASHES; k++) {
-@@ -467,6 +526,8 @@ void hv_machine_free(HvMachine *m) {
+@@ -467,6 +527,8 @@ void hv_machine_free(HvMachine *m) {
      free(m->slot_xa);
      free(m->slot_xpa);
      free(m->xchained);
@@ -1235,7 +1236,7 @@ index 7a01fdc..1ad298e 100644
      if (m->locks_initialized) {
          pthread_mutex_destroy(&m->big_mu);
          pthread_cond_destroy(&m->big_cv);
-@@ -514,6 +575,33 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
+@@ -514,6 +576,33 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
      return NULL;
  }
  
@@ -1269,7 +1270,7 @@ index 7a01fdc..1ad298e 100644
  uint32_t *hv_smc_counts;
  uint64_t *hv_smc_last;
  uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
-@@ -527,7 +615,11 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
+@@ -527,7 +616,11 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
         retranslated the next time it is looked up. The block running now may
         finish with the old code, as it would with a real instruction pipeline. */
      r->code_pages[pg] = 0;
@@ -1282,7 +1283,7 @@ index 7a01fdc..1ad298e 100644
      m->stats.flush_smc++;
      if (hv_smc_counts && pg < hv_smc_pages) {
          hv_smc_counts[pg]++;
-@@ -622,6 +714,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
+@@ -622,6 +715,7 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len) {
  
  /* MMIO is accessed in naturally sized pieces of at most 8 bytes. */
  int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
@@ -1290,7 +1291,7 @@ index 7a01fdc..1ad298e 100644
      void *p = hv_phys_ptr(m, pa, len);
      if (p) {
          memcpy(buf, p, len);
-@@ -640,8 +733,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
+@@ -640,8 +734,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
  }
  
  int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
@@ -1301,7 +1302,7 @@ index 7a01fdc..1ad298e 100644
          if (r->readonly) return 0; /* ROM: writes are ignored */
          uint64_t off = pa - r->pa;
          uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
-@@ -674,6 +768,15 @@ void hv_cpu_reset(HvCpu *cpu, HvMachine *m) {
+@@ -674,6 +769,15 @@ void hv_cpu_reset(HvCpu *cpu, HvMachine *m) {
      hv_cpu_reset_index(cpu, m, 0);
  }
  
@@ -1317,7 +1318,7 @@ index 7a01fdc..1ad298e 100644
  void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
      /* Everything but m and pc_state: other CPUs' TLBIs read those of a CPU
         being started (PSCI CPU_ON) at any time. */
-@@ -690,6 +793,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
+@@ -690,6 +794,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
      if (m->ncpus <= (int)index) m->ncpus = (int)index + 1;
      if (index == 0) m->cpu = cpu;
      HvPerCpu *p = cpu->pc_state;
@@ -1326,7 +1327,7 @@ index 7a01fdc..1ad298e 100644
      /* Ids start over, so entries tagged with the old ones must go. */
      for (int t = 0; t < HV_IJC_TABLES; t++)
          if (p->ijc_tables_used >> t & 1) memset(p->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8), 0, HV_IJC_TABLE_BYTES);
-@@ -699,6 +804,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
+@@ -699,6 +805,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
      memset(p->ijc_pages, 0, sizeof p->ijc_pages);
      memset(p->ijc_hint, 0, sizeof p->ijc_hint);
      memset(p->jc, 0, sizeof p->jc);
@@ -8702,10 +8703,16 @@ index 0000000..ed34d05
 +}
 +#endif
 diff --git a/devices/virtio_blk.c b/devices/virtio_blk.c
-index 873ab5e..4bdda26 100644
+index 873ab5e..ffe2461 100644
 --- a/devices/virtio_blk.c
 +++ b/devices/virtio_blk.c
-@@ -25,7 +25,12 @@
+@@ -20,12 +20,18 @@
+ #define S_OK 0
+ #define S_IOERR 1
+ #define S_UNSUPP 2
++#define SUBMISSION_BATCH 16u
+ 
+ /* Disk I/O straight between the file and the guest's buffers: the
     segments of one direction, skipping `off` bytes of them, `len` bytes in all.
     Returns 0, or -1 on a host error or a buffer outside guest RAM. */
  static int seg_io(HvVirtioBlk *b, const HvVirtqElem *e, int writable, uint32_t off, uint64_t disk_off, uint32_t len) {
@@ -8719,22 +8726,27 @@ index 873ab5e..4bdda26 100644
          const HvVirtqSeg *g = &e->seg[s];
          if (g->write != writable) continue;
          if (off >= g->len) {
-@@ -33,17 +38,43 @@ static int seg_io(HvVirtioBlk *b, const HvVirtqElem *e, int writable, uint32_t o
+@@ -33,17 +39,47 @@ static int seg_io(HvVirtioBlk *b, const HvVirtqElem *e, int writable, uint32_t o
              continue;
          }
          uint32_t n = g->len - off;
 -        if (n > len) n = len;
 -        void *p = hv_phys_ptr(b->vio.m, g->addr + off, n);
-+        if (n > remaining) n = remaining;
-+        if (g->addr > UINT64_MAX - off) return -1;
-+        uint64_t addr = g->addr + off;
-+        void *p = hv_phys_ptr(b->vio.m, addr, n);
-         if (!p) return -1;
+-        if (!p) return -1;
 -        int r = writable ? hv_disk_read(b->disk, disk_off, p, n) : hv_disk_write(b->disk, disk_off, p, n);
 -        if (writable && r == 0) hv_dma_written(b->vio.m, g->addr + off, n);
 -        if (r != 0) return -1;
 -        disk_off += n;
 -        len -= n;
++        if (n > remaining) n = remaining;
++        if (g->addr > UINT64_MAX - off) return -1;
++        uint64_t addr = g->addr + off;
++        HvRam *region = hv_ram_lookup(b->vio.m, addr);
++        if (!region) return -1;
++        uint64_t offset = addr - region->pa;
++        uint64_t available = region->size - offset;
++        if (n > available) return -1;
++        void *p = region->host + offset;
 +        /* Adjacent descriptors often describe pages of one guest buffer. One
 +           syscall can transfer them directly without a staging copy. Do not
 +           cross request/direction boundaries or the final status byte. Validate
@@ -8743,7 +8755,7 @@ index 873ab5e..4bdda26 100644
 +            const HvVirtqSeg *next = &e->seg[s + 1];
 +            if (next->write != writable || addr > UINT64_MAX - n || next->addr != addr + n) break;
 +            uint32_t extra = next->len < remaining - n ? next->len : remaining - n;
-+            if (extra && !hv_phys_ptr(b->vio.m, addr, (uint64_t)n + extra)) break;
++            if (extra > available - n) break;
 +            n += extra;
 +            s++;
 +        }
@@ -8771,13 +8783,20 @@ index 873ab5e..4bdda26 100644
  }
  
  static uint32_t readable(const HvVirtqElem *e) {
-@@ -57,19 +88,26 @@ static uint32_t readable(const HvVirtqElem *e) {
- static int handle(HvVirtioBlk *b, HvVirtqElem *e, uint32_t *written) {
+@@ -54,22 +90,30 @@ static uint32_t readable(const HvVirtqElem *e) {
+ }
+ 
+ /* Worker thread. */
+-static int handle(HvVirtioBlk *b, HvVirtqElem *e, uint32_t *written) {
++static int handle(HvVirtioBlk *b, HvVblkReq *request, uint32_t *written) {
      HvVirtio *v = &b->vio;
-     struct { uint32_t type, reserved; uint64_t sector; } hdr;
+-    struct { uint32_t type, reserved; uint64_t sector; } hdr;
 -    uint32_t wlen = hv_virtq_writable(e);
++    const HvVirtqElem *e = &request->e;
++    HvVblkHeader hdr = request->header;
      *written = 0;
-+    if (e->nseg < 0 || e->nseg > HV_VIRTQ_MAX_SEGS) return -1;
+-    if (wlen < 1 || hv_virtq_read(v, e, 0, &hdr, sizeof hdr) != sizeof hdr) return -1;
++    if (!request->header_valid || e->nseg < 0 || e->nseg > HV_VIRTQ_MAX_SEGS) return -1;
 +    uint64_t readable_bytes = 0, writable_bytes = 0;
 +    for (int i = 0; i < e->nseg; i++) {
 +        if (e->seg[i].write) writable_bytes += e->seg[i].len;
@@ -8785,7 +8804,7 @@ index 873ab5e..4bdda26 100644
 +    }
 +    if (readable_bytes > UINT32_MAX || writable_bytes > UINT32_MAX) return -1;
 +    uint32_t wlen = (uint32_t)writable_bytes;
-     if (wlen < 1 || hv_virtq_read(v, e, 0, &hdr, sizeof hdr) != sizeof hdr) return -1;
++    if (wlen < 1) return -1;
      uint32_t data = wlen - 1; /* the status byte is the last writable one */
      uint8_t status = S_OK;
      switch (hdr.type) {
@@ -8802,7 +8821,7 @@ index 873ab5e..4bdda26 100644
              status = S_IOERR;
          break;
      }
-@@ -115,7 +153,8 @@ static void *worker(void *opaque) {
+@@ -115,7 +159,8 @@ static void *worker(void *opaque) {
      /* HV_BLK_STATS: requests, bytes, flushes and how busy this worker was, every 10 s. */
      int stats = getenv("HV_BLK_STATS") != NULL;
      uint64_t every = stats && atoi(getenv("HV_BLK_STATS")) > 0 ? (uint64_t)atoi(getenv("HV_BLK_STATS")) * 1000000 : 10000000;
@@ -8812,11 +8831,24 @@ index 873ab5e..4bdda26 100644
      for (;;) {
          pthread_mutex_lock(&b->mu);
          while (b->fence || b->claimed == __atomic_load_n(&b->submitted, __ATOMIC_ACQUIRE)) {
-@@ -137,29 +176,54 @@ static void *worker(void *opaque) {
+@@ -126,8 +171,7 @@ static void *worker(void *opaque) {
+             pthread_cond_wait(&b->cv, &b->mu);
+         }
+         HvVblkReq *r = &b->ring[b->claimed % HV_VBLK_RING];
+-        uint32_t type = 0;
+-        hv_virtq_read(&b->vio, &r->e, 0, &type, 4);
++        uint32_t type = r->header_valid ? r->header.type : UINT32_MAX;
+         int fence = type == T_FLUSH || type == T_APPLE_BARRIER;
+         b->claimed++;
+         if (fence) {
+@@ -137,39 +181,73 @@ static void *worker(void *opaque) {
          b->inflight++;
          pthread_mutex_unlock(&b->mu);
  
 -        uint64_t t0 = stats ? now_us() : 0;
+-        if (handle(b, &r->e, &r->written) != 0) r->written = 0;
+-        if (stats) {
+-            uint64_t t1 = now_us();
 +        unsigned capture = __atomic_load_n(&b->capture_epoch, __ATOMIC_RELAXED);
 +        int measuring = stats || (capture & 1);
 +        if (!stats && capture != capture_seen) {
@@ -8825,9 +8857,7 @@ index 873ab5e..4bdda26 100644
 +            if (measuring) t_last = now_us();
 +        }
 +        uint64_t t0 = measuring ? now_us() : 0;
-         if (handle(b, &r->e, &r->written) != 0) r->written = 0;
--        if (stats) {
--            uint64_t t1 = now_us();
++        if (handle(b, r, &r->written) != 0) r->written = 0;
 +        uint64_t t1=measuring?now_us():0;
 +        if (measuring) {
              busy += t1 - t0, reqs++, bytes += r->written > 1 ? r->written : readable(&r->e);
@@ -8876,15 +8906,52 @@ index 873ab5e..4bdda26 100644
      }
      return NULL;
  }
-@@ -184,6 +248,7 @@ static void notify(HvVirtio *v, int q) {
+ 
+-/* CPU thread: hand everything the driver made available to the worker, while the ring has room. */
++/* The CPU is the sole producer. A release publication also makes the parsed
++   headers visible to workers. Keep the first I/O of a burst bounded without
++   acquiring the disk worker mutex for every descriptor chain. */
++static void publish_submissions(HvVirtioBlk *b, uint32_t submitted) {
++    pthread_mutex_lock(&b->mu);
++    __atomic_store_n(&b->submitted, submitted, __ATOMIC_RELEASE);
++    pthread_cond_broadcast(&b->cv);
++    pthread_mutex_unlock(&b->mu);
++}
++
+ static void notify(HvVirtio *v, int q) {
+     HvVirtioBlk *b = v->dev;
+-    int any = 0;
+-    while (b->submitted - b->published < HV_VBLK_RING) {
+-        HvVblkReq *r = &b->ring[b->submitted % HV_VBLK_RING];
++    uint32_t next = b->submitted;
++    while (next - b->published < HV_VBLK_RING) {
++        HvVblkReq *r = &b->ring[next % HV_VBLK_RING];
+         int got = hv_virtq_pop(v, q, &r->e);
+         if (got < 0) {
+             /* A chain this model cannot follow (too many segments, or outside
+@@ -183,13 +261,16 @@ static void notify(HvVirtio *v, int q) {
+             continue;
          }
          if (got == 0) break;
++        /* Take one header snapshot for both barrier ordering and execution.
++           Payloads still transfer directly between guest RAM and the disk. */
++        r->header = (HvVblkHeader){0};
++        r->header_valid = hv_virtq_read(v, &r->e, 0, &r->header, sizeof r->header) == sizeof r->header;
          r->q = q;
+-        pthread_mutex_lock(&b->mu);
+-        __atomic_store_n(&b->submitted, b->submitted + 1, __ATOMIC_RELEASE);
+-        pthread_mutex_unlock(&b->mu);
+-        any = 1;
 +        r->queued_us=(b->log_stats || (__atomic_load_n(&b->capture_epoch,__ATOMIC_RELAXED)&1))?now_us():0;
-         pthread_mutex_lock(&b->mu);
-         __atomic_store_n(&b->submitted, b->submitted + 1, __ATOMIC_RELEASE);
-         pthread_mutex_unlock(&b->mu);
-@@ -197,6 +262,18 @@ void hv_virtio_blk_drain(HvVirtioBlk *b) {
++        next++;
++        if (next - b->submitted == SUBMISSION_BATCH) publish_submissions(b, next);
+     }
+-    if (any) pthread_cond_broadcast(&b->cv);
++    if (next != b->submitted) publish_submissions(b, next);
+ }
+ 
+ void hv_virtio_blk_drain(HvVirtioBlk *b) {
+@@ -197,6 +278,18 @@ void hv_virtio_blk_drain(HvVirtioBlk *b) {
      hv_virtio_blk_poll(b);
  }
  
@@ -8903,7 +8970,7 @@ index 873ab5e..4bdda26 100644
  void hv_virtio_blk_stop(HvVirtioBlk *b) {
      if (!b) return;
      pthread_mutex_lock(&b->mu);
-@@ -241,6 +318,9 @@ void hv_virtio_blk_destroy(HvVirtioBlk *b) {
+@@ -241,6 +334,9 @@ void hv_virtio_blk_destroy(HvVirtioBlk *b) {
     a slot is reused once it and every slot before it are back. */
  void hv_virtio_blk_poll(HvVirtioBlk *b) {
      if (!b) return;
@@ -8913,19 +8980,34 @@ index 873ab5e..4bdda26 100644
      int q = -1;
      for (uint32_t i = b->published; i != b->submitted; i++) {
          HvVblkReq *r = &b->ring[i % HV_VBLK_RING];
-@@ -269,6 +349,7 @@ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int a
+@@ -269,6 +365,9 @@ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int a
      v->dev = b;
      v->notify = notify;
      b->disk = disk;
++    if (apple_variant == HV_VBLK_ROOT)
++        fprintf(stderr, "virtio-blk submission: batch=%u captured-header=1 same-region-spans=1\n", SUBMISSION_BATCH);
 +    b->log_stats=getenv("HV_BLK_STATS")!=NULL;
      b->ring = calloc(HV_VBLK_RING, sizeof *b->ring);
      pthread_mutex_init(&b->mu, NULL);
      pthread_cond_init(&b->cv, NULL);
 diff --git a/devices/virtio_blk.h b/devices/virtio_blk.h
-index e48d5b6..3d91a9f 100644
+index e48d5b6..47fd27e 100644
 --- a/devices/virtio_blk.h
 +++ b/devices/virtio_blk.h
-@@ -23,6 +23,7 @@ typedef struct HvVblkReq {
+@@ -17,12 +17,20 @@ enum { HV_VBLK_PLAIN = 0, HV_VBLK_ROOT = 1, HV_VBLK_AUX = 2 };
+    disk, guest buffers and these indices. */
+ #define HV_VBLK_RING 256
+ 
++typedef struct HvVblkHeader {
++    uint32_t type, reserved;
++    uint64_t sector;
++} HvVblkHeader;
++
+ typedef struct HvVblkReq {
++    HvVblkHeader header;
++    int header_valid;
+     HvVirtqElem e;
+     int q;
      uint32_t written;
      int done;            /* a worker finished it (CPU thread pushes it) */
      int pushed;          /* in the used ring (the slot is free once all before it are too) */
@@ -8933,7 +9015,7 @@ index e48d5b6..3d91a9f 100644
  } HvVblkReq;
  
  #define HV_VBLK_WORKERS 4 /* requests in flight at once: the guest queues many, and each waits on the host disk */
-@@ -34,6 +35,11 @@ typedef struct HvVirtioBlk {
+@@ -34,6 +42,11 @@ typedef struct HvVirtioBlk {
      HvVblkReq *ring;
      uint32_t submitted;  /* CPU thread: requests handed to the worker */
      uint32_t completed;  /* workers: requests done (in any order) */
@@ -8945,7 +9027,7 @@ index e48d5b6..3d91a9f 100644
      uint32_t claimed;    /* workers: requests taken (under mu) */
      int inflight;        /* taken, not done */
      int fence;           /* a flush or barrier waits for everything before it: nothing else is taken meanwhile */
-@@ -48,6 +54,9 @@ typedef struct HvVirtioBlk {
+@@ -48,6 +61,9 @@ typedef struct HvVirtioBlk {
  HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int apple_variant);
  /* CPU thread: publish finished requests and raise the interrupt. */
  void hv_virtio_blk_poll(HvVirtioBlk *b);
@@ -25936,10 +26018,10 @@ index b3af248..8493319 100644
  /* EL0, so the indirect-branch cache takes these low (user) addresses. */
 diff --git a/tests/test_blk_completion.c b/tests/test_blk_completion.c
 new file mode 100644
-index 0000000..ad9eaae
+index 0000000..21ea82a
 --- /dev/null
 +++ b/tests/test_blk_completion.c
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,137 @@
 +/* Production virtio queue, block workers and file I/O. Only RAM/PCI/CPU-wake
 +   boundaries are supplied here so the same concurrency test runs on Linux. */
 +#define _DEFAULT_SOURCE 1
@@ -25961,6 +26043,11 @@ index 0000000..ad9eaae
 +int hv_knob[HV_K_COUNT];
 +void *hv_phys_ptr(HvMachine *m,uint64_t a,uint64_t n) {
 +    (void)m;return a<=sizeof ram && n<=sizeof ram-a ? ram+a : NULL;
++}
++HvRam *hv_ram_lookup(HvMachine *m, uint64_t addr) {
++    (void)m;
++    static HvRam region = {.size=sizeof ram, .host=ram};
++    return addr < sizeof ram ? &region : NULL;
 +}
 +void hv_dma_written(HvMachine *m,uint64_t a,uint64_t n){(void)m;(void)a;(void)n;}
 +void hv_machine_wake(HvMachine *m){(void)m;atomic_fetch_add(&wakes,1);}
@@ -26057,29 +26144,44 @@ index 0000000..ad9eaae
 +    bad_scatter=1;submit(b,1,1);hv_virtio_blk_drain(b);assert(ram[0x50000]==1 && b->errors==3);
 +    assert(!hv_disk_read(&disk,0,after,sizeof after) && !memcmp(first,after,sizeof first));
 +    assert(b->io_shape[0]==1 && b->io_shape[1]==2 && b->io_shape[2]==4);
++    /* Guest-owned ring memory cannot turn an accepted write into a flush
++       between admission and execution. Data itself still transfers directly. */
++    hv_virtio_blk_stop(b);
++    bad_scatter=scattered=0;
++    submit(b,1,1);
++    uint32_t flush=4;memcpy(ram+0x20000,&flush,sizeof flush);
++    memset(ram+0x30000,0x42,512);
++    assert(!hv_virtio_blk_start(b));hv_virtio_blk_drain(b);
++    assert(ram[0x50000]==0 && !hv_disk_read(&disk,0,after,sizeof after));
++    for(unsigned i=0;i<512;i++)assert(after[i]==0x42);
 +    hv_virtio_blk_stop(b);assert(hv_virtio_blk_idle(b));hv_virtio_blk_destroy(b);close(fd);
 +    puts("block completion: 64 ready requests / 1 wake; 4096 raced completions, ring wrap, read/write, flush, barrier, restart and sector-overflow rejection passed");
 +    puts("PASS real virtqueue -> scattered DMA -> real preadv/pwritev; status/payload integrity and validate-before-file-write on invalid later vector");
++    puts("PASS batched submissions preserve the admitted request type and direct payload");
 +}
 diff --git a/tests/test_blk_segments.c b/tests/test_blk_segments.c
 new file mode 100644
-index 0000000..b190295
+index 0000000..62f8460
 --- /dev/null
 +++ b/tests/test_blk_segments.c
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,73 @@
 +/* Execute production descriptor coalescing with observable I/O boundaries. */
 +#define _DEFAULT_SOURCE 1
 +#include "../devices/virtio_blk.c"
 +#include <assert.h>
 +static unsigned char ram[65536], disk[65536];
-+static unsigned calls, invalidations, last_count;
++static unsigned calls, invalidations, last_count, ram_lookups;
 +static int fail_partial;
 +static uint64_t region_end = sizeof ram;
-+void *hv_phys_ptr(HvMachine *m,uint64_t a,uint64_t n) {
++HvRam *hv_ram_lookup(HvMachine *m, uint64_t addr) {
 +    (void)m;
-+    if(a > sizeof ram || n > sizeof ram-a) return NULL;
-+    if(a < region_end && n > region_end-a) return NULL;
-+    return ram+a;
++    static HvRam region;
++    ram_lookups++;
++    if (addr >= sizeof ram) return NULL;
++    uint64_t base = addr < region_end ? 0 : region_end;
++    uint64_t end = addr < region_end ? region_end : sizeof ram;
++    region = (HvRam){.pa=base, .size=end-base, .host=ram+base};
++    return &region;
 +}
 +int hv_disk_read(HvDisk *d,uint64_t off,void *p,uint64_t n) {
 +    (void)d;calls++;if(off>sizeof disk || n>sizeof disk-off)return -1;
@@ -26110,7 +26212,7 @@ index 0000000..b190295
 +    for(unsigned i=0;i<sizeof disk;i++)disk[i]=(unsigned char)(i*17);
 +    for(int i=0;i<4;i++)e.seg[i]=(HvVirtqSeg){.addr=4096+i*4096,.len=4096,.write=1};
 +    e.seg[4]=(HvVirtqSeg){.addr=20480,.len=1,.write=1};ram[20480]=0xa7;
-+    assert(!seg_io(&b,&e,1,0,0,16384));assert(calls==1 && invalidations==1);
++    assert(!seg_io(&b,&e,1,0,0,16384));assert(calls==1 && invalidations==1 && ram_lookups==1);
 +    assert(!memcmp(ram+4096,disk,16384) && ram[20480]==0xa7);
 +    /* Header skipping, unaligned first/last pages, no write staging copy. */
 +    for(int i=0;i<5;i++)e.seg[i].write=0;

@@ -277,6 +277,18 @@ if manifest.get('desktop_interactivity'):
         assert marker in app_executable,'Desktop120 change missing from IPA: '+repr(marker)
     data['desktop_interactivity']=dict(desktop,runtime_markers_verified=True)
 
+# Verify that the CPU and storage paths from the extraction follow-up are in
+# the device executable from the validated source.
+if manifest.get('cpu_heavy_followup'):
+    cpu_heavy = state['cpu_heavy_followup']
+    assert cpu_heavy['source_commit'] == state['final_validation']['source_commit']
+    assert cpu_heavy['patch_sha256'] == manifest['audit_repairs_sha256']
+    for marker in (b'JIT descriptor eviction uses the executable-page index',
+                   b'HV_M4_THERMAL_CPU', b'virtio-blk submission: batch=%u',
+                   b'frame-source: guest_scanouts='):
+        assert marker in app_executable, 'CPU-heavy follow-up missing from IPA: ' + repr(marker)
+    data['cpu_heavy_followup'] = dict(cpu_heavy, runtime_markers_verified=True)
+
 # Correct legacy metadata: verify the real configured default in the reconstructed source.
 assert 'as? Bool ?? true' in Path('Henge/ios/Henge/EngineTuning.swift').read_text()
 data['fastmem_default']=True

@@ -73,3 +73,16 @@ for true tail literals, with native tests for emitted words and guest results.
 Thermal event logs include one resource snapshot when continuous diagnostics
 are disabled. They record cumulative CPU time and resource accounting, not the
 guest process that caused a thermal transition.
+
+Build 123 candidate: indexed descriptor eviction is now automatic on the
+detected ten-core/16 GB iPad M4. Set `HV_JIT_INDEXED_BLOCKS=0` for a reference
+run. Other models retain the previous default. The stable hash and executable
+page index avoid rebuilding survivor metadata. The last cloud comparison
+measured 11.008 ms versus 6.806 ms for the same 400,000 descriptors.
+
+Virtio disk admission parses the command header once and publishes up to
+16 requests per mutex acquisition. Contiguous guest spans reuse one validated
+RAM region lookup per span. Flush and barrier ordering, media error handling,
+sector validation, and zero-copy scatter/gather stay intact. Native completion
+fixtures additionally change a guest header between admission and execution to
+check that workers honor the admitted opcode and sector.
