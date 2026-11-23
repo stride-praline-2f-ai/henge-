@@ -1,5 +1,5 @@
 name: Henge 125 validate and package on one Mac
-run-name: Henge 125 on self-hosted ARM64 Mac · ${{ github.sha }}
+run-name: Henge 125 on isolated cloud Xcode 27 · ${{ github.sha }}
 permissions:
   contents: read
 concurrency:
@@ -9,20 +9,20 @@ env:
   HUSK: ${{ github.workspace }}/Husk
   HENGE_GAME_MODE: '0'
   HENGE_IPA_OUTPUT: ${{ github.workspace }}/Henge-output/Henge.ipa
-  HENGE_CI_EMULATED_RUNNER: '1'
+  HENGE_CI_EMULATED_RUNNER: '0'
   HOMEBREW_NO_AUTO_UPDATE: '1'
   HOMEBREW_NO_INSTALL_CLEANUP: '1'
   IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
 jobs:
   build:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: xcode-27
     timeout-minutes: 90
     steps:
     - uses: actions/checkout@v4
       with:
         path: build-request
         persist-credentials: false
-    - name: Inspect self-hosted Mac toolchain (read-only)
+    - name: Inspect cloud Mac toolchain (read-only)
       run: |
         echo '=== macOS ==='
         sw_vers
@@ -122,8 +122,6 @@ jobs:
     - name: Integrate pinned Henge main and reviewed device PRs
       id: integration
       run: bash build-request/henge-build/integrate-upstream.sh
-    - name: Adapt Link validation to virtual Mac encoder availability
-      run: git -C Henge apply "$GITHUB_WORKSPACE/build-request/henge-build/self-hosted-link-validation.patch"
     - name: Use supported macOS test-image provider cleanup
       run: |
         python3 - <<'PYAPFS'
@@ -160,7 +158,13 @@ jobs:
         df -h .
 
         # Native networking lifecycle tests require macOS libraries.
-        bash build-request/henge-build/setup-native-network.sh "$HUSK"
+        if ! pkg-config --exists slirp; then
+          brew install libslirp
+          slirp_pc="$(brew --prefix libslirp)/lib/pkgconfig"
+          export PKG_CONFIG_PATH="$slirp_pc${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+        fi
+        pkg-config --cflags --libs slirp
     - name: Probe public Metal archive reopening independently
       working-directory: Henge
       run: |
@@ -521,7 +525,7 @@ jobs:
 'on':
   push:
     branches:
-    - fix/boot-recovery125-alt-mac
+    - fix/build125-cloud-isolated
     paths:
     - .github/workflows/henge-duo-checks.yml
     - henge-build/record-125-release-gate.py
