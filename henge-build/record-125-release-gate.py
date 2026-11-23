@@ -59,7 +59,7 @@ def record(state, manifest, steps, source, run_id, patch_sha):
 def main():
     source = os.environ["GITHUB_SHA"]
     branch = os.environ["GITHUB_REF_NAME"]
-    if int(os.environ["GITHUB_RUN_ATTEMPT"]) < 1 or branch != "fix/build125-cloud-recovery":
+    if int(os.environ["GITHUB_RUN_ATTEMPT"]) < 1 or branch != "fix/build125-cloud-lighter-macos":
         raise ValueError("Expected a valid attempt on the dedicated release branch")
     manifest = json.loads((ROOT / "manifest.json").read_text())
     if manifest["release_branch"] != branch:

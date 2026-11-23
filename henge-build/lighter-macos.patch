@@ -1,0 +1,282 @@
+diff --git a/Makefile b/Makefile
+index f99160c..2dab923 100644
+--- a/Makefile
++++ b/Makefile
+@@ -71,7 +71,7 @@ $(B)/native_touch.o: host/native_touch.c host/native_touch.h | $(B)
+ $(B)/henge-agent.gz: $(B)/henge-agent
+ 	gzip -9 -n -c $< > $@
+ 
+-$(B)/share.o: host/share.c host/share.h host/native_touch.h
++$(B)/share.o: host/share.c host/share.h host/native_touch.h host/lighter_macos.h
+ 	$(CC) $(CFLAGS) -c $< -o $@
+ 
+ $(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/native_touch.o $(B)/audio_mac.o $(B)/vm.o $(B)/snapshot.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a
+diff --git a/host/lighter_macos.h b/host/lighter_macos.h
+new file mode 100644
+index 0000000..33df03b
+--- /dev/null
++++ b/host/lighter_macos.h
+@@ -0,0 +1,81 @@
++/* Guest-side, user-initiated preference changes and undo. */
++static const char lighter_macos_script[] =
++    "#!/bin/sh\n"
++    "# The guest user runs this explicitly from Terminal.\n"
++    "export LC_ALL=C\n"
++    "umask 077\n"
++    "action=${1:-}\n"
++    "case \"$action\" in apply|undo) ;; *) exit 2 ;; esac\n"
++    "state=\"$HOME/Library/Application Support/Henge/Lighter macOS\"\n"
++    "mkdir -p \"$state\" || exit 1\n"
++    "if ! mkdir \"$state/lock\"; then\n"
++    "    echo 'Another Lighter macOS change is in progress.'\n"
++    "    exit 1\n"
++    "fi\n"
++    "trap 'rmdir \"$state/lock\"' EXIT\n"
++    "trap 'exit 1' HUP INT TERM\n"
++    "\n"
++    "# Return a typed value or an explicit missing marker. Unrecognized errors\n"
++    "# must leave the existing preference untouched.\n"
++    "read_preference() {\n"
++    "    preference_type=$(/usr/bin/defaults read-type \"$1\" \"$2\" 2>&1) || {\n"
++    "        case \"$preference_type\" in\n"
++    "            *\"does not exist\"*) printf '%s\\n' missing; return ;;\n"
++    "            *) printf '%s\\n' \"$preference_type\" >&2; return 1 ;;\n"
++    "        esac\n"
++    "    }\n"
++    "    case \"$preference_type\" in\n"
++    "        'Type is boolean') preference_type=bool ;;\n"
++    "        'Type is integer') preference_type=int ;;\n"
++    "        *) echo \"Unsupported existing preference type for $2.\" >&2; return 1 ;;\n"
++    "    esac\n"
++    "    preference_value=$(/usr/bin/defaults read \"$1\" \"$2\") || return 1\n"
++    "    case \"$preference_value\" in 1|0) ;; *) [ \"$preference_type\" = int ] || return 1 ;; esac\n"
++    "    case \"${preference_value#-}\" in ''|*[!0-9]*) return 1 ;; esac\n"
++    "    printf '%s %s\\n' \"$preference_type\" \"$preference_value\"\n"
++    "}\n"
++    "\n"
++    "change_preference() {\n"
++    "    domain=$1 key=$2 kind=$3 wanted=$4\n"
++    "    backup=\"$state/$key\"\n"
++    "    current=$(read_preference \"$domain\" \"$key\") || return 1\n"
++    "    if [ \"$action\" = apply ]; then\n"
++    "        [ \"$current\" != \"$kind $wanted\" ] || return 0\n"
++    "        if [ ! -f \"$backup\" ]; then\n"
++    "            temporary=$(mktemp \"$state/.backup.XXXXXX\") || return 1\n"
++    "            if ! printf '%s\\n' \"$current\" > \"$temporary\" || ! mv \"$temporary\" \"$backup\"; then\n"
++    "                rm -f \"$temporary\"\n"
++    "                return 1\n"
++    "            fi\n"
++    "        elif [ \"$current\" != \"$(cat \"$backup\")\" ]; then\n"
++    "            echo \"Keeping your newer value for $key. Undo before applying again.\"\n"
++    "            return 0\n"
++    "        fi\n"
++    "        /usr/bin/defaults write \"$domain\" \"$key\" \"-$kind\" \"$wanted\"\n"
++    "        return\n"
++    "    fi\n"
++    "    [ -f \"$backup\" ] || return 0\n"
++    "    if [ \"$current\" = \"$kind $wanted\" ]; then\n"
++    "        read -r saved_type saved_value < \"$backup\" || return 1\n"
++    "        case \"$saved_type\" in\n"
++    "            missing) /usr/bin/defaults delete \"$domain\" \"$key\" || return 1 ;;\n"
++    "            bool|int) /usr/bin/defaults write \"$domain\" \"$key\" \"-$saved_type\" \"$saved_value\" || return 1 ;;\n"
++    "            *) return 1 ;;\n"
++    "        esac\n"
++    "    else\n"
++    "        echo \"Keeping your newer value for $key.\"\n"
++    "    fi\n"
++    "    rm \"$backup\"\n"
++    "}\n"
++    "\n"
++    "failed=0\n"
++    "change_preference NSGlobalDomain NSAutomaticWindowAnimationsEnabled bool 0 || failed=1\n"
++    "change_preference com.apple.dock launchanim bool 0 || failed=1\n"
++    "change_preference com.apple.WindowManager StandardHideWidgets int 1 || failed=1\n"
++    "change_preference com.apple.WindowManager StageManagerHideWidgets int 1 || failed=1\n"
++    "if [ \"$failed\" -ne 0 ]; then\n"
++    "    echo 'Some preferences could not be changed. Saved values are available for Undo.'\n"
++    "else\n"
++    "    echo 'Done. Log out and back in to apply the changes across the desktop.'\n"
++    "fi\n"
++    "exit \"$failed\"\n";
+diff --git a/host/share.c b/host/share.c
+index 69131d0..dd70119 100644
+--- a/host/share.c
++++ b/host/share.c
+@@ -11,6 +11,7 @@
+    Locks are accepted but not enforced: macOS only writes to a server that offers them, and there is one client. */
+ #include "share.h"
+ #include "native_touch.h"
++#include "lighter_macos.h"
+ 
+ #include <copyfile.h>
+ #include <dirent.h>
+@@ -797,6 +798,11 @@ static int serve_henge(Conn *c, Request *r) {
+         if (body_discard(c, r) != 0) return -1;
+         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);
+     }
++    if (!strcmp(what, "lighter-macos") && !strcmp(r->method, "GET")) {
++        if (body_discard(c, r) != 0) return -1;
++        return respond(c, r, 200, "OK", "Content-Type: text/plain\r\nCache-Control: no-store\r\n",
++                       lighter_macos_script, sizeof lighter_macos_script - 1);
++    }
+     if (!strcmp(what, "agent") && !strcmp(r->method, "GET")) return serve_agent(c, r, 0);
+     if (!strcmp(what, "touch-agent") && !strcmp(r->method, "GET")) return serve_agent(c, r, 1);
+     if (!strcmp(what, "native-touch-usb") && !strcmp(r->method, "GET")) {
+diff --git a/ios/Henge/Input.swift b/ios/Henge/Input.swift
+index 15ca8b3..d64d3f9 100644
+--- a/ios/Henge/Input.swift
++++ b/ios/Henge/Input.swift
+@@ -170,8 +170,9 @@ enum Keys {
+     }
+ 
+     /// One character at a time, for what the Mac has to keep up with.
+-    @MainActor static func typeSlowly(_ text: String) async {
++    @MainActor static func typeSlowly(_ text: String, whileActive: () -> Bool = { true }) async {
+         for c in text {
++            guard !Task.isCancelled, whileActive() else { return }
+             type(c)
+             try? await Task.sleep(nanoseconds: 25_000_000)
+         }
+diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
+index 9e0800d..ae0069e 100644
+--- a/ios/Henge/SessionView.swift
++++ b/ios/Henge/SessionView.swift
+@@ -884,6 +884,14 @@ struct SessionView: View {
+                          : "Once for each Mac: open Terminal on the Mac, tap this, then press Return. When macOS asks about henge-agent and local networks, choose Allow. It types \(Sharing.setUpCommand) and needs the Mac's keyboard layout to be U.S.")
+                         .font(.footnote).foregroundStyle(.secondary)
+                 }
++                Section("Lighter macOS") {
++                    Button("Type the Lighter macOS Command") { typeLighterMacOSCommand(undo: false) }
++                        .disabled(state != 1 || !Sharing.enabledForSession)
++                    Button("Type the Undo Command") { typeLighterMacOSCommand(undo: true) }
++                        .disabled(state != 1 || !Sharing.enabledForSession)
++                    Text("Open Terminal on the Mac first, then tap a button and press Return. Use a U.S. keyboard layout and enable Guest sharing in Henge. Lighter macOS reduces window and Dock animations and hides desktop widgets. Undo restores saved preferences. For further reductions, choose a static wallpaper and enable Reduce Motion and Reduce Transparency in macOS System Settings.")
++                        .font(.footnote).foregroundStyle(.secondary)
++                }
+                 Section("Log") {
+                     VStack(alignment: .leading, spacing: 1) {
+                         ForEach(Array(log.suffix(30).enumerated()), id: \.offset) { _, line in
+@@ -897,6 +905,19 @@ struct SessionView: View {
+         }
+     }
+ 
++    private func typeLighterMacOSCommand(undo: Bool) {
++        guard state == 1, Sharing.enabledForSession else { return }
++        let generation = henge_vm_generation()
++        showDetails = false
++        Task {
++            try? await Task.sleep(nanoseconds: 600_000_000)
++            guard !Task.isCancelled, henge_vm_state() == 1, henge_vm_generation() == generation else { return }
++            await Keys.typeSlowly(Sharing.lighterMacOSCommand(undo: undo), whileActive: {
++                henge_vm_state() == 1 && henge_vm_generation() == generation
++            })
++        }
++    }
++
+     // MARK: Running
+ 
+     private static func thermalLabel(_ state: ProcessInfo.ThermalState) -> String {
+diff --git a/ios/Henge/Sharing.swift b/ios/Henge/Sharing.swift
+index 0d7bf6a..4d13cd3 100644
+--- a/ios/Henge/Sharing.swift
++++ b/ios/Henge/Sharing.swift
+@@ -30,6 +30,11 @@ enum Sharing {
+ 
+     static let setUpCommand = "curl -s http://10.0.2.4/.henge/install | sh"
+ 
++    static func lighterMacOSCommand(undo: Bool) -> String {
++        let action = undo ? "undo" : "apply"
++        return #"(t=$(mktemp) && curl --noproxy 10.0.2.4 -fsS http://10.0.2.4/.henge/lighter-macos -o "$t" && /bin/sh "$t" \#(action); r=$?; [ -z "$t" ] || rm -f "$t"; exit $r)"#
++    }
++
+     /// Before a Mac starts.
+     static func prepare() {
+         enabledForSession = UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
+diff --git a/tests/test_lighter_macos.py b/tests/test_lighter_macos.py
+new file mode 100644
+index 0000000..444bc62
+--- /dev/null
++++ b/tests/test_lighter_macos.py
+@@ -0,0 +1,82 @@
++"""Exercise the exact embedded guest script with isolated macOS defaults fixtures."""
++import ast
++import json
++import os
++from pathlib import Path
++import shlex
++import subprocess
++import sys
++import tempfile
++import unittest
++
++EMBEDDED = Path(__file__).resolve().parents[1] / "host/lighter_macos.h"
++
++MOCK_DEFAULTS = r"""
++import json, os, sys
++from pathlib import Path
++prefs = Path(os.environ["MOCK_PREFERENCES"])
++values = json.loads(prefs.read_text())
++command, domain, key, *args = sys.argv[1:]
++name = domain + "/" + key
++if command in ("read-type", "read"):
++    if name not in values:
++        sys.exit("The domain/default pair does not exist")
++    kind, value = values[name]
++    print({"bool":"Type is boolean","int":"Type is integer","string":"Type is string"}[kind]
++          if command == "read-type" else value)
++elif command == "write":
++    values[name] = [args[0][1:], args[1]]
++elif command == "delete":
++    del values[name]
++else:
++    sys.exit("Unsupported defaults command")
++prefs.write_text(json.dumps(values))
++"""
++
++
++class LighterMacOSChecks(unittest.TestCase):
++    WINDOW = "NSGlobalDomain/NSAutomaticWindowAnimationsEnabled"
++    DOCK = "com.apple.dock/launchanim"
++    WIDGET = "com.apple.WindowManager/StandardHideWidgets"
++    STAGE = "com.apple.WindowManager/StageManagerHideWidgets"
++
++    def setUp(self):
++        directory = tempfile.TemporaryDirectory()
++        self.addCleanup(directory.cleanup)
++        home = self.home = Path(directory.name)
++        mock = home / "defaults.py"
++        mock.write_text(MOCK_DEFAULTS)
++        self.prefs = home / "preferences.json"
++        self.script = home / "lighter.sh"
++        lines = (line.strip().rstrip(";") for line in EMBEDDED.read_text().splitlines())
++        script = "".join(ast.literal_eval(line) for line in lines if line.startswith('"'))
++        self.script.write_text(script.replace("/usr/bin/defaults", f"{shlex.quote(sys.executable)} {shlex.quote(str(mock))}"))
++
++    def run_action(self, action, expected=0):
++        result = subprocess.run(["sh", str(self.script), action], text=True, capture_output=True,
++                                env={**os.environ, "HOME": str(self.home), "MOCK_PREFERENCES": str(self.prefs)})
++        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
++        return json.loads(self.prefs.read_text())
++
++    def test_apply_is_idempotent_and_undo_restores_exact_previous_values(self):
++        original = {self.DOCK: ["bool", "1"], self.WIDGET: ["int", "7"], self.STAGE: ["int", "1"]}
++        self.prefs.write_text(json.dumps(original))
++        after = {self.DOCK: ["bool", "0"], self.WINDOW: ["bool", "0"],
++                 self.WIDGET: ["int", "1"], self.STAGE: ["int", "1"]}
++        self.assertEqual(self.run_action("apply"), after)
++        self.assertEqual(self.run_action("apply"), after)
++        self.assertEqual(self.run_action("undo"), original)
++        self.assertEqual(self.run_action("undo"), original)
++
++    def test_manual_changes_survive_undo_and_unknown_types_are_preserved(self):
++        self.prefs.write_text(json.dumps({self.WIDGET: ["string", "original"]}))
++        changed = self.run_action("apply", expected=1)
++        self.assertEqual(changed[self.WIDGET], ["string", "original"])
++        changed[self.STAGE] = ["int", "9"]
++        self.prefs.write_text(json.dumps(changed))
++        self.assertEqual(self.run_action("undo", expected=1),
++                         {self.WIDGET: ["string", "original"], self.STAGE: ["int", "9"]})
++
++
++if __name__ == "__main__":
++    unittest.main()
