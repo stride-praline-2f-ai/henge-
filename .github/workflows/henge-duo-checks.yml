@@ -152,6 +152,31 @@ jobs:
         xcrun --sdk macosx metal --version
     - name: Prepare build prerequisites
       run: bash build-request/henge-build/setup-runner.sh --ci
+    - name: Verify iOS compiler, Metal and Rust target before full validation
+      id: ios_preflight
+      env:
+        HENGE_PREFLIGHT_DIR: ${{ runner.temp }}/henge-125-sdk-preflight
+      run: |
+        set -euo pipefail
+        mkdir -p "$HENGE_PREFLIGHT_DIR"
+        printf 'int henge_sdk_probe(void) { return 0; }\n' > "$HENGE_PREFLIGHT_DIR/probe.c"
+        printf 'import UIKit\nimport Metal\nimport Network\n' > "$HENGE_PREFLIGHT_DIR/probe.swift"
+        printf '#include <metal_stdlib>\nusing namespace metal;\nkernel void probe(device uint *out [[buffer(0)]], uint tid [[thread_position_in_grid]]) { out[tid] = tid; }\n' > "$HENGE_PREFLIGHT_DIR/probe.metal"
+        printf 'pub fn henge_sdk_probe() -> u32 { 0 }\n' > "$HENGE_PREFLIGHT_DIR/probe.rs"
+        sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+        xcrun --sdk iphoneos clang -target arm64-apple-ios15.5 -isysroot "$sdk" \
+          -c "$HENGE_PREFLIGHT_DIR/probe.c" -o "$HENGE_PREFLIGHT_DIR/probe.o"
+        xcrun --sdk iphoneos swiftc -target arm64-apple-ios17.0 -sdk "$sdk" \
+          -typecheck "$HENGE_PREFLIGHT_DIR/probe.swift"
+        xcrun --sdk iphoneos metal -c "$HENGE_PREFLIGHT_DIR/probe.metal" -o "$HENGE_PREFLIGHT_DIR/probe.air"
+        xcrun --sdk iphoneos metallib "$HENGE_PREFLIGHT_DIR/probe.air" -o "$HENGE_PREFLIGHT_DIR/probe.metallib"
+        rustc --crate-type lib --target aarch64-apple-ios --emit=metadata \
+          "$HENGE_PREFLIGHT_DIR/probe.rs" -o "$HENGE_PREFLIGHT_DIR/probe.rmeta"
+        for script in build_app.sh fetch_deps.sh package_ipa.sh; do
+          zsh -n "Henge/ios/scripts/$script"
+        done
+        bash -n Husk/scripts/build_ios.sh
+        bash -n Husk/scripts/build_rppairing_ios.sh
     - name: Fingerprint native networking dependencies
       id: native_cache
       run: |
@@ -419,10 +444,12 @@ jobs:
 
           Henge/build/groups-*.log
     - name: Validate built-in JIT routing and recovery policy
+      if: ${{ !cancelled() && steps.native_dependencies.outcome == 'success' }}
       working-directory: Henge
       run: make test-jit-advice
       id: jit_helper
     - name: Fingerprint dependency toolchain
+      if: ${{ !cancelled() && steps.ios_preflight.outcome == 'success' }}
       id: toolchain
       run: |
         python3 - <<'PY'
@@ -433,7 +460,9 @@ jobs:
             f.write('id=' + hashlib.sha256(identity).hexdigest()[:24] + '\n')
         PY
     - name: Restore pinned dependency cache
+      if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
       uses: actions/cache@v4
+      continue-on-error: true
       with:
         path: |
           Husk/third_party/build
@@ -442,30 +471,45 @@ jobs:
         key: henge-cloud-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.husk }}-${{ steps.toolchain.outputs.id
           }}-${{ hashFiles('build-request/henge-build/fetch-required-sources.sh') }}
     - name: Fetch dependency sources
+      if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+      id: ios_sources
       working-directory: Husk
       run: bash ../build-request/henge-build/fetch-required-sources.sh "$PWD"
     - name: Build required iOS libraries
+      if: ${{ !cancelled() && steps.ios_sources.outcome == 'success' }}
+      id: ios_libraries
       working-directory: Husk
       run: bash scripts/build_ios.sh libffi glib libslirp
     - name: Build on-device pairing library
+      if: ${{ !cancelled() && steps.ios_libraries.outcome == 'success' }}
+      id: ios_pairing
       working-directory: Husk
       run: bash scripts/build_rppairing_ios.sh
     - name: Copy iOS dependencies
+      if: ${{ !cancelled() && steps.ios_pairing.outcome == 'success' }}
+      id: ios_dependencies
       working-directory: Henge
       run: zsh ios/scripts/fetch_deps.sh
     - name: Restore exact iOS libzip dependency
+      if: ${{ !cancelled() && steps.ios_dependencies.outcome == 'success' }}
       uses: actions/cache@v4
+      continue-on-error: true
       with:
         path: Henge/build/ios/deps/libzip
         key: henge-ios-libzip-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('Henge/third_party/libzip/**',
           'Henge/tools/build_ios_restore.sh') }}
     - name: Build restore stack
+      if: ${{ !cancelled() && steps.ios_dependencies.outcome == 'success' }}
+      id: ios_restore
       working-directory: Henge
       run: zsh tools/build_ios_restore.sh
     - name: Build iOS engine
+      if: ${{ !cancelled() && steps.ios_restore.outcome == 'success' }}
+      id: ios_engine
       working-directory: Henge
       run: make -j4 ios-lib
     - name: Compile and inspect iOS application without packaging
+      if: ${{ !cancelled() && steps.ios_engine.outcome == 'success' }}
       working-directory: Henge
       run: zsh ios/scripts/build_app.sh
       id: ios_compile
@@ -513,7 +557,13 @@ jobs:
                 helper = guest.extractfile('Henge Touch Agent.app/Contents/MacOS/henge-touch-agent').read()
             assert helper[:4] == bytes.fromhex('cffaedfe') and len(helper) > 4096
         output = dict(game_mode_experiment=os.environ.get('HENGE_GAME_MODE') == '1', physical_m4_energy_verified=False, native_metal_library_sha256=hashlib.sha256(shaders).hexdigest(), native_metal_precompiled=True, source_commit=os.environ['GITHUB_SHA'], upstream_commit=info['HengeUpstreamCommit'], patch_sha256=manifest['patch_sha256'], ipa_sha256=hashlib.sha256(ipa.read_bytes()).hexdigest(), bundle=info['CFBundleIdentifier'], version=info['CFBundleShortVersionString'], fastmem_default=False, prs=[14,31,32,35,36,46,60,61,63,106], touch_helper_sha256=hashlib.sha256(helper).hexdigest(), native_touch_requires_authorized_mac_signing=False, native_touch_transport="emulated USB port4", touch_archive_sha256=hashlib.sha256(helper_archive).hexdigest(), touch_launch_probe="Not repeated in this IPA-only build; physical USB display association remains unverified")
-        output['henge_link'] = dict(manifest['henge_link'], native_fix_validation='Cloud Mac protocol/credit/worker/TLS/discovery/Keychain, hardware codec and SDK UI checks passed; not an A20 Pro thermal or performance measurement', native_checks_run=int(os.environ['GITHUB_RUN_ID']))
+        validation_log = Path('build/validation-03.log').read_text()
+        if 'PASS real primary GPU mirror encode/decode' in validation_log:
+            link_check = 'real primary mirror encode/decode passed'
+        else:
+            assert 'PASS virtual Mac: hardware encoder rejection reached viewer' in validation_log
+            link_check = 'virtual Mac encoder rejection and continued TLS controls passed'
+        output['henge_link'] = dict(manifest['henge_link'], native_fix_validation=link_check, native_checks_run=int(os.environ['GITHUB_RUN_ID']))
         output['runner'] = manifest['runner']
         output['duo_efficiency'] = dict(manifest['duo_efficiency'], native_validation_run=int(os.environ['GITHUB_RUN_ID']), release_binary_markers_verified=True, physical_thermal_verified=False)
         output['superblocks'] = dict(manifest['superblocks'], native_validation_run=int(os.environ['GITHUB_RUN_ID']), physical_cpu_behavior_verified=False)

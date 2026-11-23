@@ -10,7 +10,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parent
 REQUIRED_STEPS = (
-    "sdk", "verify_patch", "integration", "metal_probe", "native_compile",
+    "sdk", "verify_patch", "integration", "ios_preflight", "metal_probe", "native_compile",
     "stack_network", "jit_mmu", "memory_devices", "indices_input", "sanitizers",
     "jit_helper", "ios_compile",
 )
