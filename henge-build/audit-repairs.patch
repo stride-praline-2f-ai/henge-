@@ -10531,6 +10531,44 @@ index 0000000..17638b3
 +that WFE spinning, GPU work or the entire desktop thermal problem is fixed.
 +No guest timing, rendering quality, CPU count or performance caps are changed.
 +No new IPA is requested by this checkpoint.
+diff --git a/docs/henge-link/README.md b/docs/henge-link/README.md
+index 99d0a6d..3c05ac9 100644
+--- a/docs/henge-link/README.md
++++ b/docs/henge-link/README.md
+@@ -253,3 +253,33 @@ wrong-key negotiation, actual hardware Metal→encode→TLS→decode pixel check
+ and iOS 17 deployment-target type checking of all new viewer/sender surfaces.
+ The IPA workflow runs the project's existing engine/device/JIT/graphics tests
+ and packages the same pinned source/dependencies. See `validation.md` for results.
++
++## Remote controls on a Tailscale network
++
++This mode uses the existing Wireless Controls and main-screen mirror. The Duo
++can use cellular data while the iPad stays on its home internet connection.
++
++1. Connect the iPad and Duo to the same Tailscale network and allow the Duo to
++   reach the iPad on TCP port 49173. Keep that port off public router forwards.
++2. Boot macOS on the iPad. Open **Wireless Controls** from the three-finger
++   menu and enable **Allow remote access over Tailscale**. Enter the iPad's
++   Tailscale IPv4 address and tap **Start private remote access**.
++3. On the Duo, open **Use as wireless keyboard or gamepad**, turn on **Connect
++   over Tailscale**, then enter the iPad's Tailscale IPv4 address and the
++   pairing key. Choose **Connect wireless controls**. Tap **Video** to show
++   the running Mac's primary desktop.
++4. Leave Henge open on the iPad with its Mac running and its screen unlocked.
++   Locking, backgrounding or restarting the iPad can interrupt the guest.
++   Remote access cannot wake a suspended host or start a stopped guest.
++5. To revoke access, tap **Stop listening and disconnect**. If the key was saved,
++   use **Revoke saved remote key** before creating a replacement.
++
++Remote mode binds to the entered IPv4 address, uses the existing authenticated
++TLS pairing, and has separate optional Keychain records. Main-screen video
++starts off. The encoder requests 2.5 Mbps and up to 30 frames per second with
++video enabled. Total cellular data depends on the content and VPN overhead.
++
++The portable checks cover accepted addresses, rejected public and malformed
++addresses, and compatibility with the existing Link protocol. iOS compilation
++and the Wi-Fi-to-cellular device test, including reconnect during a network
++change, remain release checks.
 diff --git a/docs/m4-optimisation/CONTROLS-ADVANCED.md b/docs/m4-optimisation/CONTROLS-ADVANCED.md
 new file mode 100644
 index 0000000..1d6c0b5
@@ -20745,11 +20783,69 @@ index 7e9ba85..529567b 100644
 +    mutating func accepted(now:Double,hz:Int) { deadline=now+1/Double(min(120,max(24,hz))) }
 +    mutating func reset() { deadline=0 }
 +}
+diff --git a/ios/Henge/Link/LinkPairing.swift b/ios/Henge/Link/LinkPairing.swift
+index 3b85616..ee0259b 100644
+--- a/ios/Henge/Link/LinkPairing.swift
++++ b/ios/Henge/Link/LinkPairing.swift
+@@ -66,6 +66,10 @@ struct LinkSavedPeer: Codable {
+     let key: String
+     let wired: Bool
+ }
++struct LinkSavedVPNPeer: Codable {
++    let address: String
++    let key: String
++}
+ 
+ /// Explicit opt-in only. Device-local, unlocked-only Keychain items; neither
+ /// iCloud synchronization, UserDefaults, Documents nor log/Bonjour storage.
+@@ -98,13 +102,14 @@ struct LinkPairingStore {
+         let status = SecItemDelete(query(account) as CFDictionary)
+         guard status == errSecSuccess || status == errSecItemNotFound else { throw LinkError.invalid("Could not remove saved pairing (\(status))") }
+     }
+-    func host(remember: Bool) throws -> LinkHostPairing {
++    func host(remember: Bool, privateVPN: Bool = false) throws -> LinkHostPairing {
+         if !remember { return try .fresh() }
+-        if let saved = try load("host", as: LinkHostPairing.self) {
++        let account = privateVPN ? "host-vpn" : "host"
++        if let saved = try load(account, as: LinkHostPairing.self) {
+             guard LinkDiscoveredPeer.validName(saved.name) else { throw LinkError.invalid("Invalid saved pairing; forget it and pair again") }
+             _ = try LinkTransport.parameters(key: saved.key, wired: false)
+             return saved
+         }
+-        let fresh = try LinkHostPairing.fresh(); try save("host", value: fresh); return fresh
++        let fresh = try LinkHostPairing.fresh(); try save(account, value: fresh); return fresh
+     }
+ }
 diff --git a/ios/Henge/Link/LinkProtocol.swift b/ios/Henge/Link/LinkProtocol.swift
-index 94231b2..23db487 100644
+index 94231b2..28c4daa 100644
 --- a/ios/Henge/Link/LinkProtocol.swift
 +++ b/ios/Henge/Link/LinkProtocol.swift
-@@ -23,14 +23,26 @@ struct LinkControl: Codable {
+@@ -5,6 +5,24 @@ enum LinkError: Error, LocalizedError {
+     case invalid(String)
+     var errorDescription: String? { if case let .invalid(s) = self { return s }; return nil }
+ }
++
++enum LinkPrivateVPN {
++    static let port: UInt16 = 49173
++    static let mirrorHz = 30
++    static let videoBitRate = 2_500_000
++
++    // Tailscale uses the shared-address space for its IPv4 overlay.
++    // The configured address is also used to bind the iPad's listener.
++    static func accepts(_ address: String) -> Bool {
++        let parts = address.split(separator: ".", omittingEmptySubsequences: false)
++        guard parts.count == 4 else { return false }
++        let bytes = parts.compactMap { part -> UInt8? in
++            guard let number = UInt8(part), String(number) == part else { return nil }
++            return number
++        }
++        return bytes.count == 4 && bytes[0] == 100 && (64...127).contains(bytes[1])
++    }
++}
+ struct LinkMode: Codable, Equatable {
+     var width: Int, height: Int, widthMM: Int, heightMM: Int, hz: Int
+     var codedWidth: Int { (width + 1) & ~1 }
+@@ -23,14 +41,26 @@ struct LinkControl: Codable {
      var mode: LinkMode? = nil
      var x: Int? = nil, y: Int? = nil, code: Int? = nil, down: Bool? = nil
      var sequence: UInt64? = nil
@@ -20796,7 +20892,7 @@ index 0000000..37e561d
 +    }
 +}
 diff --git a/ios/Henge/Link/LinkService.swift b/ios/Henge/Link/LinkService.swift
-index 07cd331..20faed7 100644
+index 07cd331..ac17750 100644
 --- a/ios/Henge/Link/LinkService.swift
 +++ b/ios/Henge/Link/LinkService.swift
 @@ -7,6 +7,8 @@ import CoreVideo
@@ -20808,26 +20904,36 @@ index 07cd331..20faed7 100644
      @Published private(set) var key = ""
      @Published private(set) var pairingName = ""
      @Published private(set) var port: UInt16?
-@@ -14,35 +16,42 @@ final class LinkHostService: ObservableObject {
+@@ -14,51 +16,79 @@ final class LinkHostService: ObservableObject {
      @Published private(set) var mode: LinkMode?
      @Published private(set) var active = false
      @Published private(set) var connected = false
 +    @Published private(set) var controlOnly = false
 +    @Published private(set) var mirrorActive=false
++    @Published private(set) var vpnAddress: String?
 +    var streamsVideo:Bool { active || mirrorActive }
      private var transport: LinkTransport?
      private var encoder: LinkEncoder?
      private var keys = Set<Int>(), buttons = Set<Int>()
      private var token = UUID()
      var canStart: Bool { connected && mode != nil && encoder != nil }
-     func listen(wired: Bool, remember: Bool = false) {
+-    func listen(wired: Bool, remember: Bool = false) {
 -        guard !active else { return }
++    func listen(wired: Bool, remember: Bool = false, vpnAddress: String? = nil) {
 +        guard !active, !controlOnly else { return }
++        let vpnAddress = vpnAddress?.trimmingCharacters(in: .whitespacesAndNewlines)
++        if let vpnAddress, wired || !LinkPrivateVPN.accepts(vpnAddress) {
++            status = "Enter this iPad’s Tailscale IPv4 address."
++            return
++        }
          stop(); let generation = UUID(); token = generation
          do {
-             let pairing = try LinkPairingStore.shared.host(remember: remember)
+-            let pairing = try LinkPairingStore.shared.host(remember: remember)
++            let pairing = try LinkPairingStore.shared.host(remember: remember, privateVPN: vpnAddress != nil)
++            self.vpnAddress = vpnAddress
              key = pairing.key; pairingName = pairing.name
-             HengeLog.log("link", "local Bonjour discovery enabled; remembered-pairing=\(remember); key never advertised")
+-            HengeLog.log("link", "local Bonjour discovery enabled; remembered-pairing=\(remember); key never advertised")
++            HengeLog.log("link", "\(vpnAddress == nil ? "local Bonjour discovery" : "private VPN listener") enabled; remembered-pairing=\(remember)")
              let channel = LinkTransport(); transport = channel
 -            channel.onStatus = { [weak self] text, okay in
 -                Task { @MainActor in
@@ -20859,10 +20965,17 @@ index 07cd331..20faed7 100644
                  }
              }
              channel.onListening = { [weak self] port in
-@@ -54,11 +63,25 @@ final class LinkHostService: ObservableObject {
+                 Task { @MainActor in guard let self, self.token == generation else { return }; self.port = port }
+             }
+-            channel.listen(key: key, wired: wired, port: 0, serviceName: pairingName)
++            channel.listen(key: key, wired: wired, port: 0, serviceName: pairingName, vpnAddress: vpnAddress)
+             status = "Starting secure listener…"
+         } catch { status = error.localizedDescription }
      }
      private func receive(_ command: LinkControl) {
          guard (try? command.validate()) != nil else { return }
+-        if command.type == "hello", let proposed = command.mode {
+-            guard !active, encoder == nil else { status = "This session's display mode is already fixed. Stop the Mac before pairing again."; return }
 +        if command.type == "helloInput" {
 +            guard encoder == nil, mode == nil, !active else { return }
 +            controlOnly = true
@@ -20872,8 +20985,7 @@ index 07cd331..20faed7 100644
 +            HengeLog.log("link","controls-only peer authenticated; no encoder, decoder or second display")
 +            return
 +        }
-         if command.type == "hello", let proposed = command.mode {
--            guard !active, encoder == nil else { status = "This session's display mode is already fixed. Stop the Mac before pairing again."; return }
++        if command.type == "hello", let proposed = command.mode, vpnAddress == nil {
 +            guard !active, !controlOnly, encoder == nil else { status = "This session's display mode is already fixed. Stop the Mac before pairing again."; return }
              do {
                  guard let transport else { return }
@@ -20887,7 +20999,7 @@ index 07cd331..20faed7 100644
                      guard let transport else { done(false); return }; transport.sendVideo(data, completion: done)
                  }, report: { [weak self] message in
                      HengeLog.log("link", message)
-@@ -68,34 +91,96 @@ final class LinkHostService: ObservableObject {
+@@ -68,34 +98,97 @@ final class LinkHostService: ObservableObject {
                  })
                  encoder = created; mode = proposed
                  transport.onVideoAcknowledged = { [weak created] sequence in created?.acknowledge(sequence) }
@@ -20937,6 +21049,7 @@ index 07cd331..20faed7 100644
          }
      }
 +    private func startMirror(requestedHz:Int) {
++        let requestedHz = vpnAddress == nil ? requestedHz : LinkPrivateVPN.mirrorHz
 +        if mirrorActive,encoder?.mode.hz==requestedHz { henge_vm_mirror_refresh();return }
 +        stopMirror()
 +        guard encoder==nil,henge_vm_state()==1,let transport else { return }
@@ -20947,7 +21060,7 @@ index 07cd331..20faed7 100644
 +        }
 +        let stream=LinkMode(width:Int(display.width),height:Int(display.height),widthMM:Int(display.width_mm),heightMM:Int(display.height_mm),hz:min(requestedHz,Int(display.hz)))
 +        do {
-+            let created=try LinkEncoder(mode:stream,mirrorsPrimary:true,library:shaderLibrary,requestFrame:{henge_vm_mirror_refresh()},send:{ [weak transport] data,done in
++            let created=try LinkEncoder(mode:stream,mirrorsPrimary:true,library:shaderLibrary,targetBitRate:vpnAddress == nil ? nil : LinkPrivateVPN.videoBitRate,requestFrame:{henge_vm_mirror_refresh()},send:{ [weak transport] data,done in
 +                guard let transport else { done(false);return };transport.sendVideo(data,completion:done)
 +            },report:{ HengeLog.log("link-mirror",$0) })
 +            encoder=created;mirrorActive=true
@@ -20988,7 +21101,7 @@ index 07cd331..20faed7 100644
              hv_pvg_link_set_frame_handler { texture, queue, halfMode, cursor, x, y, w, h in
                  guard let texture, let queue else { return }
                  let t = Unmanaged<AnyObject>.fromOpaque(texture).takeUnretainedValue() as! MTLTexture
-@@ -103,30 +188,52 @@ final class LinkHostService: ObservableObject {
+@@ -103,30 +196,52 @@ final class LinkHostService: ObservableObject {
                  let c = cursor.map { Unmanaged<AnyObject>.fromOpaque($0).takeUnretainedValue() as! MTLTexture }
                  encoder.capture(texture: t, queue: q, halfMode: halfMode, cursorTexture: c, rect: SIMD4(x, y, w, h))
              }
@@ -21018,10 +21131,12 @@ index 07cd331..20faed7 100644
          }
 +        if henge_vm_state() == 1 { henge_vm_link_connected(1) }
      }
-     func forgetPairing() {
+-    func forgetPairing() {
 -        guard !active else { return }
+-        do { try LinkPairingStore.shared.forget("host"); stop(); status = "Saved key revoked. Create a new pairing before connecting again." }
++    func forgetPairing(privateVPN: Bool = false) {
 +        guard !active, !controlOnly else { return }
-         do { try LinkPairingStore.shared.forget("host"); stop(); status = "Saved key revoked. Create a new pairing before connecting again." }
++        do { try LinkPairingStore.shared.forget(privateVPN ? "host-vpn" : "host"); stop(); status = "Saved key revoked. Create a new pairing before connecting again." }
          catch { status = error.localizedDescription }
      }
      func stop() { stopKeepingStatus(); status = "Display link stopped." }
@@ -21041,7 +21156,8 @@ index 07cd331..20faed7 100644
 -        active = false; connected = false
 +        active = false; connected = false; controlOnly = false
          encoder?.stop(); encoder = nil; transport?.stop(); transport = nil
-         key = ""; pairingName = ""; port = nil; mode = nil
+-        key = ""; pairingName = ""; port = nil; mode = nil
++        key = ""; pairingName = ""; port = nil; mode = nil; vpnAddress = nil
      }
      private func releaseInput() {
 -        for key in keys { henge_vm_key_hid(UInt8(key), 0) }
@@ -21051,7 +21167,7 @@ index 07cd331..20faed7 100644
          keys.removeAll(); buttons.removeAll()
      }
  }
-@@ -135,61 +242,138 @@ final class LinkHostService: ObservableObject {
+@@ -135,61 +250,146 @@ final class LinkHostService: ObservableObject {
  final class LinkViewerService: ObservableObject {
      @Published private(set) var status = "Select a local iPad or enter its address manually."
      @Published private(set) var ready = false
@@ -21064,7 +21180,7 @@ index 07cd331..20faed7 100644
 +    private struct Request {
 +        let host:String,port:UInt16,key:String,wired:Bool,mode:LinkMode
 +        let peer:LinkDiscoveredPeer?
-+        let remember:Bool,inputOnly:Bool
++        let remember:Bool,inputOnly:Bool,privateVPN:Bool
 +    }
 +    private var request:Request?
      private var transport = LinkTransport()
@@ -21089,9 +21205,10 @@ index 07cd331..20faed7 100644
 -                self.status = "Receiving the independent second monitor."
 -                HengeLog.log("link-viewer", "first decoded native frame=\(mode.width)x\(mode.height); no guest VM/JIT started by viewer")
 -            }
-+    func connect(host: String, port: UInt16, key: String, wired: Bool, mode: LinkMode, peer: LinkDiscoveredPeer? = nil, remember: Bool = false, inputOnly: Bool = false) {
++    func connect(host: String, port: UInt16, key: String, wired: Bool, mode: LinkMode, peer: LinkDiscoveredPeer? = nil, remember: Bool = false, inputOnly: Bool = false, privateVPN: Bool = false) {
 +        disconnect();foreground=true
-+        request=Request(host:host.trimmingCharacters(in:.whitespacesAndNewlines),port:port,key:key.trimmingCharacters(in:.whitespacesAndNewlines),wired:wired,mode:mode,peer:peer,remember:remember,inputOnly:inputOnly)
++        guard !privateVPN || (inputOnly && peer == nil && !wired) else { status = "Use Wireless Controls for a private VPN connection."; return }
++        request=Request(host:host.trimmingCharacters(in:.whitespacesAndNewlines),port:port,key:key.trimmingCharacters(in:.whitespacesAndNewlines),wired:wired,mode:mode,peer:peer,remember:remember,inputOnly:inputOnly,privateVPN:privateVPN)
 +        attemptConnection()
 +    }
 +    private func clearConnection() {
@@ -21155,8 +21272,14 @@ index 07cd331..20faed7 100644
 +                        self.mirrorSupported=request.inputOnly && command.capabilities?.contains("primaryMirror")==true
 +                        self.status=request.inputOnly ? "Connected. Wireless controls ready." : "Connected. Waiting for the second desktop."
 +                        if request.inputOnly { self.keyboardMapping=command.down ?? false;channel?.setInputOnly() }
-+                        if request.remember,let peer=request.peer {
-+                            do { try LinkPairingStore.shared.save("viewer",value:LinkSavedPeer(name:peer.name,key:request.key,wired:request.wired)) }
++                        if request.remember {
++                            do {
++                                if request.privateVPN {
++                                    try LinkPairingStore.shared.save("viewer-vpn", value: LinkSavedVPNPeer(address: request.host, key: request.key))
++                                } else if let peer = request.peer {
++                                    try LinkPairingStore.shared.save("viewer", value: LinkSavedPeer(name: peer.name, key: request.key, wired: request.wired))
++                                }
++                            }
 +                            catch { self.status="Connected. "+error.localizedDescription }
 +                        }
 +                        if self.wantsMirror && self.mirrorSupported { channel?.sendControl(LinkControl(type:"mirror",x:self.mirrorHz,down:true)) }
@@ -21188,7 +21311,7 @@ index 07cd331..20faed7 100644
 -        if let peer { transport.connect(peer: peer, key: secret, wired: wired) }
 -        else { transport.connect(host: host.trimmingCharacters(in: .whitespacesAndNewlines), key: secret, wired: wired, port: port) }
 +        if let peer=request.peer { channel.connect(peer:peer,key:request.key,wired:request.wired) }
-+        else { channel.connect(host:request.host,key:request.key,wired:request.wired,port:request.port) }
++        else { channel.connect(host:request.host,key:request.key,wired:request.wired,port:request.port,privateVPN:request.privateVPN) }
 +    }
 +    private func connectionLost(_ reason:String,generation g:UUID) {
 +        guard generation==g,request != nil else { return }
@@ -21212,7 +21335,8 @@ index 07cd331..20faed7 100644
 +        else { retryTask?.cancel();retryTask=nil;clearConnection();status="Connection paused; returning reconnects automatically." }
 +    }
 +    func setMirror(_ enabled:Bool,hz:Int = 60) {
-+        wantsMirror=enabled;mirrorHz=[30,60,120].contains(hz) ? hz : 60
++        wantsMirror=enabled
++        mirrorHz = request?.privateVPN == true ? LinkPrivateVPN.mirrorHz : ([30,60,120].contains(hz) ? hz : 60)
 +        guard ready,mirrorSupported else { return }
 +        if !enabled { videoActive=false;decodeWorker.stop();decodeGeneration=UUID() }
 +        send(LinkControl(type:"mirror",x:mirrorHz,down:enabled))
@@ -21232,10 +21356,15 @@ index 07cd331..20faed7 100644
      }
  }
 diff --git a/ios/Henge/Link/LinkTransport.swift b/ios/Henge/Link/LinkTransport.swift
-index ab4d4d8..14e6d1a 100644
+index ab4d4d8..9839dea 100644
 --- a/ios/Henge/Link/LinkTransport.swift
 +++ b/ios/Henge/Link/LinkTransport.swift
-@@ -7,7 +7,15 @@ import Security
+@@ -3,11 +3,19 @@ import Network
+ import Security
+ 
+ /// One authenticated TLS 1.2 AEAD peer. A random 256-bit PSK is entered out of band.
+-/// All mutable connection state belongs to queue. Local Bonjour is an address hint only; no cloud or guest NAT.
++/// All mutable connection state belongs to queue. Local Bonjour provides address hints.
  final class LinkTransport {
      let queue = DispatchQueue(label: "henge.link.transport", qos: .userInitiated)
      private let callbackLock = NSLock()
@@ -21260,17 +21389,123 @@ index ab4d4d8..14e6d1a 100644
      private var controlWindow: TimeInterval = 0
      private var controlCount = 0
      static let port: UInt16 = 49173
-@@ -134,6 +144,7 @@ final class LinkTransport {
+@@ -43,7 +53,7 @@ final class LinkTransport {
+         guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { throw LinkError.invalid("Cannot create pairing key") }
+         return Data(bytes).base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+     }
+-    static func parameters(key: String, wired: Bool) throws -> NWParameters {
++    static func parameters(key: String, wired: Bool, privateVPN: Bool = false) throws -> NWParameters {
+         guard key.count == 43, let bytes = Data(base64Encoded: key.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/") + "="), bytes.count == 32 else { throw LinkError.invalid("Pairing key must be 43 characters") }
+         let tls = NWProtocolTLS.Options()
+         // Network.framework's external-PSK path uses the explicit TLS 1.2
+@@ -59,12 +69,12 @@ final class LinkTransport {
+         let tcp = NWProtocolTCP.Options(); tcp.noDelay = true; tcp.connectionTimeout = 10
+         let parameters = NWParameters(tls: tls, tcp: tcp)
+         if wired { parameters.requiredInterfaceType = .wiredEthernet }
+-        parameters.prohibitedInterfaceTypes = [.cellular]
++        if !privateVPN { parameters.prohibitedInterfaceTypes = [.cellular] }
+         parameters.includePeerToPeer = false
+         parameters.allowLocalEndpointReuse = true
+         return parameters
+     }
+-    func listen(key: String, wired: Bool, port: UInt16 = 49173, serviceName: String? = nil) {
++    func listen(key: String, wired: Bool, port: UInt16 = 49173, serviceName: String? = nil, vpnAddress: String? = nil) {
+         queue.async { [self] in
+             // Cancellation is asynchronous. Fence and fully close the old
+             // listener before rebinding, especially after a rejected handshake.
+@@ -73,7 +83,7 @@ final class LinkTransport {
+             var started = false
+             let start = { [self] in
+                 guard generation == g, !started else { return }; started = true
+-                startListener(key: key, wired: wired, port: port, serviceName: serviceName)
++                startListener(key: key, wired: wired, port: port, serviceName: serviceName, vpnAddress: vpnAddress)
+             }
+             if let previous {
+                 previous.newConnectionHandler = { $0.cancel() }
+@@ -87,39 +97,55 @@ final class LinkTransport {
+             }
          }
      }
-     private func attach(_ c: NWConnection, wired: Bool) {
+-    private func startListener(key: String, wired: Bool, port: UInt16, serviceName: String?) {
++    private func startListener(key: String, wired: Bool, port: UInt16, serviceName: String?, vpnAddress: String?) {
+         do {
+-            let l = try NWListener(using: Self.parameters(key: key, wired: wired), on: port == 0 ? .any : NWEndpoint.Port(rawValue: port)!)
+-            if let serviceName {
++            let parameters = try Self.parameters(key: key, wired: wired, privateVPN: vpnAddress != nil)
++            let l: NWListener
++            if let vpnAddress {
++                guard !wired, LinkPrivateVPN.accepts(vpnAddress), let address = IPv4Address(vpnAddress),
++                      let vpnPort = NWEndpoint.Port(rawValue: LinkPrivateVPN.port) else {
++                    throw LinkError.invalid("Enter this iPad’s Tailscale IPv4 address.")
++                }
++                parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(address), port: vpnPort)
++                l = try NWListener(using: parameters)
++            } else {
++                l = try NWListener(using: parameters, on: port == 0 ? .any : NWEndpoint.Port(rawValue: port)!)
++            }
++            if vpnAddress == nil, let serviceName {
+                 guard LinkDiscoveredPeer.validName(serviceName) else { throw LinkError.invalid("Invalid local service name") }
+                 l.service = NWListener.Service(name: serviceName, type: LinkDiscoveredPeer.serviceType, domain: "local.")
+             }
+             listener = l
+             l.stateUpdateHandler = { [weak self, weak l] state in
+                 guard let self, let l, self.listener === l else { return }
+-                if case .ready = state, let bound = l.port {
+-                    self.onListening?(bound.rawValue)
+-                    self.onStatus?("Listening on port \(bound.rawValue). Connect the Duo before starting macOS.", false)
++                if case .ready = state, let bound = vpnAddress != nil ? LinkPrivateVPN.port : l.port?.rawValue {
++                    self.onListening?(bound)
++                    self.onStatus?(vpnAddress == nil ? "Listening on port \(bound). Connect the Duo before starting macOS." : "Private VPN link ready. Connect from the Duo.", false)
+                 }
+                 if case .failed(let e) = state { self.fail("Listener: \(e.localizedDescription)") }
+                 if case .waiting(let e) = state { self.onStatus?("Listener waiting: \(e.localizedDescription)", false) }
+             }
+             l.newConnectionHandler = { [weak self, weak l] c in
+                 guard let self, let l, self.listener === l, self.connection == nil else { c.cancel(); return }
+-                self.attach(c, wired: wired)
++                self.attach(c, wired: wired, privateVPN: vpnAddress != nil)
+             }
+             l.start(queue: queue)
+         } catch { fail(error.localizedDescription) }
+     }
+-    func connect(host: String, key: String, wired: Bool, port: UInt16 = 49173) {
++    func connect(host: String, key: String, wired: Bool, port: UInt16 = 49173, privateVPN: Bool = false) {
+         queue.async { [self] in
+             stopNow()
+             do {
+-                guard let address = IPv4Address(host) else { throw LinkError.invalid("Enter a local IPv4 address, not a hostname or URL") }
++                guard let address = IPv4Address(host) else { throw LinkError.invalid("Enter an IPv4 address.") }
+                 let ip = [UInt8](address.rawValue)
+-                guard ip[0] == 10 || ip[0] == 127 || (ip[0] == 172 && (16...31).contains(ip[1])) || (ip[0] == 192 && ip[1] == 168) || (ip[0] == 169 && ip[1] == 254) else { throw LinkError.invalid("Use a private or link-local IPv4 address on your own network") }
+-                let c = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: try Self.parameters(key: key, wired: wired))
+-                attach(c, wired: wired)
++                if privateVPN {
++                    guard !wired, port == LinkPrivateVPN.port, LinkPrivateVPN.accepts(host) else { throw LinkError.invalid("Enter the iPad’s Tailscale IPv4 address.") }
++                } else {
++                    guard ip[0] == 10 || ip[0] == 127 || (ip[0] == 172 && (16...31).contains(ip[1])) || (ip[0] == 192 && ip[1] == 168) || (ip[0] == 169 && ip[1] == 254) else { throw LinkError.invalid("Use a private or link-local IPv4 address on your own network") }
++                }
++                guard let endpointPort = NWEndpoint.Port(rawValue: port), port != 0 else { throw LinkError.invalid("Enter a valid connection port.") }
++                let c = NWConnection(host: .ipv4(address), port: endpointPort, using: try Self.parameters(key: key, wired: wired, privateVPN: privateVPN))
++                attach(c, wired: wired, privateVPN: privateVPN)
+             } catch { fail(error.localizedDescription) }
+         }
+     }
+@@ -133,7 +159,8 @@ final class LinkTransport {
+             } catch { fail(error.localizedDescription) }
+         }
+     }
+-    private func attach(_ c: NWConnection, wired: Bool) {
++    private func attach(_ c: NWConnection, wired: Bool, privateVPN: Bool = false) {
 +        invalidateIdentity()
          connection = c; parser = LinkParser(); generation &+= 1; let g = generation
          onStatus?("Connecting securely…", false)
          c.stateUpdateHandler = { [weak self, weak c] state in
-@@ -144,17 +155,21 @@ final class LinkTransport {
+@@ -142,19 +169,23 @@ final class LinkTransport {
+             case .ready:
+                 guard !wired || c.currentPath?.usesInterfaceType(.wiredEthernet) == true else { self.fail("A wired Ethernet path is required"); return }
                  self.ready = true; self.lastReceive = ProcessInfo.processInfo.systemUptime
-                 self.onStatus?(wired ? "TLS connected over Ethernet" : "TLS connected over local network", true)
+-                self.onStatus?(wired ? "TLS connected over Ethernet" : "TLS connected over local network", true)
++                self.onStatus?(privateVPN ? "TLS connected over private VPN" : (wired ? "TLS connected over Ethernet" : "TLS connected over local network"), true)
                  self.receive(c, generation: g)
 +                self.watchdog?.cancel();self.watchdog=nil
                  let timer = DispatchSource.makeTimerSource(queue: self.queue)
@@ -21292,7 +21527,7 @@ index ab4d4d8..14e6d1a 100644
              default: break
              }
          }
-@@ -227,12 +242,19 @@ final class LinkTransport {
+@@ -227,12 +258,19 @@ final class LinkTransport {
          }
      }
      func stop() { queue.async { [self] in stopNow() } }
@@ -21317,7 +21552,7 @@ index ab4d4d8..14e6d1a 100644
      }
  }
 diff --git a/ios/Henge/Link/LinkVideo.swift b/ios/Henge/Link/LinkVideo.swift
-index f49ac55..881cb5f 100644
+index f49ac55..6ed9303 100644
 --- a/ios/Henge/Link/LinkVideo.swift
 +++ b/ios/Henge/Link/LinkVideo.swift
 @@ -8,6 +8,7 @@ import VideoToolbox
@@ -21346,7 +21581,7 @@ index f49ac55..881cb5f 100644
 +        init(_ owner: LinkEncoder, epoch: UInt64) { self.owner = owner; self.epoch = epoch }
      }
 -    init(mode: LinkMode, library: MTLLibrary? = nil, send: @escaping (Data, @escaping (Bool) -> Void) -> Void, report: @escaping (String) -> Void) throws {
-+    init(mode: LinkMode, mirrorsPrimary:Bool = false, library: MTLLibrary? = nil, requestFrame:@escaping ()->Void = {}, send: @escaping (Data, @escaping (Bool) -> Void) -> Void, report: @escaping (String) -> Void) throws {
++    init(mode: LinkMode, mirrorsPrimary:Bool = false, library: MTLLibrary? = nil, targetBitRate: Int? = nil, requestFrame:@escaping ()->Void = {}, send: @escaping (Data, @escaping (Bool) -> Void) -> Void, report: @escaping (String) -> Void) throws {
          guard #available(iOS 17.4, *) else { throw LinkError.invalid("Henge Link hardware encoding requires iOS/iPadOS 17.4 or later") }
 -        try mode.validate(); guard mode.codedWidth * mode.codedHeight <= 33_554_432 else { throw LinkError.invalid("Codec canvas exceeds the supported size") }; self.mode = mode; self.send = send; self.report = report
 +        try mode.validate(); guard mode.codedWidth * mode.codedHeight <= 33_554_432 else { throw LinkError.invalid("Codec canvas exceeds the supported size") }; self.mode = mode;self.mirrorsPrimary=mirrorsPrimary;self.requestFrame=requestFrame; self.send = send; self.report = report
@@ -21362,7 +21597,27 @@ index f49ac55..881cb5f 100644
                  }, refcon: nil, compressionSessionOut: &candidate)
              guard status == noErr, let candidate else { continue }
              func set(_ key: CFString, _ value: CFTypeRef) -> Bool {
-@@ -89,12 +95,26 @@ final class LinkEncoder {
+@@ -73,10 +79,18 @@ final class LinkEncoder {
+                 if status != noErr { report("encoder property \(key) unavailable: \(status)") }
+                 return status == noErr
+             }
++            let rateControl: Bool
++            if let targetBitRate {
++                rateControl = set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: targetBitRate))
++            } else if lowLatency {
++                rateControl = set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: max(12_000_000, Int(Double(mode.width * mode.height * mode.hz) * 0.35))))
++            } else {
++                rateControl = set(kVTCompressionPropertyKey_Quality, NSNumber(value: 0.9))
++            }
+             let okay = set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue) && set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
+                 && set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: mode.hz))
+                 && set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: mode.hz * 2))
+-                && (lowLatency ? set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: max(12_000_000, Int(Double(mode.width * mode.height * mode.hz) * 0.35)))) : set(kVTCompressionPropertyKey_Quality, NSNumber(value: 0.9)))
++                && rateControl
+                 && set(kVTCompressionPropertyKey_ColorPrimaries, kCMFormatDescriptionColorPrimaries_ITU_R_709_2)
+                 && set(kVTCompressionPropertyKey_TransferFunction, kCMFormatDescriptionTransferFunction_sRGB)
+                 && set(kVTCompressionPropertyKey_YCbCrMatrix, kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2)
+@@ -89,12 +103,26 @@ final class LinkEncoder {
      /// Called synchronously by the serial guest GPU worker. Commit on its queue
      /// before returning so later guest writes cannot overtake this snapshot.
      func capture(texture: MTLTexture, queue: MTLCommandQueue, halfMode: UInt32, cursorTexture: MTLTexture?, rect: SIMD4<Float>) {
@@ -21392,7 +21647,7 @@ index f49ac55..881cb5f 100644
          var pixel: CVPixelBuffer?
          let aux = [kCVPixelBufferPoolAllocationThresholdKey as String: 3] as CFDictionary
          guard CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool, aux, &pixel) == noErr, let pixel else { slots.signal(); return }
-@@ -121,24 +141,26 @@ final class LinkEncoder {
+@@ -121,24 +149,26 @@ final class LinkEncoder {
              e.setRenderPipelineState(cursor); e.setVertexBytes(&r, length: 16, index: 0)
              e.setFragmentTexture(cursorTexture, index: 0); e.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
          }
@@ -21424,7 +21679,7 @@ index f49ac55..881cb5f 100644
          guard status == noErr, let sample, CMSampleBufferDataIsReady(sample), let format = CMSampleBufferGetFormatDescription(sample), let block = CMSampleBufferGetDataBuffer(sample) else { slots.signal(); report("Hardware encoder produced no frame: \(status)"); return }
          let hevc = CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC
          var sets = [Data]()
-@@ -155,7 +177,8 @@ final class LinkEncoder {
+@@ -155,7 +185,8 @@ final class LinkEncoder {
          let copied = bytes.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!) }
          guard copied == noErr else { slots.signal(); return }
          // VT output is serialized by the encoder when reordering is disabled.
@@ -21434,7 +21689,7 @@ index f49ac55..881cb5f 100644
          guard active else { slots.signal(); return }
          do {
              let dimensions = CMVideoFormatDescriptionGetDimensions(format)
-@@ -172,8 +195,21 @@ final class LinkEncoder {
+@@ -172,8 +203,21 @@ final class LinkEncoder {
      func acknowledge(_ sequence: UInt64) {
          if let receipt = credits.consumed(sequence) { retire(receipt) }
      }
@@ -21457,16 +21712,21 @@ index f49ac55..881cb5f 100644
          lock.lock(); acknowledged &+= 1; let count = acknowledged
          worstRoundTripMS = max(worstRoundTripMS, receipt.seconds * 1000)
 diff --git a/ios/Henge/Link/LinkViews.swift b/ios/Henge/Link/LinkViews.swift
-index 1bc238f..ccdbb33 100644
+index 1bc238f..fcc3056 100644
 --- a/ios/Henge/Link/LinkViews.swift
 +++ b/ios/Henge/Link/LinkViews.swift
-@@ -47,7 +47,13 @@ struct LinkHostView: View {
+@@ -47,7 +47,18 @@ struct LinkHostView: View {
  }
  
  struct LinkViewerView: View {
 +    @AppStorage("henge.link.controlsOnly") private var inputOnly = false
 +    @State private var inputTab = 0
 +    @AppStorage("henge.link.controllerVideo") private var controllerVideo=false
++    @AppStorage("henge.link.viewerUsesVPN") private var privateVPN = false
++    @State private var vpnVideo = false
++    @State private var vpnAddress = ""
++    @State private var vpnKey = ""
++    @State private var rememberVPN = false
 +    @State private var fillVideo=false
 +    @AppStorage("henge.link.controllerVideoHz") private var controllerVideoHz=60
      @StateObject private var viewer = LinkViewerService()
@@ -21474,37 +21734,51 @@ index 1bc238f..ccdbb33 100644
      @StateObject private var discovery = LinkDiscovery()
      @State private var selected: LinkDiscoveredPeer?
      @State private var saved: LinkSavedPeer?
-@@ -61,13 +67,28 @@ struct LinkViewerView: View {
+@@ -61,13 +72,42 @@ struct LinkViewerView: View {
      @State private var wired = false
      @State private var connecting = false
      @State private var controlsHidden = false
 +    @State private var showGamepadSettings = false
      let exit: () -> Void
++    private var remoteMode: Bool { inputOnly && privateVPN }
++    private var videoEnabled: Bool { remoteMode ? vpnVideo : controllerVideo }
++    private var canConnect: Bool {
++        if remoteMode {
++            return vpnKey.count == 43 && LinkPrivateVPN.accepts(vpnAddress.trimmingCharacters(in: .whitespacesAndNewlines))
++        }
++        return key.count == 43 && (manual ? (!host.isEmpty && (UInt16(portText) ?? 0) > 0) : selected != nil)
++    }
      var body: some View {
          GeometryReader { geometry in
              ZStack(alignment: .top) {
                  Color.black.ignoresSafeArea()
                  if connecting {
 -                    LinkVideoSurface(viewer: viewer, toggleControls: toggleControls)
-+                    if inputOnly && controllerVideo && viewer.mirrorSupported {
++                    if inputOnly && videoEnabled && viewer.mirrorSupported {
 +                        WirelessVideoControls(isDuo:HostScheduling.isDuo,tuning:gamepadPreferences.value,acceptsInput:viewer.ready,
 +                            sendPad:{viewer.send(LinkControl(type:"gamepad",gamepad:$0))},sendPointer:{viewer.send($0)},
 +                            video:LinkVideoSurface(viewer:viewer,toggleControls:toggleControls,fill:fillVideo,hz:viewer.videoHz),toolbar:controllerVideoToolbar)
 +                            .overlay { if !viewer.videoActive { VStack { Text(viewer.status);Button("Retry video") { viewer.setMirror(true,hz:controllerVideoHz) } }.padding().background(.ultraThinMaterial,in:RoundedRectangle(cornerRadius:16)) } }
 +                    } else if inputOnly {
-+                        WirelessControlsPanel(status:viewer.status,tuning:gamepadPreferences.value,isDuo:HostScheduling.isDuo,acceptsInput:viewer.ready,supportsVideo:viewer.mirrorSupported,enableVideo:{controllerVideo=true;viewer.setMirror(true,hz:controllerVideoHz)},
++                        WirelessControlsPanel(status:viewer.status,tuning:gamepadPreferences.value,isDuo:HostScheduling.isDuo,acceptsInput:viewer.ready,supportsVideo:viewer.mirrorSupported,enableVideo:{setVideo(true)},
 +                            mode:Binding(get:{ WirelessControlMode(rawValue:inputTab) ?? .touchpad },set:{inputTab=$0.rawValue}),
 +                            disconnect:{viewer.send(LinkControl(type:"release"));viewer.disconnect();connecting=false},
 +                            configure:{viewer.send(LinkControl(type:"release"));showGamepadSettings=true},
 +                            sendPad:{viewer.send(LinkControl(type:"gamepad",gamepad:$0))},sendPointer:{viewer.send($0)}) { mode in
 +                                LinkInputSurface(viewer:viewer,keyboard:mode == .keyboard)
 +                            }
++                            .safeAreaInset(edge: .bottom) {
++                                if remoteMode && !viewer.ready {
++                                    Button("Reconnect") { viewer.reconnect() }
++                                        .buttonStyle(.borderedProminent).padding(.bottom, 8)
++                                }
++                            }
 +                    } else {
 +                    LinkVideoSurface(viewer:viewer,toggleControls:toggleControls,hz:viewer.videoHz)
                          .ignoresSafeArea()
                          .accessibilityLabel("Extended Mac display")
                          .accessibilityHint("Three-finger tap hides or shows the display controls.")
-@@ -81,11 +102,12 @@ struct LinkViewerView: View {
+@@ -81,66 +121,53 @@ struct LinkViewerView: View {
                                  .accessibilityLabel("Hide display controls. Three-finger tap to show again.")
                          }.padding(8).background(.ultraThinMaterial)
                      }
@@ -21514,27 +21788,63 @@ index 1bc238f..ccdbb33 100644
                          Form {
 -                            Section("Henge Link · display viewer") {
 -                                Text("The Mac runs on your iPad. This device receives its second monitor and sends trackpad and hardware keyboard input. No Mac installation or JIT is required here.")
+-                                Text("Nearby iPads").font(.headline)
+-                                Text(discovery.status).font(.footnote)
+-                                ForEach(discovery.peers) { peer in
+-                                    Button {
+-                                        selected = peer; manual = false
+-                                        key = saved?.name == peer.name ? saved!.key : ""
+-                                    } label: {
+-                                        HStack { Text(peer.title); Spacer(); if selected?.id == peer.id { Image(systemName: "checkmark") } }
+-                                    }
+-                                }
+-                                Toggle("Use manual IP and port", isOn: $manual)
+-                                if manual {
+-                                    TextField("iPad local IP, for example 192.168.50.1", text: $host).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+-                                    TextField("Connection port shown on iPad", text: $portText).keyboardType(.numberPad)
 +                            Section(inputOnly ? "Henge Link · wireless controls" : "Henge Link · display viewer") {
 +                                Text(inputOnly ? "Open Wireless Controls from the running Mac’s three-finger menu and create a key. This device sends keyboard, touchpad and gamepad input. Optional video mirrors the main Mac screen without adding a monitor. No Mac installation or JIT runs here." : "The Mac runs on your iPad. This device receives its second monitor and sends trackpad and hardware keyboard input. No Mac installation or JIT is required here.")
-                                 Text("Nearby iPads").font(.headline)
-                                 Text(discovery.status).font(.footnote)
-                                 ForEach(discovery.peers) { peer in
-@@ -113,7 +135,7 @@ struct LinkViewerView: View {
-                                 if !pairingNotice.isEmpty { Text(pairingNotice).font(.footnote) }
-                                 Toggle("Wired Ethernet only", isOn: $wired)
-                                 Text(wired ? "Use compatible Ethernet adapters, not a plain USB-C cable. Both IP addresses must be on the same local subnet." : "Use the iPad's Wi-Fi IP address. Both devices must be on the same local network, with Wired Ethernet only turned off on both. A guest network may block device-to-device traffic.").font(.footnote)
++                                if inputOnly { Toggle("Connect over Tailscale", isOn: $privateVPN) }
++                                if remoteMode {
++                                    vpnPairingFields
++                                } else {
++                                    localPairingFields
+                                 }
+-                                SecureField("Pairing key from the iPad", text: $key).textInputAutocapitalization(.never).autocorrectionDisabled()
+-                                Toggle("Remember this iPad in Keychain", isOn: $remember).disabled(manual)
+-                                Text("Enable Remember pairing on the iPad too. After a successful first connection, choose this saved iPad and tap Connect next time. Only the key is retained securely; its current address and port are discovered again.").font(.footnote)
+-                                if saved != nil {
+-                                    Button("Forget saved iPad", role: .destructive) {
+-                                        do { try LinkPairingStore.shared.forget("viewer"); saved = nil; key = ""; remember = false; pairingNotice = "Saved pairing removed." }
+-                                        catch { pairingNotice = error.localizedDescription }
+-                                    }
+-                                }
+-                                if !pairingNotice.isEmpty { Text(pairingNotice).font(.footnote) }
+-                                Toggle("Wired Ethernet only", isOn: $wired)
+-                                Text(wired ? "Use compatible Ethernet adapters, not a plain USB-C cable. Both IP addresses must be on the same local subnet." : "Use the iPad's Wi-Fi IP address. Both devices must be on the same local network, with Wired Ethernet only turned off on both. A guest network may block device-to-device traffic.").font(.footnote)
 -                                Button("Connect as second display") {
 +                                Button(inputOnly ? "Connect wireless controls" : "Connect as second display") {
                                      let screen = UIScreen.main
                                      let scale = screen.nativeScale
                                      let w = Int((geometry.size.width * scale).rounded()), h = Int((geometry.size.height * scale).rounded())
-@@ -123,19 +145,20 @@ struct LinkViewerView: View {
-                                     let port = UInt16(portText) ?? 0
-                                     guard peer != nil || (manual && !host.isEmpty && port > 0) else { return }
+                                     // Native phone density; the guest selects HiDPI using physical size.
+                                     let mode = LinkMode(width: w, height: h, widthMM: max(1, Int(Double(w) / 460 * 25.4)), heightMM: max(1, Int(Double(h) / 460 * 25.4)), hz: min(120, screen.maximumFramesPerSecond))
+-                                    let peer = manual ? nil : selected
+-                                    let port = UInt16(portText) ?? 0
+-                                    guard peer != nil || (manual && !host.isEmpty && port > 0) else { return }
++                                    guard canConnect else { return }
++                                    let peer = remoteMode || manual ? nil : selected
++                                    let port = remoteMode ? LinkPrivateVPN.port : (UInt16(portText) ?? 0)
                                      discovery.stop(); controlsHidden = false
 -                                    viewer.connect(host: host, port: port, key: key, wired: wired, mode: mode, peer: peer, remember: remember && !manual); connecting = true
-+                                    viewer.connect(host: host, port: port, key: key, wired: wired, mode: mode, peer: peer, remember: remember && !manual,inputOnly:inputOnly); connecting = true
-                                 }.disabled(key.count != 43 || (manual ? (host.isEmpty || UInt16(portText) == nil || UInt16(portText) == 0) : selected == nil))
+-                                }.disabled(key.count != 43 || (manual ? (host.isEmpty || UInt16(portText) == nil || UInt16(portText) == 0) : selected == nil))
++                                    vpnVideo = false
++                                    viewer.connect(host: remoteMode ? vpnAddress : host, port: port, key: remoteMode ? vpnKey : key,
++                                                   wired: !remoteMode && wired, mode: mode, peer: peer,
++                                                   remember: remoteMode ? rememberVPN : remember && !manual,
++                                                   inputOnly: inputOnly, privateVPN: remoteMode)
++                                    connecting = true
++                                }.disabled(!canConnect)
                                  Text(viewer.status)
                              }
                              Section("Main desktop on iPad") { LinkMainDesktopGuide() }
@@ -21551,13 +21861,32 @@ index 1bc238f..ccdbb33 100644
          .onAppear {
              do { saved = try LinkPairingStore.shared.load("viewer", as: LinkSavedPeer.self) }
              catch { pairingNotice = error.localizedDescription }
-@@ -162,19 +185,40 @@ struct LinkViewerView: View {
+             if let saved { wired = saved.wired; remember = true }
+-            discovery.start(wired: wired)
++            loadVPNPairing()
++            updateDiscovery()
+         }
+         .onChange(of: discovery.peers) { _, peers in
+             if let selected, !peers.contains(where: { $0.id == selected.id }) { self.selected = nil }
+@@ -154,27 +181,110 @@ struct LinkViewerView: View {
+                 catch { pairingNotice = error.localizedDescription }
+             }
+         }
+-        .onChange(of: wired) { _, _ in if !connecting { selected = nil; discovery.start(wired: wired) } }
++        .onChange(of: wired) { _, _ in if !connecting { selected = nil; updateDiscovery() } }
++        .onChange(of: remoteMode) { _, _ in if !connecting { updateDiscovery() } }
+         .onChange(of: connecting) { _, value in
+             if !value, phase == .active {
+                 saved = (try? LinkPairingStore.shared.load("viewer", as: LinkSavedPeer.self)) ?? saved
+-                discovery.start(wired: wired)
++                loadVPNPairing()
++                updateDiscovery()
              }
          }
          .onChange(of: viewer.ready) { _, ready in
 +            if ready {
 +                viewer.send(LinkControl(type:"visibility",visible:phase == .active))
-+                if inputOnly { viewer.setMirror(controllerVideo,hz:controllerVideoHz) }
++                if inputOnly { viewer.setMirror(videoEnabled,hz:controllerVideoHz) }
 +            }
              UIApplication.shared.isIdleTimerDisabled = ready
              // Reveal a real connection failure rather than leaving a hidden
@@ -21571,19 +21900,79 @@ index 1bc238f..ccdbb33 100644
 -            else if phase == .active, !connecting { discovery.start(wired: wired) }
 +            viewer.send(LinkControl(type: "visibility", visible: phase == .active))
 +            if phase == .background { viewer.setForeground(false);discovery.stop();UIApplication.shared.isIdleTimerDisabled=false }
-+            else if phase == .active { viewer.setForeground(true);if !connecting { discovery.start(wired:wired) } }
++            else if phase == .active { viewer.setForeground(true);if !connecting { updateDiscovery() } }
              else if phase == .inactive { viewer.send(LinkControl(type: "release")) }
          }
          .onDisappear { discovery.stop(); viewer.disconnect(); UIApplication.shared.isIdleTimerDisabled = false }
      }
++    private func updateDiscovery() {
++        if remoteMode { discovery.stop() } else { discovery.start(wired: wired) }
++    }
++    private func loadVPNPairing() {
++        do {
++            if let savedVPN = try LinkPairingStore.shared.load("viewer-vpn", as: LinkSavedVPNPeer.self),
++               LinkPrivateVPN.accepts(savedVPN.address) {
++                vpnAddress = savedVPN.address; vpnKey = savedVPN.key; rememberVPN = true
++            }
++        } catch { pairingNotice = error.localizedDescription }
++    }
++    @ViewBuilder private var localPairingFields: some View {
++        Text("Nearby iPads").font(.headline)
++        Text(discovery.status).font(.footnote)
++        ForEach(discovery.peers) { peer in
++            Button {
++                selected = peer; manual = false
++                key = saved?.name == peer.name ? saved!.key : ""
++            } label: {
++                HStack { Text(peer.title); Spacer(); if selected?.id == peer.id { Image(systemName: "checkmark") } }
++            }
++        }
++        Toggle("Use manual IP and port", isOn: $manual)
++        if manual {
++            TextField("iPad local IP, for example 192.168.50.1", text: $host).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
++            TextField("Connection port shown on iPad", text: $portText).keyboardType(.numberPad)
++        }
++        SecureField("Pairing key from the iPad", text: $key).textInputAutocapitalization(.never).autocorrectionDisabled()
++        Toggle("Remember this iPad in Keychain", isOn: $remember).disabled(manual)
++        Text("Enable Remember pairing on the iPad too. After a successful first connection, choose this saved iPad and tap Connect next time. Only the key is retained securely; its current address and port are discovered again.").font(.footnote)
++        if saved != nil {
++            Button("Forget saved iPad", role: .destructive) {
++                do { try LinkPairingStore.shared.forget("viewer"); saved = nil; key = ""; remember = false; pairingNotice = "Saved pairing removed." }
++                catch { pairingNotice = error.localizedDescription }
++            }
++        }
++        if !pairingNotice.isEmpty { Text(pairingNotice).font(.footnote) }
++        Toggle("Wired Ethernet only", isOn: $wired)
++        Text(wired ? "Use compatible Ethernet adapters, not a plain USB-C cable. Both IP addresses must be on the same local subnet." : "Use the iPad's Wi-Fi IP address. Both devices must be on the same local network, with Wired Ethernet only turned off on both. A guest network may block device-to-device traffic.").font(.footnote)
++    }
++    @ViewBuilder private var vpnPairingFields: some View {
++        Text("Connect both devices to your Tailscale network. Enter the iPad’s Tailscale IPv4 address and the key from its Wireless Controls panel. Video starts off and can be turned on after connecting.").font(.footnote)
++        TextField("iPad’s Tailscale IPv4 address", text: $vpnAddress)
++            .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.numbersAndPunctuation)
++        SecureField("Pairing key from the iPad", text: $vpnKey)
++            .textInputAutocapitalization(.never).autocorrectionDisabled()
++        Toggle("Remember remote iPad in Keychain", isOn: $rememberVPN)
++            .onChange(of: rememberVPN) { _, value in
++                if !value {
++                    do { try LinkPairingStore.shared.forget("viewer-vpn") }
++                    catch { pairingNotice = error.localizedDescription }
++                }
++            }
++        if !pairingNotice.isEmpty { Text(pairingNotice).font(.footnote) }
++    }
++    private func setVideo(_ enabled: Bool) {
++        if remoteMode { vpnVideo = enabled } else { controllerVideo = enabled }
++        viewer.setMirror(enabled, hz: controllerVideoHz)
++    }
 +    private var controllerVideoToolbar:some View {
 +        HStack(spacing:8) {
-+            Button { controllerVideo=false;viewer.setMirror(false) } label: { Image(systemName:"video.slash").frame(width:36,height:36) }.accessibilityLabel("Video off")
++            Button { setVideo(false) } label: { Image(systemName:"video.slash").frame(width:36,height:36) }.accessibilityLabel("Video off")
 +            Spacer(minLength:0)
 +            Button { fillVideo.toggle() } label: { Image(systemName:fillVideo ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right").frame(width:36,height:36) }.accessibilityLabel(fillVideo ? "Fit video" : "Fill video")
-+            Menu {
++            if remoteMode { Text("30 Hz").font(.caption).monospacedDigit() }
++            else { Menu {
 +                Picker("Video refresh",selection:$controllerVideoHz) { Text("60 Hz").tag(60);Text("120 Hz · ProMotion").tag(120) }
-+            } label: { Text("\(controllerVideoHz)").monospacedDigit().frame(width:36,height:36) }.accessibilityLabel("Video refresh rate")
++            } label: { Text("\(controllerVideoHz)").monospacedDigit().frame(width:36,height:36) }.accessibilityLabel("Video refresh rate") }
 +            Button { viewer.send(LinkControl(type:"release"));showGamepadSettings=true } label: { Image(systemName:"slider.horizontal.3").frame(width:36,height:36) }.accessibilityLabel("Controller sensitivity and layout settings")
 +            Button { viewer.reconnect() } label: { Image(systemName:"arrow.clockwise").frame(width:36,height:36) }.accessibilityLabel("Reconnect")
 +            Button { viewer.disconnect();connecting=false } label: { Image(systemName:"xmark.circle.fill").frame(width:36,height:36) }.accessibilityLabel("Disconnect wireless controls")
@@ -21594,7 +21983,7 @@ index 1bc238f..ccdbb33 100644
      private func toggleControls() {
          controlsHidden.toggle()
          HengeLog.log("link-viewer", "viewer controls hidden=\(controlsHidden); native viewport and video mode unchanged")
-@@ -194,49 +238,47 @@ private struct LinkMainDesktopGuide: View {
+@@ -194,49 +304,47 @@ private struct LinkMainDesktopGuide: View {
  private struct LinkVideoSurface: UIViewRepresentable {
      let viewer: LinkViewerService
      let toggleControls: () -> Void
@@ -21614,12 +22003,12 @@ index 1bc238f..ccdbb33 100644
 -    static func dismantleUIView(_ view: LinkVideoView, coordinator: ()) { view.send = nil; view.toggleControls = nil; view.videoLayer.flushAndRemoveImage() }
 +    func updateUIView(_ view: LinkVideoView, context: Context) { view.toggleControls=toggleControls;view.maximumRate=hz;view.videoLayer.videoGravity=fill ? .resizeAspectFill : .resizeAspect }
 +    static func dismantleUIView(_ view: LinkVideoView, coordinator: ()) { view.send = nil; view.toggleControls = nil; view.clearVideo() }
- }
--private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
++}
 +private final class LinkVideoPulse:NSObject {
 +    weak var owner:LinkVideoView?
 +    @objc func tick(_ display:CADisplayLink) { owner?.presentLatest() }
-+}
+ }
+-private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
 +private final class LinkVideoView: LinkInputView {
 +    var maximumRate=60
 +    private var latest:CVPixelBuffer?
@@ -21675,7 +22064,7 @@ index 1bc238f..ccdbb33 100644
          var format: CMVideoFormatDescription?, sample: CMSampleBuffer?
          guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixel, formatDescriptionOut: &format) == noErr, let format else { return }
          var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
-@@ -245,25 +287,41 @@ private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
+@@ -245,25 +353,59 @@ private final class LinkVideoView: UIView, UIGestureRecognizerDelegate {
          if videoLayer.status == .failed { videoLayer.flush() }
          if videoLayer.isReadyForMoreMediaData { videoLayer.enqueue(sample) }
      }
@@ -21714,23 +22103,41 @@ index 1bc238f..ccdbb33 100644
 +    @ObservedObject private var link = LinkHostService.shared
 +    @Environment(\.dismiss) private var dismiss
 +    @State private var remember = false
++    @State private var privateVPN = false
++    @AppStorage("henge.link.hostVPNAddress") private var vpnAddress = ""
++    private var listening: Bool { !link.key.isEmpty }
 +    var body: some View {
 +        NavigationStack {
 +            Form {
 +                Section("Another phone as your controls") {
-+                    Text("On the other phone, open Henge → Use as wireless keyboard or gamepad. Both devices must be on the same local network. Controls start with video off. The viewer can enable a live mirror of the main screen; it does not add a guest monitor.")
-+                    Toggle("Remember pairing in Keychain",isOn:$remember).disabled(link.connected)
-+                    Button("Create secure pairing key") { link.listen(wired:false,remember:remember) }.disabled(link.connected || link.active)
++                    Text("On the other phone, open Henge → Use as wireless keyboard or gamepad. Controls start with video off. The viewer can mirror the main Mac screen.")
++                    Toggle("Allow remote access over Tailscale", isOn: $privateVPN).disabled(listening)
++                    if privateVPN {
++                        TextField("This iPad’s Tailscale IPv4 address", text: $vpnAddress)
++                            .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.numbersAndPunctuation)
++                            .disabled(listening)
++                        Text("Keep Tailscale connected and Henge open on this iPad. The Duo can connect from your Tailscale network using Wi-Fi or mobile data.").font(.footnote)
++                    } else {
++                        Text("Connect both devices to the same local network.").font(.footnote)
++                    }
++                    Toggle("Remember pairing in Keychain",isOn:$remember).disabled(listening)
++                    Button(privateVPN ? "Start private remote access" : "Create secure pairing key") {
++                        link.listen(wired:false,remember:remember,vpnAddress:privateVPN ? vpnAddress : nil)
++                    }.disabled(listening || link.active || (privateVPN && !LinkPrivateVPN.accepts(vpnAddress.trimmingCharacters(in:.whitespacesAndNewlines))))
 +                    if !link.key.isEmpty {
 +                        Text(link.key).font(.system(.footnote,design:.monospaced)).textSelection(.enabled)
 +                        Button("Copy key") { UIPasteboard.general.setItems([[UIPasteboard.typeAutomatic:link.key]],options:[.localOnly:true,.expirationDate:Date().addingTimeInterval(300)]) }
 +                    }
 +                    if let port = link.port { Text("Manual port: \(port)") }
 +                    Text(link.status)
-+                    Button("Disconnect controls",role:.destructive) { link.stop() }.disabled(!link.controlOnly)
++                    Button("Stop listening and disconnect",role:.destructive) { link.stop() }.disabled(!listening)
++                    if privateVPN && !listening {
++                        Button("Revoke saved remote key", role: .destructive) { link.forgetPairing(privateVPN: true) }
++                    }
 +                }
 +                Section { Text("Anyone with the pairing key can control this Mac while listening. HID controller recognition depends on macOS and the game. Keyboard mapping provides WASD, Space, mouse look and trigger clicks as a separate fallback.").font(.footnote) }
 +            }.navigationTitle("Wireless Controls")
++                .onAppear { if listening { privateVPN = link.vpnAddress != nil } }
 +                .toolbar { ToolbarItem(placement:.confirmationAction) { Button("Done") { dismiss() } } }
 +        }
      }
@@ -27190,6 +27597,28 @@ index 0000000..039b4ee
 +void test_control_paused(int enabled);
 +
 +void test_control_frame(void *texture,void *queue);
+diff --git a/tests/link_pairing_checks.swift b/tests/link_pairing_checks.swift
+index 1c785e2..80d1d2c 100644
+--- a/tests/link_pairing_checks.swift
++++ b/tests/link_pairing_checks.swift
+@@ -12,11 +12,16 @@ func linkPairingChecks() async throws {
+     require(LinkDiscoveredPeer(endpoint: .hostPort(host: "127.0.0.1", port: 1)) == nil, "Arbitrary endpoint accepted as discovered")
+     let store = LinkPairingStore(service: "henge.link.test." + UUID().uuidString)
+     do {
+-        defer { try? store.forget("host"); try? store.forget("viewer") }
++        defer { try? store.forget("host"); try? store.forget("viewer"); try? store.forget("host-vpn"); try? store.forget("viewer-vpn") }
+         let first = try store.host(remember: true), second = try store.host(remember: true)
+         require(first.name == second.name && first.key == second.key, "Saved host key rotated")
+         let ephemeral = try store.host(remember: false)
+         require(ephemeral.key != first.key && ephemeral.name != first.name, "Nonremembered pairing reused saved secret")
++        let vpn = try store.host(remember: true, privateVPN: true)
++        require(vpn.key != first.key, "VPN router reused the LAN secret")
++        try store.save("viewer-vpn", value: LinkSavedVPNPeer(address: "100.90.30.12", key: vpn.key))
++        let remote = try store.load("viewer-vpn", as: LinkSavedVPNPeer.self)
++        require(remote?.key == vpn.key && remote?.address == "100.90.30.12", "VPN pairing roundtrip")
+         try store.save("viewer", value: LinkSavedPeer(name: first.name, key: first.key, wired: false))
+         let loaded = try store.load("viewer", as: LinkSavedPeer.self)
+         require(loaded?.key == first.key, "Saved viewer key changed")
 diff --git a/tests/link_ui_fixture.swift b/tests/link_ui_fixture.swift
 index c682d62..8d8dc78 100644
 --- a/tests/link_ui_fixture.swift
@@ -31575,10 +32004,16 @@ index 0000000..689f952
 +    hv_machine_free(&machine);free(memory);pthread_cond_destroy(&ready_cv);pthread_mutex_destroy(&ready_mu);
 +}
 diff --git a/tests/test_link.swift b/tests/test_link.swift
-index 1ac8d90..1876135 100644
+index 1ac8d90..7c8998e 100644
 --- a/tests/test_link.swift
 +++ b/tests/test_link.swift
-@@ -10,6 +10,15 @@ func require(_ value: @autoclosure () -> Bool, _ text: String) {
+@@ -1,4 +1,5 @@
+ import Foundation
++import Network
+ import Darwin
+ import Metal
+ import CoreVideo
+@@ -10,6 +11,15 @@ func require(_ value: @autoclosure () -> Bool, _ text: String) {
  func mustReject(_ operation: () throws -> Void) {
      do { try operation(); fatalError("Invalid peer data accepted") } catch {}
  }
@@ -31594,7 +32029,7 @@ index 1ac8d90..1876135 100644
  @main struct LinkChecks {
      static func main() {
          setbuf(stdout, nil)
-@@ -22,8 +31,47 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -22,8 +32,47 @@ func mustReject(_ operation: () throws -> Void) {
          dispatchMain()
      }
      static func checks() throws {
@@ -31642,7 +32077,18 @@ index 1ac8d90..1876135 100644
          try LinkControl(type: "release").validate()
          try LinkControl(type: "videoAck", sequence: 1).validate()
          mustReject { try LinkControl(type: "videoAck", sequence: 0).validate() }
-@@ -160,8 +208,9 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -76,6 +125,10 @@ func mustReject(_ operation: () throws -> Void) {
+         let key = try LinkTransport.newKey(), server = LinkTransport(), client = LinkTransport()
+         require(key.count == 43, "Key encoding")
+         mustReject { _ = try LinkTransport.parameters(key: "short", wired: true) }
++        let local = try LinkTransport.parameters(key: key, wired: false)
++        let remote = try LinkTransport.parameters(key: key, wired: false, privateVPN: true)
++        require(local.prohibitedInterfaceTypes.contains(.cellular), "Local Link must keep its cellular restriction")
++        require(!remote.prohibitedInterfaceTypes.contains(.cellular), "Private VPN viewer must allow cellular")
+         let listening = DispatchSemaphore(value: 0), connected = DispatchSemaphore(value: 0), hello = DispatchSemaphore(value: 0), response = DispatchSemaphore(value: 0)
+         var serverPort: UInt16 = 0
+         server.onListening = { serverPort = $0; listening.signal() }
+@@ -160,8 +213,9 @@ func mustReject(_ operation: () throws -> Void) {
              return try decoder.decode(data)
          }, report: { print("worker-fixture: \($0)") })
          let generation = worker.start(mode: mode, output: { _ in })
@@ -31653,7 +32099,7 @@ index 1ac8d90..1876135 100644
              require(done.wait(timeout: .now() + 15) == .success, "Hardware decode timed out")
              require(ack.wait(timeout: .now() + 15) == .success, "Decoder ACK timed out")
          }
-@@ -181,7 +230,10 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -181,7 +235,10 @@ func mustReject(_ operation: () throws -> Void) {
          require(listening.wait(timeout: .now() + 10) == .success, "Video TLS listener")
          receiver.connect(host: "127.0.0.1", key: key, wired: false, port: port)
          require(secure.wait(timeout: .now() + 5) == .success, "Video TLS handshake")
@@ -31665,7 +32111,7 @@ index 1ac8d90..1876135 100644
          sender.onVideoAcknowledged = { [weak encoder] sequence in
              encoder?.acknowledge(sequence); ack.signal()
          }
-@@ -191,7 +243,13 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -191,7 +248,13 @@ func mustReject(_ operation: () throws -> Void) {
          var pixels = [UInt8](repeating: 0, count: mode.width * mode.height * 4)
          for i in stride(from: 0, to: pixels.count, by: 4) { pixels[i+2] = 255; pixels[i+3] = 255 }
          texture.replace(region: MTLRegionMake2D(0, 0, mode.width, mode.height), mipmapLevel: 0, withBytes: &pixels, bytesPerRow: mode.width * 4)
@@ -31680,7 +32126,7 @@ index 1ac8d90..1876135 100644
          waitFrame()
          expected = 1
          let cd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 32, height: 32, mipmapped: false)
-@@ -200,7 +258,7 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -200,7 +263,7 @@ func mustReject(_ operation: () throws -> Void) {
          var glyph = [UInt8](repeating: 0, count: 32*32*4)
          for i in stride(from: 0, to: glyph.count, by: 4) { glyph[i+1] = 255; glyph[i+3] = 255 }
          cursor.replace(region: MTLRegionMake2D(0, 0, 32, 32), mipmapLevel: 0, withBytes: &glyph, bytesPerRow: 32*4)
@@ -31689,7 +32135,7 @@ index 1ac8d90..1876135 100644
          waitFrame()
          expected = 2
          let hd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: mode.width, height: mode.height, mipmapped: false)
-@@ -209,25 +267,36 @@ func mustReject(_ operation: () throws -> Void) {
+@@ -209,25 +272,36 @@ func mustReject(_ operation: () throws -> Void) {
          var gray = [Float16](repeating: 0.5, count: mode.width*mode.height*4)
          for i in stride(from: 3, to: gray.count, by: 4) { gray[i] = 1 }
          half.replace(region: MTLRegionMake2D(0, 0, mode.width, mode.height), mipmapLevel: 0, withBytes: &gray, bytesPerRow: mode.width*8)
@@ -31846,6 +32292,29 @@ index 0000000..624db4e
 +        viewer.disconnect();host.stop()
 +        alarm(0)
 +        print("PASS production controls-only host/client over real TLS: negotiation, owned keyboard/gamepad, mapping, CPU gate, releases, disconnect; opt-in real GPU mirror encode/decode without a second monitor; foreground reconnect preserves pairing")
++    }
++}
+diff --git a/tests/test_link_private_vpn.swift b/tests/test_link_private_vpn.swift
+new file mode 100644
+index 0000000..c20d0ce
+--- /dev/null
++++ b/tests/test_link_private_vpn.swift
+@@ -0,0 +1,17 @@
++import Foundation
++
++@main
++struct LinkPrivateVPNChecks {
++    static func main() throws {
++        let allowed = ["100.64.0.1", "100.98.34.56", "100.127.255.254"]
++        let rejected = ["100.63.255.255", "100.128.0.0", "10.0.0.1", "127.0.0.1", "192.168.1.2",
++                        "8.8.8.8", "example.com", "https://100.64.0.1", "100.64.0.1:49173",
++                        "100.64.1", "100.064.0.1", "+100.64.0.1", "100.64.0.256", "100.64..1"]
++        precondition(allowed.allSatisfy(LinkPrivateVPN.accepts))
++        precondition(rejected.allSatisfy { !LinkPrivateVPN.accepts($0) })
++        precondition(LinkPrivateVPN.port != 0 && LinkPrivateVPN.videoBitRate == 2_500_000)
++        try LinkControl(type: "helloInput").validate()
++        try LinkControl(type: "mirror", x: LinkPrivateVPN.mirrorHz, down: true).validate()
++        print("PASS private VPN range boundaries, rejected public and malformed endpoints, and wire-compatible mirror")
 +    }
 +}
 diff --git a/tests/test_m4_defaults.swift b/tests/test_m4_defaults.swift

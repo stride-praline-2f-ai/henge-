@@ -101,3 +101,11 @@ check that workers honor the admitted opcode and sector.
 The attached build 124 launches started the extension and stopped before the guest boot. The longer attempt returned a RemotePairing socket reset. The supplied JIT word profiles came from earlier VM PIDs and cannot explain this attach failure.
 
 The recovery branch now probes the configured local tunnel using the existing pairing, in remembered, default, advertised and existing fallback order. Duplicate requests share one extension slot. Connection resets get one retry and the error stays on the library screen. This branch also stages resume and file operations, makes restore startup asynchronous, validates direct-loader headers, and reduces RAM-region probes in indirect-branch resolution.
+
+## Private VPN remote access for the Duo
+
+Wireless Controls can opt in to a Tailscale listener on the iPad. The Duo may
+then use cellular data for its existing TLS-authenticated controls and
+main-desktop stream. The host stays awake in Henge. The mobile route starts
+with video off and targets 30 fps at 2.5 Mbps when video is enabled. The LAN
+and wired routes retain their existing behavior.

@@ -145,3 +145,11 @@ Use build 123 as the physical comparison. Record guest vCPUs, RAM, Low Power Mod
 Build 125 local checks reproduced the reported connection-reset classification, stale and duplicate RemotePairing candidates, fallback candidate selection and bounded probes. Fault fixtures exercised failed resume followed by retry, installer worker allocation failure, a descendant shared-folder MOVE, packed import failure, replacement export failure, and HTTP 416 followed by a complete 200. Full iOS validation and physical LocalDevVPN attach are separate checks. Packaging requires a successful exact-source native and iOS Release run.
 
 The older build 122 capture attached and detached successfully through the same advertised RemotePairing port and reached the guest. Build 124 reported a reset before attach. The logs therefore identify a connection-stage failure without proving a stale port or pairing. The extracted production IJC lookup passed 1,000 main-RAM lookups with 1,000 region probes and continued to prioritize later host aliases. The repaired portable branch-emitter fixture passed all eight cases. These component results do not measure physical compilation, browsing, extraction, or thermals.
+
+Private VPN Link passed the portable Swift endpoint and protocol checks,
+including public address rejection and operation at the cellular path's
+30 fps setting. All modified Swift sources parsed, and the cumulative patch
+reconstructed the dedicated runtime tree. Native iOS SDK compilation and an
+iPad on Wi-Fi paired to a Duo on cellular are still required. Verify incorrect
+keys, device sleep, VPN loss, reconnect, and the video-off default before
+requesting an IPA on this branch.
