@@ -57,7 +57,7 @@ build_dependency() {
 
 build_dependency glib-2.83.0 -Dtests=false -Dnls=disabled -Dintrospection=disabled \
     -Dselinux=disabled -Dlibmount=disabled -Ddtrace=disabled -Dlibelf=disabled \
-    -Dman-pages=disabled -Dglib_debug=disabled -Dxattr=false
+    -Dman-pages=disabled -Dglib_debug=disabled -Dxattr=false -Dsysprof=disabled
 build_dependency libslirp-v4.9.1
 verify_sysroot
 pkg-config --cflags --libs slirp

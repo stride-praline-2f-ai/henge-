@@ -1,0 +1,71 @@
+--- a/tools/verify_native_touch_package.py
++++ b/tools/verify_native_touch_package.py
+@@ -5,17 +5,37 @@
+ import json
+ from pathlib import Path
+ import plistlib
++import shutil
+ import subprocess
+ import tarfile
+ import tempfile
+ from package_native_touch import validate_members
++
++def extract_validated_bundle(tar, root):
++    # The caller supplies an empty, private directory. Only copy validated
++    # regular files and directories, without restoring archive ownership or modes.
++    members = tar.getmembers()
++    validate_members(members)
++    for member in members:
++        target = root / member.name
++        if member.isdir():
++            target.mkdir(parents=True, exist_ok=True)
++            continue
++        target.parent.mkdir(parents=True, exist_ok=True)
++        source = tar.extractfile(member)
++        if source is None:
++            raise ValueError('Missing guest-helper archive contents: ' + member.name)
++        with source, target.open('xb') as output:
++            shutil.copyfileobj(source, output)
++        target.chmod(0o700 if member.mode & 0o111 else 0o600)
++
+ 
+ def verify(archive):
+     result={}
+     with tempfile.TemporaryDirectory(prefix='henge-verify-touch-') as directory:
+         root=Path(directory)
+         with tarfile.open(archive,'r:gz') as tar:
+-            validate_members(tar.getmembers());tar.extractall(root,filter='data')
++            extract_validated_bundle(tar, root)
+         for name,executable in [('Henge Touch Agent.app','henge-touch-agent'),('Henge Sharing Agent.app','henge-agent')]:
+             app=root/name
+             info=plistlib.loads((app/'Contents/Info.plist').read_bytes())
+--- a/tests/test_jit_ring.c
++++ b/tests/test_jit_ring.c
+@@ -24,7 +24,10 @@
+     return (void *)(uintptr_t)result;
+ }
+ int main(void) {
+-    alarm(60);
++    const char *emulated = getenv("HENGE_CI_EMULATED_RUNNER");
++    unsigned watchdog = emulated && strcmp(emulated,"1")==0 ? 180 : 60;
++    alarm(watchdog);
++    fprintf(stderr,"JIT ring: starting with %u-second watchdog\n",watchdog);
+     assert(!hv_machine_init(&machine,64<<10));
+     machine.chain_stub_reference=-1; /* force the large-cache inline format through tiny-cache evictions */
+     /* 4096 unique blocks exceed 64 KiB even with ideal publication dedup.
+@@ -44,6 +47,7 @@
+     hv_knob[HV_K_JITSEGS]=getenv("HV_TEST_JIT_SEGMENTS")?atoi(getenv("HV_TEST_JIT_SEGMENTS")):2;hv_flush_blocks(&machine);
+     uint64_t full=machine.stats.block_flushes;
+     for(int round=0;round<2;round++){
++        fprintf(stderr,"JIT ring: round %d/2 starting\n",round+1);
+         ready_count=0;pthread_t threads[4];
+         for(unsigned i=0;i<4;i++){
+             hv_cpu_reset_index(&cpus[i],&machine,i);cpus[i].pc=base;cpus[i].x[1]=loops;
+@@ -54,6 +58,7 @@
+             assert((uintptr_t)result==HV_EXIT_HALT);
+             assert(cpus[i].x[0]==(uint64_t)blocks*loops && cpus[i].x[1]==0);
+         }
++        fprintf(stderr,"JIT ring: round %d/2 completed and checked\n",round+1);
+     }
+     fprintf(stderr,"ring pressure: evictions=%llu full=%llu initial=%llu translations=%llu capacity_requests=%llu too_big=%u segments=%u\n",
+         (unsigned long long)machine.stats.evictions,(unsigned long long)machine.stats.block_flushes,
