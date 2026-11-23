@@ -1,0 +1,139 @@
+diff --git a/ios/Henge/Link/LinkProtocol.swift b/ios/Henge/Link/LinkProtocol.swift
+index 88b14c6..198fb80 100644
+--- a/ios/Henge/Link/LinkProtocol.swift
++++ b/ios/Henge/Link/LinkProtocol.swift
+@@ -16,6 +16,7 @@ enum LinkMirrorStatus: Int {
+     case waitingForDisplay = 2
+     case encoderUnavailable = 3
+     case setupFailed = 4
++    case unsupportedDisplayMode = 5
+ 
+     var viewerMessage: String {
+         switch self {
+@@ -23,11 +24,27 @@ enum LinkMirrorStatus: Int {
+         case .waitingForDisplay: return "Waiting for the Mac display. Wireless controls are connected."
+         case .encoderUnavailable: return "The host could not start hardware video at the requested rate or 30 Hz. Wireless controls are connected."
+         case .setupFailed: return "The host could not set up video. Check the host’s Henge Link log."
++        case .unsupportedDisplayMode: return "The Mac’s current display resolution or refresh rate cannot be mirrored. Wireless controls are connected."
+         }
+     }
+ }
+ struct LinkMode: Codable, Equatable {
+     var width: Int, height: Int, widthMM: Int, heightMM: Int, hz: Int
++    /// The guest may omit physical dimensions for 1× display modes. Supply
++    /// nominal 96 dpi metadata for the mirror handshake without changing pixels,
++    /// the primary display configuration or secondary display validation.
++    static func primaryMirror(width: Int, height: Int, widthMM: Int, heightMM: Int, hz: Int) throws -> Self {
++        var mode = Self(width: width, height: height, widthMM: widthMM, heightMM: heightMM, hz: hz)
++        if widthMM == 0 || heightMM == 0 {
++            guard (320...8192).contains(width), (240...8192).contains(height) else {
++                throw LinkError.invalid("Unsupported display mode")
++            }
++            if widthMM == 0 { mode.widthMM = (width * 254 + 480) / 960 }
++            if heightMM == 0 { mode.heightMM = (height * 254 + 480) / 960 }
++        }
++        try mode.validate()
++        return mode
++    }
+     var codedWidth: Int { (width + 1) & ~1 }
+     var codedHeight: Int { (height + 1) & ~1 }
+     func validate() throws {
+diff --git a/ios/Henge/Link/LinkService.swift b/ios/Henge/Link/LinkService.swift
+index 8841647..6c093c2 100644
+--- a/ios/Henge/Link/LinkService.swift
++++ b/ios/Henge/Link/LinkService.swift
+@@ -169,9 +169,21 @@ final class LinkHostService: ObservableObject {
+     private func configureMirror(requestedHz: Int, transport: LinkTransport) -> Bool {
+         var display = HengeVmDisplayMode()
+         guard henge_vm_state() == 1, henge_vm_display_mode(0, &display) == 0 else { return false }
+-        var stream = LinkMode(width: Int(display.width), height: Int(display.height),
+-                              widthMM: Int(display.width_mm), heightMM: Int(display.height_mm),
+-                              hz: min(requestedHz, Int(display.hz)))
++        let width = Int(display.width), height = Int(display.height)
++        let hz = min(requestedHz, Int(display.hz))
++        var stream: LinkMode
++        do {
++            stream = try LinkMode.primaryMirror(width: width, height: height,
++                                                widthMM: Int(display.width_mm), heightMM: Int(display.height_mm),
++                                                hz: hz)
++        } catch {
++            HengeLog.log("link-mirror", "Unsupported primary mirror mode \(width)x\(height) at \(hz) Hz, physical size \(display.width_mm)x\(display.height_mm) mm.")
++            reportMirror(.unsupportedDisplayMode, to: transport)
++            return true
++        }
++        if display.width_mm == 0 || display.height_mm == 0 {
++            HengeLog.log("link-mirror", "Primary display has no physical size metadata; using nominal size for \(width)x\(height) mirror.")
++        }
+         func makeEncoder() throws -> LinkEncoder {
+             try LinkEncoder(mode: stream, mirrorsPrimary: true, library: shaderLibrary,
+                             requestFrame: { henge_vm_mirror_refresh() }, send: { [weak transport] data, done in
+diff --git a/tests/link_control_service_fixture.c b/tests/link_control_service_fixture.c
+index 780f851..83637a2 100644
+--- a/tests/link_control_service_fixture.c
++++ b/tests/link_control_service_fixture.c
+@@ -35,5 +35,6 @@ void test_control_paused(int enabled){atomic_store(&vm_state,enabled ? 4 : 1);}
+ 
+ int henge_vm_display_mode(unsigned port,HengeVmDisplayMode *out){
+     if(port!=0)return -1;
+-    *out=(HengeVmDisplayMode){320,240,70,52,60};return 0;
++    /* iPad Desktop MetalFX reports 1× pixels and leaves mm unspecified. */
++    *out=(HengeVmDisplayMode){1280,960,0,0,60};return 0;
+ }
+diff --git a/tests/test_link.swift b/tests/test_link.swift
+index 1876135..42b41a1 100644
+--- a/tests/test_link.swift
++++ b/tests/test_link.swift
+@@ -110,6 +110,12 @@ final class FixtureFrameSource {
+         padded.codedWidth = 2852; mustReject { _ = try LinkVideoHeader.unpack(padded.pack(Data([1]))) }
+         padded.codedWidth = 2860; mustReject { _ = try LinkVideoHeader.unpack(padded.pack(Data([1]))) }
+         video.width = 0; mustReject { _ = try LinkVideoHeader.unpack(video.pack(Data([1]))) }
++        let primary = try LinkMode.primaryMirror(width: 1280, height: 960, widthMM: 0, heightMM: 0, hz: 60)
++        require(primary.width == 1280 && primary.height == 960 && primary.widthMM == 339 && primary.heightMM == 254, "Primary mirror changed pixels or rejected missing EDID metadata")
++        let retina = try LinkMode.primaryMirror(width: 2560, height: 1920, widthMM: 246, heightMM: 185, hz: 60)
++        require(retina.widthMM == 246 && retina.heightMM == 185, "Known physical size was overwritten")
++        mustReject { try LinkMode(width: 1280, height: 960, widthMM: 0, heightMM: 0, hz: 60).validate() }
++        mustReject { _ = try LinkMode.primaryMirror(width: Int.max, height: 960, widthMM: 0, heightMM: 0, hz: 60) }
+         print("PASS protocol: fragmentation, coalescing, hostile bounds, mode/input validation, video framing")
+         try tls(mode)
+         if ProcessInfo.processInfo.environment["HENGE_CI_EMULATED_RUNNER"] == "1" {
+diff --git a/tests/test_link_control_services.swift b/tests/test_link_control_services.swift
+index 89ab1cf..bcc42df 100644
+--- a/tests/test_link_control_services.swift
++++ b/tests/test_link_control_services.swift
+@@ -1,6 +1,7 @@
+ import Foundation
+ import Darwin
+ import Metal
++import CoreVideo
+ 
+ enum HengeLog { static func log(_ tag:String,_ message:String) { print("\(tag): \(message)") } }
+ @MainActor final class GamepadHub {
+@@ -24,7 +25,11 @@ enum HengeLog { static func log(_ tag:String,_ message:String) { print("\(tag):
+         let host=LinkHostService(library:library),viewer=LinkViewerService()
+         host.listen(wired:false)
+         await wait("listener never opened") { host.port != nil }
+-        var pixels = 0; viewer.onPixel = { _ in pixels += 1 }
++        var pixels = 0
++        viewer.onPixel = { image in
++            precondition(CVPixelBufferGetWidth(image) == 1280 && CVPixelBufferGetHeight(image) == 960)
++            pixels += 1
++        }
+         let mode = LinkMode(width:320,height:240,widthMM:70,heightMM:52,hz:60)
+         viewer.connect(host:"127.0.0.1",port:host.port!,key:host.key,wired:false,mode:mode,inputOnly:true)
+         await wait("production controls-only handshake failed") { viewer.ready && host.controlOnly }
+@@ -70,11 +75,12 @@ enum HengeLog { static func log(_ tag:String,_ message:String) { print("\(tag):
+         if verifiedVideo {
+             precondition(!host.active && host.controlOnly && host.mode==nil && (viewer.videoHz==60 || viewer.videoHz==30) && test_control_displays()==0)
+             precondition(!viewer.mirrorFrameReady)
+-            let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm,width:320,height:240,mipmapped:false)
++            let width = 1280, height = 960
++            let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm,width:width,height:height,mipmapped:false)
+             descriptor.storageMode = .shared;descriptor.usage = [.shaderRead,.renderTarget]
+             let texture=gpu.makeTexture(descriptor:descriptor)!
+-            var bytes=[UInt8](repeating:128,count:320*240*4)
+-            bytes.withUnsafeMutableBytes { texture.replace(region:MTLRegionMake2D(0,0,320,240),mipmapLevel:0,withBytes:$0.baseAddress!,bytesPerRow:320*4) }
++            var bytes=[UInt8](repeating:128,count:width*height*4)
++            bytes.withUnsafeMutableBytes { texture.replace(region:MTLRegionMake2D(0,0,width,height),mipmapLevel:0,withBytes:$0.baseAddress!,bytesPerRow:width*4) }
+             test_control_frame(Unmanaged.passUnretained(texture as AnyObject).toOpaque(),Unmanaged.passUnretained(queue as AnyObject).toOpaque())
+             await wait("real mirrored texture did not encode/network/decode") { pixels>0 && viewer.mirrorFrameReady }
+             viewer.setMirror(false)
