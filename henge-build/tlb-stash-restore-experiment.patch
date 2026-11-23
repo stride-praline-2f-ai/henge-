@@ -1,0 +1,172 @@
+diff --git a/core/mmu.c b/core/mmu.c
+index a9991649c5aa9a895d68f5350d899a52f05d5616..0d6d2389d6b7d371f8d14d039298cc1c410a583e 100644
+--- a/core/mmu.c
++++ b/core/mmu.c
+@@ -1423,30 +1423,38 @@ void hv_tlb_switch_user(HvCpu *cpu, uint64_t old, uint64_t now) {
+         }
+         /* Writable entries: all their hints, one fence, then each page's code check (write_guard, batched: one fence per
+            switch instead of one per entry; every entry is in place before the fence and checked after it). */
+-        uint16_t pend[HV_STASH_CAP];
++        struct {
++            const uint8_t *code_page;
++            HvTlbEntry *entry;
++        } pending[HV_STASH_CAP];
+         uint32_t npend = 0;
+         for (uint32_t j = 0; j < r->n; j++) {
+             const HvTlbEntry *from = &r->ent[j];
+             if (from->read_tag == HV_TLB_INVALID && from->write_tag == HV_TLB_INVALID && from->exec_tag == HV_TLB_INVALID)
+                 continue; /* its page had a TLBI while it was put aside (stash_drop_va) */
+-            HvTlbEntry *e = &cpu->tlb[0] + r->slot[j];
++            uint16_t slot = r->slot[j];
++            HvTlbEntry *e = &cpu->tlb[0] + slot;
+             *e = *from;
+-            cpu->user_fills[cpu->nuser_fills++] = r->slot[j];
++            cpu->user_fills[cpu->nuser_fills++] = slot;
+             if (e->write_tag != HV_TLB_INVALID) {
+                 const uint8_t *host = (const uint8_t *)(uintptr_t)(from->write_tag + HV_TLB_ADJ + from->addend);
+                 HvRam *ram = ram_of_host(m, host);
+-                if (!ram) e->write_tag = HV_TLB_INVALID;
+-                else write_hint(cpu, ram, (uint64_t)(host - ram->host) >> HV_TLB_PAGE_BITS, r->slot[j]), pend[npend++] = (uint16_t)j;
++                if (ram) {
++                    uint64_t page = (uint64_t)(host - ram->host) >> HV_TLB_PAGE_BITS;
++                    write_hint(cpu, ram, page, slot);
++                    pending[npend].code_page = &ram->code_pages[page];
++                    pending[npend++].entry = e;
++                } else {
++                    e->write_tag = HV_TLB_INVALID;
++                }
+             }
+         }
++        /* The RAM backing is stable across this fence. Reread the live code
++           flag after publishing all hints so concurrent protection still wins. */
+         if (npend) __atomic_thread_fence(__ATOMIC_SEQ_CST);
+-        for (uint32_t q = 0; q < npend; q++) {
+-            const HvTlbEntry *from = &r->ent[pend[q]];
+-            const uint8_t *host = (const uint8_t *)(uintptr_t)(from->write_tag + HV_TLB_ADJ + from->addend);
+-            HvRam *ram = ram_of_host(m, host);
+-            if (ram && __atomic_load_n(&ram->code_pages[(uint64_t)(host - ram->host) >> HV_TLB_PAGE_BITS], __ATOMIC_RELAXED))
+-                (&cpu->tlb[0] + r->slot[pend[q]])->write_tag = HV_TLB_INVALID;
+-        }
++        for (uint32_t q = 0; q < npend; q++)
++            if (__atomic_load_n(pending[q].code_page, __ATOMIC_RELAXED))
++                pending[q].entry->write_tag = HV_TLB_INVALID;
+         if (m->stats_interval) m->stats.stash_hits++;
+         if (m->stats_interval) m->stats.stash_entries += r->n;
+         break;
+diff --git a/tests/test_tlb_stash_restore.c b/tests/test_tlb_stash_restore.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..2ba3f0359694a35d4325e40c5c67acee3f958489
+--- /dev/null
++++ b/tests/test_tlb_stash_restore.c
+@@ -0,0 +1,111 @@
++#define _POSIX_C_SOURCE 200809L
++#include "machine.h"
++#include "mmu.h"
++
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++static HvMachine machine;
++static HvCpu cpu;
++static HvPerCpu *percpu;
++static HvTlbStash *stash;
++static uint16_t slots[HV_STASH_CAP];
++static HvTlbEntry entries[HV_STASH_CAP];
++static uint8_t code_pages[HV_STASH_CAP];
++static uint64_t write_hints[HV_STASH_CAP];
++static uint8_t *guest_memory, *rom;
++static const uint64_t asid_base = 7ull << 48 | 0x4000;
++static const uint64_t page_size = 1ull << HV_TLB_PAGE_BITS;
++
++static void init(void) {
++    guest_memory = malloc(HV_STASH_CAP * page_size);
++    rom = malloc(page_size);
++    assert(guest_memory && rom);
++    machine.nram = 2;
++    machine.ram[0] = (HvRam){.host = rom, .size = page_size, .readonly = 1};
++    machine.ram[1] = (HvRam){.host = guest_memory, .size = HV_STASH_CAP * page_size,
++        .code_pages = code_pages, .whint = write_hints, .npages = HV_STASH_CAP};
++    percpu = &machine.percpu[0];
++    cpu.m = &machine;
++    cpu.pc_state = percpu;
++    cpu.ttbr0_el1 = asid_base;
++    stash = &percpu->stash[0];
++    stash->slot = slots;
++    stash->ent = entries;
++    memset(cpu.tlb, 0x80, sizeof cpu.tlb);
++}
++
++static void seed(unsigned length, int table) {
++    for (unsigned i = 0; i < length; i++) {
++        uint64_t va = (i + 1) * page_size;
++        slots[i] = hv_tlb_code(i + 1, table);
++        entries[i] = (HvTlbEntry){.read_tag = va - HV_TLB_ADJ, .write_tag = va - HV_TLB_ADJ,
++            .exec_tag = HV_TLB_INVALID, .addend = (int64_t)((uintptr_t)guest_memory - page_size)};
++    }
++    stash->n = length;
++}
++
++static void restore(void) {
++    stash->ttbr0 = asid_base;
++    hv_tlb_switch_user(&cpu, 0, asid_base);
++    assert(!stash->ttbr0);
++}
++
++static void correctness(void) {
++    seed(HV_STASH_CAP, 0);
++    /* An unmapped write address, an invalidated slot and read-only mapping. */
++    entries[0].addend = (int64_t)(0x1000 - page_size); /* no registered RAM contains host 0x1000 */
++    entries[1].read_tag = entries[1].write_tag = HV_TLB_INVALID;
++    entries[2].write_tag = HV_TLB_INVALID;
++    for (unsigned i = 3; i < HV_STASH_CAP; i += 3) code_pages[i] = 1;
++    restore();
++    assert(cpu.nuser_fills == HV_STASH_CAP - 1);
++    for (unsigned i = 0; i < HV_STASH_CAP; i++) {
++        HvTlbEntry *e = &cpu.tlb[slots[i]];
++        assert(e->read_tag == entries[i].read_tag && e->exec_tag == HV_TLB_INVALID);
++        assert(e->write_tag == (i < 3 || code_pages[i] ? HV_TLB_INVALID : entries[i].write_tag));
++        assert(write_hints[i] == (i < 3 ? 0 : (uint64_t)slots[i] + 1));
++    }
++    ++stash->gen;
++    restore();
++    assert(cpu.nuser_fills == 0);
++    assert(cpu.tlb[slots[4]].read_tag == HV_TLB_INVALID);
++    stash->saved_gen = stash->gen;
++    memset(code_pages, 0, sizeof code_pages);
++}
++
++static uint64_t time_ns(void) {
++    struct timespec t;
++    assert(!clock_gettime(CLOCK_MONOTONIC, &t));
++    return (uint64_t)t.tv_sec * 1000000000 + (unsigned)t.tv_nsec;
++}
++
++int main(void) {
++    init();
++    correctness();
++    for (int layout = 0; layout < 2; layout++) {
++        hv_tlb_tmajor = layout;
++        for (unsigned length = 128; length <= HV_STASH_CAP; length *= 8) {
++            seed(length, 1);
++            unsigned iterations = 20000000 / length;
++            for (unsigned i = 0; i < 1000; i++) restore();
++            uint64_t begin = time_ns();
++            for (unsigned i = 0; i < iterations; i++) restore();
++            printf("stash-restore: layout=%d entries=%u ns_per_entry=%.3f\n",
++                   layout, length, (double)(time_ns() - begin) / iterations / length);
++            assert(cpu.nuser_fills == length);
++            assert(cpu.tlb[slots[length - 1]].write_tag == entries[length - 1].write_tag);
++            /* Empty the previous layout before switching its index encoding. */
++            ++stash->gen;
++            restore();
++            stash->saved_gen = stash->gen;
++            memset(write_hints, 0, sizeof write_hints);
++        }
++    }
++    puts("PASS stash restore: live permissions, code-page guards, and stale generations");
++    free(rom);
++    free(guest_memory);
++}
