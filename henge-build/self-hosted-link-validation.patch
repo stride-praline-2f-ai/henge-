@@ -1,0 +1,68 @@
+--- a/tests/test_link_control_services.swift
++++ b/tests/test_link_control_services.swift
+@@ -54,21 +54,39 @@
+         await wait("automatic foreground reconnect failed") { viewer.ready && host.controlOnly }
+         precondition(host.key==pairingKey && host.port==listenerPort && viewer.mirrorSupported)
+         viewer.setMirror(true,hz:120)
+-        await wait("primary video mirror handshake failed") { viewer.videoActive && host.mirrorActive }
+-        precondition(!host.active && host.controlOnly && host.mode==nil && viewer.videoHz==60 && test_control_displays()==0)
+-        let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm,width:320,height:240,mipmapped:false)
+-        descriptor.storageMode = .shared;descriptor.usage = [.shaderRead,.renderTarget]
+-        let texture=gpu.makeTexture(descriptor:descriptor)!
+-        var bytes=[UInt8](repeating:128,count:320*240*4)
+-        bytes.withUnsafeMutableBytes { texture.replace(region:MTLRegionMake2D(0,0,320,240),mipmapLevel:0,withBytes:$0.baseAddress!,bytesPerRow:320*4) }
+-        test_control_frame(Unmanaged.passUnretained(texture as AnyObject).toOpaque(),Unmanaged.passUnretained(queue as AnyObject).toOpaque())
+-        await wait("real mirrored texture did not encode/network/decode") { pixels>0 }
+-        viewer.setMirror(false)
+-        await wait("mirror video did not stop") { !host.mirrorActive && !viewer.videoActive }
+-        precondition(host.controlOnly && test_control_displays()==0)
++        let emulated = ProcessInfo.processInfo.environment["HENGE_CI_EMULATED_RUNNER"] == "1"
++        let encoderUnavailable = { host.status.contains("No supported hardware encoder") }
++        await wait("primary video mirror handshake failed") {
++            (viewer.videoActive && host.mirrorActive) ||
++            (emulated && encoderUnavailable() && viewer.status.contains("Host video is not ready"))
++        }
++        let verifiedVideo = viewer.videoActive && host.mirrorActive
++        if verifiedVideo {
++            precondition(!host.active && host.controlOnly && host.mode==nil && viewer.videoHz==60 && test_control_displays()==0)
++            let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm,width:320,height:240,mipmapped:false)
++            descriptor.storageMode = .shared;descriptor.usage = [.shaderRead,.renderTarget]
++            let texture=gpu.makeTexture(descriptor:descriptor)!
++            var bytes=[UInt8](repeating:128,count:320*240*4)
++            bytes.withUnsafeMutableBytes { texture.replace(region:MTLRegionMake2D(0,0,320,240),mipmapLevel:0,withBytes:$0.baseAddress!,bytesPerRow:320*4) }
++            test_control_frame(Unmanaged.passUnretained(texture as AnyObject).toOpaque(),Unmanaged.passUnretained(queue as AnyObject).toOpaque())
++            await wait("real mirrored texture did not encode/network/decode") { pixels>0 }
++            viewer.setMirror(false)
++            await wait("mirror video did not stop") { !host.mirrorActive && !viewer.videoActive }
++            precondition(host.controlOnly && test_control_displays()==0)
++        } else {
++            precondition(emulated && encoderUnavailable())
++            precondition(viewer.ready && host.controlOnly && !host.active && host.mode==nil)
++            precondition(!viewer.videoActive && !host.mirrorActive && test_control_displays()==0)
++            precondition(test_control_video()==0 && pixels==0)
++            let keysAfterReject = test_control_keys()
++            viewer.send(LinkControl(type:"key",code:29,down:true))
++            await wait("video rejection interrupted controls") { test_control_keys()>keysAfterReject }
++            print("PASS virtual Mac: hardware encoder rejection reached viewer; real TLS controls and display topology retained. Hardware mirroring requires a physical-device check.")
++        }
++        let expectedVideoHandlers:UInt32 = verifiedVideo ? 1 : 0
+         viewer.disconnect()
+         await wait("disconnect did not release owned input") { !host.connected && test_control_held()==0 && !GamepadHub.shared.last.connected }
+-        host.stop();precondition(test_control_video()==1 && test_control_displays()==0 && pixels>0)
++        host.stop();precondition(test_control_video()==expectedVideoHandlers && test_control_displays()==0)
+         // A restored one-port Mac must reject a video peer before allocating an
+         // encoder or silently changing the guest topology. Controls-only remains valid.
+         host.listen(wired:false)
+@@ -76,9 +94,10 @@
+         viewer.connect(host:"127.0.0.1",port:host.port!,key:host.key,wired:false,mode:mode)
+         await wait("running one-port Mac accepted a new monitor") { host.status.contains("saved second monitor") }
+         precondition(!viewer.ready && !host.active && host.mode==nil)
+-        precondition(test_control_video()==1 && test_control_displays()==0)
++        precondition(test_control_video()==expectedVideoHandlers && test_control_displays()==0)
+         viewer.disconnect();host.stop()
+         alarm(0)
+-        print("PASS production controls-only host/client over real TLS: negotiation, owned keyboard/gamepad, mapping, CPU gate, releases, disconnect; opt-in real GPU mirror encode/decode without a second monitor; foreground reconnect preserves pairing")
++        if verifiedVideo { print("PASS real primary GPU mirror encode/decode without a second monitor") }
++        print("PASS production controls-only host/client over real TLS: negotiation, owned keyboard/gamepad, mapping, CPU gate, releases, disconnect and foreground pairing")
+     }
+ }
