@@ -150,6 +150,24 @@ jobs:
         xcrun --sdk macosx metal --version
     - name: Prepare build prerequisites
       run: bash build-request/henge-build/setup-runner.sh --ci
+    - name: Fingerprint native networking dependencies
+      id: native_cache
+      run: |
+        fingerprint=$({
+          sw_vers -buildVersion
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-build-version
+          meson --version
+          printf '%s\n' "$HUSK/build/henge-native-network/sysroot"
+        } | shasum -a 256 | cut -d ' ' -f1)
+        echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+    - name: Restore native networking sysroot
+      id: native_cache_restore
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: Husk/build/henge-native-network/sysroot
+        key: henge-native-slirp-v1-${{ runner.arch }}-${{ steps.inputs.outputs.husk }}-${{ steps.native_cache.outputs.fingerprint }}-${{ hashFiles('build-request/henge-build/setup-native-network.sh', 'build-request/henge-build/fetch-required-sources.sh') }}
     - name: Verify build inputs and native networking dependency
       id: native_dependencies
       run: |
@@ -161,6 +179,19 @@ jobs:
 
         # Native networking lifecycle tests require macOS libraries.
         bash build-request/henge-build/setup-native-network.sh "$HUSK"
+    - name: Check whether a native sysroot was built
+      id: native_sysroot
+      run: |
+        if [[ -f "$HUSK/build/henge-native-network/sysroot/lib/pkgconfig/slirp.pc" ]]; then
+          echo 'present=true' >> "$GITHUB_OUTPUT"
+        fi
+    - name: Save verified native networking sysroot
+      if: steps.native_sysroot.outputs.present == 'true' && steps.native_cache_restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: Husk/build/henge-native-network/sysroot
+        key: ${{ steps.native_cache_restore.outputs.cache-primary-key }}
     - name: Probe public Metal archive reopening independently
       working-directory: Henge
       run: |
