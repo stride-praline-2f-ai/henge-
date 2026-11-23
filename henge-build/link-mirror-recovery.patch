@@ -1,0 +1,272 @@
+diff --git a/ios/Henge/Link/LinkProtocol.swift b/ios/Henge/Link/LinkProtocol.swift
+index 23db487..88b14c6 100644
+--- a/ios/Henge/Link/LinkProtocol.swift
++++ b/ios/Henge/Link/LinkProtocol.swift
+@@ -3,7 +3,28 @@ import Foundation
+ // Original protocol. Never deserialize an unbounded peer-controlled allocation.
+ enum LinkError: Error, LocalizedError {
+     case invalid(String)
+-    var errorDescription: String? { if case let .invalid(s) = self { return s }; return nil }
++    case encoderUnavailable
++    var errorDescription: String? {
++        switch self {
++        case .invalid(let message): return message
++        case .encoderUnavailable: return "No supported hardware encoder for this stream. The host display is unchanged."
++        }
++    }
++}
++enum LinkMirrorStatus: Int {
++    case displayUnavailable = 1 // Version 2 peers already understand this value.
++    case waitingForDisplay = 2
++    case encoderUnavailable = 3
++    case setupFailed = 4
++
++    var viewerMessage: String {
++        switch self {
++        case .displayUnavailable: return "The Mac display is still unavailable. Open the Mac desktop on the host and retry video."
++        case .waitingForDisplay: return "Waiting for the Mac display. Wireless controls are connected."
++        case .encoderUnavailable: return "The host could not start hardware video at the requested rate or 30 Hz. Wireless controls are connected."
++        case .setupFailed: return "The host could not set up video. Check the host’s Henge Link log."
++        }
++    }
+ }
+ struct LinkMode: Codable, Equatable {
+     var width: Int, height: Int, widthMM: Int, heightMM: Int, hz: Int
+diff --git a/ios/Henge/Link/LinkService.swift b/ios/Henge/Link/LinkService.swift
+index 20faed7..12f3c26 100644
+--- a/ios/Henge/Link/LinkService.swift
++++ b/ios/Henge/Link/LinkService.swift
+@@ -21,6 +21,9 @@ final class LinkHostService: ObservableObject {
+     var streamsVideo:Bool { active || mirrorActive }
+     private var transport: LinkTransport?
+     private var encoder: LinkEncoder?
++    private var mirrorRetryTask: Task<Void,Never>?
++    private var mirrorRequestedHz: Int?
++    private var peerSupportsMirrorStatus = false
+     private var keys = Set<Int>(), buttons = Set<Int>()
+     private var token = UUID()
+     var canStart: Bool { connected && mode != nil && encoder != nil }
+@@ -66,6 +69,7 @@ final class LinkHostService: ObservableObject {
+         if command.type == "helloInput" {
+             guard encoder == nil, mode == nil, !active else { return }
+             controlOnly = true
++            peerSupportsMirrorStatus = command.capabilities?.contains("mirrorStatus") == true
+             transport?.sendControl(LinkControl(type:"readyInput",down:GamepadHub.shared.keyboardMapping,capabilities:["inputOnly","gamepad","viewerVisibility","primaryMirror"]))
+             transport?.setInputOnly()
+             status = "Secure wireless keyboard, touchpad and gamepad connected; video is off."
+@@ -132,28 +136,87 @@ final class LinkHostService: ObservableObject {
+         default: break
+         }
+     }
+-    private func startMirror(requestedHz:Int) {
+-        if mirrorActive,encoder?.mode.hz==requestedHz { henge_vm_mirror_refresh();return }
++    private func startMirror(requestedHz: Int) {
++        if mirrorActive, mirrorRequestedHz == requestedHz {
++            henge_vm_mirror_refresh()
++            return
++        }
+         stopMirror()
+-        guard encoder==nil,henge_vm_state()==1,let transport else { return }
+-        var display=HengeVmDisplayMode()
+-        guard henge_vm_display_mode(0,&display)==0 else {
+-            status="The main Mac display is not ready yet. Try Video again after startup."
+-            transport.sendControl(LinkControl(type:"mirror",code:1,down:false));return
++        guard controlOnly, encoder == nil, let transport else { return }
++        mirrorRequestedHz = requestedHz
++        if configureMirror(requestedHz: requestedHz, transport: transport) { return }
++
++        reportMirror(.waitingForDisplay, to: transport)
++        mirrorRetryTask = Task { @MainActor [weak self, weak transport] in
++            let delays: [UInt64] = [250_000_000, 500_000_000, 1_000_000_000, 2_000_000_000]
++            for delay in delays {
++                do { try await Task.sleep(nanoseconds: delay) } catch { return }
++                guard !Task.isCancelled, let self, let transport, self.transport === transport,
++                      self.controlOnly, self.mirrorRequestedHz == requestedHz else { return }
++                if self.configureMirror(requestedHz: requestedHz, transport: transport) {
++                    self.mirrorRetryTask = nil
++                    return
++                }
++            }
++            guard let self, let transport, self.transport === transport else { return }
++            self.mirrorRetryTask = nil
++            self.reportMirror(.displayUnavailable, to: transport)
++        }
++    }
++
++    // Returns false only while the VM or primary display is temporarily unavailable.
++    private func configureMirror(requestedHz: Int, transport: LinkTransport) -> Bool {
++        var display = HengeVmDisplayMode()
++        guard henge_vm_state() == 1, henge_vm_display_mode(0, &display) == 0 else { return false }
++        var stream = LinkMode(width: Int(display.width), height: Int(display.height),
++                              widthMM: Int(display.width_mm), heightMM: Int(display.height_mm),
++                              hz: min(requestedHz, Int(display.hz)))
++        func makeEncoder() throws -> LinkEncoder {
++            try LinkEncoder(mode: stream, mirrorsPrimary: true, library: shaderLibrary,
++                            requestFrame: { henge_vm_mirror_refresh() }, send: { [weak transport] data, done in
++                guard let transport else { done(false); return }
++                transport.sendVideo(data, completion: done)
++            }, report: { HengeLog.log("link-mirror", $0) })
+         }
+-        let stream=LinkMode(width:Int(display.width),height:Int(display.height),widthMM:Int(display.width_mm),heightMM:Int(display.height_mm),hz:min(requestedHz,Int(display.hz)))
+         do {
+-            let created=try LinkEncoder(mode:stream,mirrorsPrimary:true,library:shaderLibrary,requestFrame:{henge_vm_mirror_refresh()},send:{ [weak transport] data,done in
+-                guard let transport else { done(false);return };transport.sendVideo(data,completion:done)
+-            },report:{ HengeLog.log("link-mirror",$0) })
+-            encoder=created;mirrorActive=true
+-            transport.onVideoAcknowledged={ [weak created] in created?.acknowledge($0) }
+-            transport.sendControl(LinkControl(type:"readyMirror",mode:stream,down:GamepadHub.shared.keyboardMapping,capabilities:["primaryMirror","gamepad","viewerVisibility"]))
++            let created: LinkEncoder
++            do { created = try makeEncoder() }
++            catch LinkError.encoderUnavailable where stream.hz > 30 {
++                HengeLog.log("link-mirror", "Encoder rejected \(stream.width)x\(stream.height) at \(stream.hz) Hz; trying 30 Hz.")
++                stream.hz = 30
++                created = try makeEncoder()
++            }
++            encoder = created
++            mirrorActive = true
++            transport.onVideoAcknowledged = { [weak created] in created?.acknowledge($0) }
++            transport.sendControl(LinkControl(type: "readyMirror", mode: stream, down: GamepadHub.shared.keyboardMapping,
++                                               capabilities: ["primaryMirror","gamepad","viewerVisibility"]))
+             hv_pvg_link_set_primary_frame_handler(Self.captureHandler(created))
+-            henge_vm_mirror_refresh();status="Streaming the main Mac display with wireless controls."
+-        } catch { status=error.localizedDescription;stopMirror();transport.sendControl(LinkControl(type:"mirror",code:1,down:false)) }
++            henge_vm_mirror_refresh()
++            status = "Streaming the main Mac display at \(stream.hz) Hz with wireless controls."
++        } catch LinkError.encoderUnavailable {
++            HengeLog.log("link-mirror", "No hardware encoder accepted \(stream.width)x\(stream.height) at \(stream.hz) Hz.")
++            reportMirror(.encoderUnavailable, to: transport)
++        } catch {
++            HengeLog.log("link-mirror", "Video setup failed: \(error.localizedDescription)")
++            reportMirror(.setupFailed, to: transport)
++        }
++        return true
+     }
++
++    private func reportMirror(_ result: LinkMirrorStatus, to transport: LinkTransport) {
++        status = result.viewerMessage
++        if peerSupportsMirrorStatus {
++            transport.sendControl(LinkControl(type: "mirror", code: result.rawValue, down: false))
++        } else if result != .waitingForDisplay {
++            transport.sendControl(LinkControl(type: "mirror", code: LinkMirrorStatus.displayUnavailable.rawValue, down: false))
++        }
++    }
++
+     private func stopMirror() {
++        mirrorRetryTask?.cancel()
++        mirrorRetryTask = nil
++        mirrorRequestedHz = nil
+         guard mirrorActive else { return }
+         hv_pvg_link_set_primary_frame_handler(nil);mirrorActive=false
+         encoder?.stop();encoder=nil;transport?.onVideoAcknowledged=nil
+@@ -292,7 +355,9 @@ final class LinkViewerService: ObservableObject {
+                 guard let self,let channel,self.generation==g else { return }
+                 self.status=text
+                 if connected {
+-                    channel.sendControl(LinkControl(type:request.inputOnly ? "helloInput" : "hello",mode:request.inputOnly ? nil : request.mode))
++                    channel.sendControl(LinkControl(type: request.inputOnly ? "helloInput" : "hello",
++                                                    mode: request.inputOnly ? nil : request.mode,
++                                                    capabilities: request.inputOnly ? ["mirrorStatus"] : nil))
+                     Task { @MainActor [weak self] in
+                         try? await Task.sleep(nanoseconds:8_000_000_000)
+                         guard !Task.isCancelled,let self,self.generation==g,!self.ready else { return }
+@@ -325,7 +390,9 @@ final class LinkViewerService: ObservableObject {
+                         self.beginDecode(mode,generation:g);self.videoHz=mode.hz;self.videoActive=true;self.status="Connected. Main Mac screen and controls."
+                     } else if command.type=="mirror",command.down==false,request.inputOnly {
+                         self.videoActive=false;self.decodeWorker.stop();self.decodeGeneration=UUID()
+-                        if command.code==1 { self.status="Host video is not ready. Retry after the Mac display appears." }
++                        if self.wantsMirror, let code = command.code, let result = LinkMirrorStatus(rawValue: code) {
++                            self.status = result.viewerMessage
++                        }
+                     }
+                 } else if packet.kind==2 && (!request.inputOnly || self.videoActive) {
+                     self.decodeWorker.consume(packet.payload,generation:self.decodeGeneration,consumed:{ [weak channel] sequence in
+diff --git a/ios/Henge/Link/LinkVideo.swift b/ios/Henge/Link/LinkVideo.swift
+index 881cb5f..1b6f778 100644
+--- a/ios/Henge/Link/LinkVideo.swift
++++ b/ios/Henge/Link/LinkVideo.swift
+@@ -89,7 +89,7 @@ final class LinkEncoder {
+             if okay && VTCompressionSessionPrepareToEncodeFrames(candidate) == noErr { session = candidate; selected = (codec == kCMVideoCodecType_HEVC ? "HEVC" : "H.264") + (lowLatency ? " low-latency" : " realtime fallback"); break }
+             VTCompressionSessionInvalidate(candidate)
+         }
+-        guard session != nil else { throw LinkError.invalid("No supported hardware encoder for this native resolution. The iPad display is unchanged.") }
++        guard session != nil else { throw LinkError.encoderUnavailable }
+         report("hardware encoder \(selected) \(mode.width)x\(mode.height) target=\(mode.hz)Hz; codec canvas=\(mode.codedWidth)x\(mode.codedHeight), visible pixels unchanged; decode-ack-window=3, no CPU pixel readback")
+     }
+     /// Called synchronously by the serial guest GPU worker. Commit on its queue
+diff --git a/tests/test_link_control_services.swift b/tests/test_link_control_services.swift
+index 624db4e..ef48f52 100644
+--- a/tests/test_link_control_services.swift
++++ b/tests/test_link_control_services.swift
+@@ -53,22 +53,46 @@ enum HengeLog { static func log(_ tag:String,_ message:String) { print("\(tag):
+         viewer.setForeground(true)
+         await wait("automatic foreground reconnect failed") { viewer.ready && host.controlOnly }
+         precondition(host.key==pairingKey && host.port==listenerPort && viewer.mirrorSupported)
++        test_control_paused(1)
+         viewer.setMirror(true,hz:120)
+-        await wait("primary video mirror handshake failed") { viewer.videoActive && host.mirrorActive }
+-        precondition(!host.active && host.controlOnly && host.mode==nil && viewer.videoHz==60 && test_control_displays()==0)
+-        let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm,width:320,height:240,mipmapped:false)
+-        descriptor.storageMode = .shared;descriptor.usage = [.shaderRead,.renderTarget]
+-        let texture=gpu.makeTexture(descriptor:descriptor)!
+-        var bytes=[UInt8](repeating:128,count:320*240*4)
+-        bytes.withUnsafeMutableBytes { texture.replace(region:MTLRegionMake2D(0,0,320,240),mipmapLevel:0,withBytes:$0.baseAddress!,bytesPerRow:320*4) }
+-        test_control_frame(Unmanaged.passUnretained(texture as AnyObject).toOpaque(),Unmanaged.passUnretained(queue as AnyObject).toOpaque())
+-        await wait("real mirrored texture did not encode/network/decode") { pixels>0 }
+-        viewer.setMirror(false)
+-        await wait("mirror video did not stop") { !host.mirrorActive && !viewer.videoActive }
+-        precondition(host.controlOnly && test_control_displays()==0)
++        await wait("viewer did not receive display startup status") {
++            viewer.status == LinkMirrorStatus.waitingForDisplay.viewerMessage
++        }
++        precondition(viewer.ready && !viewer.videoActive && test_control_video()==0)
++        test_control_paused(0)
++        let emulated = ProcessInfo.processInfo.environment["HENGE_CI_EMULATED_RUNNER"] == "1"
++        let encoderUnavailable = { host.status == LinkMirrorStatus.encoderUnavailable.viewerMessage }
++        await wait("primary video mirror handshake failed") {
++            (viewer.videoActive && host.mirrorActive) ||
++            (emulated && encoderUnavailable() && viewer.status == LinkMirrorStatus.encoderUnavailable.viewerMessage)
++        }
++        let verifiedVideo = viewer.videoActive && host.mirrorActive
++        if verifiedVideo {
++            precondition(!host.active && host.controlOnly && host.mode==nil && (viewer.videoHz==60 || viewer.videoHz==30) && test_control_displays()==0)
++            let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm,width:320,height:240,mipmapped:false)
++            descriptor.storageMode = .shared;descriptor.usage = [.shaderRead,.renderTarget]
++            let texture=gpu.makeTexture(descriptor:descriptor)!
++            var bytes=[UInt8](repeating:128,count:320*240*4)
++            bytes.withUnsafeMutableBytes { texture.replace(region:MTLRegionMake2D(0,0,320,240),mipmapLevel:0,withBytes:$0.baseAddress!,bytesPerRow:320*4) }
++            test_control_frame(Unmanaged.passUnretained(texture as AnyObject).toOpaque(),Unmanaged.passUnretained(queue as AnyObject).toOpaque())
++            await wait("real mirrored texture did not encode/network/decode") { pixels>0 }
++            viewer.setMirror(false)
++            await wait("mirror video did not stop") { !host.mirrorActive && !viewer.videoActive }
++            precondition(host.controlOnly && test_control_displays()==0)
++        } else {
++            precondition(emulated && encoderUnavailable())
++            precondition(viewer.ready && host.controlOnly && !host.active && host.mode==nil)
++            precondition(!viewer.videoActive && !host.mirrorActive && test_control_displays()==0)
++            precondition(test_control_video()==0 && pixels==0)
++            let keysAfterReject = test_control_keys()
++            viewer.send(LinkControl(type:"key",code:29,down:true))
++            await wait("video rejection interrupted controls") { test_control_keys()>keysAfterReject }
++            print("PASS virtual Mac: hardware encoder rejection reached viewer; real TLS controls and display topology retained. Hardware mirroring requires a physical-device check.")
++        }
++        let expectedVideoHandlers:UInt32 = verifiedVideo ? 1 : 0
+         viewer.disconnect()
+         await wait("disconnect did not release owned input") { !host.connected && test_control_held()==0 && !GamepadHub.shared.last.connected }
+-        host.stop();precondition(test_control_video()==1 && test_control_displays()==0 && pixels>0)
++        host.stop();precondition(test_control_video()==expectedVideoHandlers && test_control_displays()==0)
+         // A restored one-port Mac must reject a video peer before allocating an
+         // encoder or silently changing the guest topology. Controls-only remains valid.
+         host.listen(wired:false)
+@@ -76,9 +100,10 @@ enum HengeLog { static func log(_ tag:String,_ message:String) { print("\(tag):
+         viewer.connect(host:"127.0.0.1",port:host.port!,key:host.key,wired:false,mode:mode)
+         await wait("running one-port Mac accepted a new monitor") { host.status.contains("saved second monitor") }
+         precondition(!viewer.ready && !host.active && host.mode==nil)
+-        precondition(test_control_video()==1 && test_control_displays()==0)
++        precondition(test_control_video()==expectedVideoHandlers && test_control_displays()==0)
+         viewer.disconnect();host.stop()
+         alarm(0)
+-        print("PASS production controls-only host/client over real TLS: negotiation, owned keyboard/gamepad, mapping, CPU gate, releases, disconnect; opt-in real GPU mirror encode/decode without a second monitor; foreground reconnect preserves pairing")
++        if verifiedVideo { print("PASS real primary GPU mirror encode/decode without a second monitor") }
++        print("PASS production controls-only host/client over real TLS: negotiation, owned keyboard/gamepad, mapping, CPU gate, releases, disconnect and foreground pairing")
+     }
+ }
