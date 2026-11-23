@@ -19,8 +19,8 @@ fi
 task_fetch() {
     local task_url="$1" task_file="$2" task_sha="$3"
     if [[ ! -s "$task_file" ]] || [[ "$(shasum -a 256 "$task_file" | cut -d ' ' -f1)" != "$task_sha" ]]; then
-        curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 30 --max-time 600 "$task_url" -o "$task_file.part"
-        echo "$task_sha  $task_file.part" | shasum -a 256 -c -
+        curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 30 --max-time 600 "$task_url" -o "$task_file.part" || return
+        echo "$task_sha  $task_file.part" | shasum -a 256 -c - || return
         mv "$task_file.part" "$task_file"
     fi
 }
@@ -33,8 +33,10 @@ if ! command -v xcodegen >/dev/null; then
     chmod +x "$task_tools/bin/xcodegen"
 fi
 if ! command -v pkg-config >/dev/null; then
-    task_fetch https://distfiles.dereferenced.org/pkgconf/pkgconf-2.3.0.tar.xz \
-        "$task_tools/downloads/pkgconf-2.3.0.tar.xz" 3a9080ac51d03615e7c1910a0a2a8df08424892b5f13b0628a204d3fcce0ea8b
+    task_pkgconf="$task_tools/downloads/pkgconf-2.3.0.tar.xz"
+    task_pkgconf_sha=3a9080ac51d03615e7c1910a0a2a8df08424892b5f13b0628a204d3fcce0ea8b
+    task_fetch https://distfiles.dereferenced.org/pkgconf/pkgconf-2.3.0.tar.xz "$task_pkgconf" "$task_pkgconf_sha" ||
+        task_fetch https://sources.buildroot.net/pkgconf/pkgconf-2.3.0.tar.xz "$task_pkgconf" "$task_pkgconf_sha"
     tar -xf "$task_tools/downloads/pkgconf-2.3.0.tar.xz" -C "$task_tools/downloads"
     ( cd "$task_tools/downloads/pkgconf-2.3.0"
       ./configure --prefix="$task_tools" --disable-shared --disable-tests
