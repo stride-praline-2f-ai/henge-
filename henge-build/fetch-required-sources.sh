@@ -2,10 +2,11 @@
 # Henge needs Husk's libffi/glib/slirp sources, not its QEMU/pixman/ucontext
 # emulator stages. Preserve the pinned source definitions and unpack stamps.
 set -euo pipefail
-task_husk="${1:?usage: fetch-required-sources.sh HUSK_CHECKOUT}"
+task_husk="${1:?usage: fetch-required-sources.sh HUSK_CHECKOUT [SOURCE_CACHE]}"
+task_source_cache="${2:-$task_husk/third_party}"
 source "$task_husk/scripts/sources.sh"
-task_downloads="$task_husk/third_party/sources"
-task_sources="$task_husk/third_party/build"
+task_downloads="$task_source_cache/sources"
+task_sources="$task_source_cache/build"
 mkdir -p "$task_downloads" "$task_sources"
 for task_url in "$FFI_SRC" "$ICONV_SRC" "$GETTEXT_SRC" "$GLIB_SRC" "$SLIRP_SRC"; do
     task_name="${task_url##*/}"

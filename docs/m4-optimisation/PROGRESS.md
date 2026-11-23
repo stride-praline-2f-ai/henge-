@@ -101,3 +101,12 @@ check that workers honor the admitted opcode and sector.
 The attached build 124 launches started the extension and stopped before the guest boot. The longer attempt returned a RemotePairing socket reset. The supplied JIT word profiles came from earlier VM PIDs and cannot explain this attach failure.
 
 The recovery branch now probes the configured local tunnel using the existing pairing, in remembered, default, advertised and existing fallback order. Duplicate requests share one extension slot. Connection resets get one retry and the error stays on the library screen. This branch also stages resume and file operations, makes restore startup asynchronous, validates direct-loader headers, and reduces RAM-region probes in indirect-branch resolution.
+
+### Build 125 self-hosted recovery
+
+Run 45245075958 passed the compiler, Metal and Rust preflight. GitHub reported
+loss of runner communication during native networking setup. The previous
+completed run identified the Python 3.9 touch-verifier incompatibility and JIT
+ring watchdog. The revised workflow preserves partial Meson/Ninja work across
+runner restarts and accepts fresh attempts at the same commit until a verified
+IPA exists. The Link primary-mirror recovery is included as a pinned follow-up.

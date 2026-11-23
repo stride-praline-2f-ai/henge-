@@ -10,7 +10,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parent
 REQUIRED_STEPS = (
-    "sdk", "verify_patch", "integration", "ios_preflight", "metal_probe", "native_compile",
+    "sdk", "verify_patch", "integration", "release_followups", "ios_preflight", "metal_probe", "native_compile",
     "stack_network", "jit_mmu", "memory_devices", "indices_input", "sanitizers",
     "jit_helper", "ios_compile",
 )
@@ -37,6 +37,7 @@ def record(state, manifest, steps, source, run_id, patch_sha):
         patch_sha256=patch_sha, source_commit=source, run_id=run_id, native_regressions="passed",
         sanitizers="passed", ios_app_compile="passed",
     )
+    state["final_validation"]["release_followups"] = manifest.get("release_followups", {})
     state["final_reconciliation_complete"] = True
     state["release_requested"] = True
     state["workstreams"][-1]["state"] = "pending"
@@ -58,8 +59,8 @@ def record(state, manifest, steps, source, run_id, patch_sha):
 def main():
     source = os.environ["GITHUB_SHA"]
     branch = os.environ["GITHUB_REF_NAME"]
-    if os.environ["GITHUB_RUN_ATTEMPT"] != "1" or branch != "fix/boot-recovery125-alt-mac":
-        raise ValueError("Expected the first run on the dedicated release branch")
+    if int(os.environ["GITHUB_RUN_ATTEMPT"]) < 1 or branch != "fix/boot-recovery125-alt-mac":
+        raise ValueError("Expected a valid attempt on the dedicated release branch")
     manifest = json.loads((ROOT / "manifest.json").read_text())
     if manifest["release_branch"] != branch:
         raise ValueError("Release branch differs from manifest")

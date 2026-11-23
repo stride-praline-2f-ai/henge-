@@ -7,7 +7,7 @@ if pkg-config --exists slirp; then
     exit 0
 fi
 
-build_dir="$husk/build/henge-native-network"
+build_dir="${HENGE_NATIVE_NETWORK_CACHE:-$husk/build/henge-native-network}"
 prefix="$build_dir/sysroot"
 export PKG_CONFIG_PATH="$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
@@ -39,20 +39,28 @@ if verify_sysroot; then
 fi
 
 # Husk's iOS build uses separate Meson build directories and a separate sysroot.
-bash "$(dirname "$0")/fetch-required-sources.sh" "$husk"
-source_dir="$husk/third_party/build"
+echo 'Preparing pinned native networking source archives'
+bash "$(dirname "$0")/fetch-required-sources.sh" "$husk" "$build_dir/sources"
+source_dir="$build_dir/sources/build"
 export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 export CC="$(xcrun --sdk macosx --find clang)"
 export CXX="$(xcrun --sdk macosx --find clang++)"
 mkdir -p "$build_dir"
+jobs="$(sysctl -n hw.logicalcpu)"
+if (( jobs > 1 )); then jobs=$((jobs - 1)); fi
+if (( jobs > 4 )); then jobs=4; fi
 
 build_dependency() {
     local name="$1"
     shift
-    meson setup "$build_dir/$name" "$source_dir/$name" --prefix "$prefix" \
+    local target="$build_dir/$name"
+    if [[ -f "$target/meson-private/coredata.dat" ]]; then set -- --reconfigure "$@"; fi
+    echo "Configuring $name; retaining compatible build objects"
+    meson setup "$target" "$source_dir/$name" --prefix "$prefix" \
         --libdir lib --buildtype release --default-library shared "$@"
-    meson compile -C "$build_dir/$name" -j 4
-    meson install -C "$build_dir/$name"
+    echo "Compiling $name with $jobs workers"
+    meson compile -C "$target" -j "$jobs"
+    meson install -C "$target"
 }
 
 build_dependency glib-2.83.0 -Dtests=false -Dnls=disabled -Dintrospection=disabled \

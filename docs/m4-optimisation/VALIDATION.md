@@ -145,3 +145,9 @@ Use build 123 as the physical comparison. Record guest vCPUs, RAM, Low Power Mod
 Build 125 local checks reproduced the reported connection-reset classification, stale and duplicate RemotePairing candidates, fallback candidate selection and bounded probes. Fault fixtures exercised failed resume followed by retry, installer worker allocation failure, a descendant shared-folder MOVE, packed import failure, replacement export failure, and HTTP 416 followed by a complete 200. Full iOS validation and physical LocalDevVPN attach are separate checks. Packaging requires a successful exact-source native and iOS Release run.
 
 The older build 122 capture attached and detached successfully through the same advertised RemotePairing port and reached the guest. Build 124 reported a reset before attach. The logs therefore identify a connection-stage failure without proving a stale port or pairing. The extracted production IJC lookup passed 1,000 main-RAM lookups with 1,000 region probes and continued to prioritize later host aliases. The repaired portable branch-emitter fixture passed all eight cases. These component results do not measure physical compilation, browsing, extraction, or thermals.
+
+Build 125 recovery checks passed locally for workflow syntax, interrupted native
+dependency recovery with mocked tools, both pinned follow-up patches, and the
+release gate with synthetic successful and failed step outcomes. No local check
+substitutes for the signed touch bundle check, JIT stress completion or full
+device-SDK build on macOS.

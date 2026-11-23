@@ -21,6 +21,8 @@ with zipfile.ZipFile(ipa) as z:
     plist=plistlib.loads(z.read("Payload/Henge.app/Info.plist"))
     app_executable=z.read("Payload/Henge.app/"+plist["CFBundleExecutable"])
 assert plist.get("HengeAuditRepairsSHA256")==manifest["audit_repairs_sha256"], "Incorrect audit repairs"
+if "release_followups" in manifest:
+    assert plist.get("HengeReleaseFollowupsSHA256")==manifest["release_followups"], "Incorrect release follow-ups"
 assert plist.get("HengeSnapshotSchema")==3, "Incorrect snapshot schema"
 assert plist['CFBundleShortVersionString'] == manifest['app_version'], 'Unexpected app version'
 assert plist['CFBundleVersion'] == manifest['app_build'], 'Unexpected app build'
@@ -106,6 +108,8 @@ data['packaging_validation'] = dict(architectures=architectures, ios_device_plat
     nested_signature_verified=True, entitlement_values_verified=True, core_motion_linked=True,
     distribution_signing='ad hoc; installation tool must sign with its own supported profile')
 state=json.loads(Path('build-request/henge-build/optimization-state.json').read_text())
+if "release_followups" in manifest:
+    assert state["final_validation"]["release_followups"]==manifest["release_followups"], "Unvalidated release follow-ups"
 data['optimization_validation'] = state.get('final_validation')
 # New engine/input code must be present in the actual device archive, beyond
 # the native source test receipt. Keep physical-device claims separate.

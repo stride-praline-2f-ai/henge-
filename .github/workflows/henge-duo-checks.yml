@@ -2,6 +2,7 @@ name: Henge 125 validate and package on one Mac
 run-name: Henge 125 on self-hosted ARM64 Mac · ${{ github.sha }}
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: henge-custom-ipa-${{ github.ref }}
   cancel-in-progress: true
@@ -65,6 +66,10 @@ jobs:
         set -euo pipefail
         current_head=$(git -C build-request ls-remote origin "refs/heads/${GITHUB_REF_NAME}" | cut -f1)
         test "$current_head" = "$GITHUB_SHA" || { echo "Superseded source; build refused" >&2; exit 1; }
+    - name: Check whether this commit already has an IPA
+      env:
+        HENGE_ACTIONS_TOKEN: ${{ github.token }}
+      run: python3 build-request/henge-build/check-existing-ipa.py
     - name: Load pinned inputs
       id: inputs
       run: |
@@ -123,9 +128,9 @@ jobs:
       id: integration
       run: bash build-request/henge-build/integrate-upstream.sh
     - name: Apply self-hosted validation compatibility fixes
+      id: release_followups
       run: |
-        git -C Henge apply "$GITHUB_WORKSPACE/build-request/henge-build/link-mirror-recovery.patch"
-        git -C Henge apply "$GITHUB_WORKSPACE/build-request/henge-build/self-hosted-validation-recovery.patch"
+        python3 build-request/henge-build/verify-release-followups.py Henge
     - name: Use supported macOS test-image provider cleanup
       run: |
         python3 - <<'PYAPFS'
@@ -179,22 +184,30 @@ jobs:
         bash -n Husk/scripts/build_rppairing_ios.sh
     - name: Fingerprint native networking dependencies
       id: native_cache
+      env:
+        HENGE_HUSK_PIN: ${{ steps.inputs.outputs.husk }}
+      shell: bash
       run: |
+        set -euo pipefail
         fingerprint=$({
+          printf '%s\n' "$HENGE_HUSK_PIN" "$HOME" "$HUSK"
+          shasum -a 256 build-request/henge-build/setup-native-network.sh build-request/henge-build/fetch-required-sources.sh
           sw_vers -buildVersion
           xcodebuild -version
           xcrun --sdk macosx --show-sdk-build-version
           meson --version
-          printf '%s\n' "$HUSK/build/henge-native-network/sysroot"
         } | shasum -a 256 | cut -d ' ' -f1)
+        checkpoint="$HOME/Library/Caches/HengeCI/native-network-v2/$fingerprint"
+        echo "cache_path=$checkpoint/sysroot" >> "$GITHUB_OUTPUT"
+        echo "HENGE_NATIVE_NETWORK_CACHE=$checkpoint" >> "$GITHUB_ENV"
         echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
     - name: Restore native networking sysroot
       id: native_cache_restore
       uses: actions/cache/restore@v4
       continue-on-error: true
       with:
-        path: Husk/build/henge-native-network/sysroot
-        key: henge-native-slirp-v1-${{ runner.arch }}-${{ steps.inputs.outputs.husk }}-${{ steps.native_cache.outputs.fingerprint }}-${{ hashFiles('build-request/henge-build/setup-native-network.sh', 'build-request/henge-build/fetch-required-sources.sh') }}
+        path: ${{ steps.native_cache.outputs.cache_path }}
+        key: henge-native-slirp-v2-${{ runner.arch }}-${{ steps.native_cache.outputs.fingerprint }}
     - name: Verify build inputs and native networking dependency
       id: native_dependencies
       run: |
@@ -209,7 +222,7 @@ jobs:
     - name: Check whether a native sysroot was built
       id: native_sysroot
       run: |
-        if [[ -f "$HUSK/build/henge-native-network/sysroot/lib/pkgconfig/slirp.pc" ]]; then
+        if [[ -f "$HENGE_NATIVE_NETWORK_CACHE/sysroot/lib/pkgconfig/slirp.pc" ]]; then
           echo 'present=true' >> "$GITHUB_OUTPUT"
         fi
     - name: Save verified native networking sysroot
@@ -217,7 +230,7 @@ jobs:
       uses: actions/cache/save@v4
       continue-on-error: true
       with:
-        path: Husk/build/henge-native-network/sysroot
+        path: ${{ steps.native_cache.outputs.cache_path }}
         key: ${{ steps.native_cache_restore.outputs.cache-primary-key }}
     - name: Probe public Metal archive reopening independently
       working-directory: Henge
@@ -253,7 +266,7 @@ jobs:
       if: ${{ always() && !cancelled() }}
       uses: actions/upload-artifact@v4
       with:
-        name: metal-api-${{ github.run_id }}
+        name: metal-api-${{ github.run_id }}-${{ github.run_attempt }}
         path: |
           Henge/build/archive-api.log
           Henge/build/archive-api-build.log
@@ -383,7 +396,7 @@ jobs:
       if: ${{ failure() && !cancelled() }}
       uses: actions/upload-artifact@v4
       with:
-        name: early-native-validation-${{ github.run_id }}
+        name: early-native-validation-${{ github.run_id }}-${{ github.run_attempt }}
         path: Henge/build/validation-0*.log
         if-no-files-found: ignore
         retention-days: 7
@@ -432,7 +445,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: Henge-validation-${{ github.run_id }}
+        name: Henge-validation-${{ github.run_id }}-${{ github.run_attempt }}
         retention-days: 7
         if-no-files-found: ignore
         path: |
@@ -518,7 +531,10 @@ jobs:
       if: ${{ success() }}
       env:
         HENGE_RELEASE_STEPS: ${{ toJSON(steps) }}
-      run: python3 build-request/henge-build/record-125-release-gate.py
+        HENGE_ACTIONS_TOKEN: ${{ github.token }}
+      run: |
+        python3 build-request/henge-build/check-existing-ipa.py
+        python3 build-request/henge-build/record-125-release-gate.py
     - name: Package and inspect IPA
       working-directory: Henge
       run: |
@@ -534,6 +550,7 @@ jobs:
             assert info['HengeCustomPullRequests'] == [14, 31, 32, 35, 36, 46, 60, 61, 63, 106]
             manifest = json.loads(Path('../build-request/henge-build/manifest.json').read_text())
             assert info['HengeUpstreamCommit'] == manifest['henge_sha']
+            assert info['HengeReleaseFollowupsSHA256'] == manifest['release_followups']
             assert info['CFBundleIdentifier'] == 'com.henge.app'
             assert (info.get('LSSupportsGameMode') is True) == (os.environ.get('HENGE_GAME_MODE') == '1')
             assert info.get('HengeLinkExperimental') is True and info.get('HengeLinkProtocolVersion') == manifest['henge_link']['protocol_version']
@@ -592,7 +609,7 @@ jobs:
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: Henge-build-logs-${{ github.run_id }}
+        name: Henge-build-logs-${{ github.run_id }}-${{ github.run_attempt }}
         retention-days: 3
         if-no-files-found: ignore
         path: |
@@ -600,7 +617,6 @@ jobs:
           Henge/build/*.log
           Husk/build/logs/*.log
           Henge/build/scheduling-check/*.log
-    if: ${{ github.run_attempt == 1 }}
 'on':
   push:
     branches:
