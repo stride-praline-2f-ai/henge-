@@ -1,0 +1,261 @@
+diff --git a/core/dispatch.c b/core/dispatch.c
+index d8b51d4..a0eb263 100644
+--- a/core/dispatch.c
++++ b/core/dispatch.c
+@@ -137,17 +137,35 @@ static int exit_in_segment(const HvExitRetirement *ev, uintptr_t address) {
+     return address >= (uintptr_t)ev->lo && address < (uintptr_t)ev->hi;
+ }
+ 
+-static void unlink_evicted_chain(HvMachine *m, uint32_t slot) {
++// Keep next links available until all dead slots are marked, then sweep
++// each affected physical-page bucket once under the existing quiescence.
++static void mark_evicted_chain(HvMachine *m, uint64_t *dirty_buckets, uint32_t slot) {
+     uint64_t page = m->slot_xpa[slot];
+     if (!page) return;
+-    uint32_t *link = &m->xchain_heads[hv_xchain_bucket(page)];
+-    while (*link && *link != slot + 1) link = &m->xchained[*link - 1];
+-    if (*link) {
+-        *link = m->xchained[slot];
+-        m->nxchained--;
+-    }
++    uint32_t bucket = hv_xchain_bucket(page);
++    dirty_buckets[bucket / 64] |= 1ull << (bucket % 64);
+     m->slot_xpa[slot] = 0;
+-    m->xchained[slot] = 0;
++}
++
++static void sweep_evicted_chains(HvMachine *m, const uint64_t *dirty_buckets) {
++    for (uint32_t word = 0; word < (HV_XCHAIN_BUCKETS + 63) / 64; word++) {
++        uint64_t bits = dirty_buckets[word];
++        while (bits) {
++            uint32_t bucket = word * 64 + (uint32_t)__builtin_ctzll(bits);
++            bits &= bits - 1;
++            uint32_t *link = &m->xchain_heads[bucket];
++            while (*link) {
++                uint32_t slot = *link - 1;
++                if (m->slot_xpa[slot]) {
++                    link = &m->xchained[slot];
++                } else {
++                    *link = m->xchained[slot];
++                    m->xchained[slot] = 0;
++                    m->nxchained--;
++                }
++            }
++        }
++    }
+ }
+ 
+ static void finish_evicted_branch(HvMachine *m, HvExitRetirement *ev, uint32_t *site) {
+@@ -184,6 +202,7 @@ static void restore_evicted_branch(HvMachine *m, HvExitRetirement *ev, uint32_t
+    physical-page lists, and examine only groups that could refer to the victim
+    or allocations that have never been through retirement. */
+ static void retire_indexed_exits(HvMachine *m, HvExitRetirement *ev, uint32_t seg, uint32_t nslots) {
++    uint64_t dirty_buckets[(HV_XCHAIN_BUCKETS + 63) / 64] = {0};
+     uint32_t free_count = 0;
+     uint32_t high_water = m->slot_evict_high_water;
+     for (uint32_t i = 0; i < m->nslot_free; i++) {
+@@ -206,17 +225,18 @@ static void retire_indexed_exits(HvMachine *m, HvExitRetirement *ev, uint32_t se
+             if (!site) {
+                 if (slot >= high_water) m->slot_free[free_count++] = slot;
+             } else if (exit_in_segment(ev, (uintptr_t)site)) {
+-                unlink_evicted_chain(m, slot);
++                mark_evicted_chain(m, dirty_buckets, slot);
+                 m->slots[slot] = 0;
+                 m->slot_site[slot] = NULL;
+                 m->slot_cond[slot] = NULL;
+                 m->slot_free[free_count++] = slot;
+             } else if (exit_in_segment(ev, m->slots[slot])) {
+-                unlink_evicted_chain(m, slot);
++                mark_evicted_chain(m, dirty_buckets, slot);
+                 restore_evicted_branch(m, ev, slot, site);
+             }
+         }
+     }
++    sweep_evicted_chains(m, dirty_buckets);
+     m->slot_evict_high_water = nslots;
+     m->nslot_free = free_count;
+     __atomic_fetch_add(&m->slot_evict_examined, examined, __ATOMIC_RELAXED);
+diff --git a/ios/Henge/Link/LinkService.swift b/ios/Henge/Link/LinkService.swift
+index 12f3c26..8841647 100644
+--- a/ios/Henge/Link/LinkService.swift
++++ b/ios/Henge/Link/LinkService.swift
+@@ -137,6 +137,7 @@ final class LinkHostService: ObservableObject {
+         }
+     }
+     private func startMirror(requestedHz: Int) {
++        HengeLog.log("link-mirror", "Received primary mirror request at \(requestedHz) Hz; VM state=\(henge_vm_state()).")
+         if mirrorActive, mirrorRequestedHz == requestedHz {
+             henge_vm_mirror_refresh()
+             return
+@@ -307,6 +308,7 @@ final class LinkViewerService: ObservableObject {
+     @Published private(set) var ready = false
+     @Published private(set) var videoHz=60
+     @Published private(set) var videoActive=false
++    @Published private(set) var mirrorFrameReady=false
+     @Published private(set) var mirrorSupported=false
+     @Published var keyboardMapping = false {
+         didSet { if oldValue != keyboardMapping { send(LinkControl(type:"padMode",down:keyboardMapping)) } }
+@@ -321,6 +323,7 @@ final class LinkViewerService: ObservableObject {
+     private let decodeWorker = LinkDecodeWorker(report: { HengeLog.log("link-viewer", $0) })
+     private var generation = UUID()
+     private var decodeGeneration=UUID()
++    private var pixelGeneration=UUID()
+     private var hostReady: LinkControl?
+     private var foreground=true
+     private var wantsMirror=false
+@@ -336,11 +339,25 @@ final class LinkViewerService: ObservableObject {
+     private func clearConnection() {
+         generation=UUID();ready=false;videoActive=false;mirrorSupported=false;hostReady=nil
+         transport.onPacket=nil;transport.onStatus=nil;transport.onClosed=nil;transport.stop();transport=LinkTransport()
+-        decodeWorker.stop();decodeGeneration=UUID()
++        stopDecode()
++    }
++    private func stopDecode() {
++        mirrorFrameReady = false
++        pixelGeneration = UUID()
++        decodeWorker.stop()
++        decodeGeneration = UUID()
+     }
+     private func beginDecode(_ mode:LinkMode,generation g:UUID) {
++        let pixelRun = UUID()
++        pixelGeneration = pixelRun
++        mirrorFrameReady = false
+         let mailbox=LinkPixelMailbox { [weak self] pixel in
+-            guard let self,self.generation==g,self.foreground else { return }
++            guard let self, self.generation == g, self.pixelGeneration == pixelRun, self.foreground else { return }
++            if self.request?.inputOnly == true, !self.mirrorFrameReady {
++                self.mirrorFrameReady = true
++                self.status = "Connected. Main Mac screen and controls."
++                HengeLog.log("link-viewer", "First primary mirror frame decoded and delivered to the viewer.")
++            }
+             self.onPixel?(pixel)
+         }
+         decodeGeneration=decodeWorker.start(mode:mode,output:{mailbox.submit($0)})
+@@ -387,18 +404,32 @@ final class LinkViewerService: ObservableObject {
+                         }
+                         if self.wantsMirror && self.mirrorSupported { channel?.sendControl(LinkControl(type:"mirror",x:self.mirrorHz,down:true)) }
+                     } else if command.type=="readyMirror",request.inputOnly,self.wantsMirror,self.mirrorSupported,let mode=command.mode {
+-                        self.beginDecode(mode,generation:g);self.videoHz=mode.hz;self.videoActive=true;self.status="Connected. Main Mac screen and controls."
++                        self.beginDecode(mode,generation:g);self.videoHz=mode.hz;self.videoActive=true
++                        self.status="Connected. Waiting for the first Mac frame."
++                        HengeLog.log("link-viewer", "Primary mirror accepted at \(mode.width)x\(mode.height) \(mode.hz) Hz.")
+                     } else if command.type=="mirror",command.down==false,request.inputOnly {
+-                        self.videoActive=false;self.decodeWorker.stop();self.decodeGeneration=UUID()
++                        self.videoActive=false;self.stopDecode()
+                         if self.wantsMirror, let code = command.code, let result = LinkMirrorStatus(rawValue: code) {
+                             self.status = result.viewerMessage
+                         }
+                     }
+                 } else if packet.kind==2 && (!request.inputOnly || self.videoActive) {
+-                    self.decodeWorker.consume(packet.payload,generation:self.decodeGeneration,consumed:{ [weak channel] sequence in
++                    let decodeRun = self.decodeGeneration
++                    self.decodeWorker.consume(packet.payload,generation:decodeRun,consumed:{ [weak channel] sequence in
+                         channel?.sendControl(LinkControl(type:"videoAck",sequence:sequence))
+                     },failed:{ [weak self] reason in
+-                        Task { @MainActor in self?.connectionLost(reason,generation:g) }
++                        Task { @MainActor in
++                            guard let self, self.generation == g, self.decodeGeneration == decodeRun else { return }
++                            if request.inputOnly {
++                                self.videoActive = false
++                                self.stopDecode()
++                                self.send(LinkControl(type: "mirror", down: false))
++                                self.status = "Video stopped: \(reason). Wireless controls are connected."
++                                HengeLog.log("link-viewer", self.status)
++                            } else {
++                                self.connectionLost(reason, generation: g)
++                            }
++                        }
+                     })
+                 }
+             }
+@@ -429,8 +460,11 @@ final class LinkViewerService: ObservableObject {
+     }
+     func setMirror(_ enabled:Bool,hz:Int = 60) {
+         wantsMirror=enabled;mirrorHz=[30,60,120].contains(hz) ? hz : 60
++        if enabled {
++            HengeLog.log("link-viewer", "Primary mirror requested at \(mirrorHz) Hz; controls ready=\(ready), host mirror support=\(mirrorSupported).")
++        }
+         guard ready,mirrorSupported else { return }
+-        if !enabled { videoActive=false;decodeWorker.stop();decodeGeneration=UUID() }
++        if !enabled { videoActive=false;stopDecode() }
+         send(LinkControl(type:"mirror",x:mirrorHz,down:enabled))
+     }
+     func send(_ control: LinkControl) {
+diff --git a/ios/Henge/Link/LinkViews.swift b/ios/Henge/Link/LinkViews.swift
+index ccdbb33..d9e93a8 100644
+--- a/ios/Henge/Link/LinkViews.swift
++++ b/ios/Henge/Link/LinkViews.swift
+@@ -78,7 +78,7 @@ struct LinkViewerView: View {
+                         WirelessVideoControls(isDuo:HostScheduling.isDuo,tuning:gamepadPreferences.value,acceptsInput:viewer.ready,
+                             sendPad:{viewer.send(LinkControl(type:"gamepad",gamepad:$0))},sendPointer:{viewer.send($0)},
+                             video:LinkVideoSurface(viewer:viewer,toggleControls:toggleControls,fill:fillVideo,hz:viewer.videoHz),toolbar:controllerVideoToolbar)
+-                            .overlay { if !viewer.videoActive { VStack { Text(viewer.status);Button("Retry video") { viewer.setMirror(true,hz:controllerVideoHz) } }.padding().background(.ultraThinMaterial,in:RoundedRectangle(cornerRadius:16)) } }
++                            .overlay { if !viewer.mirrorFrameReady { VStack { Text(viewer.status);Button("Retry video") { viewer.setMirror(true,hz:controllerVideoHz) } }.padding().background(.ultraThinMaterial,in:RoundedRectangle(cornerRadius:16)) } }
+                     } else if inputOnly {
+                         WirelessControlsPanel(status:viewer.status,tuning:gamepadPreferences.value,isDuo:HostScheduling.isDuo,acceptsInput:viewer.ready,supportsVideo:viewer.mirrorSupported,enableVideo:{controllerVideo=true;viewer.setMirror(true,hz:controllerVideoHz)},
+                             mode:Binding(get:{ WirelessControlMode(rawValue:inputTab) ?? .touchpad },set:{inputTab=$0.rawValue}),
+diff --git a/tests/test_chain_index.py b/tests/test_chain_index.py
+index 8aa0001..e6db84b 100644
+--- a/tests/test_chain_index.py
++++ b/tests/test_chain_index.py
+@@ -96,7 +96,8 @@ static void bench_exits(void) {
+  m.slot_free=calloc(SLOT_COUNT,4);m.max_slots=SLOT_COUNT;
+  uint64_t *index=calloc(hv_slot_group_count(SLOT_COUNT),8);assert(index&&m.slot_free&&m.jit.base);
+  unsigned char *free_map=calloc(SLOT_COUNT,1);assert(free_map);
+- for(unsigned run=0;run<6;run++){
++ for(unsigned run=0;run<8;run++){
++  int concentrated=run>=6;
+   m.slot_segments=run&1?index:NULL;
+   memset(index,0,hv_slot_group_count(SLOT_COUNT)*sizeof *index);
+   memset(free_map,0,SLOT_COUNT);
+@@ -113,14 +114,16 @@ static void bench_exits(void) {
+    *site=0x14000000u|((target-site)&0x3ffffff);
+    m.slots[i]=(uintptr_t)target;m.slot_xpa[i]=0;m.xchained[i]=0;
+    if(i==2||i==3||i>=SLOT_COUNT-3){m.slot_site[i]=m.slot_cond[i]=NULL;m.slots[i]=0;continue;}
+-   if(i%13==0){
+-    uint64_t pa=(i+1)*PAGE;unsigned bucket=hv_xchain_bucket(pa);
++   if(concentrated||i%13==0){
++    uint64_t pa=concentrated?PAGE:(i+1)*PAGE;unsigned bucket=hv_xchain_bucket(pa);
+     m.slot_xpa[i]=pa|1;m.xchained[i]=m.xchain_heads[bucket];
+     m.xchain_heads[bucket]=i+1;m.nxchained++;
+    }
+    hv_slot_mark_segment(&m,i,(uintptr_t)site);
+    hv_slot_mark_segment(&m,i,(uintptr_t)target);
+   }
++  /* A hot target page can put nearly all slots in one bucket. */
++  if(concentrated)assert(m.nxchained==SLOT_COUNT-5);
+   m.slot_cond[61]=m.jit.base+SLOT_COUNT+61;*m.slot_cond[61]=0x54000000u;
+   uint64_t examined=m.slot_evict_examined,start=mach_absolute_time();
+   hv_evict_blocks(&m);
+@@ -137,7 +140,7 @@ static void bench_exits(void) {
+    assert(free_map[i]==gone);
+    if(gone){assert(!m.slot_site[i]&&!m.slots[i]&&!m.slot_xpa[i]);continue;}
+    if(dst==VICTIM){assert(!m.slots[i]&&*m.slot_site[i]==0x14000001u&&!m.slot_xpa[i]);}
+-   else{assert(m.slots[i]==(uintptr_t)(m.jit.base+dst*SEG_WORDS));assert(m.slot_xpa[i]==(i%13?0:((i+1)*PAGE|1)));}
++   else{assert(m.slots[i]==(uintptr_t)(m.jit.base+dst*SEG_WORDS));assert(m.slot_xpa[i]==(concentrated?(PAGE|1):i%13?0:((i+1)*PAGE|1)));}
+   }
+   for(unsigned b=0;b<HV_XCHAIN_BUCKETS;b++)
+    for(uint32_t link=m.xchain_heads[b];link;link=m.xchained[link-1]){
+diff --git a/tests/test_link_control_services.swift b/tests/test_link_control_services.swift
+index ef48f52..89ab1cf 100644
+--- a/tests/test_link_control_services.swift
++++ b/tests/test_link_control_services.swift
+@@ -69,15 +69,16 @@ enum HengeLog { static func log(_ tag:String,_ message:String) { print("\(tag):
+         let verifiedVideo = viewer.videoActive && host.mirrorActive
+         if verifiedVideo {
+             precondition(!host.active && host.controlOnly && host.mode==nil && (viewer.videoHz==60 || viewer.videoHz==30) && test_control_displays()==0)
++            precondition(!viewer.mirrorFrameReady)
+             let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm,width:320,height:240,mipmapped:false)
+             descriptor.storageMode = .shared;descriptor.usage = [.shaderRead,.renderTarget]
+             let texture=gpu.makeTexture(descriptor:descriptor)!
+             var bytes=[UInt8](repeating:128,count:320*240*4)
+             bytes.withUnsafeMutableBytes { texture.replace(region:MTLRegionMake2D(0,0,320,240),mipmapLevel:0,withBytes:$0.baseAddress!,bytesPerRow:320*4) }
+             test_control_frame(Unmanaged.passUnretained(texture as AnyObject).toOpaque(),Unmanaged.passUnretained(queue as AnyObject).toOpaque())
+-            await wait("real mirrored texture did not encode/network/decode") { pixels>0 }
++            await wait("real mirrored texture did not encode/network/decode") { pixels>0 && viewer.mirrorFrameReady }
+             viewer.setMirror(false)
+-            await wait("mirror video did not stop") { !host.mirrorActive && !viewer.videoActive }
++            await wait("mirror video did not stop") { !host.mirrorActive && !viewer.videoActive && !viewer.mirrorFrameReady }
+             precondition(host.controlOnly && test_control_displays()==0)
+         } else {
+             precondition(emulated && encoderUnavailable())
