@@ -19554,7 +19554,7 @@ index af0bc1b..2496178 100644
 +    }
 +}
 diff --git a/ios/Henge/HengeApp.swift b/ios/Henge/HengeApp.swift
-index 04b1a49..e613b17 100644
+index 04b1a49..5792937 100644
 --- a/ios/Henge/HengeApp.swift
 +++ b/ios/Henge/HengeApp.swift
 @@ -12,14 +12,15 @@ struct HengeApp: App {
@@ -19576,6 +19576,16 @@ index 04b1a49..e613b17 100644
          Machines.shared.collectImports()
          // The display question: does this iOS have Apple's paravirtualized graphics at all?
          for path in ["/System/Library/Frameworks/ParavirtualizedGraphics.framework/ParavirtualizedGraphics",
+@@ -79,6 +80,9 @@ struct RootView: View {
+             guard !viewerOnly, scenePhase == .active else { return }
+             machines.collectImports()
+             jit.enableAtLaunchIfAsked()
++            // A built-in request reports its own attachment. Do not start a
++            // second prewarm watcher while the helper is still connecting.
++            if jit.busy { return }
+             // StikDebug can launch Henge before it attaches. A task also runs
+             // on the first appearance, when there may be no phase change.
+             for _ in 0..<100 {
 diff --git a/ios/Henge/HengeBridge.h b/ios/Henge/HengeBridge.h
 index 76630c6..ec21294 100644
 --- a/ios/Henge/HengeBridge.h
@@ -20359,7 +20369,7 @@ index 1887244..2c9e4d4 100644
          return attempt < maxAttempts ? .retry(after: 4) : .giveUp
      }
 diff --git a/ios/Henge/JIT/JITSetup.swift b/ios/Henge/JIT/JITSetup.swift
-index 356a34d..77d8dfe 100644
+index 356a34d..523d3bb 100644
 --- a/ios/Henge/JIT/JITSetup.swift
 +++ b/ios/Henge/JIT/JITSetup.swift
 @@ -166,8 +166,7 @@ final class JITCoordinator: ObservableObject {
@@ -20470,7 +20480,7 @@ index 356a34d..77d8dfe 100644
                  status = "JIT is on."
                  error = nil
                  attachGeneration += 1
-@@ -388,42 +380,39 @@ final class JITCoordinator: ObservableObject {
+@@ -388,42 +380,40 @@ final class JITCoordinator: ObservableObject {
              }
          }
  
@@ -20512,11 +20522,12 @@ index 356a34d..77d8dfe 100644
 +                readiness = Self.watchForDebugger { finish(nil) }
 +            },
 +            completion: { [weak self] result in
-+                guard let self, !finished else { return }
++                guard let self else { return }
 +                switch result {
 +                case .success(let response):
 +                    txmPresent = response.txmPresent
 +                    log("helper: \(response.message)")
++                    guard !finished else { return }
 +                    if response.success {
 +                        if JITBootstrap.debuggedFlag || JITBootstrap.ready { finish(nil) }
 +                        else { finish("The helper exited before JIT was ready. Try again.") }
@@ -20542,7 +20553,7 @@ index 356a34d..77d8dfe 100644
          busy = true
          error = nil
          status = "Resetting the Developer Disk Image cache…"
-@@ -478,22 +467,18 @@ final class JITCoordinator: ObservableObject {
+@@ -478,22 +468,18 @@ final class JITCoordinator: ObservableObject {
          return true
      }
  
@@ -20551,14 +20562,15 @@ index 356a34d..77d8dfe 100644
 -                                        completion: @escaping (Bool) -> Void) -> Timer {
 -        let deadline = Date().addingTimeInterval(timeout)
 -        let timer = Timer(timeInterval: 0.5, repeats: true) { timer in
+-            if JITBootstrap.debuggedFlag {
+-                timer.invalidate()
+-                completion(true)
+-            } else if Date() >= deadline {
 +    /// Watch only while the extension request is in flight. Its result owns the timeout.
 +    private static func watchForDebugger(_ attached: @escaping () -> Void) -> Timer {
 +        let timer = Timer(timeInterval: 0.25, repeats: true) { timer in
-             if JITBootstrap.debuggedFlag {
++            if JITBootstrap.debuggedFlag && JITBootstrap.isTraced {
                  timer.invalidate()
--                completion(true)
--            } else if Date() >= deadline {
--                timer.invalidate()
 -                completion(false)
 +                attached()
              }
@@ -20570,7 +20582,7 @@ index 356a34d..77d8dfe 100644
  }
  
  /// LocalDevVPN, which Built-in StikJIT and StikDebug reach the device through:
-@@ -530,133 +515,3 @@ enum LocalDevVPN {
+@@ -530,133 +516,3 @@ enum LocalDevVPN {
          UIApplication.shared.open(installed ? connect : appStore)
      }
  }
@@ -27917,10 +27929,10 @@ index 0000000..157f42f
 +}
 diff --git a/tests/test_branch_stub.py b/tests/test_branch_stub.py
 new file mode 100644
-index 0000000..f244755
+index 0000000..ed53b20
 --- /dev/null
 +++ b/tests/test_branch_stub.py
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,92 @@
 +"""Execute the production far-chain emitter: linked/empty slots and host exits.
 +Unicorn checks guest state and generated instruction count, not device FPS.
 +"""
@@ -27941,6 +27953,7 @@ index 0000000..f244755
 +__thread HvCpu *hv_self;
 +void hv_mmu_walk(HvCpu *c,uint64_t va,HvAccess a,int el,HvWalk *w){(void)c;(void)va;(void)a;(void)el;w->fsc=1;}
 +HvRam *hv_ram_lookup(HvMachine *m,uint64_t pa){(void)m;(void)pa;return NULL;}
++int hv_ijc_site_admitted(HvMachine *m,uint64_t site,uint32_t flags){(void)m;(void)site;(void)flags;abort();}
 +int main(int argc,char **argv){
 +    (void)argc;static HvMachine m;static uint64_t slots[4],xa[4],pa[4];
 +    static Emit literal;literal.w=literal.hot;
@@ -31171,10 +31184,10 @@ index 0000000..7c993ad
 +}
 diff --git a/tests/test_ijc_front.c b/tests/test_ijc_front.c
 new file mode 100644
-index 0000000..a327982
+index 0000000..7811188
 --- /dev/null
 +++ b/tests/test_ijc_front.c
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,79 @@
 +/* Exercise production resolution, not a duplicate lookup model. The timed
 +   portion excludes diagnostic increments and alternates the reference. */
 +#include "machine.h"
@@ -31190,12 +31203,13 @@ index 0000000..a327982
 +int main(void) {
 +    enum {P=16384,N=200000};
 +    assert(!hv_machine_init(&m,4<<20));
-+    uint8_t *ram=aligned_alloc(P,3*P);assert(ram);memset(ram,0,3*P);
++    uint8_t *ram=aligned_alloc(P,4*P);assert(ram);memset(ram,0,4*P);
 +    uint32_t *code=(uint32_t *)(ram+P);code[0]=0x91000400;code[1]=0xd65f03c0;
 +    /* Firmware/main RAM/configuration ordering matches the real board. */
 +    assert(!hv_machine_add_ram(&m,0x20000000,P,ram,0));
-+    assert(!hv_machine_add_ram(&m,(uintptr_t)code,P,code,0));
-+    assert(!hv_machine_add_ram(&m,0x30000000,P,ram+2*P,0));
++    assert(!hv_machine_add_ram(&m,(uintptr_t)code,2*P,code,0));
++    assert(!hv_machine_add_ram(&m,0x30000000,P,ram+3*P,0));
++    assert(m.main_ram == &m.ram[1] && m.main_ram_host_disjoint);
 +    hv_cpu_reset(&cpu,&m);cpu.el=0;cpu.spsel=0;cpu.cpacr_el1=3u<<20;
 +    cpu.pc=(uintptr_t)code;m.stop_pc=(uintptr_t)(code+1);
 +    assert(hv_run(&cpu)==HV_EXIT_HALT&&cpu.x[0]==1);
@@ -31205,9 +31219,15 @@ index 0000000..a327982
 +        hv_knob[HV_K_IJCFRONT]=(int)mode;
 +        uint64_t probes=m.stats.light_ram_probes,hits=m.stats.light_front_hits;
 +        for(unsigned n=0;n<1000;n++)assert(hv_ijc_resolve(&cpu,(uintptr_t)code,0)==entry);
-+        assert(m.stats.light_ram_probes-probes==(mode?1000:3000));
++        assert(m.stats.light_ram_probes-probes==1000);
 +        assert(m.stats.light_front_hits-hits==(mode?1000:0));
 +    }
++    hv_knob[HV_K_IJCFRONT]=0;
++    m.main_ram_host_disjoint=0;
++    uint64_t probes=m.stats.light_ram_probes;
++    for (unsigned n=0; n<1000; n++) assert(hv_ijc_resolve(&cpu,(uintptr_t)code,0)==entry);
++    assert(m.stats.light_ram_probes-probes==2000);
++    m.main_ram_host_disjoint=1;
 +    m.stats_interval=0;
 +    mach_timebase_info_data_t tb;assert(!mach_timebase_info(&tb));
 +    for(unsigned round=0;round<5;round++)for(unsigned order=0;order<2;order++) {
@@ -31239,12 +31259,13 @@ index 0000000..a327982
 +    /* A later physical alias of the SAME host bytes preserves last-region
 +       reference semantics; it must not reuse the earlier region's block. */
 +    assert(!hv_machine_add_ram(&m,0x40000000,P,code,0));
++    assert(!m.main_ram_host_disjoint);
 +    for(unsigned mode=0;mode<2;mode++) {
 +        hv_knob[HV_K_IJCFRONT]=(int)mode;
 +        assert(!hv_ijc_resolve(&cpu,(uintptr_t)code,0));
 +    }
 +    hv_machine_free(&m);free(ram);
-+    puts("PASS production early IJC: 3000->1000 region probes; exact code result, SMC generation, remapped executable and later host alias respect reference");
++    puts("PASS production IJC: main RAM lookup used one probe; exact code result, SMC generation, remapping and host aliases respect reference");
 +}
 diff --git a/tests/test_input_ring.c b/tests/test_input_ring.c
 new file mode 100644
