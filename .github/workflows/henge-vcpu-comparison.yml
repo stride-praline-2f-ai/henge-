@@ -1,0 +1,80 @@
+name: Henge 4 vs 8 guest vCPUs
+on:
+  push:
+    branches: [test/vcpu-4-vs-8]
+    paths:
+      - .github/workflows/henge-vcpu-comparison.yml
+      - henge-build/compare-vcpus.py
+      - henge-build/jit-ring-vcpu-comparison.patch
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Compare 4 vs 8 on ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: self-hosted Mac
+            labels: '["self-hosted", "macOS", "ARM64"]'
+          - name: cloud Xcode 27
+            labels: '["xcode-27"]'
+    runs-on: ${{ fromJSON(matrix.labels) }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: build-request
+          persist-credentials: false
+      - name: Load pinned Henge source
+        id: pin
+        run: |
+          python3 - <<'PY'
+          import json, os
+          manifest = json.load(open("build-request/henge-build/manifest.json"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print("source=" + manifest["henge_sha"], file=output)
+          PY
+      - uses: actions/checkout@v4
+        with:
+          repository: Leviidev/Henge
+          ref: ${{ steps.pin.outputs.source }}
+          path: Henge
+          persist-credentials: false
+      - name: Reconstruct build 125 source
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, subprocess
+          from pathlib import Path
+          root = Path("build-request/henge-build")
+          patch = (root / "henge.patch").resolve()
+          manifest = json.loads((root / "manifest.json").read_text())
+          assert hashlib.sha256(patch.read_bytes()).hexdigest() == manifest["patch_sha256"]
+          subprocess.run(["git", "-C", "Henge", "apply", str(patch)], check=True)
+          PY
+          git -C Henge add -A
+          git -C Henge -c user.name='Henge CI' -c user.email='henge-ci@users.noreply.github.com' commit -m 'Apply pinned custom Henge patch'
+          bash build-request/henge-build/integrate-upstream.sh
+          git -C Henge apply "$GITHUB_WORKSPACE/build-request/henge-build/jit-ring-vcpu-comparison.patch"
+      - name: Build engine stress fixture
+        working-directory: Henge
+        run: |
+          test "$(uname -m)" = arm64
+          xcrun --sdk macosx --find clang
+          make -j4 build/test_jit_ring
+      - name: Compare equivalent guest work at 4 and 8 vCPUs
+        working-directory: Henge
+        run: |
+          set -o pipefail
+          ulimit -s 65520
+          python3 ../build-request/henge-build/compare-vcpus.py ./build/test_jit_ring build/vcpu-comparison.json | tee build/vcpu-comparison.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vcpu-comparison-${{ strategy.job-index }}
+          path: |
+            Henge/build/vcpu-comparison.json
+            Henge/build/vcpu-comparison.log

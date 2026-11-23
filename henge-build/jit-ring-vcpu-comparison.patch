@@ -1,0 +1,73 @@
+--- a/tests/test_jit_ring.c
++++ b/tests/test_jit_ring.c
+@@ -6,31 +6,37 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+-/* Real four-vCPU dispatch, translations, cross-page chains and global eviction.
++/* Real multi-vCPU dispatch, translations, cross-page chains and global eviction.
+    Each basic block is on a different page so repair cannot pass on same-page
+    chains alone. No ROM, timer sleeps or device fixture is involved. */
+ static HvMachine machine;
+-static HvCpu cpus[4];
++static HvCpu cpus[HV_MAX_CPUS];
++static unsigned vcpus=4;
+ static pthread_mutex_t ready_mu=PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t ready_cv=PTHREAD_COND_INITIALIZER;
+ static unsigned ready_count;
+ static void *run_cpu(void *opaque) {
+     HvCpu *cpu=opaque;hv_self=cpu;
+     pthread_mutex_lock(&ready_mu);
+-    if(++ready_count==4)pthread_cond_broadcast(&ready_cv);
+-    while(ready_count<4)pthread_cond_wait(&ready_cv,&ready_mu);
++    if(++ready_count==vcpus)pthread_cond_broadcast(&ready_cv);
++    while(ready_count<vcpus)pthread_cond_wait(&ready_cv,&ready_mu);
+     pthread_mutex_unlock(&ready_mu);
+     int result=hv_run(cpu);
+     return (void *)(uintptr_t)result;
+ }
+-int main(void) {
+-    alarm(60);
++int main(int argc,char **argv) {
++    if(argc==2 && strcmp(argv[1],"8")==0)vcpus=8;
++    else if(argc!=1 && !(argc==2 && strcmp(argv[1],"4")==0)){
++        fprintf(stderr,"usage: %s [4|8]\n",argv[0]);return 2;
++    }
++    alarm(argc==1 ? 60 : 180);
+     assert(!hv_machine_init(&machine,64<<10));
+     machine.chain_stub_reference=-1; /* force the large-cache inline format through tiny-cache evictions */
+     /* 4096 unique blocks exceed 64 KiB even with ideal publication dedup.
+        The old 512-block workload could fit when poison-mode timing removed
+        concurrent chunk wastage; allocator contention is not eviction proof. */
+-    enum {blocks=4096,loops=4,page=16384};
++    enum {blocks=4096,traversals=16,page=16384};
++    unsigned loops=traversals/vcpus;
+     void *memory;assert(!posix_memalign(&memory,page,(blocks+1)*page));memset(memory,0,(blocks+1)*page);
+     uint64_t base=(uint64_t)(uintptr_t)memory;
+     assert(!hv_machine_add_ram(&machine,base,(blocks+1)*page,memory,0));
+@@ -44,12 +50,12 @@
+     hv_knob[HV_K_JITSEGS]=getenv("HV_TEST_JIT_SEGMENTS")?atoi(getenv("HV_TEST_JIT_SEGMENTS")):2;hv_flush_blocks(&machine);
+     uint64_t full=machine.stats.block_flushes;
+     for(int round=0;round<2;round++){
+-        ready_count=0;pthread_t threads[4];
+-        for(unsigned i=0;i<4;i++){
++        ready_count=0;pthread_t threads[HV_MAX_CPUS];
++        for(unsigned i=0;i<vcpus;i++){
+             hv_cpu_reset_index(&cpus[i],&machine,i);cpus[i].pc=base;cpus[i].x[1]=loops;
+             assert(!pthread_create(&threads[i],NULL,run_cpu,&cpus[i]));
+         }
+-        for(int i=0;i<4;i++){
++        for(unsigned i=0;i<vcpus;i++){
+             void *result;assert(!pthread_join(threads[i],&result));
+             assert((uintptr_t)result==HV_EXIT_HALT);
+             assert(cpus[i].x[0]==(uint64_t)blocks*loops && cpus[i].x[1]==0);
+@@ -60,7 +66,7 @@
+         (unsigned long long)full,(unsigned long long)machine.stats.translations,
+         (unsigned long long)machine.stats.flush_capacity,machine.jit.too_big,machine.jit.nseg);
+     assert(machine.stats.evictions>10 && machine.stats.block_flushes==full);
+-    printf("JIT ring: four vCPUs, %llu evictions, %llu exits repaired, no capacity full reset; cross-page counters correct\n",
+-        (unsigned long long)machine.stats.evictions,(unsigned long long)machine.stats.evict_unchained);
++    printf("JIT ring: %u vCPUs, %llu evictions, %llu exits repaired, no capacity full reset; cross-page counters correct\n",
++        vcpus,(unsigned long long)machine.stats.evictions,(unsigned long long)machine.stats.evict_unchained);
+     hv_machine_free(&machine);free(memory);pthread_cond_destroy(&ready_cv);pthread_mutex_destroy(&ready_mu);
+ }
