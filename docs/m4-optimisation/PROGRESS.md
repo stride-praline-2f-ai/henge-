@@ -95,3 +95,9 @@ check that workers honor the admitted opcode and sector.
 - Opt-in HV_HOT_GROUP_RETRANSLATION=1 uses an exact per-vCPU key and a bounded wider compile when a previously observed block needs retranslation. It replaces no live block and adds no execution sampling by default.
 - Small and medium vectored I/O requests can pass validated vectors through directly. Short transfers, overflow, EINTR, and flush order retain coverage.
 - Release gate requires the exact pinned patch, cloud native and iOS validation, and a verified single package. Physical extraction, install, clean-build, and thermal comparisons are open.
+
+## Build 125 launch recovery
+
+The attached build 124 launches started the extension and stopped before the guest boot. The longer attempt returned a RemotePairing socket reset. The supplied JIT word profiles came from earlier VM PIDs and cannot explain this attach failure.
+
+The recovery branch now probes the configured local tunnel using the existing pairing, in remembered, default, advertised and existing fallback order. Duplicate requests share one extension slot. Connection resets get one retry and the error stays on the library screen. This branch also stages resume and file operations, makes restore startup asynchronous, validates direct-loader headers, and reduces RAM-region probes in indirect-branch resolution.
