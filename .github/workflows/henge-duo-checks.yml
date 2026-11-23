@@ -1,7 +1,6 @@
-name: Henge native validation and gated IPA
+name: Henge 125 validate and package on one Mac
 permissions:
   contents: read
-  actions: write
 concurrency:
   group: henge-custom-ipa-${{ github.ref }}
   cancel-in-progress: true
@@ -9,16 +8,13 @@ env:
   HUSK: ${{ github.workspace }}/Husk
   HENGE_GAME_MODE: '0'
   HENGE_IPA_OUTPUT: ${{ github.workspace }}/Henge-output/Henge.ipa
-  HENGE_CI_EMULATED_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_mode
-    == 'henge' && '1' || '0' }}
+  HENGE_CI_EMULATED_RUNNER: '0'
   HOMEBREW_NO_AUTO_UPDATE: '1'
   HOMEBREW_NO_INSTALL_CLEANUP: '1'
   IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
 jobs:
   build:
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_mode ==
-      'henge' && fromJSON('["self-hosted","macOS","ARM64","henge"]') || 'xcode-27'
-      }}
+    runs-on: xcode-27
     timeout-minutes: 90
     steps:
     - uses: actions/checkout@v4
@@ -26,60 +22,45 @@ jobs:
         path: build-request
         persist-credentials: false
     - name: Select newest installed Xcode for native touch
-      run: "python3 - <<'PYSDK'\nimport glob, os, re, subprocess\nassert subprocess.check_output(['uname',\
-        \ '-m'], text=True).strip() == 'arm64', 'This Henge runner requires native\
-        \ arm64 macOS'\ncandidates = []\nfor app in glob.glob('/Applications/Xcode*.app'):\n\
-        \    developer = app + '/Contents/Developer'\n    try:\n        version =\
-        \ subprocess.check_output(['xcodebuild', '-version'], env={**os.environ, 'DEVELOPER_DIR':\
-        \ developer}, text=True)\n        match = re.search(r'Xcode (\\d+(?:\\.\\\
-        d+)*)', version)\n        if match: candidates.append((tuple(map(int, match[1].split('.'))),\
-        \ developer, version))\n    except subprocess.CalledProcessError:\n      \
-        \  pass\nif not candidates: raise SystemExit('No installed Xcode found')\n\
-        _, developer, version = max(candidates)\nprint(version + developer)\nwith\
-        \ open(os.environ['GITHUB_ENV'], 'a') as f: f.write('DEVELOPER_DIR=' + developer\
-        \ + '\\n')\nPYSDK\n"
+      run: |
+        python3 - <<'PYSDK'
+        import glob, os, re, subprocess
+        assert subprocess.check_output(['uname', '-m'], text=True).strip() == 'arm64', 'This Henge runner requires native arm64 macOS'
+        candidates = []
+        for app in glob.glob('/Applications/Xcode*.app'):
+            developer = app + '/Contents/Developer'
+            try:
+                version = subprocess.check_output(['xcodebuild', '-version'], env={**os.environ, 'DEVELOPER_DIR': developer}, text=True)
+                match = re.search(r'Xcode (\d+(?:\.\d+)*)', version)
+                if match: candidates.append((tuple(map(int, match[1].split('.'))), developer, version))
+            except subprocess.CalledProcessError:
+                pass
+        if not candidates: raise SystemExit('No installed Xcode found')
+        _, developer, version = max(candidates)
+        sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-version'],
+                                      env={**os.environ, 'DEVELOPER_DIR': developer}, text=True).strip()
+        if tuple(map(int, sdk.split('.'))) < (27, 1):
+            raise SystemExit(f'Build 125 requires iOS SDK 27.1 or newer; found {sdk}')
+        print(version + developer + ': iphoneos ' + sdk)
+        with open(os.environ['GITHUB_ENV'], 'a') as f: f.write('DEVELOPER_DIR=' + developer + '\n')
+        PYSDK
+      id: sdk
     - name: Require current development head
-      run: 'set -euo pipefail
-
-        current_head=$(git -C build-request ls-remote origin "refs/heads/${GITHUB_REF_NAME}"
-        | cut -f1)
-
-        test "$current_head" = "$GITHUB_SHA" || { echo "Superseded source; build refused"
-        >&2; exit 1; }
-
-        '
-    - name: Cancel superseded IPA runs from the two packaging workflows
-      env:
-        GH_TOKEN: ${{ github.token }}
-      shell: bash
-      run: "python3 - <<'PYCANCEL'\nimport json, os, urllib.request, urllib.error\n\
-        from pathlib import Path\nbase='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']\n\
-        headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}\n\
-        def call(path, method='GET'):\n    request=urllib.request.Request(base+path,headers=headers,method=method)\n\
-        \    with urllib.request.urlopen(request,timeout=30) as response:\n      \
-        \  body=response.read()\n        return json.loads(body) if body else {}\n\
-        current=call('/actions/runs/'+os.environ['GITHUB_RUN_ID'])\npaths={'.github/workflows/henge-ipa.yml','.github/workflows/henge-duo-checks.yml'}\n\
-        ids={w['id'] for w in call('/actions/workflows?per_page=100')['workflows']\
-        \ if w['path'] in paths}\nresults=[]\nfor status in ('queued','in_progress','waiting','pending','requested'):\n\
-        \    for run in call('/actions/runs?status='+status+'&per_page=100')['workflow_runs']:\n\
-        \        if run['id']==current['id'] or run['workflow_id'] not in ids or run['created_at']>current['created_at'] or run['head_branch']!=current['head_branch']:continue\n\
-        \        if any(x['id']==run['id'] for x in results):continue\n        item={'id':run['id'],'head_sha':run['head_sha'],'status':run['status']}\n\
-        \        results.append(item)\n        for action in ('cancel','force-cancel'):\n\
-        \            try:\n                call('/actions/runs/'+str(run['id'])+'/'+action,'POST')\n\
-        \                item['request']=action;item['result']='accepted';break\n\
-        \            except urllib.error.HTTPError as error:\n                item[action+'_http']=error.code\n\
-        \                if error.code!=409:break\n        if item.get('result')!='accepted':item['result']='provider\
-        \ rejected; preserved for review'\n        print('Superseded IPA cleanup:',json.dumps(item))\n\
-        out=Path(os.environ['HENGE_IPA_OUTPUT']).parent\nout.mkdir(parents=True,exist_ok=True)\n\
-        (out/'Henge-build-cleanup.json').write_text(json.dumps({'current_run':current['id'],'results':results},indent=2)+'\\\
-        n')\nprint('Checked only the two IPA workflows; unrelated workflows retained.')\n\
-        PYCANCEL\n"
+      run: |
+        set -euo pipefail
+        current_head=$(git -C build-request ls-remote origin "refs/heads/${GITHUB_REF_NAME}" | cut -f1)
+        test "$current_head" = "$GITHUB_SHA" || { echo "Superseded source; build refused" >&2; exit 1; }
     - name: Load pinned inputs
       id: inputs
-      run: "python3 - <<'PY'\nimport json, os\nfrom pathlib import Path\ndata = json.loads(Path('build-request/henge-build/manifest.json').read_text())\n\
-        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:\n    f.write('henge=' +\
-        \ data['henge_sha'] + '\\n')\n    f.write('husk=' + data['husk_sha'] + '\\\
-        n')\nPY\n"
+      run: |
+        python3 - <<'PY'
+        import json, os
+        from pathlib import Path
+        data = json.loads(Path('build-request/henge-build/manifest.json').read_text())
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write('henge=' + data['henge_sha'] + '\n')
+            f.write('husk=' + data['husk_sha'] + '\n')
+        PY
     - uses: actions/checkout@v4
       with:
         repository: Leviidev/Henge
@@ -95,366 +76,233 @@ jobs:
     - name: Verify and apply reviewed changes
       env:
         CUSTOM_SOURCE_COMMIT: ${{ github.sha }}
-      run: "python3 - <<'PY'\nimport hashlib, json, os, plistlib, subprocess\nfrom\
-        \ pathlib import Path\nfolder = Path('build-request/henge-build')\ndata =\
-        \ json.loads((folder / 'manifest.json').read_text())\npatch = folder / 'henge.patch'\n\
-        assert hashlib.sha256(patch.read_bytes()).hexdigest() == data['patch_sha256']\n\
-        for check in (['git', '-C', 'Henge', 'apply', '--check', str(patch.resolve())],\n\
-        \              ['git', '-C', 'Henge', 'apply', str(patch.resolve())]):\n \
-        \   subprocess.run(check, check=True)\npath = Path('Henge/ios/Henge/Info.plist')\n\
-        with path.open('rb') as f: info = plistlib.load(f)\ninfo['HengeCustomSourceCommit']\
-        \ = os.environ['CUSTOM_SOURCE_COMMIT']\ninfo['HengeUpstreamCommit'] = data['henge_sha']\n\
-        info['HengeCustomPullRequests'] = [14, 31, 32, 35, 36, 46, 60, 61, 63, 106]\n\
-        with path.open('wb') as f: plistlib.dump(info, f)\nif os.environ.get('HENGE_GAME_MODE')\
-        \ == '1':\n    subprocess.run(['python3', 'Henge/tools/configure_gaming_experiments.py',\
-        \ '--info', str(path), '--game-mode'], check=True)\n# Do not silently change\
-        \ normal/personal-team signing requirements.\nfor name in ['Henge.entitlements',\
-        \ 'Henge.personal.entitlements']:\n    actual = Path('Henge/ios/Henge') /\
-        \ name\n    expected = subprocess.check_output(['git', '-C', 'Henge', 'show',\
-        \ data['henge_sha'] + ':ios/Henge/' + name])\n    assert actual.read_bytes()\
-        \ == expected\nPY\ngit -C Henge add -A\ngit -C Henge -c user.name='Henge CI'\
-        \ -c user.email='henge-ci@users.noreply.github.com' commit -m \"Custom Henge\
-        \ 0.3 from ${GITHUB_SHA}\"\n"
+      run: |
+        python3 - <<'PY'
+        import hashlib, json, os, plistlib, subprocess
+        from pathlib import Path
+        folder = Path('build-request/henge-build')
+        data = json.loads((folder / 'manifest.json').read_text())
+        patch = folder / 'henge.patch'
+        assert hashlib.sha256(patch.read_bytes()).hexdigest() == data['patch_sha256']
+        for check in (['git', '-C', 'Henge', 'apply', '--check', str(patch.resolve())],
+                      ['git', '-C', 'Henge', 'apply', str(patch.resolve())]):
+            subprocess.run(check, check=True)
+        path = Path('Henge/ios/Henge/Info.plist')
+        with path.open('rb') as f: info = plistlib.load(f)
+        info['HengeCustomSourceCommit'] = os.environ['CUSTOM_SOURCE_COMMIT']
+        info['HengeUpstreamCommit'] = data['henge_sha']
+        info['HengeCustomPullRequests'] = [14, 31, 32, 35, 36, 46, 60, 61, 63, 106]
+        with path.open('wb') as f: plistlib.dump(info, f)
+        if os.environ.get('HENGE_GAME_MODE') == '1':
+            subprocess.run(['python3', 'Henge/tools/configure_gaming_experiments.py', '--info', str(path), '--game-mode'], check=True)
+        # Do not silently change normal/personal-team signing requirements.
+        for name in ['Henge.entitlements', 'Henge.personal.entitlements']:
+            actual = Path('Henge/ios/Henge') / name
+            expected = subprocess.check_output(['git', '-C', 'Henge', 'show', data['henge_sha'] + ':ios/Henge/' + name])
+            assert actual.read_bytes() == expected
+        PY
+        git -C Henge add -A
+        git -C Henge -c user.name='Henge CI' -c user.email='henge-ci@users.noreply.github.com' commit -m "Custom Henge 0.3 from ${GITHUB_SHA}"
+      id: verify_patch
     - name: Integrate pinned Henge main and reviewed device PRs
       id: integration
       run: bash build-request/henge-build/integrate-upstream.sh
     - name: Use supported macOS test-image provider cleanup
-      run: 'python3 - <<''PYAPFS''
-
+      run: |
+        python3 - <<'PYAPFS'
         import hashlib
-
         from pathlib import Path
-
-        p=Path(''Henge/tests/test_disk_recovery_macos.py'')
-
-        assert hashlib.sha256(p.read_bytes()).hexdigest()==''6b471d30c3cd29469c2edb1e6223e54f425037c026fb7ad3f47c16a6f9844f76'',
-        ''Review APFS fixture adapter after source changes''
-
+        p=Path('Henge/tests/test_disk_recovery_macos.py')
+        assert hashlib.sha256(p.read_bytes()).hexdigest()=='6b471d30c3cd29469c2edb1e6223e54f425037c026fb7ad3f47c16a6f9844f76', 'Review APFS fixture adapter after source changes'
         s=p.read_text()
-
-        old="        run(''hdiutil'',''detach'',''-force'',device)"
-
-        new="        # APFS creates separate synthesized media objects. Disk Arbitration
-        can\n        # retain them after volume verification even when every volume
-        is cleanly\n        # unmounted. Eject those OWNED synthesized objects before
-        the backing image.\n        # Each operation changes device state; no sleeps,
-        skipped assertions or\n        # ignored final detach failure. Never touch
-        a container with foreign stores.\n        for container in containers(device):\n            prefix=device.removeprefix(''/dev/'')+''s''\n            stores=container.get(''PhysicalStores'',[])\n            assert
-        stores and all(v.get(''DeviceIdentifier'','''').startswith(prefix) for v in
-        stores),container\n            reference=container[''ContainerReference'']\n            assert
-        re.fullmatch(r''(?:/dev/)?disk[0-9]+'',reference),reference\n            for
-        volume in container.get(''Volumes'',[]):\n                info=run(''diskutil'',''info'',''-plist'',volume[''DeviceIdentifier''],plist=True)\n                assert
-        not info.get(''Mounted'') and not info.get(''MountPoint''),info\n            result=subprocess.run([''diskutil'',''eject'',''force'',reference],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)\n            errors.append(((''diskutil'',''eject'',''force'',reference),result.returncode,result.stderr.decode(errors=''replace'')))\n            if
-        not attached():break\n        if attached():\n            # Reconfirm the
-        complete current association immediately before force.\n            current=attached()\n            assert
-        len(current)==1 and Path(current[0][''image-path'']).resolve()==expected_image.resolve(),current\n            for
-        container in containers(device):\n                for volume in container.get(''Volumes'',[]):\n                    info=run(''diskutil'',''info'',''-plist'',volume[''DeviceIdentifier''],plist=True)\n                    assert
-        not info.get(''Mounted'') and not info.get(''MountPoint''),info\n            result=subprocess.run([''diskutil'',''eject'',''force'',device],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)\n            if
-        result.returncode:\n                print(''Provider release failed after
-        owned synthesized media eject:'',attached(),containers(device),flush=True)\n                subprocess.run([''lsof'',device],stdout=sys.stderr,stderr=sys.stderr,timeout=15)\n                raise
-        RuntimeError((''diskutil backing-image eject'',result.returncode,result.stdout,result.stderr))\n"
-
+        old="        run('hdiutil','detach','-force',device)"
+        new="        # APFS creates separate synthesized media objects. Disk Arbitration can\n        # retain them after volume verification even when every volume is cleanly\n        # unmounted. Eject those OWNED synthesized objects before the backing image.\n        # Each operation changes device state; no sleeps, skipped assertions or\n        # ignored final detach failure. Never touch a container with foreign stores.\n        for container in containers(device):\n            prefix=device.removeprefix('/dev/')+'s'\n            stores=container.get('PhysicalStores',[])\n            assert stores and all(v.get('DeviceIdentifier','').startswith(prefix) for v in stores),container\n            reference=container['ContainerReference']\n            assert re.fullmatch(r'(?:/dev/)?disk[0-9]+',reference),reference\n            for volume in container.get('Volumes',[]):\n                info=run('diskutil','info','-plist',volume['DeviceIdentifier'],plist=True)\n                assert not info.get('Mounted') and not info.get('MountPoint'),info\n            result=subprocess.run(['diskutil','eject','force',reference],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)\n            errors.append((('diskutil','eject','force',reference),result.returncode,result.stderr.decode(errors='replace')))\n            if not attached():break\n        if attached():\n            # Reconfirm the complete current association immediately before force.\n            current=attached()\n            assert len(current)==1 and Path(current[0]['image-path']).resolve()==expected_image.resolve(),current\n            for container in containers(device):\n                for volume in container.get('Volumes',[]):\n                    info=run('diskutil','info','-plist',volume['DeviceIdentifier'],plist=True)\n                    assert not info.get('Mounted') and not info.get('MountPoint'),info\n            result=subprocess.run(['diskutil','eject','force',device],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)\n            if result.returncode:\n                print('Provider release failed after owned synthesized media eject:',attached(),containers(device),flush=True)\n                subprocess.run(['lsof',device],stdout=sys.stderr,stderr=sys.stderr,timeout=15)\n                raise RuntimeError(('diskutil backing-image eject',result.returncode,result.stdout,result.stderr))\n"
         assert s.count(old)==1
-
         patched=s.replace(old,new.rstrip())
-
-        compile(patched,str(p),''exec'')
-
-        # Keep the final assert-not-attached and every payload/Recovery/GPT/filesystem
-        check.
-
-        assert patched.count(''assert not attached(),errors'')==1
-
+        compile(patched,str(p),'exec')
+        # Keep the final assert-not-attached and every payload/Recovery/GPT/filesystem check.
+        assert patched.count('assert not attached(),errors')==1
         p.write_text(patched)
-
-        print(''PASS macOS27 fixture adapter: owned APFS synthesized media released
-        before backing image; all validation retained'')
-
+        print('PASS macOS27 fixture adapter: owned APFS synthesized media released before backing image; all validation retained')
         PYAPFS
-
-        '
     - name: Ensure Metal shader compiler
-      run: "if ! xcrun --sdk macosx metal --version; then\n  xcodebuild -downloadComponent\
-        \ MetalToolchain\nfi\nxcrun --sdk macosx metal --version\n"
+      run: |
+        if ! xcrun --sdk macosx metal --version; then
+          xcodebuild -downloadComponent MetalToolchain
+        fi
+        xcrun --sdk macosx metal --version
     - name: Prepare and verify build prerequisites
-      run: 'set -euo pipefail
-
+      run: |
+        set -euo pipefail
         bash build-request/henge-build/setup-runner.sh --ci
-
         test -d Husk/src/app/Frameworks/StikJIT.xcframework
-
         test -f Husk/src/rppairing-ios/Cargo.lock
-
         test -f Henge/third_party/libzip/CMakeLists.txt
-
         df -h .
 
-
         # Native networking lifecycle tests require a macOS libslirp.
-
         if ! pkg-config --exists slirp; then brew install libslirp; fi
-
         pkg-config --cflags --libs slirp
-
-        '
     - name: Probe public Metal archive reopening independently
       working-directory: Henge
-      run: "mkdir -p build\nexec > >(tee build/archive-api-build.log) 2>&1\nxcrun\
-        \ -sdk macosx metal -c tests/archive_fixture.metal -o build/archive_fixture.air\n\
-        xcrun -sdk macosx metallib build/archive_fixture.air -o build/archive_fixture.metallib\n\
-        xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror tests/test_pipeline_archive_api.m\
-        \ -framework Foundation -framework Metal -o build/test_pipeline_archive_api\n\
-        for name in av af anr ak ak2; do\n  xcrun -sdk macosx metal -DHENGE_ARCHIVE_FUNC_$name=1\
-        \ -c tests/archive_fixture.metal -o \"build/archive_$name.air\"\n  xcrun -sdk\
-        \ macosx metallib \"build/archive_$name.air\" -o \"build/archive_$name.metallib\"\
-        \ndone\nset +e\nfailed=0\nfor kind in basic compute mixed separate delayed;\
-        \ do\n  extra=()\n  if [[ \"$kind\" != basic ]]; then extra=(\"$kind\"); fi\n\
-        \  build/test_pipeline_archive_api build/archive_fixture.metallib \"build/archive-api-$kind.bin\"\
-        \ write \"${extra[@]}\" 2>&1 | tee -a build/archive-api.log\n  if [[ ${PIPESTATUS[0]}\
-        \ != 0 ]]; then failed=$((failed+1)); fi\n  build/test_pipeline_archive_api\
-        \ build/archive_fixture.metallib \"build/archive-api-$kind.bin\" read \"${extra[@]}\"\
-        \ 2>&1 | tee -a build/archive-api.log\n  read_rc=${PIPESTATUS[0]}\n  if [[\
-        \ \"$kind\" == mixed && \"$read_rc\" == 78 ]]; then\n    echo 'Mixed-container\
-        \ driver limitation reproduced; production must use separate render/compute/tile\
-        \ files' | tee -a build/archive-api.log\n  elif [[ ( \"$kind\" == separate\
-        \ || \"$kind\" == delayed ) && \"$read_rc\" == 78 ]]; then\n    echo 'Independent\
-        \ exact single-function API control proved Paravirtual missing-function behavior;\
-        \ all four GPU executions and normal fallback passed; production cold-hit\
-        \ requirements unchanged' | tee -a build/archive-api.log\n  elif [[ \"$read_rc\"\
-        \ != 0 ]]; then failed=$((failed+1)); fi\ndone\nif [[ \"$failed\" == 0 ]];\
-        \ then echo 'PASS independent Metal archives: cold render hits; compute persistence\
-        \ capability checked; all four PSOs executed; fallback checked' | tee -a build/archive-api.log;\
-        \ fi\nexit $((failed > 0))\n"
+      run: |
+        mkdir -p build
+        exec > >(tee build/archive-api-build.log) 2>&1
+        xcrun -sdk macosx metal -c tests/archive_fixture.metal -o build/archive_fixture.air
+        xcrun -sdk macosx metallib build/archive_fixture.air -o build/archive_fixture.metallib
+        xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror tests/test_pipeline_archive_api.m -framework Foundation -framework Metal -o build/test_pipeline_archive_api
+        for name in av af anr ak ak2; do
+          xcrun -sdk macosx metal -DHENGE_ARCHIVE_FUNC_$name=1 -c tests/archive_fixture.metal -o "build/archive_$name.air"
+          xcrun -sdk macosx metallib "build/archive_$name.air" -o "build/archive_$name.metallib"
+        done
+        set +e
+        failed=0
+        for kind in basic compute mixed separate delayed; do
+          extra=()
+          if [[ "$kind" != basic ]]; then extra=("$kind"); fi
+          build/test_pipeline_archive_api build/archive_fixture.metallib "build/archive-api-$kind.bin" write "${extra[@]}" 2>&1 | tee -a build/archive-api.log
+          if [[ ${PIPESTATUS[0]} != 0 ]]; then failed=$((failed+1)); fi
+          build/test_pipeline_archive_api build/archive_fixture.metallib "build/archive-api-$kind.bin" read "${extra[@]}" 2>&1 | tee -a build/archive-api.log
+          read_rc=${PIPESTATUS[0]}
+          if [[ "$kind" == mixed && "$read_rc" == 78 ]]; then
+            echo 'Mixed-container driver limitation reproduced; production must use separate render/compute/tile files' | tee -a build/archive-api.log
+          elif [[ ( "$kind" == separate || "$kind" == delayed ) && "$read_rc" == 78 ]]; then
+            echo 'Independent exact single-function API control proved Paravirtual missing-function behavior; all four GPU executions and normal fallback passed; production cold-hit requirements unchanged' | tee -a build/archive-api.log
+          elif [[ "$read_rc" != 0 ]]; then failed=$((failed+1)); fi
+        done
+        if [[ "$failed" == 0 ]]; then echo 'PASS independent Metal archives: cold render hits; compute persistence capability checked; all four PSOs executed; fallback checked' | tee -a build/archive-api.log; fi
+        exit $((failed > 0))
+      id: metal_probe
     - name: Retain independent Metal API result
       if: ${{ always() && !cancelled() }}
       uses: actions/upload-artifact@v4
       with:
         name: metal-api-${{ github.run_id }}
-        path: 'Henge/build/archive-api.log
-
+        path: |
+          Henge/build/archive-api.log
           Henge/build/archive-api-build.log
-
-          '
         if-no-files-found: ignore
         retention-days: 7
     - name: Compile engine regression checks
       if: ${{ !cancelled() && steps.integration.outcome == 'success' }}
       id: native_compile
       working-directory: Henge
-      run: 'set -euo pipefail
-
+      run: |
+        set -euo pipefail
         mkdir -p build
-
         exec > >(tee build/validation-00.log) 2>&1
-
-        trap ''task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND"
-        >&2'' ERR
-
+        trap 'task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND" >&2' ERR
         ulimit -s 65520
-
         set -x
+        make -j4 build/test_ijc_front build/bench_evict_scan build/test_register_groups build/bench_far_chain build/bench_snapshot_admission build/test_tlb_preload build/test_stw_flush build/test_xhci_slots build/test_inline_sysreg build/test_jit_region build/test_jit_ring build/test_pvg_linear_bounds build/test_mmu build/test_mem build/test_jit build/test_devices build/test_fastmem build/test_memory_bounds build/test_tail_recheck build/test_cpu_sync build/test_timer_dispatch build/test_blk_completion build/test_blk_segments build/test_disk_iov build/test_idle_integration
 
-        make -j4 build/test_ijc_front build/bench_evict_scan build/test_register_groups build/bench_far_chain build/bench_snapshot_admission
-        build/test_tlb_preload build/test_stw_flush build/test_xhci_slots build/test_inline_sysreg
-        build/test_jit_region build/test_jit_ring build/test_pvg_linear_bounds build/test_mmu
-        build/test_mem build/test_jit build/test_devices build/test_fastmem build/test_memory_bounds
-        build/test_tail_recheck build/test_cpu_sync build/test_timer_dispatch build/test_blk_completion
-        build/test_blk_segments build/test_disk_iov build/test_idle_integration
-
-
-        make -j4 build/test_snapshot_pack build/test_shutdown build/test_dns_lifecycle
-        build/test_vm_lifecycle build/test_pvg_lifecycle build/test_audio_lifecycle
-        build/test_fastmem_bench
-
-        '
+        make -j4 build/test_snapshot_pack build/test_shutdown build/test_dns_lifecycle build/test_vm_lifecycle build/test_pvg_lifecycle build/test_audio_lifecycle build/test_fastmem_bench
     - name: Checked stack translations, precise exceptions and network batches
       if: ${{ !cancelled() && steps.native_compile.outcome == 'success' }}
       working-directory: Henge
       shell: bash
-      run: 'set -euo pipefail
-
-        make -j4 build/test_exc build/test_mem_register_reference build/test_exc_register_reference
+      run: |
+        set -euo pipefail
+        make -j4 build/test_exc build/test_mem_register_reference build/test_exc_register_reference build/test_net_batch
         build/test_net_batch
-
-        build/test_net_batch
-
         HV_GROUPS=2 build/test_mem
-
         HV_GROUPS=2 build/test_mem_register_reference
-
         build/test_exc
-
         build/test_exc_register_reference
-
-        '
+      id: stack_network
     - name: Validate JIT publication, MMU and superblocks
       if: ${{ !cancelled() && steps.native_compile.outcome == 'success' }}
       working-directory: Henge
-      run: 'set -euo pipefail
-
+      run: |
+        set -euo pipefail
         mkdir -p build
-
         exec > >(tee build/validation-01.log) 2>&1
-
-        trap ''task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND"
-        >&2'' ERR
-
+        trap 'task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND" >&2' ERR
         ulimit -s 65520
-
         set -x
-
         build/test_ijc_front
-
         HV_JIT_SPLIT=1 build/test_ijc_front
-
         build/bench_evict_scan
 
-
         build/test_register_groups
-
         build/bench_far_chain
-
         build/bench_snapshot_admission
 
-
         build/test_stw_flush
-
         HV_STW_IPI=1 build/test_stw_flush
-
         build/test_xhci_slots
-
         build/test_inline_sysreg
-
         HV_JIT_SPLIT=1 build/test_inline_sysreg
-
         build/test_jit_region
-
         build/test_jit_ring
-
         HV_JIT_POISON=1 build/test_jit_ring
-
         HV_JIT_SPLIT=1 build/test_jit_ring
-
         HV_JIT_INDEXED_BLOCKS=1 HV_JIT_POISON=1 build/test_jit_ring
-
         HV_JIT_INDEXED_BLOCKS=1 HV_JIT_INDEXED_EXITS=1 HV_JIT_POISON=1 build/test_jit_ring
-
         HV_JIT_INDEXED_BLOCKS=1 HV_JIT_SPLIT=1 build/test_jit_ring
-
         HV_JIT_INDEXED_BLOCKS=1 HV_JIT_INDEXED_EXITS=1 HV_JIT_SPLIT=1 build/test_jit_ring
-
         build/test_pvg_linear_bounds
-
         HV_JIT_RELAXED_BRANCH=1 build/test_jit_region
-
         build/test_mmu
-
         HV_WALK_LOG=0 HV_IJC_PAGES=0 build/test_mmu
-
         build/test_jit
-
         HV_SUPERBLOCKS=1 build/test_jit
-
         HV_SUPERBLOCKS=1 HV_JIT_SPLIT=1 build/test_jit
-
-        '
+      id: jit_mmu
     - name: Validate memory, timing, CPU sync and devices
       if: ${{ !cancelled() && steps.native_compile.outcome == 'success' }}
       working-directory: Henge
-      run: 'set -euo pipefail
-
+      run: |
+        set -euo pipefail
         mkdir -p build
-
         exec > >(tee build/validation-02.log) 2>&1
-
-        trap ''task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND"
-        >&2'' ERR
-
+        trap 'task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND" >&2' ERR
         ulimit -s 65520
-
         set -x
-
         build/test_mem
-
         HV_WALK_LOG=0 HV_IJC_PAGES=0 build/test_mem
-
         HV_FASTMEM=1 build/test_mem
-
 
         HV_FASTMEM=1 HV_FASTMEM_ORDER=tlb-first build/test_mem
 
-
         HV_FASTMEM=1 HV_FASTMEM_ORDER=tlb-first HV_JIT_SPLIT=1 build/test_mem
 
-
         HV_FASTMEM=1 HV_FASTMEM_ORDER=tlb-first HV_TLB_PRELOAD=1 build/test_tail_recheck
-
         HV_SUPERBLOCKS=1 build/test_mem
-
         build/test_fastmem
-
         build/test_memory_bounds
-
         build/test_tail_recheck
-
         HV_TLB_PRELOAD=1 build/test_mem
-
         HV_TLB_PRELOAD=1 build/test_tail_recheck
-
         build/test_tlb_preload
-
         HV_JIT_SPLIT=1 build/test_tlb_preload
 
-
         build/test_cpu_sync
-
         build/test_timer_dispatch
-
         build/test_blk_completion
 
-
         build/test_blk_segments
-
         build/test_disk_iov
-
         build/test_idle_integration
-
         build/test_devices
-
         python3 tests/test_chain_index.py
 
-
         build/test_shutdown
-
         build/test_dns_lifecycle
-
         build/test_snapshot_pack
-
         build/test_vm_lifecycle
-
         build/test_pvg_lifecycle
-
         python3 tests/test_pipeline_archive.py
-
         build/test_audio_lifecycle
-
         bash tests/benchmark_fastmem.sh
-
         python3 tests/benchmark_surface_hash.py
 
-
-        # One paired correctness/timing check of existing grouped shapes and address
-        increments.
-
+        # One paired correctness/timing check of existing grouped shapes and address increments.
         make build/test_bench
-
         HV_GROUPS=0 build/test_bench > build/groups-off.log
-
         HV_GROUPS=1 build/test_bench > build/groups-on.log
-
         cat build/groups-off.log build/groups-on.log
-
-        '
+      id: memory_devices
     - name: Retain early native failure output
       if: ${{ failure() && !cancelled() }}
       uses: actions/upload-artifact@v4
@@ -466,74 +314,44 @@ jobs:
     - name: Validate indexes, DNS, input and Link protocol
       if: ${{ !cancelled() && steps.integration.outcome == 'success' }}
       working-directory: Henge
-      run: 'set -euo pipefail
-
+      run: |
+        set -euo pipefail
         mkdir -p build
-
         exec > >(tee build/validation-03.log) 2>&1
-
-        trap ''task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND"
-        >&2'' ERR
-
+        trap 'task_rc=$?; echo "Validation failed: exit=$task_rc line=$LINENO command=$BASH_COMMAND" >&2' ERR
         ulimit -s 65520
-
         set -x
-
         python3 tests/test_translation_race.py
-
         python3 tests/test_walk_log.py
-
         python3 tests/test_hvsparse.py
-
         python3 tests/test_installer_preflight.py
-
         python3 tests/test_session_resume.py
-
-        cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread
-        -Itests/dns_mock -Icore -Ihost tests/test_dns_proxy.c -o build/test_dns_proxy
-
+        cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -pthread -Itests/dns_mock -Icore -Ihost tests/test_dns_proxy.c -o build/test_dns_proxy
         build/test_dns_proxy
-
-        swiftc ios/Henge/PhysicalMouseButtons.swift tests/test_physical_mouse_buttons.swift
-        -o build/test_physical_mouse_buttons
-
+        swiftc ios/Henge/PhysicalMouseButtons.swift tests/test_physical_mouse_buttons.swift -o build/test_physical_mouse_buttons
         build/test_physical_mouse_buttons
-
         make test-runner
-
         bash tools/link/check.sh
-
         bash tools/check_host_scheduling.sh
 
-
         # Reproduce Xcode environment while building real macOS guest samples.
-
         SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" make build/tl-samples.dmg
 
-
         touch_checks=0
-
         bash tools/check_native_touch.sh || touch_checks=1
-
         python3 tests/test_disk_resize.py || touch_checks=1
-
         python3 tests/test_disk_recovery_macos.py || touch_checks=1
-
         test "$touch_checks" -eq 0
-
-        '
+      id: indices_input
     - name: Collect independent lifetime, concurrency and graphics diagnostics
       if: ${{ !cancelled() && steps.integration.outcome == 'success' }}
       working-directory: Henge
-      run: 'set -euo pipefail
-
+      run: |
+        set -euo pipefail
         mkdir -p build
-
         ulimit -s 65520
-
         bash tests/run_lifecycle_sanitizers.sh 2>&1 | tee build/validation-04.log
-
-        '
+      id: sanitizers
     - name: Save validation output
       if: always()
       uses: actions/upload-artifact@v4
@@ -541,190 +359,134 @@ jobs:
         name: Henge-validation-${{ github.run_id }}
         retention-days: 7
         if-no-files-found: ignore
-        path: 'Henge/build/validation-*.log
-
+        path: |
+          Henge/build/validation-*.log
           Henge/build/scheduling-check/*.log
 
-
           Henge/build/fastmem-*.log
-
           Henge/build/fastmem-native-summary.json
 
-
           Henge/build/groups-*.log
-
-          '
     - name: Validate built-in JIT routing and recovery policy
       working-directory: Henge
       run: make test-jit-advice
-    - name: Read explicit final release request
-      id: release_request
-      run: 'set -euo pipefail
-
-        python3 build-request/henge-build/test-release-request.py
-
-        python3 build-request/henge-build/test-pairing-metadata.py
-
-        python3 build-request/henge-build/read-release-request.py
-
-        '
-    - name: Require complete optimisation implementation before IPA
-      if: ${{ success() && github.run_attempt == 1 && ((github.event_name == 'workflow_dispatch' && inputs.build_ipa
-        == true) || (github.event_name == 'push' && steps.release_request.outputs.requested
-        == 'true')) }}
-      run: python3 build-request/henge-build/check-optimization-gate.py
+      id: jit_helper
     - name: Fingerprint dependency toolchain
       id: toolchain
-      run: "python3 - <<'PY'\nimport hashlib, os, subprocess\ncommands = [['xcodebuild',\
-        \ '-version'], ['xcrun', '--sdk', 'iphoneos', '--show-sdk-version'], ['rustc',\
-        \ '-vV'], ['meson', '--version'], ['ninja', '--version'], ['pkg-config', '--version'],\
-        \ ['cmake', '--version'], ['xcodegen', '--version']]\nidentity = b'\\n'.join(subprocess.check_output(c)\
-        \ for c in commands)\nwith open(os.environ['GITHUB_OUTPUT'], 'a') as f:\n\
-        \    f.write('id=' + hashlib.sha256(identity).hexdigest()[:24] + '\\n')\n\
-        PY\n"
-      if: ${{ success() && (github.event_name == 'push' || inputs.compile_app == true
-        || inputs.build_ipa == true) }}
+      run: |
+        python3 - <<'PY'
+        import hashlib, os, subprocess
+        commands = [['xcodebuild', '-version'], ['xcrun', '--sdk', 'iphoneos', '--show-sdk-version'], ['rustc', '-vV'], ['meson', '--version'], ['ninja', '--version'], ['pkg-config', '--version'], ['cmake', '--version'], ['xcodegen', '--version']]
+        identity = b'\n'.join(subprocess.check_output(c) for c in commands)
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write('id=' + hashlib.sha256(identity).hexdigest()[:24] + '\n')
+        PY
     - name: Restore pinned dependency cache
       uses: actions/cache@v4
       with:
-        path: 'Husk/third_party/build
-
+        path: |
+          Husk/third_party/build
           Husk/build/ios-arm64
-
           Husk/build/stamps
-
-          '
-        key: henge-cloud-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.husk
-          }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('build-request/henge-build/fetch-required-sources.sh')
-          }}
-      if: ${{ success() && (github.event_name == 'push' || inputs.compile_app == true
-        || inputs.build_ipa == true) }}
+        key: henge-cloud-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.inputs.outputs.husk }}-${{ steps.toolchain.outputs.id
+          }}-${{ hashFiles('build-request/henge-build/fetch-required-sources.sh') }}
     - name: Fetch dependency sources
       working-directory: Husk
       run: bash ../build-request/henge-build/fetch-required-sources.sh "$PWD"
-      if: ${{ success() && (github.event_name == 'push' || inputs.compile_app == true
-        || inputs.build_ipa == true) }}
     - name: Build required iOS libraries
       working-directory: Husk
       run: bash scripts/build_ios.sh libffi glib libslirp
-      if: ${{ success() && (github.event_name == 'push' || inputs.compile_app == true
-        || inputs.build_ipa == true) }}
     - name: Build on-device pairing library
       working-directory: Husk
       run: bash scripts/build_rppairing_ios.sh
-      if: ${{ success() && (github.event_name == 'push' || inputs.compile_app == true
-        || inputs.build_ipa == true) }}
     - name: Copy iOS dependencies
       working-directory: Henge
       run: zsh ios/scripts/fetch_deps.sh
-      if: ${{ success() && (github.event_name == 'push' || inputs.compile_app == true
-        || inputs.build_ipa == true) }}
     - name: Restore exact iOS libzip dependency
       uses: actions/cache@v4
       with:
         path: Henge/build/ios/deps/libzip
-        key: henge-ios-libzip-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id
-          }}-${{ hashFiles('Henge/third_party/libzip/**', 'Henge/tools/build_ios_restore.sh')
-          }}
-      if: ${{ success() && (github.event_name == 'push' || inputs.compile_app == true
-        || inputs.build_ipa == true) }}
+        key: henge-ios-libzip-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('Henge/third_party/libzip/**',
+          'Henge/tools/build_ios_restore.sh') }}
     - name: Build restore stack
       working-directory: Henge
       run: zsh tools/build_ios_restore.sh
-      if: ${{ success() && (github.event_name == 'push' || inputs.compile_app == true
-        || inputs.build_ipa == true) }}
     - name: Build iOS engine
       working-directory: Henge
       run: make -j4 ios-lib
-      if: ${{ success() && (github.event_name == 'push' || inputs.compile_app == true
-        || inputs.build_ipa == true) }}
     - name: Compile and inspect iOS application without packaging
       working-directory: Henge
-      if: ${{ success() && (github.event_name == 'push' || inputs.compile_app == true
-        || inputs.build_ipa == true) }}
       run: zsh ios/scripts/build_app.sh
+      id: ios_compile
+    - name: Establish final exact-source release gate after successful iOS compile
+      id: final_gate
+      if: ${{ success() }}
+      env:
+        HENGE_RELEASE_STEPS: ${{ toJSON(steps) }}
+      run: python3 build-request/henge-build/record-125-release-gate.py
     - name: Package and inspect IPA
       working-directory: Henge
-      run: "zsh ios/scripts/package_ipa.sh\npython3 - <<'PY'\nimport io, tarfile,\
-        \ gzip, hashlib, json, os, plistlib, subprocess, zipfile\nfrom pathlib import\
-        \ Path\nipa = Path(os.environ['HENGE_IPA_OUTPUT'])\nwith zipfile.ZipFile(ipa)\
-        \ as z:\n    assert z.testzip() is None\n    info = plistlib.loads(z.read('Payload/Henge.app/Info.plist'))\n\
-        \    assert info['HengeCustomSourceCommit'] == os.environ['GITHUB_SHA']\n\
-        \    assert info['HengeCustomPullRequests'] == [14, 31, 32, 35, 36, 46, 60,\
-        \ 61, 63, 106]\n    manifest = json.loads(Path('../build-request/henge-build/manifest.json').read_text())\n\
-        \    assert info['HengeUpstreamCommit'] == manifest['henge_sha']\n    assert\
-        \ info['CFBundleIdentifier'] == 'com.henge.app'\n    assert (info.get('LSSupportsGameMode')\
-        \ is True) == (os.environ.get('HENGE_GAME_MODE') == '1')\n    assert info.get('HengeLinkExperimental')\
-        \ is True and info.get('HengeLinkProtocolVersion') == manifest['henge_link']['protocol_version']\n\
-        \    assert ('Henge Link protocol ' + str(manifest['henge_link']['protocol_version'])).encode()\
-        \ in z.read('Payload/Henge.app/HengeLink.txt')\n    executable = z.read('Payload/Henge.app/Henge')\n\
-        \    assert b'header-port=%u' in executable and b'codec canvas=' in executable\n\
-        \    assert b'decode-ack-window=3' in executable and b'decode-consumed=' in\
-        \ executable\n    assert '_henge-link._tcp' in info.get('NSBonjourServices',\
-        \ [])\n    assert b'Decoder cannot keep up' not in executable\n    assert\
-        \ b'viewer controls hidden=' in executable\n    assert b'CPU runner requires\
-        \ foreground GPU drain' not in executable and b'CPU background prepared; guest\
-        \ GPU commands retained' not in executable\n    assert b'host-capabilities:'\
-        \ in executable and b'host-scheduling:' in executable\n    assert b'host-qos:'\
-        \ in executable and b'A20 Pro (Duo model profile)' in executable\n    assert\
-        \ b'utility_requests=' in executable\n    assert b'efficiency-v3:' in executable\n\
-        \    assert b'efficiency-v2:' in executable and b'bounded IPv4/UDP/DNS parser'\
-        \ in executable\n    shaders = z.read('Payload/Henge.app/default.metallib')\n\
-        \    assert shaders[:4] == b'MTLB' and len(shaders) > 1024\n    helper_archive\
-        \ = z.read('Payload/Henge.app/henge-touch-agent.tar.gz')\n    with tarfile.open(fileobj=io.BytesIO(helper_archive),mode='r:gz')\
-        \ as guest:\n        helper = guest.extractfile('Henge Touch Agent.app/Contents/MacOS/henge-touch-agent').read()\n\
-        \    assert helper[:4] == bytes.fromhex('cffaedfe') and len(helper) > 4096\n\
-        output = dict(game_mode_experiment=os.environ.get('HENGE_GAME_MODE') == '1',\
-        \ physical_m4_energy_verified=False, native_metal_library_sha256=hashlib.sha256(shaders).hexdigest(),\
-        \ native_metal_precompiled=True, source_commit=os.environ['GITHUB_SHA'], upstream_commit=info['HengeUpstreamCommit'],\
-        \ patch_sha256=manifest['patch_sha256'], ipa_sha256=hashlib.sha256(ipa.read_bytes()).hexdigest(),\
-        \ bundle=info['CFBundleIdentifier'], version=info['CFBundleShortVersionString'],\
-        \ fastmem_default=False, prs=[14,31,32,35,36,46,60,61,63,106], touch_helper_sha256=hashlib.sha256(helper).hexdigest(),\
-        \ native_touch_requires_authorized_mac_signing=False, native_touch_transport=\"\
-        emulated USB port4\", touch_archive_sha256=hashlib.sha256(helper_archive).hexdigest(),\
-        \ touch_launch_probe=\"Not repeated in this IPA-only build; physical USB display\
-        \ association remains unverified\")\noutput['henge_link'] = dict(manifest['henge_link'],\
-        \ native_fix_validation='Cloud Mac protocol/credit/worker/TLS/discovery/Keychain,\
-        \ hardware codec and SDK UI checks passed; not an A20 Pro thermal or performance\
-        \ measurement', native_checks_run=int(os.environ['GITHUB_RUN_ID']))\noutput['runner']\
-        \ = manifest['runner']\noutput['duo_efficiency'] = dict(manifest['duo_efficiency'],\
-        \ native_validation_run=int(os.environ['GITHUB_RUN_ID']), release_binary_markers_verified=True,\
-        \ physical_thermal_verified=False)\noutput['superblocks'] = dict(manifest['superblocks'],\
-        \ native_validation_run=int(os.environ['GITHUB_RUN_ID']), physical_cpu_behavior_verified=False)\n\
-        output['background_execution'] = manifest['background_execution']\noutput['efficiency_v2']\
-        \ = dict(manifest['efficiency_v2'], native_validation_run=int(os.environ['GITHUB_RUN_ID']))\n\
-        (ipa.parent / 'Henge-build-verification.json').write_text(json.dumps(output,\
-        \ indent=2))\nPY\n"
-      if: ${{ success() && github.run_attempt == 1 && ((github.event_name == 'workflow_dispatch' && inputs.build_ipa
-        == true) || (github.event_name == 'push' && steps.release_request.outputs.requested
-        == 'true')) }}
+      run: |
+        zsh ios/scripts/package_ipa.sh
+        python3 - <<'PY'
+        import io, tarfile, gzip, hashlib, json, os, plistlib, subprocess, zipfile
+        from pathlib import Path
+        ipa = Path(os.environ['HENGE_IPA_OUTPUT'])
+        with zipfile.ZipFile(ipa) as z:
+            assert z.testzip() is None
+            info = plistlib.loads(z.read('Payload/Henge.app/Info.plist'))
+            assert info['HengeCustomSourceCommit'] == os.environ['GITHUB_SHA']
+            assert info['HengeCustomPullRequests'] == [14, 31, 32, 35, 36, 46, 60, 61, 63, 106]
+            manifest = json.loads(Path('../build-request/henge-build/manifest.json').read_text())
+            assert info['HengeUpstreamCommit'] == manifest['henge_sha']
+            assert info['CFBundleIdentifier'] == 'com.henge.app'
+            assert (info.get('LSSupportsGameMode') is True) == (os.environ.get('HENGE_GAME_MODE') == '1')
+            assert info.get('HengeLinkExperimental') is True and info.get('HengeLinkProtocolVersion') == manifest['henge_link']['protocol_version']
+            assert ('Henge Link protocol ' + str(manifest['henge_link']['protocol_version'])).encode() in z.read('Payload/Henge.app/HengeLink.txt')
+            executable = z.read('Payload/Henge.app/Henge')
+            assert b'header-port=%u' in executable and b'codec canvas=' in executable
+            assert b'decode-ack-window=3' in executable and b'decode-consumed=' in executable
+            assert '_henge-link._tcp' in info.get('NSBonjourServices', [])
+            assert b'Decoder cannot keep up' not in executable
+            assert b'viewer controls hidden=' in executable
+            assert b'CPU runner requires foreground GPU drain' not in executable and b'CPU background prepared; guest GPU commands retained' not in executable
+            assert b'host-capabilities:' in executable and b'host-scheduling:' in executable
+            assert b'host-qos:' in executable and b'A20 Pro (Duo model profile)' in executable
+            assert b'utility_requests=' in executable
+            assert b'efficiency-v3:' in executable
+            assert b'efficiency-v2:' in executable and b'bounded IPv4/UDP/DNS parser' in executable
+            shaders = z.read('Payload/Henge.app/default.metallib')
+            assert shaders[:4] == b'MTLB' and len(shaders) > 1024
+            helper_archive = z.read('Payload/Henge.app/henge-touch-agent.tar.gz')
+            with tarfile.open(fileobj=io.BytesIO(helper_archive),mode='r:gz') as guest:
+                helper = guest.extractfile('Henge Touch Agent.app/Contents/MacOS/henge-touch-agent').read()
+            assert helper[:4] == bytes.fromhex('cffaedfe') and len(helper) > 4096
+        output = dict(game_mode_experiment=os.environ.get('HENGE_GAME_MODE') == '1', physical_m4_energy_verified=False, native_metal_library_sha256=hashlib.sha256(shaders).hexdigest(), native_metal_precompiled=True, source_commit=os.environ['GITHUB_SHA'], upstream_commit=info['HengeUpstreamCommit'], patch_sha256=manifest['patch_sha256'], ipa_sha256=hashlib.sha256(ipa.read_bytes()).hexdigest(), bundle=info['CFBundleIdentifier'], version=info['CFBundleShortVersionString'], fastmem_default=False, prs=[14,31,32,35,36,46,60,61,63,106], touch_helper_sha256=hashlib.sha256(helper).hexdigest(), native_touch_requires_authorized_mac_signing=False, native_touch_transport="emulated USB port4", touch_archive_sha256=hashlib.sha256(helper_archive).hexdigest(), touch_launch_probe="Not repeated in this IPA-only build; physical USB display association remains unverified")
+        output['henge_link'] = dict(manifest['henge_link'], native_fix_validation='Cloud Mac protocol/credit/worker/TLS/discovery/Keychain, hardware codec and SDK UI checks passed; not an A20 Pro thermal or performance measurement', native_checks_run=int(os.environ['GITHUB_RUN_ID']))
+        output['runner'] = manifest['runner']
+        output['duo_efficiency'] = dict(manifest['duo_efficiency'], native_validation_run=int(os.environ['GITHUB_RUN_ID']), release_binary_markers_verified=True, physical_thermal_verified=False)
+        output['superblocks'] = dict(manifest['superblocks'], native_validation_run=int(os.environ['GITHUB_RUN_ID']), physical_cpu_behavior_verified=False)
+        output['background_execution'] = manifest['background_execution']
+        output['efficiency_v2'] = dict(manifest['efficiency_v2'], native_validation_run=int(os.environ['GITHUB_RUN_ID']))
+        (ipa.parent / 'Henge-build-verification.json').write_text(json.dumps(output, indent=2))
+        PY
+      if: ${{ success() && steps.final_gate.outcome == 'success' }}
     - name: Verify merged upstream and PRs in packaged IPA
       run: python3 build-request/henge-build/verify-integrated-ipa.py
-      if: ${{ success() && github.run_attempt == 1 && ((github.event_name == 'workflow_dispatch' && inputs.build_ipa
-        == true) || (github.event_name == 'push' && steps.release_request.outputs.requested
-        == 'true')) }}
+      if: ${{ success() && steps.final_gate.outcome == 'success' }}
     - uses: actions/upload-artifact@v4
       with:
         name: Henge-IPA-${{ github.sha }}
         retention-days: 14
         compression-level: 0
         if-no-files-found: error
-        path: '${{ github.workspace }}/Henge-output/Henge.ipa
-
+        path: |-
+          ${{ github.workspace }}/Henge-output/Henge.ipa
           ${{ github.workspace }}/Henge-output/Henge-build-verification.json
 
-
           ${{ github.workspace }}/Henge-output/Henge-optimization-completion.json
-
           ${{ github.workspace }}/Henge-output/Henge-symbols.txt
-
-
-          ${{ github.workspace }}/Henge-output/Henge-build-cleanup.json
-
-          '
-      if: ${{ success() && github.run_attempt == 1 && ((github.event_name == 'workflow_dispatch' && inputs.build_ipa
-        == true) || (github.event_name == 'push' && steps.release_request.outputs.requested
-        == 'true')) }}
+      if: ${{ success() && steps.final_gate.outcome == 'success' }}
     - name: Retain failure logs
       if: failure()
       uses: actions/upload-artifact@v4
@@ -732,51 +494,16 @@ jobs:
         name: Henge-build-logs-${{ github.run_id }}
         retention-days: 3
         if-no-files-found: ignore
-        path: 'Henge/ios/build/*.buildlog
-
+        path: |
+          Henge/ios/build/*.buildlog
           Henge/build/*.log
-
           Husk/build/logs/*.log
-
           Henge/build/scheduling-check/*.log
-
-          '
+    if: ${{ github.run_attempt == 1 }}
 'on':
   push:
     branches:
-    - feature/duo-efficiency
-    - feature/m4-ultra-efficiency
-    - review/project-038
-    - feature/desktop-memory-touch
-    - feature/metal4-pipeline-efficiency
-    - perf/engine-memory-dispatch
-    - perf/safari-compositing
-    - perf/replay-mapping-sync
-    - fix/desktop120-launch
-    - perf/tlbi-range-batch
-    - engine/sustained-124
-    - fix/boot-recovery125
+    - fix/boot-recovery125-alt-mac
     paths:
-    - henge-build/**
     - .github/workflows/henge-duo-checks.yml
-  workflow_dispatch:
-    inputs:
-      runner_mode:
-        description: Where to run (Henge requires the configured Mac runner to be
-          online)
-        required: false
-        type: choice
-        options:
-        - cloud
-        - henge
-        default: cloud
-      build_ipa:
-        description: Package an IPA after all validation passes (explicit opt-in)
-        required: false
-        type: boolean
-        default: false
-      compile_app:
-        description: Compile the complete iOS app without creating an IPA
-        required: false
-        type: boolean
-        default: true
+    - henge-build/record-125-release-gate.py
