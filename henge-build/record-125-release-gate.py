@@ -14,7 +14,7 @@ REQUIRED_STEPS = (
     "stack_network", "jit_mmu", "memory_devices", "indices_input", "sanitizers",
     "jit_helper", "ios_compile",
 )
-PATCH_SHA = "8c47f643a574a3f4ec5ceca7fecabdbaf5ecf9184ec1c2bb72073c1db5360916"
+PATCH_SHA = "f249154cad2513e5bbcb4ab8fb5e38b749c606956d3241929d8bd5b235e482e1"
 
 
 def record(state, manifest, steps, source, run_id, patch_sha):

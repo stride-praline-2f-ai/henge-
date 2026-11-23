@@ -20369,7 +20369,7 @@ index 1887244..2c9e4d4 100644
          return attempt < maxAttempts ? .retry(after: 4) : .giveUp
      }
 diff --git a/ios/Henge/JIT/JITSetup.swift b/ios/Henge/JIT/JITSetup.swift
-index 356a34d..523d3bb 100644
+index 356a34d..d308776 100644
 --- a/ios/Henge/JIT/JITSetup.swift
 +++ b/ios/Henge/JIT/JITSetup.swift
 @@ -166,8 +166,7 @@ final class JITCoordinator: ObservableObject {
@@ -20553,36 +20553,27 @@ index 356a34d..523d3bb 100644
          busy = true
          error = nil
          status = "Resetting the Developer Disk Image cache…"
-@@ -478,22 +468,18 @@ final class JITCoordinator: ObservableObject {
-         return true
-     }
- 
--    /// Polls CS_DEBUGGED until it is set or `timeout` passes.
--    private static func waitForDebugger(timeout: TimeInterval = 90,
--                                        completion: @escaping (Bool) -> Void) -> Timer {
--        let deadline = Date().addingTimeInterval(timeout)
--        let timer = Timer(timeInterval: 0.5, repeats: true) { timer in
--            if JITBootstrap.debuggedFlag {
--                timer.invalidate()
--                completion(true)
--            } else if Date() >= deadline {
-+    /// Watch only while the extension request is in flight. Its result owns the timeout.
-+    private static func watchForDebugger(_ attached: @escaping () -> Void) -> Timer {
-+        let timer = Timer(timeInterval: 0.25, repeats: true) { timer in
-+            if JITBootstrap.debuggedFlag && JITBootstrap.isTraced {
-                 timer.invalidate()
--                completion(false)
-+                attached()
-             }
-         }
+@@ -494,6 +484,19 @@ final class JITCoordinator: ObservableObject {
          RunLoop.main.add(timer, forMode: .common)
          return timer
      }
 +
++    /// Watch only while the extension request is in flight. Its result owns the timeout.
++    private static func watchForDebugger(_ attached: @escaping () -> Void) -> Timer {
++        let timer = Timer(timeInterval: 0.25, repeats: true) { timer in
++            if JITBootstrap.debuggedFlag && JITBootstrap.isTraced {
++                timer.invalidate()
++                attached()
++            }
++        }
++        RunLoop.main.add(timer, forMode: .common)
++        return timer
++    }
++
  }
  
  /// LocalDevVPN, which Built-in StikJIT and StikDebug reach the device through:
-@@ -530,133 +516,3 @@ enum LocalDevVPN {
+@@ -530,133 +533,3 @@ enum LocalDevVPN {
          UIApplication.shared.open(installed ? connect : appStore)
      }
  }
@@ -22241,7 +22232,7 @@ index 29c8b3b..8103e9b 100644
          all.removeAll { $0.id == id }
          save()
 diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
-index 34d6a98..445c338 100644
+index 34d6a98..c42e562 100644
 --- a/ios/Henge/Native/henge-vm.c
 +++ b/ios/Henge/Native/henge-vm.c
 @@ -3,7 +3,10 @@
@@ -22255,7 +22246,7 @@ index 34d6a98..445c338 100644
  
  #include <os/proc.h>
  #include <TargetConditionals.h>
-@@ -20,26 +23,62 @@
+@@ -20,26 +23,63 @@
  #include "vm.h"
  #include "install.h"
  #include "snapshot.h"
@@ -22264,6 +22255,7 @@ index 34d6a98..445c338 100644
  #include <fcntl.h>
  #include <unistd.h>
 +#include <sys/resource.h>
++#include <sys/stat.h>
 +#include <mach/mach.h>
 +#include <errno.h>
 +
@@ -22320,7 +22312,7 @@ index 34d6a98..445c338 100644
      exit_reason = reason;
      int halt = hv_vm_cpu(0)->halted;
      exit_outcome = HENGE_VM_OUTCOME_ERROR;
-@@ -49,13 +88,12 @@ static void on_exit(int reason) {
+@@ -49,13 +89,12 @@ static void on_exit(int reason) {
      case HV_HALT_HOST: exit_outcome = HENGE_VM_OUTCOME_HOST_STOP; break;
      case HV_HALT_PANIC: exit_outcome = HENGE_VM_OUTCOME_PANIC; break;
      }
@@ -22337,7 +22329,7 @@ index 34d6a98..445c338 100644
      fprintf(stderr, "henge: the machine stopped (%s, halt reason %d); CPU threads ended, disks flushed%s\n",
              exit_description(), halt, installer_session ? "" : ", machine released");
      pthread_rwlock_unlock(&api_lock);
-@@ -67,6 +105,11 @@ static int begin_start(char *err, size_t errlen) {
+@@ -67,6 +106,11 @@ static int begin_start(char *err, size_t errlen) {
          snprintf(err, errlen, "A Mac app ran in this launch. Quit Henge (swipe it away) and open it again to start a Mac.");
          return -1;
      }
@@ -22349,7 +22341,7 @@ index 34d6a98..445c338 100644
      pthread_rwlock_wrlock(&api_lock);
      if ((state != 0 && state != 2) || installer_session) {
          snprintf(err, errlen, "%s", installer_session
-@@ -75,26 +118,31 @@ static int begin_start(char *err, size_t errlen) {
+@@ -75,26 +119,31 @@ static int begin_start(char *err, size_t errlen) {
          pthread_rwlock_unlock(&api_lock);
          return -1;
      }
@@ -22386,7 +22378,7 @@ index 34d6a98..445c338 100644
      pthread_rwlock_unlock(&api_lock);
      return 0;
  }
-@@ -116,9 +164,25 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
+@@ -116,9 +165,25 @@ int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int6
      return hv_snapshot_check(path, ident, bytes, saved_at);
  }
  
@@ -22414,7 +22406,7 @@ index 34d6a98..445c338 100644
          snprintf(err, errlen, "No Mac is running.");
          return -1;
      }
-@@ -133,21 +197,76 @@ int henge_vm_pause(char *err, size_t errlen) {
+@@ -133,21 +198,76 @@ int henge_vm_pause(char *err, size_t errlen) {
          snprintf(err, errlen, "The Mac stopped by itself.");
          return -1;
      }
@@ -22497,7 +22489,7 @@ index 34d6a98..445c338 100644
      fprintf(stderr, "henge: %s\n", r ? err : "the paused Mac is saved");
      return r;
  }
-@@ -160,18 +279,44 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
+@@ -160,18 +280,56 @@ int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errl
  }
  
  int henge_vm_continue(void) {
@@ -22524,6 +22516,18 @@ index 34d6a98..445c338 100644
 +            pthread_rwlock_unlock(&api_lock);
 +            return -1;
 +        }
++        // Both names belong to regular checkpoint files. A successful rename
++        // of a directory would otherwise let the guest run without invalidating it.
++        const char *paths[] = {saved_path, used};
++        for (size_t i = 0; i < sizeof paths / sizeof *paths; i++) {
++            struct stat entry;
++            int rc = lstat(paths[i], &entry);
++            if ((rc == 0 && !S_ISREG(entry.st_mode)) || (rc != 0 && errno != ENOENT)) {
++                if (err && errlen) snprintf(err, errlen, "The saved state could not be invalidated because its path is not a regular file. The Mac remains paused.");
++                pthread_rwlock_unlock(&api_lock);
++                return -1;
++            }
++        }
 +        if (rename(saved_path, used) == 0) moved = 1;
 +        else if (errno != ENOENT) {
 +            if (err && errlen) snprintf(err, errlen, "The saved state could not be staged: %s. The Mac remains paused.", strerror(errno));
@@ -22548,7 +22552,7 @@ index 34d6a98..445c338 100644
      }
      pthread_rwlock_unlock(&api_lock);
      fprintf(stderr, "henge: the Mac runs on%s\n", r ? " -- no, its CPU threads could not start" : "");
-@@ -192,17 +337,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
+@@ -192,17 +350,25 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
      fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
              jit->size >> 20);
      if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
@@ -22577,7 +22581,7 @@ index 34d6a98..445c338 100644
  }
  
  static volatile int install_step = -1;
-@@ -234,12 +387,12 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
+@@ -234,12 +400,12 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
      if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
      install_step = 0;
      install_progress = 0;
@@ -22592,7 +22596,7 @@ index 34d6a98..445c338 100644
  }
  
  int henge_install_step(void) { return install_step; }
-@@ -293,22 +446,29 @@ static int lock_running(void) {
+@@ -293,22 +459,29 @@ static int lock_running(void) {
      return 0;
  }
  void henge_vm_stop(void) {
@@ -22633,7 +22637,7 @@ index 34d6a98..445c338 100644
  }
  
  long henge_vm_balloon(long target_mb) {
-@@ -336,21 +496,23 @@ int henge_vm_knob(const char *name, int value) {
+@@ -336,21 +509,23 @@ int henge_vm_knob(const char *name, int value) {
      return result;
  }
  void henge_vm_log_cache(void) {
@@ -22660,7 +22664,7 @@ index 34d6a98..445c338 100644
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
-@@ -375,9 +537,35 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
+@@ -375,9 +550,35 @@ void henge_vm_share(const char *folder, const char *socket_path, const char *age
      if (hv_share_start(folder, socket_path, agent) == 0) hv_net_set_share_socket(socket_path);
  }
  void henge_share_set_clipboard(const char *text) { hv_share_set_clipboard(text); }
@@ -22696,7 +22700,7 @@ index 34d6a98..445c338 100644
  void henge_vm_set_display(uint32_t width, uint32_t height) { hv_pvg_lite_set_mode(width, height); }
  void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm) { hv_pvg_lite_set_size_mm(width_mm, height_mm); }
  int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,uint32_t height_mm,uint32_t hz) {
-@@ -388,6 +576,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
+@@ -388,6 +589,26 @@ int henge_vm_set_link_display(uint32_t width,uint32_t height,uint32_t width_mm,u
      pthread_rwlock_unlock(&api_lock);
      return result;
  }
@@ -22723,7 +22727,7 @@ index 34d6a98..445c338 100644
  void henge_vm_link_connected(int connected) {
      if (!lock_running()) return;
      HvVmapple *b = hv_vm_board();
-@@ -454,13 +662,51 @@ void henge_vm_set_display_layer(void *layer) {
+@@ -454,13 +675,51 @@ void henge_vm_set_display_layer(void *layer) {
      hv_vm_set_display_layer(layer);
  }
  uint64_t henge_vm_gpu_frames(void) {
@@ -22778,7 +22782,7 @@ index 34d6a98..445c338 100644
      HvBootDisplay d;
      int result = -1;
      if (hv_vm_boot_display(&d) == 0) {
-@@ -509,3 +755,130 @@ uint64_t henge_largest_mapping_mb(void) {
+@@ -509,3 +768,130 @@ uint64_t henge_largest_mapping_mb(void) {
      }
      return 0;
  }
