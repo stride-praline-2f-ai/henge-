@@ -1,0 +1,139 @@
+diff --git a/devices/pvg_metal.m b/devices/pvg_metal.m
+index e0e4c08754e921ae0148e2245a97600c32a84669..4d4a772afe6a3fc87002645a72a2bfb59f4ba9c6 100644
+--- a/devices/pvg_metal.m
++++ b/devices/pvg_metal.m
+@@ -208,6 +208,9 @@ static HvPvgLinkFrameHandler link_frame_handler(void) {
+     BOOL copy_full;
+     uint64_t classic_empty_avoided;
+     uint64_t buffer_map_allocations, buffer_map_pages, buffer_map_calls, buffer_map_snapshot_reuses;
++    uint64_t surface_map_attempts, surface_map_pages, surface_map_calls, surface_map_range_retries;
++    uint64_t surface_map_forced_single, surface_map_timed;
++    double surface_map_seconds, surface_map_worst;
+     BOOL batch_cache, gpu_timing, resource_tally;
+     atomic_int capture_timing;
+     uint64_t command_epoch, current_epoch, object_hits, object_reads, page_checks, page_hits;
+@@ -455,7 +458,7 @@ static const void *mapping_ram_read(void *context, uint64_t address, uint64_t le
+    Never overwrite a mapping already pinned by an MTLBuffer. */
+ static HvPageViewResult map_page_view(HvPvgLite *lite, vm_address_t base,
+         const uint32_t *pages, uint64_t count, BOOL tagged, BOOL single,
+-        uint64_t *calls) {
++        uint64_t *calls, uint64_t *range_retries) {
+     for (uint64_t i = 0; i < count;) {
+         if (!pages[i]) { i++; continue; }
+         const void *source = NULL;
+@@ -470,6 +473,7 @@ static HvPageViewResult map_page_view(HvPvgLite *lite, vm_address_t base,
+             &current, &maximum, VM_INHERIT_NONE);
+         (*calls)++;
+         if (result != KERN_SUCCESS && span > 1) {
++            if (range_retries) ++*range_retries;
+             single = YES; span = 1; to = base + (i << 14);
+             result = vm_remap(mach_task_self(), &to, 0x4000, 0,
+                 VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)source, FALSE,
+@@ -497,7 +501,7 @@ static BOOL map_pages_snapshot(HvReplay *r, uint32_t task, HvObject *o,
+     }
+     uint64_t calls = 0;
+     HvPageViewResult result = map_page_view(r->lite, base, pages, n, NO,
+-                                           hv_env_flag("HV_PVG_REMAP_SINGLE"), &calls);
++                                           hv_env_flag("HV_PVG_REMAP_SINGLE"), &calls, NULL);
+     r->buffer_map_calls += calls;
+     if (result != HV_PAGE_VIEW_OK) {
+         fprintf(stderr, "hengevm: pvg-metal: task buffer mapping rejected: %s\n",
+@@ -1524,9 +1528,24 @@ static const void *surface_table_read(void *context, uint64_t address, uint64_t
+         return nil;
+     }
+     surface->mapped = (uint8_t *)surface_base;
+-    uint64_t remap_calls = 0;
++    uint64_t remap_calls = 0, range_retries = 0;
++    BOOL single = hv_env_flag("HV_PVG_REMAP_SINGLE");
++    BOOL timed = diagnostics_enabled || gpu_timing || tracing ||
++        atomic_load_explicit(&capture_timing, memory_order_relaxed);
++    double map_start = timed ? now_seconds() : 0;
+     HvPageViewResult mapped = map_page_view(lite, surface_base, pages, n, YES,
+-                                           hv_env_flag("HV_PVG_REMAP_SINGLE"), &remap_calls);
++                                           single, &remap_calls, &range_retries);
++    if (timed) {
++        double elapsed = now_seconds() - map_start;
++        surface_map_seconds += elapsed;
++        if (elapsed > surface_map_worst) surface_map_worst = elapsed;
++        surface_map_timed++;
++    }
++    surface_map_attempts++;
++    surface_map_pages += n;
++    surface_map_calls += remap_calls;
++    surface_map_range_retries += range_retries;
++    surface_map_forced_single += single;
+     if (mapped != HV_PAGE_VIEW_OK) {
+         free(pages);vm_deallocate(mach_task_self(), surface_base, surface->length);surface->mapped=NULL;
+         [self complain:mapped == HV_PAGE_VIEW_RAM ? @"surface leaf is outside guest RAM; allocation rejected" :
+@@ -1550,8 +1569,10 @@ static const void *surface_table_read(void *context, uint64_t address, uint64_t
+ 
+     }
+     free(pages);
+-    fprintf(stderr, "hengevm: pvg-metal: surface %llu: %llux%llu, row %llu, %llu KB, fourcc %c%c%c%c planes %u page_table=%s pages=%llu remap_calls=%llu\n", mapping, (unsigned long long)sw, (unsigned long long)sh, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], planes, n>4096?"two-level":"flat", (unsigned long long)n, (unsigned long long)remap_calls);
+-        return surface;
++    if (tracing || surface_map_attempts <= 4) {
++        fprintf(stderr, "hengevm: pvg-metal: surface %llu: %llux%llu, row %llu, %llu KB, fourcc %c%c%c%c planes %u page_table=%s pages=%llu remap_calls=%llu\n", mapping, (unsigned long long)sw, (unsigned long long)sh, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], planes, n>4096?"two-level":"flat", (unsigned long long)n, (unsigned long long)remap_calls);
++    }
++    return surface;
+ }
+ 
+ /* The surface under a mapping id as the guest describes it now. macOS 14's driver reuses ids for new surfaces
+@@ -3000,6 +3021,11 @@ static NSArray<NSData *> *snapshot_commands(HvReplay *r,uint32_t task,
+         fprintf(stderr, "hengevm: gpu-surface-checks: performed=%llu duplicate_scans_avoided=%llu (exact surface identity; one check per command batch)\n",
+                 (unsigned long long)surface_checks, (unsigned long long)surface_checks_avoided);
+         fprintf(stderr,"gpu-submission-reuse: empty_classic_before_metal4_avoided=%llu (runtime queue signal/wait and guest completion retained)\n",(unsigned long long)classic_empty_avoided);
++        fprintf(stderr, "gpu-surface-mapping: attempts=%llu pages=%llu remap_calls=%llu range_retries=%llu forced_single=%llu timed_attempts=%llu total_ms=%.3f max_ms=%.3f (cumulative host mapping loop; excludes page-table snapshots and GPU work)\n",
++            (unsigned long long)surface_map_attempts, (unsigned long long)surface_map_pages,
++            (unsigned long long)surface_map_calls, (unsigned long long)surface_map_range_retries,
++            (unsigned long long)surface_map_forced_single, (unsigned long long)surface_map_timed,
++            surface_map_seconds * 1000, surface_map_worst * 1000);
+         fprintf(stderr,"gpu-buffer-mapping: allocations=%llu pages=%llu remap_calls=%llu checked_snapshots_reused=%llu (immutable buffer backing; single-page fallback retained)\n",(unsigned long long)buffer_map_allocations,(unsigned long long)buffer_map_pages,(unsigned long long)buffer_map_calls,(unsigned long long)buffer_map_snapshot_reuses);
+         if(command_pool)fprintf(stderr,"gpu-command-storage: enabled=1 arena_allocations=%llu arena_reuses=%llu published_views=%llu captured_bytes=%llu independent_buffers=%llu small_reference_batches=%llu cached_bytes=%lu suspended=%d pinned_slots_replaced=%llu budget_bytes=%lu (bounded CPU snapshot storage; all active views retain immutable bytes)\n",(unsigned long long)command_pool->allocations,(unsigned long long)command_pool->reuses,(unsigned long long)command_pool->views,(unsigned long long)command_pool->captured_bytes,(unsigned long long)command_pool->independent_buffers,(unsigned long long)command_pool->small_batches,(unsigned long)[command_pool cachedBytes],command_pool->suspended,(unsigned long long)command_pool->pinned_replacements,(unsigned long)command_pool->budget);
+         else fprintf(stderr,"gpu-command-storage: enabled=0 reference=independent-buffers\n");
+diff --git a/tests/test_surface_mapping.py b/tests/test_surface_mapping.py
+index 2495e6f52673dcd227c20f1090c869fc602f9e3a..eaba2a2659294d6e0f9a1cedeee95d87e50496a8 100644
+--- a/tests/test_surface_mapping.py
++++ b/tests/test_surface_mapping.py
+@@ -17,6 +17,7 @@ prefix=r'''
+ #include <assert.h>
+ #include <string.h>
+ #include <stdio.h>
++#include <stdatomic.h>
+ #include "gpu_surface_pages.h"
+ /* The extracted plain-surface fixture uses the registry identity type but
+    not all standalone registry operations. Production is compiled separately
+@@ -32,6 +33,8 @@ static int hv_pvg_lite_old_driver(HvPvgLite *l){(void)l;return 0;}
+ static void *hv_pvg_lite_phys(HvPvgLite *l,uint64_t at,uint64_t n){(void)l;return at<=ram_size&&n<=ram_size-at?ram+at:NULL;}
+ static const void *surface_table_read(void *l,uint64_t at,uint64_t n){return hv_pvg_lite_phys(l,at,n);}
+ #include "env_flag.h"
++static double clock_reads;
++static double now_seconds(void){return ++clock_reads * 0.001;}
+ static unsigned remap_calls,task_reads;static BOOL reject_large,reject_all;
+ static uint32_t task_pages[4097];
+ static void hv_pvg_lite_task_pages(HvPvgLite *l,uint32_t task,uint32_t at,uint64_t n,uint32_t *out){
+@@ -57,6 +60,11 @@ static kern_return_t observed_remap(vm_map_t target,vm_address_t *address,vm_siz
+  HvPvgLite *lite;id<MTLDevice> device;NSMutableDictionary *surfaces,*planar;
+  BOOL batch_cache;uint64_t current_epoch,page_hits,page_checks,remaps;
+  uint64_t buffer_map_calls,buffer_map_allocations,buffer_map_pages,buffer_map_snapshot_reuses;
++ BOOL diagnostics_enabled,gpu_timing,tracing;
++ atomic_int capture_timing;
++ uint64_t surface_map_attempts,surface_map_pages,surface_map_calls,surface_map_range_retries;
++ uint64_t surface_map_forced_single,surface_map_timed;
++ double surface_map_seconds,surface_map_worst;
+ }
+ - (HvObject *)newSurface:(uint64_t)mapping;
+ - (void)complain:(NSString *)message;
+@@ -117,8 +125,13 @@ int main(void){@autoreleasepool{
+  setenv("HV_PVG_REMAP_SINGLE","1",1);before=remap_calls;HvObject *reference=[replay newSurface:8];
+  assert(reference&&remap_calls-before==4097);unsetenv("HV_PVG_REMAP_SINGLE");
+  assert(!memcmp(dense->mapped,reference->mapped,(size_t)alloc));
++ assert(replay->surface_map_forced_single==1&&replay->surface_map_range_retries==0&&clock_reads==0);
++ replay->diagnostics_enabled=YES;
++ uint64_t surface_calls_before=replay->surface_map_calls;
+  reject_large=YES;before=remap_calls;HvObject *fallback=[replay newSurface:9];reject_large=NO;
+  assert(fallback&&remap_calls-before==4098&&!memcmp(dense->mapped,fallback->mapped,(size_t)alloc));
++ assert(replay->surface_map_calls-surface_calls_before==4098&&replay->surface_map_range_retries==1);
++ assert(replay->surface_map_timed==1&&replay->surface_map_seconds>0&&clock_reads==2);
+  cb=[queue commandBuffer];blit=[cb blitCommandEncoder];
+  [blit copyFromBuffer:dense->object sourceOffset:0 toBuffer:output destinationOffset:0 size:16];
+  [blit copyFromBuffer:dense->object sourceOffset:4096ull*16384 toBuffer:output destinationOffset:16 size:16];
