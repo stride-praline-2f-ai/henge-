@@ -23,8 +23,8 @@ def record(state, manifest, steps, source, run_id, patch_sha):
         raise ValueError("Required validation steps did not pass: " + ", ".join(missing))
     if patch_sha != PATCH_SHA or patch_sha != manifest["audit_repairs_sha256"] or patch_sha != state["integrated_patch_sha256"]:
         raise ValueError("Build 125 source inputs do not match the frozen patch")
-    if manifest["app_build"] != "128" or state["release_requested"] is not False:
-        raise ValueError("Expected a fresh build 128 release request")
+    if manifest["app_build"] != "129" or state["release_requested"] is not False:
+        raise ValueError("Expected a fresh build 129 release request")
     if not re.fullmatch("[0-9a-f]{40}", source) or run_id <= 0:
         raise ValueError("Invalid Actions provenance")
     evidence = f"Exact-source ARM64 native, sanitizer, and complete iOS Release steps passed in Actions run {run_id}."
@@ -59,7 +59,7 @@ def record(state, manifest, steps, source, run_id, patch_sha):
 def main():
     source = os.environ["GITHUB_SHA"]
     branch = os.environ["GITHUB_REF_NAME"]
-    if int(os.environ["GITHUB_RUN_ATTEMPT"]) < 1 or branch != "fix/build128-m4-memory":
+    if int(os.environ["GITHUB_RUN_ATTEMPT"]) < 1 or branch != "fix/build129-screen-engine":
         raise ValueError("Expected a valid attempt on the dedicated release branch")
     manifest = json.loads((ROOT / "manifest.json").read_text())
     if manifest["release_branch"] != branch:
