@@ -827,11 +827,15 @@ replace_once(
 )
 replace_once(
     '''            expandedSDKIDs = []
-            fixAppID = ""''',
+            fixAppID = ""
+            layoutAppID = ""
+            verifiedPriorSDK = ""''',
     '''            expandedSDKIDs = []
             dashboardIcons.removeAll()
             attemptedDashboardIcons.removeAll()
-            fixAppID = ""''',
+            fixAppID = ""
+            layoutAppID = ""
+            verifiedPriorSDK = ""''',
     "Clear icon cache on explicit rescan",
 )
 replace_once(
