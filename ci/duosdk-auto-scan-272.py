@@ -956,3 +956,201 @@ assert 'run(0)  // Read-only installed-app scan' in s
 assert 'DuoSDKMaintenanceForSelection(actualAction, payload)' in s
 source.write_text(s, encoding="utf-8")
 print("Dashboard artwork: local UIKit icon lookup, lazy in-memory cache, initials fallback.")
+
+
+# App Store artwork fallback: explicitly opt in before sending bundle IDs to Apple.
+# Local lookup remains the default. No extra entitlements or cross-container reads.
+s = source.read_text(encoding="utf-8")
+
+replace_once(
+    '    @State private var attemptedDashboardIcons: Set<String> = []',
+    '''    @State private var attemptedDashboardIcons: Set<String> = []
+    @AppStorage("duosdk.appStoreArtwork.v1") private var useStoreArtwork = false
+    @State private var storeArtwork: [String: UIImage] = [:]
+    @State private var storeArtworkAttempts: Set<String> = []
+    @State private var artworkGeneration = 0
+    @State private var artworkLoading = false''',
+    "Opt-in artwork settings",
+)
+replace_once(
+    '''            dashboardIcons.removeAll()
+            attemptedDashboardIcons.removeAll()''',
+    '''            dashboardIcons.removeAll()
+            attemptedDashboardIcons.removeAll()
+            storeArtwork.removeAll()
+            storeArtworkAttempts.removeAll()
+            artworkGeneration += 1''',
+    "Invalidate artwork on refresh",
+)
+replace_once(
+    '''            .accessibilityHidden(scanningApps)
+
+            if scanningApps''',
+    '''            .accessibilityHidden(scanningApps)
+            .task(id: artworkTaskKey) {
+                await loadAppStoreArtwork()
+            }
+
+            if scanningApps''',
+    "Run artwork requests separately from scan",
+)
+replace_once(
+    '''            if let icon = dashboardIcons[item.id] {
+                Image(uiImage: icon)''',
+    '''            if let icon = (useStoreArtwork ? storeArtwork[item.id] : nil) ?? dashboardIcons[item.id] {
+                Image(uiImage: icon)''',
+    "Prefer verified App Store artwork when enabled",
+)
+replace_once(
+    '''    private var toolsDashboard: some View {
+        List {
+            if completedSDKScan''',
+    '''    private var artworkTaskKey: String {
+        "\(useStoreArtwork)-\(artworkGeneration)-" +
+            candidates.map(\.id).sorted().joined(separator: ",")
+    }
+
+    private struct StoreArtworkResponse: Decodable {
+        let results: [StoreArtworkRecord]
+    }
+
+    private struct StoreArtworkRecord: Decodable {
+        let bundleId: String?
+        let artworkUrl100: String?
+        let artworkUrl512: String?
+    }
+
+    @MainActor
+    private func loadAppStoreArtwork() async {
+        guard useStoreArtwork, completedSDKScan, !candidates.isEmpty else {
+            artworkLoading = false
+            return
+        }
+        let generation = artworkGeneration
+        let ids = candidates.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }.map(\.id)
+        let pending = ids.filter { storeArtwork[$0] == nil && !storeArtworkAttempts.contains($0) }
+        guard !pending.isEmpty else { artworkLoading = false; return }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.httpShouldSetCookies = false
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 10
+        config.timeoutIntervalForResource = 15
+        let session = URLSession(configuration: config)
+        artworkLoading = true
+        defer {
+            session.invalidateAndCancel()
+            if artworkGeneration == generation && !Task.isCancelled {
+                artworkLoading = false
+            }
+        }
+        let region = Locale.current.region?.identifier.lowercased() ?? "gb"
+        for (index, id) in pending.enumerated() {
+            guard !Task.isCancelled, useStoreArtwork, artworkGeneration == generation else { return }
+            // Apple asks clients to keep lookup traffic modest.
+            if index > 0 {
+                do { try await Task.sleep(for: .seconds(3)) } catch { return }
+            }
+            guard !Task.isCancelled, useStoreArtwork, artworkGeneration == generation else { return }
+            let icon = await fetchStoreArtwork(id, country: region, session: session)
+            guard !Task.isCancelled, useStoreArtwork, artworkGeneration == generation else { return }
+            storeArtworkAttempts.insert(id)
+            if let icon { storeArtwork[id] = icon }
+        }
+    }
+
+    private func fetchStoreArtwork(_ id: String, country: String, session: URLSession) async -> UIImage? {
+        guard !id.isEmpty, id.count <= 255,
+              var components = URLComponents(string: "https://itunes.apple.com/lookup") else { return nil }
+        components.queryItems = [
+            URLQueryItem(name: "bundleId", value: id),
+            URLQueryItem(name: "country", value: country),
+            URLQueryItem(name: "entity", value: "software")
+        ]
+        guard let url = components.url else { return nil }
+        do {
+            let (data, response) = try await session.data(from: url)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  http.url?.host == "itunes.apple.com", data.count <= 4_000_000,
+                  let payload = try? JSONDecoder().decode(StoreArtworkResponse.self, from: data),
+                  let record = payload.results.first(where: { $0.bundleId == id }),
+                  let address = record.artworkUrl100 ?? record.artworkUrl512,
+                  let artworkURL = URL(string: address), artworkURL.scheme == "https",
+                  let host = artworkURL.host?.lowercased(),
+                  host == "mzstatic.com" || host.hasSuffix(".mzstatic.com") ||
+                  host == "apple.com" || host.hasSuffix(".apple.com"),
+                  !Task.isCancelled else { return nil }
+            let (bytes, imageResponse) = try await session.data(from: artworkURL)
+            guard let imageHTTP = imageResponse as? HTTPURLResponse, imageHTTP.statusCode == 200,
+                  let finalHost = imageHTTP.url?.host?.lowercased(),
+                  finalHost == "mzstatic.com" || finalHost.hasSuffix(".mzstatic.com") ||
+                  finalHost == "apple.com" || finalHost.hasSuffix(".apple.com"),
+                  bytes.count <= 2_000_000,
+                  let image = UIImage(data: bytes), image.size.width > 0, image.size.height > 0
+            else { return nil }
+            return image
+        } catch { return nil }
+    }
+
+    private var toolsDashboard: some View {
+        List {
+            Section {
+                Toggle("Use App Store artwork", isOn: $useStoreArtwork)
+                if useStoreArtwork {
+                    if artworkLoading {
+                        ProgressView("Loading App Store icons…")
+                    }
+                    Text("\(storeArtwork.count) App Store icons loaded")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Retry missing icons") {
+                        storeArtworkAttempts.removeAll()
+                        artworkGeneration += 1
+                    }
+                    .disabled(artworkLoading || !completedSDKScan)
+                }
+            } header: {
+                Text("App icons")
+            } footer: {
+                Text("Optional. Sends eligible app bundle identifiers and your storefront region to Apple to retrieve public App Store artwork. No account credentials are sent. Unlisted or sideloaded apps may still show initials.")
+            }
+            if completedSDKScan''',
+    "Independent Apple artwork lookup and controls",
+)
+replace_once(
+    '''                    .padding(.vertical, 10)
+                    if !scanNotice.isEmpty''',
+    '''                    .padding(.vertical, 10)
+                    if !candidates.isEmpty && !useStoreArtwork &&
+                       dashboardIcons.count < candidates.count {
+                        Button {
+                            selectedDashboardTab = 1
+                        } label: {
+                            Label("Missing icons? Use App Store artwork", systemImage: "photo.on.rectangle")
+                                .font(.subheadline)
+                        }
+                    }
+                    if !scanNotice.isEmpty''',
+    "Discoverable artwork setting",
+)
+# Keep existing local method; accept unsigned integer formats where available.
+impl_text = impl.read_text(encoding="utf-8")
+old = '''        if (strcmp(formatType, @encode(NSInteger)) == 0) {
+            [invocation setArgument:&largeFormat atIndex:3];
+        } else if (strcmp(formatType, @encode(int)) == 0) {
+            [invocation setArgument:&smallFormat atIndex:3];'''
+new = '''        if (strcmp(formatType, @encode(NSInteger)) == 0 ||
+            strcmp(formatType, @encode(NSUInteger)) == 0) {
+            [invocation setArgument:&largeFormat atIndex:3];
+        } else if (strcmp(formatType, @encode(int)) == 0 ||
+                   strcmp(formatType, @encode(unsigned int)) == 0) {
+            [invocation setArgument:&smallFormat atIndex:3];'''
+assert impl_text.count(old) == 1
+impl.write_text(impl_text.replace(old, new, 1), encoding="utf-8")
+assert 'guard useStoreArtwork, completedSDKScan' in s
+assert 'record.bundleId' not in s or 'payload.results.first(where:' in s
+assert 'DuoSDKMaintenanceForSelection(actualAction, payload)' in s
+source.write_text(s, encoding="utf-8")
+print("Optional App Store artwork retrieval: exact bundle ID, HTTPS, cancellable async requests, no new permissions.")
