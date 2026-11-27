@@ -811,3 +811,144 @@ assert 'selectedIDs = Set(eligible.map(\\.id))' in s
 assert 'Undo recorded changes' in s
 source.write_text(s, encoding="utf-8")
 print("DuoSDK dashboard: launch scanner, eligible app list, fixed Apply bar, separate Tools tab.")
+
+
+# Installed-app artwork: request only the already-scanned app identifiers.
+# This uses a best-effort UIKit icon lookup with no new permissions, network
+# requests, app-container reads, or changes to the SDK transaction engine.
+s = source.read_text(encoding="utf-8")
+replace_once(
+    '    @State private var selectedDashboardTab = 0',
+    '''    @State private var selectedDashboardTab = 0
+    @State private var dashboardIcons: [String: UIImage] = [:]
+    @State private var attemptedDashboardIcons: Set<String> = []
+    @Environment(\.displayScale) private var dashboardIconScale''',
+    "App icon cache state",
+)
+replace_once(
+    '''            expandedSDKIDs = []
+            fixAppID = ""''',
+    '''            expandedSDKIDs = []
+            dashboardIcons.removeAll()
+            attemptedDashboardIcons.removeAll()
+            fixAppID = ""''',
+    "Clear icon cache on explicit rescan",
+)
+replace_once(
+    '''                Image(systemName: "app.fill")
+                    .font(.title2)
+                    .foregroundStyle(Color.accentColor.opacity(0.75))
+                    .frame(width: 42, height: 42)
+                    .background(Color.accentColor.opacity(0.10),
+                                in: RoundedRectangle(cornerRadius: 11))
+                    .accessibilityHidden(true)''',
+    '''                dashboardAppIcon(item)''',
+    "Replace generic app artwork",
+)
+replace_once(
+    '''        .accessibilityValue(selected ? "Selected" : "Not selected")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private var toolsDashboard: some View {''',
+    '''        .accessibilityValue(selected ? "Selected" : "Not selected")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .task(id: item.id) { @MainActor in
+            // Lazy, local lookups; do not hold up the startup scan.
+            guard !attemptedDashboardIcons.contains(item.id),
+                  candidates.contains(where: { $0.id == item.id }) else { return }
+            attemptedDashboardIcons.insert(item.id)
+            if let icon = DuoSDKIconForBundleID(item.id, dashboardIconScale) {
+                dashboardIcons[item.id] = icon
+            }
+        }
+    }
+
+    private func dashboardAppIcon(_ item: DuoSDKCandidate) -> some View {
+        Group {
+            if let icon = dashboardIcons[item.id] {
+                Image(uiImage: icon)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                ZStack {
+                    Color.accentColor.opacity(0.12)
+                    Text(item.name.isEmpty ? "?" : String(item.name.prefix(1)).uppercased())
+                        .font(.system(size: 19, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+        }
+        .frame(width: 44, height: 44)
+        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .accessibilityHidden(true)
+    }
+
+    private var toolsDashboard: some View {''',
+    "Lazy icon loading with monogram fallback",
+)
+# Existing bridge and compilation unit are already part of the Xcode target.
+bridge = source.parent / "Bridge.h"
+impl = source.parent / "XFlags.m"
+bridge_text = bridge.read_text(encoding="utf-8")
+impl_text = impl.read_text(encoding="utf-8")
+assert "DuoSDKIconForBundleID" not in bridge_text
+assert "DuoSDKIconForBundleID" not in impl_text
+bridge.write_text(bridge_text + r'''
+
+#import <UIKit/UIKit.h>
+FOUNDATION_EXPORT UIImage * _Nullable DuoSDKIconForBundleID(
+    NSString * _Nonnull identifier, CGFloat scale);
+''', encoding="utf-8")
+impl.write_text(impl_text + r'''
+
+#import <UIKit/UIKit.h>
+#import <string.h>
+
+// Best effort: this private UIKit selector is not guaranteed on all releases.
+// No fallback that attempts to cross the application's sandbox.
+UIImage * _Nullable DuoSDKIconForBundleID(NSString * _Nonnull identifier, CGFloat scale) {
+    if (!NSThread.isMainThread || !identifier.length || identifier.length > 255) return nil;
+    @try {
+        SEL selector = NSSelectorFromString(@"_applicationIconImageForBundleIdentifier:format:scale:");
+        Class imageClass = UIImage.class;
+        if (![imageClass respondsToSelector:selector]) return nil;
+        NSMethodSignature *sig = [imageClass methodSignatureForSelector:selector];
+        if (!sig || sig.numberOfArguments != 5 || sig.methodReturnType[0] != '@') return nil;
+        const char *bundleType = [sig getArgumentTypeAtIndex:2];
+        const char *formatType = [sig getArgumentTypeAtIndex:3];
+        const char *scaleType = [sig getArgumentTypeAtIndex:4];
+        if (bundleType[0] != '@' || strcmp(scaleType, @encode(CGFloat)) != 0) return nil;
+        NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:sig];
+        invocation.target = imageClass;
+        invocation.selector = selector;
+        __unsafe_unretained NSString *bundleID = identifier;
+        [invocation setArgument:&bundleID atIndex:2];
+        NSInteger largeFormat = 2;
+        int smallFormat = 2;
+        if (strcmp(formatType, @encode(NSInteger)) == 0) {
+            [invocation setArgument:&largeFormat atIndex:3];
+        } else if (strcmp(formatType, @encode(int)) == 0) {
+            [invocation setArgument:&smallFormat atIndex:3];
+        } else {
+            return nil;
+        }
+        CGFloat requestedScale = MAX(1.0, MIN(3.0, scale));
+        [invocation setArgument:&requestedScale atIndex:4];
+        [invocation invoke];
+        __unsafe_unretained id value = nil;
+        [invocation getReturnValue:&value];
+        if (![value isKindOfClass:UIImage.class]) return nil;
+        UIImage *icon = value;
+        return icon.size.width > 0 && icon.size.height > 0 ? icon : nil;
+    } @catch (NSException *exception) {
+        return nil;
+    }
+}
+''', encoding="utf-8")
+assert 'dashboardAppIcon(item)' in s
+assert 'DuoSDKIconForBundleID(item.id, dashboardIconScale)' in s
+assert 'run(0)  // Read-only installed-app scan' in s
+assert 'DuoSDKMaintenanceForSelection(actualAction, payload)' in s
+source.write_text(s, encoding="utf-8")
+print("Dashboard artwork: local UIKit icon lookup, lazy in-memory cache, initials fallback.")
