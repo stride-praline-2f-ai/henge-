@@ -482,3 +482,332 @@ assert 'DuoSDKMaintenanceForSelection(actualAction, payload)' in s
 assert 'confirmApply = true' in s
 source.write_text(s, encoding="utf-8")
 print("Workspace review: compact editors, bulk selection, ordered launch, scan/error states and recovery UI repaired.")
+
+
+# Two-tab dashboard redesign. Reuse the existing Tools controls and engine
+# methods rather than rewriting any transaction, signing, or cache logic.
+s = source.read_text(encoding="utf-8")
+replace_once(
+    '    @State private var operationLabel = "Checking…"',
+    '''    @State private var operationLabel = "Checking…"
+    @State private var selectedDashboardTab = 0''',
+    "Dashboard tab state",
+)
+
+view_start = s.index('private struct DuoSDKView: View {')
+body_start = s.index('    var body: some View {', view_start)
+tools_start = s.index('                Section {\n                    DisclosureGroup("Fix Mode"', body_start)
+tools_end = s.index('            }\n            .searchable(text: $search, prompt: "Search apps")', tools_start)
+dialogs_start = s.index('            .confirmationDialog("Apply this compatibility trial?"', tools_end)
+# Keep confirmation dialogs, orientation notifications and the foreground task
+# attached to the shared parent, not a tab that disappears when switching.
+body_end = s.index('    private var oneFixApp:', dialogs_start)
+old_tools = s[tools_start:tools_end]
+old_modifiers = s[dialogs_start:body_end]
+assert 'run(3)' in old_tools and 'Advanced & diagnostics' in old_tools
+assert 'run(0)  // Read-only installed-app scan' in old_modifiers
+assert 'run(1)' in old_modifiers
+
+new_body = r'''
+    private var scanningApps: Bool {
+        !startedInitialSDKScan || (working && operationLabel == "Scanning installed apps…")
+    }
+
+    var body: some View {
+        ZStack {
+            TabView(selection: $selectedDashboardTab) {
+                NavigationStack {
+                    appsDashboard
+                        .navigationTitle("DuoSDK")
+                        .navigationBarTitleDisplayMode(.large)
+                        .toolbar {
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button {
+                                    run(0)
+                                } label: {
+                                    Image(systemName: "arrow.clockwise")
+                                }
+                                .accessibilityLabel("Refresh installed apps")
+                                .disabled(working || heartbeatChecking)
+                            }
+                        }
+                }
+                .tabItem { Label("Apps", systemImage: "square.grid.2x2") }
+                .tag(0)
+
+                NavigationStack {
+                    toolsDashboard
+                        .navigationTitle("Tools")
+                        .navigationBarTitleDisplayMode(.large)
+                }
+                .tabItem { Label("Tools", systemImage: "slider.horizontal.3") }
+                .tag(1)
+            }
+            .disabled(working || heartbeatChecking)
+            .accessibilityHidden(scanningApps)
+
+            if scanningApps {
+                launchScanView
+                    .zIndex(1)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.22), value: scanningApps)
+'''
+# Old modifiers include the final NavigationStack closing brace and body brace.
+# Strip the old NavigationStack close; modifiers now attach to ZStack.
+tail = old_modifiers.rstrip()
+assert tail.endswith('        }\n    }'), tail[-250:]
+tail = tail[:-len('        }\n    }')] + '    }\n\n'
+# Indentation is cosmetic in Swift; keep existing closure structure intact.
+new_body += tail
+new_body += r'''
+    private var launchScanView: some View {
+        ZStack {
+            Color(uiColor: .systemGroupedBackground).ignoresSafeArea()
+            VStack(spacing: 24) {
+                Spacer()
+                ZStack {
+                    RoundedRectangle(cornerRadius: 30, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.12))
+                        .frame(width: 108, height: 108)
+                    Image(systemName: "square.grid.2x2.fill")
+                        .font(.system(size: 44, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                }
+                VStack(spacing: 8) {
+                    Text("DuoSDK")
+                        .font(.system(.largeTitle, design: .rounded).weight(.bold))
+                    Text("Searching installed apps")
+                        .font(.headline)
+                    Text("Checking recorded SDK versions below 27.2")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(.accentColor)
+                    .accessibilityLabel("Scanning installed apps")
+                Spacer()
+                Text("Read-only scan")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.bottom, 24)
+            }
+            .padding(.horizontal, 32)
+            .frame(maxWidth: 480)
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private var appsDashboard: some View {
+        List {
+            if completedSDKScan {
+                Section {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(alignment: .center) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("\(candidates.count)")
+                                    .font(.system(size: 52, weight: .bold, design: .rounded))
+                                    .monospacedDigit()
+                                    .foregroundStyle(Color.accentColor)
+                                Text("Eligible apps")
+                                    .font(.headline)
+                            }
+                            Spacer()
+                            Image(systemName: "checkmark.circle")
+                                .font(.system(size: 36, weight: .light))
+                                .foregroundStyle(Color.accentColor)
+                                .accessibilityHidden(true)
+                        }
+                        Text("Recorded SDK below 27.2")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        if !candidates.isEmpty {
+                            Divider()
+                            HStack {
+                                Text("\(selectedIDs.count) selected")
+                                    .font(.subheadline.weight(.medium))
+                                Spacer()
+                                Button(selectedIDs.count == candidates.count ? "Deselect all" : "Select all") {
+                                    if selectedIDs.count == candidates.count {
+                                        selectedIDs.removeAll()
+                                    } else {
+                                        selectedIDs = Set(candidates.map(\.id))
+                                    }
+                                }
+                                .buttonStyle(.borderless)
+                                .font(.subheadline.weight(.medium))
+                            }
+                        }
+                    }
+                    .padding(.vertical, 10)
+                    if !scanNotice.isEmpty {
+                        Label(scanNotice, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if candidates.isEmpty {
+                    Section {
+                        ContentUnavailableView("No eligible apps",
+                            systemImage: "checkmark.seal",
+                            description: Text("No recognised installed apps have a recorded SDK below 27.2.0."))
+                    }
+                } else {
+                    Section("Installed apps") {
+                        ForEach(candidates.sorted {
+                            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+                        }) { item in
+                            dashboardAppRow(item)
+                        }
+                    }
+                }
+            } else if !scanningApps {
+                Section {
+                    if scanFailed {
+                        ContentUnavailableView("Scan unavailable",
+                            systemImage: "exclamationmark.triangle",
+                            description: Text("DuoSDK could not read or decode the app inventory. Open Tools for details."))
+                        Button("View technical details") {
+                            showRawOutput = true
+                            selectedDashboardTab = 1
+                        }
+                    } else {
+                        ContentUnavailableView("Refresh apps",
+                            systemImage: "arrow.clockwise",
+                            description: Text("A new scan is required before making another change."))
+                    }
+                    if !report.isEmpty {
+                        Text(briefResult(report))
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    Button("Scan installed apps") { run(0) }
+                        .disabled(working || heartbeatChecking)
+                }
+            }
+            if working && !scanningApps {
+                Section { ProgressView(operationLabel) }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if completedSDKScan && !candidates.isEmpty {
+                VStack(spacing: 8) {
+                    Button {
+                        confirmApply = true
+                    } label: {
+                        HStack {
+                            Spacer()
+                            Label("Apply to \(selectedIDs.count) apps", systemImage: "checkmark.circle.fill")
+                                .font(.headline)
+                            Spacer()
+                        }
+                        .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(!canApply || working || heartbeatChecking)
+                    if !selectedIDs.isEmpty && !canApply {
+                        Text("Check SDK targets in Tools. SDK 27.3 requires one selected app.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    } else {
+                        Text("Changes require confirmation.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+                .background(.regularMaterial)
+            }
+        }
+    }
+
+    private func dashboardAppRow(_ item: DuoSDKCandidate) -> some View {
+        let selected = selectedIDs.contains(item.id)
+        return Button {
+            if selected { selectedIDs.remove(item.id) }
+            else { selectedIDs.insert(item.id) }
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "app.fill")
+                    .font(.title2)
+                    .foregroundStyle(Color.accentColor.opacity(0.75))
+                    .frame(width: 42, height: 42)
+                    .background(Color.accentColor.opacity(0.10),
+                                in: RoundedRectangle(cornerRadius: 11))
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.name)
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.primary)
+                    Text(selected ? "SDK \(item.fromVersion) → \(target(item))" :
+                         "SDK \(item.fromVersion)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .font(.title2)
+                    .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                    .accessibilityHidden(true)
+            }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(selected ? "Selected" : "Not selected")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private var toolsDashboard: some View {
+        List {
+            if completedSDKScan && !candidates.isEmpty {
+                Section("SDK options") {
+                    Button("Reset selected targets to SDK 27.2.0") {
+                        for id in selectedIDs { targets[id] = "27.2.0" }
+                    }
+                    .disabled(selectedIDs.isEmpty)
+                    DisclosureGroup("Edit individual SDK targets") {
+                        ForEach(candidates.sorted {
+                            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+                        }) { item in
+                            compactAppRow(item)
+                        }
+                    }
+                }
+            }
+'''
+new_body += old_tools
+new_body += r'''
+        }
+        .listStyle(.insetGrouped)
+    }
+
+'''
+s = s[:body_start] + new_body + s[body_end:]
+# The selection scope no longer involves search on the Apps tab.
+replace_once(
+    '''Text("Apply the displayed SDK targets to \(selectedIDs.count) selected apps, "
+                     + "including selected apps hidden by search? Keep a device backup.")''',
+    '''Text("Apply the displayed SDK targets to \(selectedIDs.count) selected apps? "
+                     + "These changes are experimental. Keep a device backup.")''',
+    "Dashboard confirmation",
+)
+
+assert 'TabView(selection: $selectedDashboardTab)' in s
+assert 'launchScanView' in s and 'ProgressView()' in s
+assert 'run(0)  // Read-only installed-app scan' in s
+assert 'DuoSDKMaintenanceForSelection(actualAction, payload)' in s
+assert 'confirmApply = true' in s
+assert 'selectedIDs = Set(eligible.map(\\.id))' in s
+assert 'Undo recorded changes' in s
+source.write_text(s, encoding="utf-8")
+print("DuoSDK dashboard: launch scanner, eligible app list, fixed Apply bar, separate Tools tab.")
