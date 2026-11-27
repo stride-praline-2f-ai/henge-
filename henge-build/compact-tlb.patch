@@ -1,0 +1,195 @@
+diff --git a/core/translate.c b/core/translate.c
+index 1970b9d..8263d32 100644
+--- a/core/translate.c
++++ b/core/translate.c
+@@ -44,10 +44,7 @@ typedef struct {
+     uint8_t kind;
+     uint8_t nrestore;
+     uint8_t restore[4]; /* scratch registers to reload from cpu->spill first */
+-    /* Loads and stores: redo the TLB check exactly (the fast one rejects an
+-       access in a page's last HV_TLB_ADJ bytes) and go back if it passes. */
+-    uint8_t recheck, addr, t, u, bytes, preloaded, table;
+-    uint32_t tag_off;
++    uint8_t addr, t, u, table;
+     uint32_t fastmem_join;
+     uint8_t fastmem;
+     uint64_t site;      /* guest PC of the instruction that branches out of line */
+@@ -116,6 +113,8 @@ typedef struct {
+     HvMachine *m;
+     uint64_t cur_pc;     /* guest PC of the instruction being translated (or whose out-of-line exit is) */
+     /* Grouped accesses (Group). */
++    HvInsnKind planned_kind[HV_MAX_BLOCK_INSNS];
++    uint32_t planned_count; /* classified prefix of the current guest block */
+     Group grp[MAX_GROUPS];
+     uint32_t ngrp;
+     int wider_groups, wide_group_used;
+@@ -1087,13 +1086,9 @@ static uint32_t put_fastmem_probe(Emit *e, int addr, int T, int U, int el_idx) {
+     return fm_done;
+ }
+ 
+-/* Only on an ordinary TLB miss: retain the normal hit path byte for byte.
+-   A LUT miss restores the TLB slot/addend needed by the exact tail recheck. */
+ static void put_fastmem_fallback(Emit *e, const Ool *o) {
+     uint32_t hit = put_fastmem_probe(e, o->addr, o->t, o->u, o->table);
+     plink(e, hit, e->in_cold, o->fastmem_join, 0);
+-    uint32_t tlb = put_tlb_slot(e, o->t, o->addr, o->table);
+-    if (o->preloaded) put(e, LDR_X(o->u, o->t, tlb + 24));
+ }
+ 
+ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+@@ -1244,8 +1239,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+         : put_tlb_slot(e, T, addr, el_idx);
+     /* Both CPU-owned fields share a cache line. Issue independent loads
+        before checking the tag, instead of serializing the addend load behind
+-       the check. Only the guarded memory instruction dereferences the addend.
+-       A miss recomputes the slot in the cold recheck, never in the hit path. */
++       the check. Only the guarded memory instruction dereferences the addend. */
+     int check = preloaded ? T : U;
+     if (preloaded) put(e, LDR_X(U, T, tlb + 24));
+     put(e, LDR_X(check, tlb_base, tlb + (op.store ? 8 : 0)));
+@@ -1257,25 +1251,23 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+         put(e, 0xd1000000u | HV_TLB_ADJ << 10 | check << 5 | check); /* sub check, check, #ADJ */
+         put(e, 0x92400000u | 50u << 16 | (49u + k) << 10 | check << 5 | check);
+     } else {
+-        if (op.bytes > HV_TLB_ADJ + 1) put_add_imm(e, check, check, op.bytes - 1 - HV_TLB_ADJ);
++        /* The biased permission tag gives offset + ADJ. Test the last byte
++           directly so a valid tail hit needs no second lookup or cold stub. */
++        int can_hit_tail = !literal || ((pc + op.imm) & ((1u << HV_TLB_PAGE_BITS) - 1)) >=
++                                      (1u << HV_TLB_PAGE_BITS) - HV_TLB_ADJ;
++        if (op.bytes > HV_TLB_ADJ + 1 || (can_hit_tail && hv_knob[HV_K_RECHECK]))
++            put_add_imm(e, check, check, (int64_t)op.bytes - 1 - HV_TLB_ADJ);
+         put(e, UBFM_X(check, check, HV_TLB_PAGE_BITS, 63));
+     }
+     put(e, CBNZ_X(check));
+     /* Writeback forms change their base, and the retry recomputes it: those
+        (and RMW, exclusive and vector forms) go straight to the helper. */
+     int can_refill = !vec_kind && !rmw && op.mode != HV_ADDR_PRE && op.mode != HV_ADDR_POST && op.bytes <= 64 && !e->slow_mem;
+-    /* A literal's offset within the 16 KiB page is known when translated.
+-       The conservative guard already admits it when it cannot hit the tail. */
+-    int can_hit_tail = !literal || ((pc + op.imm) & ((1u << HV_TLB_PAGE_BITS) - 1)) >= (1u << HV_TLB_PAGE_BITS) - HV_TLB_ADJ;
+     /* hv_tlb_refill's flags: bit 9 set (so never 0), bit 0 write, bits 2..1 the table, 8..3 bytes - 1 */
+     uint32_t rflags = can_refill ? 1u << 9 | (uint32_t)(op.store ? 1 : 0) | (uint32_t)el_idx << 1 | (op.bytes - 1) << 3 : 0;
+     put_ool(e, (Ool){.kind = OOL_SLOW, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U},
+-                     /* The exact recheck for a page's last 15 bytes costs 6 words in every access's slow path; without it
+-                        (HV_RECHECK=0) such an access takes the refill, which sends it to the helper. */
+-                     .recheck = hv_knob[HV_K_RECHECK] && can_hit_tail && !(op.align && op.bytes > 1) && op.bytes < HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
+-                     .t = (uint8_t)tlb_base, .u = (uint8_t)U, .bytes = (uint8_t)op.bytes,
+-                     .tag_off = tlb + (op.store ? 8 : 0), .retry = retry, .rflags = rflags,
+-                     .preloaded = preloaded, .table = el_idx, .fastmem = fastmem && e->m->fastmem_tlb_first});
++                     .addr = (uint8_t)addr, .t = (uint8_t)tlb_base, .u = (uint8_t)U,
++                     .retry = retry, .rflags = rflags, .table = el_idx, .fastmem = fastmem && e->m->fastmem_tlb_first});
+     slow = e->nool - 1;
+     if (!preloaded) put(e, LDR_X(U, tlb_base, tlb + 24));
+     e->ool[slow].fastmem_join = e->n;
+@@ -1764,8 +1756,7 @@ static int is_fp_insn(uint32_t insn) {
+ }
+ 
+ /* Returns 1 if the instruction ends the block. */
+-static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
+-    HvInsnKind kind = hv_classify(insn);
++static int translate_one(Emit *e, uint32_t insn, uint64_t pc, HvInsnKind kind) {
+     e->site_hint_candidate=e->m->branch_site_hints &&
+         ((insn&0xfffffc1fu)==0xd61f0000u||(insn&0xfffffc1fu)==0xd63f0000u);
+     if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) {
+@@ -1975,17 +1966,6 @@ static void emit_ool(Emit *e) {
+         }
+         uint32_t site_at = link_site(e, o->at);
+         if (o->fastmem) put_fastmem_fallback(e, o);
+-        if (o->recheck) { /* the fast check refuses a page's last 15 bytes: check exactly, and go back if it fits */
+-            if (o->preloaded && !o->fastmem) put_tlb_slot(e, o->t, o->addr, o->table);
+-            int check = o->preloaded ? o->t : o->u;
+-            put(e, LDR_X(check, o->t, o->tag_off));
+-            put(e, SUB_X(check, o->addr, check));
+-            put_add_imm(e, check, check, (int64_t)o->bytes - 1 - HV_TLB_ADJ);
+-            put(e, UBFM_X(check, check, HV_TLB_PAGE_BITS, 63));
+-            put(e, CBNZ_X(check) | 2u << 5); /* a real miss */
+-            put(e, B_OP);
+-            plink(e, e->n - 1, 1, o->at + 1, 0);
+-        }
+         if (o->kind == OOL_GROUP) {
+             unspill(e, o->restore, o->nrestore);
+             put(e, B_OP);
+@@ -2056,7 +2036,7 @@ static int register_group(const Emit *e, const Group *g, unsigned id, const uint
+     unsigned count=0;
+     for (unsigned i=g->first;i<=g->last;i++) {
+         uint32_t insn=code[i];
+-        HvInsnKind kind = hv_classify(insn);
++        HvInsnKind kind = e->planned_kind[i];
+         if (kind == HV_INSN_MEMORY) {
+             HvMemOp op;
+             if (e->gid[i] != (int)id || hv_mem_decode(insn, &op) || !group_op(&op) ||
+@@ -2098,7 +2078,7 @@ static int cached_group(const Emit *e,const Group *g,const uint32_t *code) {
+     if(hv_knob[HV_K_GROUP_MIN]>=3 && minimum<3)minimum=3;
+     if(g->accesses<minimum)return 0;
+     for(unsigned i=g->first;i<=g->last;i++) {
+-        HvInsnKind kind=hv_classify(code[i]);
++        HvInsnKind kind = e->planned_kind[i];
+         if(kind==HV_INSN_COPY||kind==HV_INSN_PREFETCH)continue;
+         if(kind==HV_INSN_PCREL && (code[i]&31)!=g->base)continue;
+         HvMemOp op;
+@@ -2121,7 +2101,11 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+     for (uint32_t i = 0; i < max && i < HV_MAX_BLOCK_INSNS; i++) {
+         uint32_t insn = code[i];
+         if (i > 0 && (va + 4ull * i == e->m->stop_pc || va + 4ull * i == e->m->stop_pc2)) break;
+-        HvInsnKind kind = hv_classify(insn);
++        if (i == e->planned_count) {
++            e->planned_kind[i] = hv_classify(insn);
++            e->planned_count++;
++        }
++        HvInsnKind kind = e->planned_kind[i];
+         if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) break;
+         if (kind == HV_INSN_COPY && (insn & 0xfffff01fu) == 0xd503201fu) continue; /* hints (NOP, BTI): no register */
+         HvMemOp op;
+@@ -2262,7 +2246,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
+         changed=0;
+         for(unsigned k=0;k<e->ngrp;k++) {
+             Group *g=&e->grp[k];if(!g->live)continue;
+-            for(unsigned i=g->first;i<=g->last;i++)if(hv_classify(code[i])==HV_INSN_MEMORY &&
++            for(unsigned i=g->first;i<=g->last;i++)if(e->planned_kind[i]==HV_INSN_MEMORY &&
+                 (e->gid[i]<0 || !e->grp[(unsigned)e->gid[i]].live)) {g->live=0;changed=1;break;}
+         }
+     }
+@@ -2313,7 +2297,7 @@ static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_
+             e->cur_pc = va + 4ull * i;
+             e->cur_i = i;
+             e->u_prev = e->u_live = 0;
+-            if (translate_one(e, code[i], va + 4ull * i)) return -1; /* cannot happen: groups hold no block ends */
++            if (translate_one(e, code[i], va + 4ull * i, e->planned_kind[i])) return -1; /* cannot happen: groups hold no block ends */
+         }
+         put(e, B_OP);
+         patch_branch(&e->w[e->n - 1], (int64_t)e->after[end] - (e->n - 1));
+@@ -2363,6 +2347,7 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
+     /* No prologue: hv_enter, chained exits and the indirect-branch cache all
+        enter with guest x0 and x1 live. */
+     uint32_t max = avail < HV_MAX_BLOCK_INSNS ? avail : HV_MAX_BLOCK_INSNS;
++    e->planned_count = 0;
+     plan_groups(e, code, max, b->va);
+     if (e->wider_groups && !e->wide_group_used) {
+         e->wider_groups = 0;
+@@ -2377,9 +2362,10 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
+         e->cur_i = i;
+         e->u_prev = e->u_live, e->u_live = 0;
+         uint32_t n0 = e->n;
+-        ended = translate_one(e, code[i], pc);
++        uint32_t insn = code[i];
++        HvInsnKind k = i < e->planned_count ? e->planned_kind[i] : hv_classify(insn);
++        ended = translate_one(e, insn, pc, k);
+         if (m->stats_interval) {
+-            HvInsnKind k = hv_classify(code[i]);
+             m->stats.kind_insns[k & 15]++;
+             m->stats.kind_words[k & 15] += e->n - n0;
+         }
+diff --git a/tests/test_tail_recheck.c b/tests/test_tail_recheck.c
+index 360b8ef..c4dc6d0 100644
+--- a/tests/test_tail_recheck.c
++++ b/tests/test_tail_recheck.c
+@@ -75,7 +75,8 @@ int main(void) {
+             assert(cpu.x[2] == 5000 && cpu.x[3] == 0);
+             uint64_t words = code_words() - before;
+             if (!precise) reference_words = words;
+-            if (precise) assert(tail ? words > reference_words : words == reference_words);
++            if (precise && !tail) assert(words == reference_words);
++            if (precise && tail) assert(words <= reference_words + 2);
+             if (tail) assert(precise ? m.stat_slow_mem <= 1 : m.stat_slow_mem == 1000);
+         }
+     }
