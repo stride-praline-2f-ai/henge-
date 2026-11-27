@@ -1154,3 +1154,111 @@ assert 'record.bundleId' not in s or 'payload.results.first(where:' in s
 assert 'DuoSDKMaintenanceForSelection(actualAction, payload)' in s
 source.write_text(s, encoding="utf-8")
 print("Optional App Store artwork retrieval: exact bundle ID, HTTPS, cancellable async requests, no new permissions.")
+
+
+# Fullscreen is a separate workspace. Do not imply that LaunchServices SDK
+# metadata can control UIKit status bars in other applications.
+s = source.read_text(encoding="utf-8")
+replace_once(
+    '    @State private var selectedDashboardTab = 0',
+    '''    @State private var selectedDashboardTab = 0
+    @State private var fullscreenPreviewHidden = false''',
+    "Fullscreen preview state",
+)
+replace_once(
+    '''                .tabItem { Label("Tools", systemImage: "slider.horizontal.3") }
+                .tag(1)
+            }''',
+    '''                .tabItem { Label("Tools", systemImage: "slider.horizontal.3") }
+                .tag(1)
+
+                NavigationStack {
+                    fullscreenDashboard
+                        .navigationTitle("Fullscreen")
+                        .navigationBarTitleDisplayMode(.large)
+                }
+                .tabItem {
+                    Label("Fullscreen", systemImage: "arrow.up.left.and.arrow.down.right")
+                }
+                .tag(2)
+            }''',
+    "Separate Fullscreen tab",
+)
+replace_once(
+    '        .animation(.easeInOut(duration: 0.22), value: scanningApps)',
+    '''        .statusBarHidden(selectedDashboardTab == 2 && fullscreenPreviewHidden && !scanningApps)
+        .animation(.easeInOut(duration: 0.22), value: scanningApps)''',
+    "DuoSDK-only native status bar preview",
+)
+replace_once(
+    '    private var toolsDashboard: some View {',
+    r'''    private var fullscreenDashboard: some View {
+        List {
+            Section {
+                VStack(alignment: .leading, spacing: 12) {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 32, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                        .accessibilityHidden(true)
+                    Text("Status bar & fullscreen")
+                        .font(.title2.weight(.semibold))
+                    Text("Preview the native status bar behaviour in DuoSDK without changing other apps.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 12)
+            }
+            Section {
+                Toggle("Hide status bar in DuoSDK", isOn: $fullscreenPreviewHidden)
+            } header: {
+                Text("Live preview")
+            } footer: {
+                Text("Only the Fullscreen tab is affected. Switching tabs restores the status bar. No cache or app executable is modified.")
+            }
+            Section {
+                HStack {
+                    Label("Hide status bar in other apps", systemImage: "iphone")
+                    Spacer()
+                    Text("Unavailable")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                HStack {
+                    Label("Remove reserved safe-area space", systemImage: "rectangle.expand.vertical")
+                    Spacer()
+                    Text("Unavailable")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Per-app controls")
+            } footer: {
+                Text("The existing SDK override does not provide a verified status bar or safe-area setting for other apps. These controls are not implemented.")
+            }
+            Section {
+                Button {
+                    sampleSelfScene()
+                } label: {
+                    Label("Inspect current display geometry", systemImage: "viewfinder")
+                }
+                Text(selfSceneReport)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            } header: {
+                Text("Display diagnostics")
+            } footer: {
+                Text("Measurements describe DuoSDK's current scene, not other applications.")
+            }
+        }
+        .listStyle(.insetGrouped)
+    }
+
+    private var toolsDashboard: some View {''',
+    "Fullscreen preview and honest capability status",
+)
+assert '.tag(2)' in s and 'fullscreenDashboard' in s
+assert '.statusBarHidden(selectedDashboardTab == 2 && fullscreenPreviewHidden && !scanningApps)' in s
+assert 'DuoSDKMaintenanceForSelection(actualAction, payload)' in s
+source.write_text(s, encoding="utf-8")
+print("Fullscreen tab: native DuoSDK-only live preview and display diagnostics; no unverified cross-app changes.")
